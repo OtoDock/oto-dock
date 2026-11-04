@@ -153,6 +153,22 @@ async def test_drain_until_turn_ended_skips_stale_marker():
 
 
 @pytest.mark.asyncio
+async def test_drain_until_turn_ended_hands_a_sub_agents_ask_to_the_engine_prompts(monkeypatch):
+    """A background sub-agent's ask can land in the window after the turn's
+    stop: it reaches the engine prompts (answered or shown), never dropped."""
+    from core.session import engine_prompts
+    seen: list[dict] = []
+    monkeypatch.setattr(engine_prompts, "note_frame", lambda sid, d, **kw: seen.append(d))
+    info = _make_info()
+    ask = {"type": "control_request", "request_id": "r1",
+           "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}}
+    info.event_queue.put_nowait(ask)
+    info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "current"})
+    await cli_remote.drain_until_turn_ended(info, timeout=1.0, expected_command_id="current")
+    assert seen == [ask]
+
+
+@pytest.mark.asyncio
 async def test_drain_until_turn_ended_times_out_on_only_stale():
     """If only a stale marker is in the queue, drain should time out (not
     short-circuit on the stale one).
@@ -452,6 +468,9 @@ class TestAdoptSession:
                 self.q = asyncio.Queue(maxsize=maxsize)
                 return self.q
 
+            def tunnel_port(self, machine_id):
+                return 41000
+
             async def send_fire_and_forget(self, machine_id, msg):
                 sent.append(msg)
                 # Emulate the satellite's replay onto the queue.
@@ -484,6 +503,9 @@ class TestAdoptSession:
             def create_session_queue(self, machine_id, sid, path, *, maxsize=1000):
                 self.q = asyncio.Queue(maxsize=maxsize)
                 return self.q
+
+            def tunnel_port(self, machine_id):
+                return 41000
 
             async def send_fire_and_forget(self, machine_id, msg):
                 self.q.put_nowait({"type": "_resume_replay_begin",

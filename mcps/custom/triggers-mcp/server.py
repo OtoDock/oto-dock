@@ -41,6 +41,15 @@ API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 server = Server("triggers-mcp")
 TOOL_ARGS = ToolArgs()
+
+#: A subscription that receives nothing because of its MCP, by the list's
+#: ``mcp_state`` (absent from an older proxy): the status the line prints
+#: and the dashboard's sentence for it.
+_MCP_STATE_STATUS = {
+    "off": ("mcp_off", "Its MCP is turned off. It receives no events until an admin turns the MCP on again."),
+    "removed": ("mcp_removed", "Its MCP was removed. It receives no events. Delete it, or install the MCP again."),
+}
+
 _client = httpx.AsyncClient(timeout=30)
 
 
@@ -224,6 +233,16 @@ async def list_tools() -> list[Tool]:
                                     "(agent-scope)."
                                 ),
                             },
+                            "audience": {
+                                "type": "string",
+                                "enum": ["manager", "editor", "contributor", "viewer"],
+                                "description": (
+                                    "Who is told, for target_scope='agent': the lowest role on "
+                                    "this agent that receives it (platform admins always do). "
+                                    "Omit for editors and managers; viewer tells everyone who "
+                                    "uses the agent."
+                                ),
+                            },
                         },
                     },
                     "debounce_seconds": {
@@ -297,7 +316,9 @@ async def list_tools() -> list[Tool]:
                 "entry includes the subscription_id (use in create_trigger), "
                 "provider (github / slack / linear / microsoft / zoom), "
                 "vendor_target (e.g. GitHub repo or Slack channel), the events the "
-                "subscription receives, status (active / failed / renew_failed), "
+                "subscription receives, status (active / failed / renew_failed, or "
+                "mcp_off / mcp_removed when its MCP is turned off or was removed, and "
+                "then it receives nothing), "
                 "and the manifest's event_catalog so you know which event_type "
                 "values are valid for event_filter, and its scope: [personal] "
                 "rows link to user-scope triggers, [agent <name>] rows to "
@@ -332,8 +353,9 @@ async def list_tools() -> list[Tool]:
                 "user-scoped triggers + all agent-scoped triggers for this agent. "
                 "Each row: slug, name, scope (user/<creator> or agent), status "
                 "(active/paused), fired_count, last_fired_at, its action — "
-                "`task=<name> model=<id> [pinned|agent default|layer default, "
-                "tier N]` (the linked task's effective model: a trigger has no "
+                "`task=<name> model=<id> [pinned|your engine|agent default|layer "
+                "default, tier N]` (the linked task's effective model: a trigger "
+                "has no "
                 "model of its own), `app=<slug>/<handler>`, or "
                 "`notify(<severity>)` — and id. get_trigger returns the webhook "
                 "path. "
@@ -404,6 +426,11 @@ async def list_tools() -> list[Tool]:
                         "enum": ["user", "agent", "global"],
                     },
                     "notify_target": {"type": "string"},
+                    "notify_audience": {
+                        "type": "string",
+                        "enum": ["manager", "editor", "contributor", "viewer"],
+                        "description": "Who an agent-scope notify tells: the lowest role on this agent.",
+                    },
                     "debounce_seconds": {"type": "integer"},
                     "event_filter": {
                         "type": "object",
@@ -576,6 +603,7 @@ async def _handle_create(args: dict) -> list[TextContent]:
             "body": notify.get("body"),
             "target_scope": notify.get("target_scope"),
             "target": notify.get("target"),
+            "audience": notify.get("audience"),
         }
     result = await _post("/v1/triggers", payload)
     trig = result.get("trigger", {})
@@ -637,11 +665,16 @@ async def _handle_list_subscriptions(args: dict) -> list[TextContent]:
         # The kind says what the target covers (GitHub: one repository or
         # every repository in an organization); the default kind is unnamed.
         kind = f" ({r.get('target_kind')})" if r.get("target_kind") else ""
+        # Its own status still reads active while its MCP is off or gone,
+        # and nothing reaches it then.
+        held = _MCP_STATE_STATUS.get(str(r.get("mcp_state") or ""))
         lines.append(
             f"  • {r.get('provider_id')}/{r.get('account_label')} → "
             f"{r.get('vendor_target')}{kind}  [{scope}]  events={events or '—'}  "
-            f"status={r.get('status')}  id={r.get('id', '')}"
+            f"status={held[0] if held else r.get('status')}  id={r.get('id', '')}"
         )
+        if held:
+            lines.append(f"      {held[1]}")
     return [TextContent(type="text", text="\n".join(lines))]
 
 
@@ -667,8 +700,9 @@ async def _handle_list(args: dict) -> list[TextContent]:
         last = r.get("last_fired_at") or "never"
         actions = []
         if r.get("task_id"):
-            # A trigger has no model of its own: the linked task's pin or
-            # its agent's default decides, so the listing says which.
+            # A trigger has no model of its own: the linked task's pin, its
+            # creator's engine or its agent's default decides, so the
+            # listing says which.
             model = r.get("task_effective_model") or ""
             source = r.get("task_effective_model_source") or (
                 "pinned" if r.get("task_override_model") else "agent default")
@@ -708,7 +742,7 @@ async def _handle_edit(args: dict) -> list[TextContent]:
     editable = {
         "name", "task_id", "app_slug", "handler",
         "notify_enabled", "notify_severity", "notify_title", "notify_body",
-        "notify_target_scope", "notify_target", "debounce_seconds",
+        "notify_target_scope", "notify_target", "notify_audience", "debounce_seconds",
         "event_filter", "subscription_id",
     }
     payload = {k: v for k, v in args.items() if k in editable}

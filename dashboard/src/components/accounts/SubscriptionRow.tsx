@@ -6,7 +6,7 @@
  */
 
 import { useState } from 'react'
-import { fetchSigningSecret, type WebhookSubscription } from '../../api/subscriptions'
+import { fetchSigningSecret, mcpStateMark, type WebhookSubscription } from '../../api/subscriptions'
 import { isRelayDelivery } from './useDeleteWithConfirm'
 import { BADGE_BASE, BADGE_TONE } from '../ui/classes'
 
@@ -52,6 +52,7 @@ export function SubscriptionRow({
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap">
           <StatusPill status={sub.status} />
+          <McpStatePill state={sub.mcp_state} />
           <ScopePill sub={sub} agentLabel={agentLabel} />
           <span className="font-mono truncate">{sub.vendor_target}</span>
           {sub.target_kind && (
@@ -161,6 +162,16 @@ export function ScopePill({
       title={isAgent ? `Created for agent ${sub.agent ?? ''}` : 'Your personal subscription'}
     >
       {isAgent ? `Agent ${agentLabel || sub.agent || ''}` : 'Personal'}
+    </span>
+  )
+}
+
+export function McpStatePill({ state }: { state: WebhookSubscription['mcp_state'] }) {
+  const mark = mcpStateMark(state)
+  if (!mark) return null
+  return (
+    <span className={`${BADGE_BASE} ${BADGE_TONE.warning}`} title={mark.why} data-testid="subscription-mcp-state">
+      {mark.note}
     </span>
   )
 }

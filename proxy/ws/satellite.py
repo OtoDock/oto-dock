@@ -104,15 +104,20 @@ _VERSION_LINE_RE = re.compile(
 )
 
 
-def _cli_pins() -> dict[str, str]:
+def _cli_pins(satellite_version: str | None = None) -> dict[str, str]:
     """``{pin_key: pinned version}`` for every engine with a CLI binary. The
     keys are the satellite's WIRE vocabulary (``claude_code`` / ``codex``,
     frozen — `satellite/host/cli_versions.py` drops unknown keys fail-open),
     declared on each engine's descriptor; the version is read at call time
-    so a runtime change to ``config.PINNED_*`` reaches the next handshake."""
+    so a runtime change to ``config.PINNED_*`` reaches the next handshake.
+    With the connecting satellite's version, each engine may cap its pin
+    for a satellite whose spawn cannot run the newer CLI yet
+    (``pinned_cli_version_for``)."""
     from core.session.session_manager import get_all_layers
     return {
-        layer.capabilities.runtime.pin_key: layer.pinned_cli_version()
+        layer.capabilities.runtime.pin_key: (
+            layer.pinned_cli_version() if satellite_version is None
+            else layer.pinned_cli_version_for(satellite_version))
         for layer in get_all_layers().values()
         if layer.capabilities.runtime.pin_key
     }
@@ -307,7 +312,8 @@ def _version_at_least(version: str, minimum: str) -> bool:
     return v_parts >= m_parts
 
 
-def _auth_ok(machine: dict, *, cli_pins: dict[str, str] | None = None) -> dict:
+def _auth_ok(machine: dict, *, cli_pins: dict[str, str] | None = None,
+             satellite_version: str | None = None) -> dict:
     """The ``auth_result: ok`` frame. It carries the satellite-host policy so
     the satellite can re-validate file writes locally: defense in depth, a
     compromised proxy can't trick a home-only satellite into writing
@@ -342,7 +348,7 @@ def _auth_ok(machine: dict, *, cli_pins: dict[str, str] | None = None) -> dict:
         # CLI version pins (VERSIONS.md) — the satellite reconciles its installed
         # claude/codex to these on auth, so the fleet runs the EXACT versions the
         # platform verified. Empty value → satellite skips that CLI (fail-open).
-        "cli_pins": _cli_pins() if cli_pins is None else cli_pins,  # {pin_key: version}
+        "cli_pins": _cli_pins(satellite_version) if cli_pins is None else cli_pins,  # {pin_key: version}
     }
 
 
@@ -741,7 +747,7 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
         await run_db(remote_store.set_satellite_version, machine_id, sat_version)
     except Exception:
         logger.exception("Failed to record satellite_version")
-    answer = json.dumps(_auth_ok(machine))
+    answer = json.dumps(_auth_ok(machine, satellite_version=sat_version or ""))
     cm = get_connection_manager()
     try:
         await websocket.send_text(answer)
@@ -777,11 +783,7 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
     # --- Message loop ---
     try:
         async for raw in websocket.iter_text():
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            await cm.handle_message(machine_id, msg)
+            await _dispatch_frame(cm, machine_id, conn, raw)
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001  # one satellite connection's loop: an error ends this connection only
@@ -792,6 +794,20 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
         # socket was draining, and popping blindly would unregister the LIVE
         # connection (proxy shows the machine down, satellite thinks it's up).
         await cm.deregister(machine_id, expected=conn)
+
+
+async def _dispatch_frame(cm, machine_id: str, conn, raw: str) -> None:
+    """One frame of the message loop, read on the socket ``conn`` holds."""
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    # A socket a duplicate reconnect replaced may still drain a frame it
+    # received before the swap: its heartbeat must not overwrite the live
+    # connection's link state and port. Its other frames (an ack) still count.
+    if isinstance(msg, dict) and msg.get("type") == "heartbeat" and cm.get_connection(machine_id) is not conn:
+        return
+    await cm.handle_message(machine_id, msg)
 
 
 # ---------------------------------------------------------------------------

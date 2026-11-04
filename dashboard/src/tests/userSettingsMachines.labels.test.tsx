@@ -7,10 +7,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { findAlertDialog, personClick, renderWithDialogs } from './dialogsHarness'
 
-const machine = (id: string, name: string, allow_full_fs: boolean) => ({
+const machine = (id: string, name: string, allow_full_fs: boolean, link = {}) => ({
   id, name, allow_full_fs, pairing_scope: 'user', status: 'online', last_seen: null,
   last_heartbeat_age_s: 2, capabilities: { os: 'linux' }, assigned_agents: [],
-  browser_mode: 'dedicated',
+  browser_mode: 'dedicated', ...link,
 })
 
 const idle = { mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false, error: null }
@@ -18,7 +18,11 @@ vi.mock('@/api/remoteMachines', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/remoteMachines')>()),
   useMyRemoteMachines: () => ({
     data: {
-      machines: [machine('m-full-0001', 'Work laptop', true), machine('m-home-0002', 'Home laptop', false)],
+      machines: [
+        machine('m-full-0001', 'Work laptop', true, {
+          link_ok: false, link_down_s: 90, link_error: 'the listening socket at 127.0.0.1:57353 was closed' }),
+        machine('m-home-0002', 'Home laptop', false),
+      ],
       targets: [],
     },
     isLoading: false,
@@ -35,7 +39,10 @@ vi.mock('@/api/remoteMachines', async (importOriginal) => ({
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { sub: 'u1', role: 'member', agent_roles: {}, feature_flags: {} } }),
 }))
-vi.mock('@/components/RemoteBadge', () => ({ default: () => null }))
+vi.mock('@/components/RemoteBadge', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/components/RemoteBadge')>()),
+  default: () => null,
+}))
 vi.mock('@/components/PairInstallCommand', () => ({ default: () => null }))
 
 import { MyMachinesSection } from '@/pages/UserSettings.machines'
@@ -51,6 +58,19 @@ function infoTexts(label: string): string[] {
     return text
   })
 }
+
+describe('My machine whose local link is down', () => {
+  it('says to restart the satellite, and the reason once the card is open', () => {
+    render(<MyMachinesSection />)
+    expect(screen.getAllByTestId('machine-link-notice')).toHaveLength(1)
+    expect(screen.getByText(
+      'Its sessions cannot reach OtoDock. Restart the satellite on that machine.')).toBeInTheDocument()
+    expect(screen.queryByText(/Last problem/)).toBeNull()
+    fireEvent.click(screen.getByText('Work laptop'))
+    expect(screen.getByText(
+      'Last problem: the listening socket at 127.0.0.1:57353 was closed')).toBeInTheDocument()
+  })
+})
 
 describe('My machines filesystem-access texts', () => {
   it('names the refused folder on a full-access card and the guardrail on a home-only one', () => {

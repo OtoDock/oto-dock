@@ -40,7 +40,6 @@ def _clear_module_state():
     input_queue._registry.clear()
     input_queue._deleting.clear()
     for table in (session_state._permission_events, session_state._permission_decisions,
-                  session_state._question_events, session_state._question_answers,
                   dashboard_prompts._recently_answered):
         table.clear()
 
@@ -382,6 +381,9 @@ def test_a_permission_answered_on_one_socket_closes_on_the_other(temp_db, monkey
 
 def test_a_question_answered_on_one_socket_closes_on_the_other_and_a_late_answer_starts_no_turn(
         temp_db, monkeypatch):
+    """A held question card stored by 1.9.0 (no question holds a turn since
+    1.9.1): A's answer closes the card on B and is the person's next message,
+    a turn of its own; B's late answer is dropped."""
     from core.session import session_state
     from ws import dashboard_prompts
     layer, gate, slug = _setup(monkeypatch)
@@ -394,7 +396,6 @@ def test_a_question_answered_on_one_socket_closes_on_the_other_and_a_late_answer
             await drain_startup(ws2)
             chat_id, sid = await _start(ws1, layer, slug)
             await _attach_second(ws2, chat_id)
-            session_state._question_events["req-q"] = asyncio.Event()
             session_state.get_permission_queue(sid).put_nowait({
                 "event_type": "question_prompt", "request_id": "req-q",
                 "tool_name": "request_user_input",
@@ -406,7 +407,10 @@ def test_a_question_answered_on_one_socket_closes_on_the_other_and_a_late_answer
             assert await _until(ws2, "permission_resolved") == {
                 "type": "permission_resolved", "request_id": "req-q", "chat_id": chat_id}
             gate.set()
-            await _until(ws1, "done")
+            # A's answer is the person's next message: queued, then its turn.
+            frames = await _collect_until(ws1, "done")
+            assert "queue_sent" in [f["type"] for f in frames]
+            assert layer.messages[-1][1] == "a"
             await _until(ws2, "done")
             # B's late answer between turns, for a question A answered:
             # dropped, never replayed as a chat turn.
@@ -456,6 +460,84 @@ def test_a_permission_answer_after_the_waiter_left_changes_nothing(temp_db, monk
     run_ws_scenario(scenario)
 
 
+def test_a_tab_opened_mid_turn_gets_the_card_waiting_between_turns(temp_db, monkeypatch):
+    """A card shown between turns still waits while a later turn shows its
+    own: a tab that opens the chat gets it after the turn's live state (whose
+    paint replaces the chat), and the turn's own card from that live state
+    alone."""
+    from core.session import engine_prompts, session_state
+    layer, gate, slug = _setup(monkeypatch)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws1, \
+                dashboard_connection(session_cookie()) as ws2:
+            await drain_startup(ws1)
+            await drain_startup(ws2)
+            chat_id, sid = await _start(ws1, layer, slug)
+            session_state.open_permission_wait("req-before", sid)
+            engine_prompts.offer_hook_card(asyncio.Queue(), _perm_item("req-before"),
+                                           session_id=sid, chat_id=chat_id)
+            # The turn's own card: the engine's ask, held in the pump's slot
+            # and registered for its chat as the pump does.
+            session_state.open_permission_wait("req-turn", sid)
+            engine_prompts._pending["req-turn"] = engine_prompts.EnginePrompt(
+                request_id="req-turn", session_id=sid, chat_id=chat_id, tool_name="Bash",
+                tool_input={"command": "ls"}, frame={
+                    "request_id": "req-turn", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+            session_state.get_permission_queue(sid).put_nowait(_perm_item("req-turn"))
+            while (await _until(ws1, "permission_prompt"))["request_id"] != "req-turn":
+                pass
+            try:
+                ws2.client_send({"type": "resume_chat", "chat_id": chat_id})
+                before = await _collect_until(ws2, "live_state")
+                assert before[-1]["pending_permission"]["request_id"] == "req-turn"
+                assert "permission_prompt" not in [f["type"] for f in before]
+                ws2.client_send({"type": "ping"})
+                after = await _collect_until(ws2, "pong")
+                assert [f["request_id"] for f in after
+                        if f["type"] == "permission_prompt"] == ["req-before"]
+            finally:
+                engine_prompts._pending.pop("req-turn", None)
+                engine_prompts._hook_cards.clear()
+                for rid in ("req-before", "req-turn"):
+                    session_state.resolve_permission(rid, False)
+                gate.set()
+            await _until(ws1, "done")
+            await _until(ws2, "done")
+    run_ws_scenario(scenario)
+
+
+def test_an_answer_to_another_card_leaves_the_turns_card_in_its_slot(temp_db, monkeypatch):
+    """A card shown between turns still waits while a new turn shows its own:
+    the answer to the first, from a tab on the turn, resolves it and leaves
+    the turn's card where a reconnect finds it."""
+    from core.session import session_state
+    layer, gate, slug = _setup(monkeypatch)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await _start(ws, layer, slug)
+            session_state.open_permission_wait("req-turn", sid)
+            session_state.get_permission_queue(sid).put_nowait(_perm_item("req-turn"))
+            assert (await _until(ws, "permission_prompt"))["request_id"] == "req-turn"
+            session_state.open_permission_wait("req-before", sid)
+            ws.client_send({"type": "permission_response", "request_id": "req-before",
+                            "approved": True})
+            assert (await _until(ws, "permission_resolved"))["request_id"] == "req-before"
+            assert session_state._permission_decisions["req-before"] is True
+            pump = stream_pump._active_pumps[chat_id]
+            assert pump._permission_active["request_id"] == "req-turn"
+            assert session_state.prompt_waits("req-turn")
+            ws.client_send({"type": "permission_response", "request_id": "req-turn",
+                            "approved": True})
+            await _until(ws, "permission_resolved")
+            assert pump._permission_active is None
+            gate.set()
+            await _until(ws, "done")
+    run_ws_scenario(scenario)
+
+
 def test_a_second_plan_review_answer_changes_nothing(temp_db, monkeypatch):
     """A plan review answered on A: B gets the close with the action. B's
     own answer, clicked before its card closed and landing after the hook's
@@ -483,8 +565,9 @@ def test_a_second_plan_review_answer_changes_nothing(temp_db, monkeypatch):
             assert await _until(ws2, "permission_resolved") == {
                 "type": "permission_resolved", "request_id": "req-plan", "action": "reject",
                 "chat_id": chat_id}
-            # A reject approves the exit from plan mode; the waiter is gone.
-            assert await asyncio.wait_for(waiter, 5) is True
+            # Cancel denies the exit (the engine stays in Plan for the turn);
+            # the waiter is gone.
+            assert await asyncio.wait_for(waiter, 5) is False
             assert not session_state.prompt_waits("req-plan")
             ws2.client_send({"type": "plan_review_response", "request_id": "req-plan",
                              "action": "implement_auto", "filename": "plan.md"})

@@ -151,7 +151,7 @@ describe('useInteractiveChat on a task chat (no terminal toggle there)', () => {
   it('the run\'s own live terminal stays interactive and takes the sends', () => {
     const ws = makeWs()
     const { result } = renderHook(() => useInteractiveChat(ws, '', { taskChat: true }))
-    act(() => { result.current.onWarmupReady({ interactive: true, chat_id: 'task-run-1' }, { onDecline: vi.fn() }) })
+    act(() => { result.current.onWarmupReady({ interactive: true, chat_id: 'task-run-1' }) })
     expect(result.current.interactiveMode).toBe(true)
     expect(result.current.chatExecMode).toBe('interactive')
     act(() => {

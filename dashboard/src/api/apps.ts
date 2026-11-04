@@ -195,6 +195,24 @@ export interface PinnedApp {
    * from a link need a bot check, and the session cookie's lifetime. Every
    * key present with its default; absent on an older proxy. */
   external?: AppExternal
+  /** services/apps/app_follow.py: the app this copy came from, the release
+   * it stands at, whether this viewer may take the source's releases, and
+   * the update the card offers. Only for whoever may manage the row; absent
+   * on an older proxy. */
+  follows?: AppFollows
+}
+
+export interface AppFollows {
+  agent: string
+  agent_name: string
+  slug: string
+  release: number
+  exists: boolean
+  /** This app's release an update from the source cut and holds for approval (0 when none). */
+  held_release?: number
+  can_take: boolean
+  /** The release offered; in `asked`, `path` is where it is unpacked. */
+  update: { release: number; mode: 'update' | 'merge' | 'asked'; path?: string } | null
 }
 
 export interface AppExternal {
@@ -549,6 +567,54 @@ export const useRollbackApp = (agent: string) => {
       qc.invalidateQueries({ queryKey: ['chat-pins'] })
       qc.invalidateQueries({ queryKey: ['app'] })
     },
+  })
+}
+
+/** The answer of a follow move: the release cut, the sentence for the
+ * person, and for a staged merge the folder the source's release went to. */
+export interface FollowResult {
+  status: string
+  mode?: string
+  release: number
+  source_release?: number
+  path?: string
+  text: string
+}
+
+const invalidateApps = (qc: ReturnType<typeof useQueryClient>, agent: string) => {
+  qc.invalidateQueries({ queryKey: ['apps', agent] })
+  qc.invalidateQueries({ queryKey: ['chat-pins'] })
+  qc.invalidateQueries({ queryKey: ['app'] })
+}
+
+/** The source's newer release onto this app (`update`), or unpacked beside
+ * it for the agent to merge (`merge`); a person at the keyboard. */
+export const useTakeRelease = (agent: string) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ appId, mode }: { appId: string; mode: 'update' | 'merge' }): Promise<FollowResult> =>
+      apiJson<FollowResult>(`/v1/apps/${appId}/follow/take`, { method: 'POST', json: { mode } }, 'The update failed'),
+    onSettled: () => invalidateApps(qc, agent),
+  })
+}
+
+/** This app's live release onto the source, held for the source's approval. */
+export const useSendToSource = (agent: string) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (appId: string): Promise<FollowResult> =>
+      apiJson<FollowResult>(`/v1/apps/${appId}/follow/send`, { method: 'POST' }, 'The release was not sent'),
+    onSettled: () => invalidateApps(qc, agent),
+  })
+}
+
+export const useStopFollowing = (agent: string) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (appId: string) => {
+      await apiOk(`/v1/apps/${appId}/follow`, { method: 'DELETE' }, 'The app still follows its source')
+    },
+    onSettled: () => invalidateApps(qc, agent),
   })
 }
 

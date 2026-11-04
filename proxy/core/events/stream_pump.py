@@ -672,6 +672,12 @@ class ChatStreamPump(PumpEventHandlers):
         # whose pinged card was retired with its caller gone, key -> when.
         self._pinged: dict[str, str] = {}
         self._retried: dict[str, float] = {}
+        # A question card drawn in this turn, or a plan review left waiting
+        # between turns (a Codex plan), not yet followed by a message the
+        # person sent (``_accept_queue_turn``, ``_accept_steer``): the
+        # end-of-turn notice says what waits for them.
+        self._asked = False
+        self._plan_waits = False
 
         # Stop-and-send flags ({"fired": bool, "note": bool}) — assigned ONLY
         # by dashboard_chat._start_new_stream, whose producer drains
@@ -998,6 +1004,8 @@ class ChatStreamPump(PumpEventHandlers):
         saved, the steer's row awaited on the lane after them, then the
         frame forwarded in place."""
         qi = data["item"]
+        # The person's message reached the turn: an answer waits no more.
+        self._asked = self._plan_waits = False
         try:
             self._flush_pending_text()
             # Previews held for the turn's end are in the blocks this save
@@ -1032,6 +1040,7 @@ class ChatStreamPump(PumpEventHandlers):
         # The restart replay covers the engine turn starting now only.
         self._steer_saved_ranges = []
         self._engine_turn_begins()
+        self._asked = self._plan_waits = False
         inputs = list(data.get("inputs") or [])
         if not inputs and data.get("text"):
             meta = data.get("event_data") or {}
@@ -2014,6 +2023,16 @@ class ChatStreamPump(PumpEventHandlers):
         saved (the thinking rest, the active tools, a late steer, the spoken
         leftovers) and the plan's status lands."""
         self._done = True
+        # A hook card put after the final drain, while this pump still looked
+        # live, is shown between turns now (nothing awaits since the flag).
+        # A failure there never skips the rest of the tail.
+        from core.session import engine_prompts
+        try:
+            engine_prompts.hand_off_hook_cards(self.perm_queue, session_id=self.session_id,
+                                               chat_id=self.chat_id)
+        except Exception:
+            logger.exception("ChatStreamPump: the hook cards of chat=%s were not handed off",
+                             self.chat_id)
         # Whatever ended the pump (a cancelled producer, an exception),
         # nothing drains the queues any more.
         self.close_queue()
@@ -2250,11 +2269,11 @@ class ChatStreamPump(PumpEventHandlers):
         if self.source_type == session_kind.TASK.source_type or self.deleting:
             return
         if not in_meeting:
+            title, body = notification_manager.turn_end_words(
+                agent_label or chat.get("agent") or "", asked=self._asked,
+                plan=self._plan_waits)
             spawn(notification_manager.fire_ephemeral(
-                chat["user_sub"],
-                title=f"{agent_label or chat.get('agent') or ''} finished",
-                body="Response ready",
-                chat_id=self.chat_id,
+                chat["user_sub"], title=title, body=body, chat_id=self.chat_id,
             ), name="fire_ephemeral", owner="stream_pump")
 
     def _live_append_text(self, live: dict, text: str, note: bool | None = None):
@@ -2312,6 +2331,10 @@ class ChatStreamPump(PumpEventHandlers):
             self._turn_blocks.append(evt)
             if live:
                 live["live_blocks"].append(evt)
+            # The engine just forgot what it had not saved: the next
+            # message carries the memory-capture reminder once.
+            from services.memory import memory_nudge
+            memory_nudge.arm(self.session_id)
         elif phase == "usage":
             # Post-compaction gauge state (no chip, not a turn block): a
             # compaction at/after turn end has no follow-up METADATA frame,
@@ -2369,13 +2392,22 @@ class ChatStreamPump(PumpEventHandlers):
                            "tool_use_id": tool_use_id,
                            "summary": perm_data["summary"],
                            "result_content": result_content}})
-            # Attach result to the active tool block (PostToolUse fires before tool_end,
-            # so the tool is still in _active_tools). This ensures tool_result is
-            # persisted to DB when the tool block moves to _turn_blocks on tool_end.
-            # Prefer the exact tool_use_id (parallel same-name tools attach to
-            # the right block); fall back to name for older CLIs without it.
-            target = self._active_tools.get(tool_use_id) if tool_use_id else None
-            if target is None:
+            # Attach result to its tool block. The hook's result and the CLI's
+            # own tool_result frame reach the pump on two channels, so the
+            # block may still be active or already closed into _turn_blocks
+            # (the same dict the live list holds): with an id, the block is
+            # found by that id alone, active first, then closed; a name match
+            # would hand a closed call's output to a parallel call of the
+            # same tool still running. The name is the key only for an older
+            # CLI that sends no id.
+            target = None
+            if tool_use_id:
+                target = self._active_tools.get(tool_use_id)
+                if target is None:
+                    target = next((b for b in reversed(self._turn_blocks)
+                                   if b.get("type") == wire.PERSISTED_TOOL
+                                   and b.get("tool_id") == tool_use_id), None)
+            else:
                 for t in self._active_tools.values():
                     if t["name"] == tool_name:
                         target = t
@@ -2411,6 +2443,41 @@ class ChatStreamPump(PumpEventHandlers):
             evt = self._stamp_speaker(
                 {"type": wire.QUESTION, "tool_name": perm_data["tool_name"],
                  "tool_input": perm_data["tool_input"]})
+            self._asked = True
+            self._flush_pending_text()
+            self._turn_blocks.append(evt)
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+            if live:
+                live["live_blocks"].append(evt)
+        elif evt_type == wire.ITEM_SETTINGS_CARD:
+            # A setting's card (api/settings): a block of the turn like the
+            # question card, no answer awaited, no value in it.
+            evt = self._stamp_speaker(wire.settings_card_block(
+                perm_data.get("setting", ""), perm_data.get("label", ""),
+                int(perm_data.get("catalog_version") or 0)))
+            self._flush_pending_text()
+            self._turn_blocks.append(evt)
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+            if live:
+                live["live_blocks"].append(evt)
+        elif evt_type == wire.ITEM_ACTION_CARD:
+            # An action card (api/cards): a block of the turn like the
+            # settings card; the click goes to the act route, never here.
+            evt = self._stamp_speaker(wire.action_card_block(
+                str(perm_data.get("card_id") or ""), str(perm_data.get("title") or ""),
+                str(perm_data.get("text") or ""), str(perm_data.get("note") or ""),
+                list(perm_data.get("buttons") or []), list(perm_data.get("options") or [])))
+            self._flush_pending_text()
+            self._turn_blocks.append(evt)
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+            if live:
+                live["live_blocks"].append(evt)
+        elif evt_type == wire.ITEM_LIST_CARD:
+            # A list card (api/cards): the kind and the filters alone; the
+            # dashboard fetches the rows for the person when it renders.
+            evt = self._stamp_speaker(wire.list_card_block(
+                str(perm_data.get("kind") or ""), dict(perm_data.get("filters") or {}),
+                str(perm_data.get("title") or ""), str(perm_data.get("person") or "")))
             self._flush_pending_text()
             self._turn_blocks.append(evt)
             await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
@@ -2427,6 +2494,10 @@ class ChatStreamPump(PumpEventHandlers):
         elif evt_type == wire.ITEM_PLAN_REVIEW:
             plan_content = perm_data.get("plan", "")
             plan_tool_input = perm_data.get("tool_input", {})
+            # Nothing waits on a Codex plan's card (its mark,
+            # ``codex.layer.PLAN_BETWEEN_TURNS``): the turn ends with it.
+            if plan_tool_input.get("between_turns"):
+                self._plan_waits = True
             plan_filename = ""
             for key in ("planFilePath", "plan_file_path", "file_path"):
                 val = plan_tool_input.get(key, "")

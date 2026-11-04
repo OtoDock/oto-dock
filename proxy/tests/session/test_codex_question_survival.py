@@ -1,17 +1,19 @@
-"""An unanswered ``request_user_input`` must not cost the user their answer.
+"""A prompt that waits on a person must not cost them their answer.
 
-Live on T1 (2026-08-06): a headless codex session blocked on
-``request_user_input`` was reaped by the idle sweep (which only looked at
+Live on T1 (2026-08-06): a headless codex session blocked on a held server
+request was reaped by the idle sweep (which only looked at
 ``last_activity``); answering afterwards resolved an event whose waiter was
 gone, and the app-server answer write blew up on a closed transport
 (``RuntimeError: … <WriteUnixTransport closed=True …>``) as an unhandled task
 exception. The answer vanished and the turn never resumed.
 
 Three seams pinned here:
-  * the codex idle sweep spares a session with a pending question for one extra
-    idle window (``_codex_reap_candidates``);
-  * a ``question_response`` that reaches no live waiter falls back to the chat
-    path (``_handle_chat`` → registry-aware single-flight revival);
+  * the codex idle sweep spares a session with a pending prompt (an approval
+    the bridge holds; a question holds nothing since 1.9.1)
+    (``_codex_reap_candidates``);
+  * a ``question_response`` (a held question card stored by 1.9.0) is the
+    person's next message: the chat path (``_handle_chat`` → registry-aware
+    single-flight revival), claimed once across sockets;
   * ``respond()`` on a closed transport logs and returns instead of raising.
 
 No daemon / no DB.
@@ -19,8 +21,6 @@ No daemon / no DB.
 Run individually (conftest DB-pool gotcha):
     venv/bin/python -m pytest tests/session/test_codex_question_survival.py -q
 """
-import asyncio
-
 import pytest
 
 from core.layers.codex import session as codex_session
@@ -45,18 +45,18 @@ class _FakeCodexSession:
 
 @pytest.fixture
 def codex_registry():
-    """Isolate the module-level session pool + the question registries."""
+    """Isolate the module-level session pool + the prompt registries."""
     codex_session._codex_sessions.clear()
     yield codex_session._codex_sessions
     codex_session._codex_sessions.clear()
-    session_state._question_events.clear()
+    for rid in ("q-1", "q-x"):
+        session_state._permission_events.pop(rid, None)
     session_state._session_permission_requests.clear()
 
 
 def _park_question(session_id: str, request_id: str = "q-1") -> None:
-    """Register an unanswered request_user_input the way wait_for_question does."""
-    session_state._question_events[request_id] = asyncio.Event()
-    session_state._session_permission_requests.setdefault(session_id, set()).add(request_id)
+    """Register an unanswered approval the way wait_for_permission does."""
+    session_state.open_permission_wait(request_id, session_id)
 
 
 class TestCodexReapCandidates:
@@ -87,17 +87,6 @@ class TestCodexReapCandidates:
         codex_registry["s-dead"] = _FakeCodexSession(idle=1, alive=False)
         _park_question("s-dead")
         assert codex_session._codex_reap_candidates(1000.0, 100) == ["s-dead"]
-
-
-def test_has_pending_question_tracks_the_session_index():
-    session_state._question_events.clear()
-    session_state._session_permission_requests.clear()
-    assert session_state.has_pending_question("s-x") is False
-    _park_question("s-x", "q-x")
-    assert session_state.has_pending_question("s-x") is True
-    session_state._question_events.pop("q-x")
-    assert session_state.has_pending_question("s-x") is False
-    session_state._session_permission_requests.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -135,52 +124,52 @@ def _answers(*values: str) -> dict:
     return {"q-id-verbatim": {"answers": list(values)}}
 
 
+def _rid() -> str:
+    # Each answer is claimed once across sockets (a late second answer is
+    # dropped), so every test answers its own card.
+    import uuid
+    return f"q-{uuid.uuid4().hex[:8]}"
+
+
 @pytest.mark.asyncio
 class TestQuestionResponseFallback:
-    async def test_live_waiter_takes_the_answer_no_chat_turn(self):
-        event = asyncio.Event()
-        session_state._question_events["q-live"] = event
-        try:
-            conn = _FakeConnection()
-            await conn._dispatch_client_message({
-                "type": "question_response", "request_id": "q-live",
-                "answers": _answers("Option A"),
-            })
-            assert event.is_set()
-            assert session_state._question_answers["q-live"] == _answers("Option A")
-            assert conn.chat_calls == []   # the held turn resumes in place
-        finally:
-            session_state._question_events.pop("q-live", None)
-            session_state._question_answers.pop("q-live", None)
-
-    async def test_no_waiter_replays_the_answer_as_a_chat_message(self):
-        # The parked session was reaped — resolve_question finds nothing, so the
-        # answer rides the composer path (dead-session branch → revival).
+    async def test_the_answer_is_sent_as_a_chat_message(self):
+        # The answer rides the composer path (dead-session branch → revival).
         conn = _FakeConnection()
         await conn._dispatch_client_message({
-            "type": "question_response", "request_id": "q-dead",
+            "type": "question_response", "request_id": _rid(),
             "answers": _answers("Ship it", "with tests"),
         })
         assert conn.chat_calls == [
             {"text": "Ship it, with tests", "chat_id": "chat-q"}
         ]
 
-    async def test_no_waiter_while_streaming_queues_instead(self):
+    async def test_while_streaming_it_queues_instead(self):
         conn = _FakeConnection(streaming=True)
         await conn._dispatch_client_message({
-            "type": "question_response", "request_id": "q-dead",
+            "type": "question_response", "request_id": _rid(),
             "answers": _answers("Option B"),
         })
         assert conn.chat_calls == []
         assert conn.queued == [("chat-q", "Option B")]
 
-    async def test_no_waiter_and_no_answer_text_is_a_noop(self):
+    async def test_no_answer_text_is_a_noop(self):
         conn = _FakeConnection()
         await conn._dispatch_client_message({
-            "type": "question_response", "request_id": "q-dead", "answers": {},
+            "type": "question_response", "request_id": _rid(), "answers": {},
         })
         assert conn.chat_calls == []
         assert conn.queued == []
+
+    async def test_two_sockets_answering_one_card_send_one_message(self):
+        rid = _rid()
+        first, second = _FakeConnection(), _FakeConnection()
+        for conn in (first, second):
+            await conn._dispatch_client_message({
+                "type": "question_response", "request_id": rid,
+                "answers": _answers("Option A"),
+            })
+        assert len(first.chat_calls) + len(second.chat_calls) == 1
 
 
 class TestAnswersToText:

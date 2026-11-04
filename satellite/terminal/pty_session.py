@@ -70,7 +70,8 @@ def _seed_interactive_cli_config(claude_dir: Path, cwd: str, theme: str = "dark"
     # Suppress Claude Code's resume-from-summary picker (≥2.1.x, old + large
     # sessions): platform cold-flushed prompts would type into the picker and
     # the deferred Enter would confirm "resume from summary", degrading the
-    # session. Same key the picker's "Don't ask me again" writes; the proxy
+    # session. Same key the picker's "Don't ask me again" writes, and the one
+    # 2.1.304's "Resume this conversation?" usage question checks; the proxy
     # twin (cli_settings_manager) carries the full rationale.
     data["resumeReturnDismissed"] = True
     data["theme"] = "light" if str(theme).lower().startswith("light") else "dark"
@@ -185,6 +186,9 @@ class PtySession(BasePtySession):
         # CC 2.1.233 removed Todo/Task tools on newer models; the dashboard
         # todo checklist depends on their frames. Mirrors proxy env_builder.
         env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1"
+        # The advisor tool is a model call the platform can neither meter nor
+        # show. Mirrors proxy env_builder.
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
         env.pop("CLAUDECODE", None)
         env = session_tools_env(self._translate_env(env), self._claude_dir)
 

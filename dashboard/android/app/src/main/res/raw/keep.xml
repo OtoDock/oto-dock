@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The resource shrinker keeps what the code references by id. The
+     notification channels' sounds are android.resource:// addresses built
+     from their names (MainActivity.createNotificationChannels), so they are
+     kept here by name. -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@raw/notif_*" />

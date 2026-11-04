@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 
 // ─── Connecting a Claude account: a paste that matched an account already
 //     connected says so instead of closing quietly, a refused paste offers a
@@ -98,7 +99,7 @@ describe('admin Setup form — Connect Claude', () => {
     await waitFor(() => expect(onDone).toHaveBeenCalled())
   })
 
-  it('the same account again stays open and says so, with a Start again that opens a fresh popup', async () => {
+  it('the same account again renews it and says so first, with a Start again that opens a fresh popup', async () => {
     h.exchangeImpl.current = async () => matched('active')
     const onDone = vi.fn()
     render(<ConnectOAuth engine={claude} ownerType="platform" onDone={onDone} />)
@@ -107,7 +108,8 @@ describe('admin Setup form — Connect Claude', () => {
     expect(screen.getByText(/To add a second account, sign out of your Claude account there first/)).toBeInTheDocument()
     await pasteAndConnect()
     const notice = await screen.findByTestId('claude-connect-notice')
-    expect(notice).toHaveTextContent('That is the account you already connected: a@example.com.')
+    // The Setup form is how an admin renews a login that ends soon.
+    expect(notice.textContent).toMatch(/^Renewed a@example\.com: its login is fresh again\. No new account was added\./)
     expect(notice).toHaveTextContent('sign out of platform.claude.com in this browser first')
     expect(onDone).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Start again' }))
@@ -174,9 +176,57 @@ const sub = (over: object = {}) => ({
 
 function renderCard(subs: object[]) {
   h.layersRef.current = [layer(subs)]
-  render(<ExecutionLayersSection />)
-  fireEvent.click(screen.getByText('Claude Code'))
+  render(<MemoryRouter><ExecutionLayersSection /></MemoryRouter>)
+  fireEvent.click(screen.getByText('Claude Code', { selector: 'span' }))
 }
+
+// A card holding a login that ends soon opens by itself: no header click.
+function renderOpenCard(subs: object[]) {
+  h.layersRef.current = [layer(subs)]
+  render(<MemoryRouter><ExecutionLayersSection /></MemoryRouter>)
+}
+const inHours = (hours: number) => new Date(Date.now() + hours * 3_600_000).toISOString()
+
+describe('User Settings card — Reconnect a login that ends soon', () => {
+  it('signing in as already-connected B names A and says its login still ends', async () => {
+    h.exchangeImpl.current = async () => matched('active', 'b@example.com', 's2')
+    renderOpenCard([sub({ login_expires_at: inHours(50) }), sub({ id: 's2', oauth_email: 'b@example.com' })])
+    // Only the row that ends soon offers Reconnect.
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+    const dialog = screen.getByRole('dialog', { name: 'Reconnect a@example.com' })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    await waitFor(() => expect(h.opened).toHaveLength(1))
+    await pasteAndConnect()
+    expect(await screen.findByText(
+      /You signed in as b@example.com, which is already connected, so its login was renewed\./,
+    )).toBeInTheDocument()
+    expect(dialog).toHaveTextContent('The login of “Claude Max (a@example.com)” still ends in 2 days.')
+    expect(dialog).toHaveTextContent('Press Reconnect again and sign in as that account to renew it.')
+    expect(dialog).not.toHaveTextContent('expired')
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('a new account says it was added, and the login still ends', async () => {
+    renderOpenCard([sub({ login_expires_at: inHours(50) })])
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    await waitFor(() => expect(h.opened).toHaveLength(1))
+    await pasteAndConnect()
+    expect(await screen.findByText(/You signed in as b@example.com, so a new subscription was added\./)).toBeInTheDocument()
+    expect(screen.getByRole('dialog')).toHaveTextContent('still ends in 2 days')
+  })
+
+  it('the same account renews in place: the dialog closes', async () => {
+    h.exchangeImpl.current = async () => matched('active', 'a@example.com', 's1')
+    renderOpenCard([sub({ login_expires_at: inHours(50) })])
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    await waitFor(() => expect(h.opened).toHaveLength(1))
+    await pasteAndConnect()
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+})
 
 describe('User Settings card — Add another account', () => {
   it('the same account again keeps the connect box open with the message', async () => {
@@ -215,7 +265,7 @@ describe('User Settings card — Add another account', () => {
     await pasteAndConnect()
     expect(await screen.findByText(/You signed in as b@example.com, which is already connected/)).toBeInTheDocument()
     // The dialog stays open with the sentence until Done.
-    expect(dialog).toHaveTextContent('“Claude Max” is still expired')
+    expect(dialog).toHaveTextContent('“Claude Max (a@example.com)” is still expired')
     fireEvent.click(screen.getByRole('button', { name: 'Done' }))
     expect(screen.queryByRole('dialog')).toBeNull()
   })
@@ -228,6 +278,22 @@ describe('User Settings card — Add another account', () => {
     await waitFor(() => expect(h.opened).toHaveLength(1))
     await pasteAndConnect()
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('an identity without an email is never shown, in the title or the sentence', async () => {
+    const uuid = '3f2a9c1e-0000-4000-8000-000000000000'
+    const other = '7b1d4c2a-0000-4000-8000-000000000000'
+    h.exchangeImpl.current = async () => matched('active', other, 's2')
+    renderCard([sub({ status: 'expired', oauth_email: uuid }), sub({ id: 's2', oauth_email: other })])
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+    const dialog = screen.getByRole('dialog', { name: 'Reconnect Claude Max' })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    await waitFor(() => expect(h.opened).toHaveLength(1))
+    await pasteAndConnect()
+    expect(await screen.findByText(/You signed in as a different account, which is already connected\./)).toBeInTheDocument()
+    expect(dialog).toHaveTextContent('“Claude Max” is still expired')
+    expect(dialog).not.toHaveTextContent(uuid)
+    expect(dialog).not.toHaveTextContent(other)
   })
 
   it('on a desktop the paste step focuses its field', async () => {

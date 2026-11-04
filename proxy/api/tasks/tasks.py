@@ -8,17 +8,18 @@ dashboard users on their role.
 """
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
 import uuid
 import zoneinfo
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
 import psycopg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel
 
 import config
 from api.tasks import run_stream, task_quota
@@ -37,7 +38,7 @@ from core.session.visibility import nouser_read_targets
 from services.scheduler import schedule_text, scheduler, task_kinds
 from storage import database as task_store
 from storage.agents import agent_store
-from storage.automation import run_status, trigger_store
+from storage.automation import notification_severity, run_status, trigger_store
 from storage.pg import run_db
 from ws import wire_events as wire
 
@@ -77,6 +78,9 @@ def _check_agent_access_s2s(body_agent: str, x_agent_name: str | None) -> None:
 
 # --- Request models ---
 
+# A severity outside the vocabulary is stored as info, as an app handler's is.
+_Severity = Annotated[str, AfterValidator(notification_severity.normalize)]
+
 
 class CreateScheduledTaskRequest(BaseModel):
     name: str
@@ -93,7 +97,7 @@ class CreateScheduledTaskRequest(BaseModel):
     # completion (auto/manual/none). The task agent's prompt is auto-injected
     # with mode-specific guidance so the two never disagree.
     notification_mode: Literal["auto", "manual", "none"]
-    notify_severity: str = "info"
+    notify_severity: _Severity = "info"
     # IANA timezone snapshot. Usually proxy-resolved from the calling session
     # (browser-detected via client_info). Callers may override explicitly.
     user_tz: str | None = None
@@ -116,6 +120,10 @@ class CreateScheduledTaskRequest(BaseModel):
     # by name, run at the end of each run's turn; the agent's mandatory
     # checks run without being named.
     checks: list[str] | None = None
+    # Who is told (an agent-scope task): the lowest per-agent role its
+    # notifications reach, admins always. Omit for the editor tier, or, from
+    # a task run's session, that run's own audience.
+    notify_audience: str | None = None
 
 
 class CreateOneTimeTaskRequest(BaseModel):
@@ -139,7 +147,7 @@ class CreateOneTimeTaskRequest(BaseModel):
     scope: str = "user"
     # REQUIRED — see CreateScheduledTaskRequest.
     notification_mode: Literal["auto", "manual", "none"]
-    notify_severity: str = "info"
+    notify_severity: _Severity = "info"
     source_agent: str | None = None
     user_tz: str | None = None
     # 'one_time' (default — needs run_at OR delay_seconds), 'trigger'
@@ -154,6 +162,40 @@ class CreateOneTimeTaskRequest(BaseModel):
     # has no reviewer). Omit for Don't Ask.
     permission_mode: Literal["dontAsk", "autoReview"] | None = None
     checks: list[str] | None = None
+    notify_audience: str | None = None
+
+
+def _audience_word(value: str | None) -> str:
+    """Who is told, as stored: one of the per-agent roles, else 400."""
+    word = (value or "").strip()
+    if word not in roles.AGENT_ROLES:
+        raise HTTPException(400, f"notify_audience must be one of: {', '.join(roles.AGENT_ROLES)}")
+    return word
+
+
+async def task_audience(u: UserContext, wanted: str | None) -> str:
+    """A new task's or trigger's audience: the one asked for (never wider
+    than the run creating it, ``checked_audience``), else the audience of
+    the task run whose session creates it (a run's follow-up keeps telling
+    the same people), else the editor tier."""
+    if wanted:
+        return await checked_audience(u, wanted)
+    if u.is_session and u.session_id:
+        return await run_db(task_store.audience_of_session, u.session_id) or roles.EDITOR
+    return roles.EDITOR
+
+
+async def checked_audience(u: UserContext, wanted: str) -> str:
+    """``wanted`` as stored, refused with 400 when a task run's own session
+    names a wider audience than its run's: the run's audience comes from its
+    token, never from a value the run supplies."""
+    word = _audience_word(wanted)
+    floor = (await run_db(task_store.audience_of_session, u.session_id)
+             if u.is_session and u.session_id else None)
+    if floor and roles.rank(word) < roles.rank(floor):
+        raise HTTPException(400, f"This task run notifies people at the {floor} role and above. "
+                                 f"What it creates or edits cannot notify more people than that.")
+    return word
 
 
 def _validate_user_tz(value: str | None) -> str | None:
@@ -205,20 +247,23 @@ def _stored_task_mode(agent: str, layer: str | None, mode: str | None) -> str:
 
 
 async def _validate_task_overrides(
-    agent: str, layer: str | None, model: str | None,
+    agent: str, layer: str | None, model: str | None, created_by: str | None = None,
 ) -> None:
     """Reject a per-task model/engine pin outside the agent's envelope.
 
     Delegates to the SAME validator the delegate-spawn path uses
     (``spawn_authz.validate_spawn_overrides``) so a schedule and a delegation
     can never advertise different sets: layer must be one of the agent's
-    enabled execution paths, model must be enabled on that layer. Raises 400.
-    Call after the agent-access check and before any row write.
+    enabled execution paths, model must be enabled on that layer, and a
+    model alone on the engine the runner picks for it (the creator's own
+    engine first). Raises 400. Call after the agent-access check and before
+    any row write.
     """
     if not (layer or model):
         return
     from services.delegation.spawn_authz import validate_spawn_overrides
-    await asyncio.to_thread(validate_spawn_overrides, agent, layer, model)
+    await asyncio.to_thread(validate_spawn_overrides, agent, layer, model,
+                            user_sub=created_by or "")
 
 
 #: The word that names the agent's default machine (``chat_targets.find``).
@@ -234,20 +279,25 @@ def is_default_machine(wanted: str | None) -> bool:
     return (wanted or "").strip() in ("", MACHINE_DEFAULT)
 
 
-def task_run_person(agent: str, scope: str, created_by: str | None):
+def task_run_person(agent: str, scope: str, created_by: str | None, *, chat_worker: bool = False):
     """The person a task's runs (or a delegated worker's) run as, for its
     machine: the creator of a user-scope task on an agent that is not
     Shared-only; no person otherwise (``resolve_task_identity``: those runs
-    never reach a personal machine). Synchronous: the DB executor."""
+    never reach a personal machine). A chat-surface worker a person
+    delegated also names that person as its machine owner: it may run on
+    their own computer, as that person, whatever its scope. Synchronous: the
+    DB executor."""
     from auth.providers import acting_role_of
     from services.remote.chat_targets import RunPerson
     if scope == _vis.SCOPE_USER and created_by and not _vis.is_shared_only(agent):
         return RunPerson(created_by, acting_role_of(created_by, agent))
-    return RunPerson(None, roles.MANAGER)
+    owner = created_by if chat_worker and created_by and task_store.get_user(created_by) else None
+    return RunPerson(None, roles.MANAGER, machine_owner=owner)
 
 
 async def resolve_task_machine(u: UserContext, agent: str, wanted: str | None, *,
-                               scope: str, created_by: str | None, engine_path: str = "") -> str:
+                               scope: str, created_by: str | None, engine_path: str = "",
+                               chat_worker: bool = False) -> str:
     """The ``target_machine`` to store for ``wanted`` ("" = the agent's
     default), validated with ``chat_targets.resolve_work_machine`` for the
     run person (``task_run_person``); a platform admin writer is offered
@@ -258,7 +308,8 @@ async def resolve_task_machine(u: UserContext, agent: str, wanted: str | None, *
     if u.acting_sub is None:
         raise HTTPException(400, _NO_PERSON_MACHINE)
     from services.remote import chat_targets
-    person = await run_db(task_run_person, agent, scope, created_by)
+    person = await run_db(functools.partial(task_run_person, agent, scope, created_by,
+                                            chat_worker=chat_worker))
     machine, refusal = await run_db(functools.partial(
         chat_targets.resolve_work_machine, agent, str(wanted).strip(), person=person,
         admin_asker=u.is_admin, engine_path=engine_path or ""))
@@ -418,7 +469,9 @@ def _check_run_access(run: dict, user: UserContext) -> None:
 
     Rules:
     - master key (s2s): full access
-    - Agent-scoped runs (or legacy runs without scope): any user with agent access
+    - Agent-scoped runs (or legacy runs without scope): the editor tier and up
+      on the agent (``sees_agent_automations``: what the agent does on its own
+      behalf), the agent's own no-user sessions and their delegation edges
     - User-scoped runs: only the creator (or admin)
 
     Only the master key bypasses — a session token (interactive USER_SESSION or a
@@ -433,10 +486,12 @@ def _check_run_access(run: dict, user: UserContext) -> None:
         if not (run.get("scope", _vis.SCOPE_AGENT) != _vis.SCOPE_USER
                 and run["agent"] in nouser_read_targets(user)):
             raise HTTPException(403, "Not authorized to access this agent's runs")
-    run_scope = run.get("scope", "agent")
+    run_scope = run.get("scope") or _vis.SCOPE_AGENT
     if run_scope == _vis.SCOPE_USER and run.get("created_by") != user.sub:
         if not user.is_admin:
             raise HTTPException(403, "Not authorized to access this run")
+    if run_scope != _vis.SCOPE_USER and not user.sees_agent_automations(run["agent"]):
+        raise HTTPException(403, "Not authorized to access this run")
 
 
 async def _check_callback_anchor(
@@ -589,9 +644,9 @@ async def create_scheduled_task(
         err = scheduler._validate_interval_seconds(req.interval_seconds)
         if err:
             raise HTTPException(400, err)
-    await _validate_task_overrides(req.agent, req.layer, req.model)
-
     created_by, acting_sub = _resolve_creator_identity(u, req.scope, _caller_agent(u, x_agent_name))
+    await _validate_task_overrides(req.agent, req.layer, req.model, created_by)
+
     machine = await resolve_task_machine(u, req.agent, req.machine, scope=req.scope,
                                          created_by=created_by, engine_path=req.layer or "")
     checks = await _validate_checks(req.agent, req.checks, u)
@@ -617,6 +672,7 @@ async def create_scheduled_task(
         permission_mode=await asyncio.to_thread(_stored_task_mode, req.agent, req.layer,
                                                 req.permission_mode),
         checks=checks,
+        notify_audience=await task_audience(u, req.notify_audience),
     )
     async with task_quota.creating():
         await task_quota.enforce_task_caps(u, req.agent, created_by, req.scope)
@@ -664,9 +720,9 @@ async def create_one_time_task(
                 f"Agent '{req.source_agent}' is not allowed to delegate to '{req.agent}'. "
                 f"Configure delegation targets in agent settings.",
             )
-    await _validate_task_overrides(req.agent, req.layer, req.model)
-
     created_by, acting_sub = _resolve_creator_identity(u, req.scope, _caller_agent(u, x_agent_name))
+    await _validate_task_overrides(req.agent, req.layer, req.model, created_by)
+
     machine = await resolve_task_machine(u, req.agent, req.machine, scope=req.scope,
                                          created_by=created_by, engine_path=req.layer or "")
     checks = await _validate_checks(req.agent, req.checks, u)
@@ -715,6 +771,7 @@ async def create_one_time_task(
         permission_mode=await asyncio.to_thread(_stored_task_mode, req.agent, req.layer,
                                                 req.permission_mode),
         checks=checks,
+        notify_audience=await task_audience(u, req.notify_audience),
     )
     async with task_quota.creating():
         if task_type in task_quota.COUNTED_KINDS:
@@ -769,7 +826,8 @@ async def list_tasks(
         filtered = []
         for t in all_tasks:
             if t.scope == _vis.SCOPE_AGENT:
-                filtered.append(t)
+                if u.sees_agent_automations(t.agent):
+                    filtered.append(t)
             elif (t.scope == _vis.SCOPE_USER and u.acting_sub is not None
                     and t.created_by == u.acting_sub):
                 filtered.append(t)
@@ -811,24 +869,56 @@ def _run_count_for(t, history_count: int) -> int:
 
 
 def _make_model_resolver():
-    """What a task will ACTUALLY run on: its own pins, else the agent's
-    default resolved WITH the effective layer (the runner's rule: an agent
+    """What a task will ACTUALLY run on: its own pins, else for a user-scope
+    task its creator's own engine on the agent (the runner's rule,
+    ``engine_resolution``; the creator's holdings read once per creator),
+    else the agent's default resolved WITH the effective layer (an agent
     default the pinned engine does not serve is skipped for that engine's
     own first choice). Memoized per (agent, layer): the admin listing spans
     agents and every resolution hits the DB. An install with no enabled
     model for the layer resolves to "" = unresolved, which the UI renders
     as nothing rather than a wrong claim."""
+    from services.engines import engine_resolution, subscription_pool
     from storage.agents.agent_store import _get_execution_paths
     from storage.billing import subscription_store
 
     agent_rows: dict[str, dict] = {}
     defaults: dict[tuple[str, str], str] = {}
     layer_rows: dict[str, list[dict]] = {}
+    holdings: dict[str, engine_resolution.Holdings] = {}
+    catalog: list[engine_resolution.EngineCatalog] = []
+    pooled: dict[str, bool] = {}
 
     def _agent(slug: str) -> dict:
         if slug not in agent_rows:
             agent_rows[slug] = agent_store.get_agent(slug) or {}
         return agent_rows[slug]
+
+    def _person_engine(t) -> tuple[str, str]:
+        """The creator's engine and model on the task's agent for an
+        unpinned user-scope task; ("", "") when nothing resolves (a
+        Shared-only agent's runs draw on the pool: the agent's default)."""
+        from core.session.visibility import is_shared_only
+        creator = getattr(t, "created_by", None) or ""
+        if getattr(t, "scope", "user") != _vis.SCOPE_USER or not creator or is_shared_only(t.agent):
+            return "", ""
+        try:
+            if creator not in holdings:
+                holdings[creator] = engine_resolution.person_holdings(creator)
+            if not catalog:
+                catalog.append(engine_resolution.engine_catalog())
+            r = engine_resolution.resolve_for_person(_agent(t.agent), holdings[creator], catalog[0])
+        except (psycopg.Error, RuntimeError):
+            return "", ""
+        return r.execution_path, r.model
+
+    def _pool_has(layer: str) -> bool:
+        if layer not in pooled:
+            try:
+                pooled[layer] = subscription_pool.layer_platform_configured(layer)
+            except psycopg.Error:
+                pooled[layer] = True
+        return pooled[layer]
 
     def _models(layer: str) -> list[dict]:
         if layer not in layer_rows:
@@ -845,24 +935,37 @@ def _make_model_resolver():
         # The pin as the run will use it: a retired id as its successor.
         override_model = config.live_model_id(getattr(t, "override_model", None) or "")
         override_path = getattr(t, "override_execution_path", None) or ""
-        path = override_path or (_agent(t.agent).get("execution_path") or "")
+        # An engine pin as given; a model pin without one runs where the
+        # model is offered, the creator's own engine first (the runner's
+        # rule); an unpinned task follows its creator's engine.
+        person_path, person_model = ("", "") if override_path else _person_engine(t)
+        path = override_path or person_path or (_agent(t.agent).get("execution_path") or "")
+        if override_model and not override_path:
+            with contextlib.suppress(psycopg.Error):
+                path = engine_resolution.engine_for_model(_agent(t.agent), override_model, first=path) or path
         key = (t.agent, path)
         if key not in defaults:
             try:
                 defaults[key] = config.resolve_agent_model(t.agent, layer=path or None)
             except (RuntimeError, psycopg.Error):
                 defaults[key] = ""
-        model = override_model or defaults[key]
+        model = override_model or (person_model if person_path else "") or defaults[key]
         if override_model:
             source = "pinned"
         elif override_path:
             source = "layer default"
+        elif person_path:
+            source = "your engine"
         else:
             source = "agent default"
         tier, tier_label, _good_at = config.get_model_tier(model) if model else (None, "", "")
         warnings: list[str] = []
         if override_path and override_path not in _get_execution_paths(_agent(t.agent)):
             warnings.append(f"the pinned engine '{override_path}' is not enabled for this agent")
+        if (override_path and getattr(t, "scope", "user") == _vis.SCOPE_AGENT
+                and not _pool_has(override_path)):
+            warnings.append(f"the platform has no '{override_path}' subscription for the "
+                            "agent's own runs")
         if override_model:
             rows = [m for m in _models(path) if m.get("model_id") == override_model]
             if not rows:
@@ -1048,7 +1151,7 @@ class EditTaskRequest(BaseModel):
     timeout_seconds: int | None = None
     # Optional on edit (None = leave unchanged). Same enum as create.
     notification_mode: Literal["auto", "manual", "none"] | None = None
-    notify_severity: str | None = None
+    notify_severity: _Severity | None = None
     user_tz: str | None = None
     # Per-task execution overrides. "" (or null) CLEARS the pin — the task
     # goes back to the agent's default on its next run; a non-empty value is
@@ -1063,10 +1166,13 @@ class EditTaskRequest(BaseModel):
     permission_mode: Literal["dontAsk", "autoReview"] | None = None
     # Checks (CHECKS.md): the whole list; [] clears it. Omit to leave it.
     checks: list[str] | None = None
+    # Who is told: one of the per-agent roles. Omit to leave it.
+    notify_audience: str | None = None
 
 
 # The edit fields with no null state: omitted leaves them, null is refused.
-_EDIT_REQUIRED = ("name", "prompt", "timeout_seconds", "notification_mode", "notify_severity")
+_EDIT_REQUIRED = ("name", "prompt", "timeout_seconds", "notification_mode", "notify_severity",
+                  "notify_audience")
 
 
 async def _validate_checks(agent: str, names: list[str] | None, u: UserContext) -> list[str]:
@@ -1187,6 +1293,8 @@ async def _edit_task_impl(
     if "checks" in fields:
         refs = await _validate_checks(dyn["agent"], fields.pop("checks") or [], user)
         fields["checks"] = json.dumps(refs) if refs else ""
+    if "notify_audience" in fields:
+        fields["notify_audience"] = await checked_audience(user, fields["notify_audience"])
     adopter = ""
     if "prompt" in fields and (dyn.get("transferred_from") or ""):
         # A manager of the agent (or an admin) who rewrites a transferred
@@ -1231,11 +1339,12 @@ async def _edit_task_impl(
         # A trigger and the task it fires keep one creator.
         await run_db(trigger_store.adopt_linked, task_id, dyn.get("created_by") or "", adopter)
     if (fields.get("name") or "").strip():
-        # Task-history rows AND the Active-now widget label task rows by the
-        # task's NAME — re-label the chats of live (running|pending) runs
-        # everywhere now via title_updated; idle rows refresh on the next
-        # list poll. Best-effort, sanitized like a chat rename (the frame
-        # reaches OTHER users' sidebars).
+        # Task-history rows AND the Active-now widget label a task row by the
+        # task's NAME until its run chat has its own title (generated or
+        # renamed, ``title_generated``) — re-label the live (running|pending)
+        # runs still labeled by the name everywhere now via title_updated;
+        # idle rows refresh on the next list poll. Best-effort, sanitized like
+        # a chat rename (the frame reaches OTHER users' sidebars).
         try:
             from api.agents.chats import _sanitize_title
             new_name = _sanitize_title(str(fields["name"]))
@@ -1245,7 +1354,7 @@ async def _edit_task_impl(
                 from services.notifications import notification_manager
                 for cid in chat_ids:
                     row = await asyncio.to_thread(task_store.get_chat, cid)
-                    if row:
+                    if row and not row.get("title_generated"):
                         notification_manager.broadcast_chat_title(
                             row.get("user_sub") or "", cid, new_name,
                             agent=row.get("agent") or "",
@@ -1459,16 +1568,22 @@ async def list_runs(
         edge_filter = sorted(
             await asyncio.to_thread(nouser_read_targets, u) - reach
         ) or None
+    # Below the editor tier an agent's own runs drop out of the listing,
+    # in the same SQL that pages and counts.
+    shared: list[str] | None = None
+    if scope_sub is not None and agents_filter is not None and u.acting_sub is not None:
+        shared = [a for a in agents_filter if u.sees_agent_automations(a)]
     runs = await asyncio.to_thread(
         task_store.list_runs, limit, offset, agent, status, task_id, session_id,
         scope_user_sub=scope_sub, created_by=created_by,
         exclude_task_type=exclude, agents_filter=agents_filter,
-        edge_agents_filter=edge_filter,
+        edge_agents_filter=edge_filter, shared_agents=shared,
     )
     total = await asyncio.to_thread(
         task_store.get_run_count, agent, status, scope_user_sub=scope_sub,
         created_by=created_by, exclude_task_type=exclude,
         agents_filter=agents_filter, edge_agents_filter=edge_filter,
+        shared_agents=shared,
     )
     return {"runs": await run_db(_label_run_targets, runs), "total": total,
             "limit": limit, "offset": offset}
@@ -1573,7 +1688,10 @@ async def cancel_run(run_id: str, user: UserContext | None = Depends(get_current
 
 @router.get("/v1/tasks/stats")
 async def get_stats(user: UserContext | None = Depends(get_current_user)):
-    require_auth(user)
+    """Platform-wide run counts: the admin Overview's cards."""
+    u = require_auth(user)
+    if not (u.is_admin or u.is_service):
+        raise HTTPException(403, "Only an admin can read the platform's task counts")
     stats = await run_db(task_store.get_stats)
     stats["scheduled_tasks"] = len(await run_db(scheduler.next_run_times))
     stats["running_tasks"] = len(scheduler.get_running_tasks())
@@ -1604,6 +1722,8 @@ async def get_task(
             raise HTTPException(404, "Task not found")
         if (task_def.scope == _vis.SCOPE_USER and not (audit and u.is_admin)
                 and task_def.created_by != u.acting_sub):
+            raise HTTPException(404, "Task not found")
+        if task_def.scope != _vis.SCOPE_USER and not u.sees_agent_automations(task_def.agent):
             raise HTTPException(404, "Task not found")
 
     def _build() -> dict:
@@ -1662,6 +1782,8 @@ async def get_task_session(task_id: str, user: UserContext | None = Depends(get_
         require_agent_access(u, task_def.agent)
         if task_def.scope == _vis.SCOPE_USER and task_def.created_by != u.sub:
             raise HTTPException(403, "Not authorized to access this task")
+        if task_def.scope != _vis.SCOPE_USER and not u.sees_agent_automations(task_def.agent):
+            raise HTTPException(403, "Not authorized to access this task")
     session_id = await asyncio.to_thread(task_store.get_task_session, task_id)
     return {"task_id": task_id, "session_id": session_id}
 
@@ -1683,6 +1805,8 @@ async def list_schedules(user: UserContext | None = Depends(get_current_user)):
         if t is None or not u.can_access_agent(t.agent):
             continue
         if t.scope == _vis.SCOPE_USER and t.created_by != u.sub:
+            continue
+        if t.scope != _vis.SCOPE_USER and not u.sees_agent_automations(t.agent):
             continue
         visible.append(j)
     return {"schedules": visible}

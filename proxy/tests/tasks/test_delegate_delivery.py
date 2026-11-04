@@ -511,6 +511,50 @@ class TestLaneCollection:
         assert scheduler._collect_lane_output_since(
             "lane-6", 0, 0, "do the work\nplease") == "answer"
 
+    def test_the_platforms_rows_are_not_a_persons(self, temp_db):
+        # A delegated task's or steer's row carries the agent it came from:
+        # never "[User interjected]", never "a person wrote after the turn".
+        # A person's row keeps counting, attachment meta or not.
+        task_store.create_chat("lane-7", "user-1", "pa")
+        task_store.add_chat_message("lane-7", "assistant", "OLD ROUND")
+        cursor = task_store.get_last_chat_message_id("lane-7")
+        meta = json.dumps(lanes.prompt_row_meta("boss", "pa"))
+        own = task_store.add_chat_message("lane-7", "user", "do the work", event_data=meta)
+        task_store.add_chat_message("lane-7", "assistant", "part one")
+        task_store.add_chat_message("lane-7", "user", "also the docs", event_data=meta)
+        task_store.add_chat_message("lane-7", "user", "and hurry",
+                                    event_data=json.dumps({"images": [{"name": "p.png"}]}))
+        task_store.add_chat_message("lane-7", "assistant", "part two")
+        out = scheduler._collect_lane_output_since("lane-7", cursor, own, "do the work")
+        assert out == "part one\n\n[User interjected]: and hurry\n\npart two"
+        assert lanes.user_rows_after("lane-7", cursor) is True
+
+        task_store.create_chat("lane-8", "user-1", "pa")
+        task_store.add_chat_message("lane-8", "assistant", "OLD ROUND")
+        c8 = task_store.get_last_chat_message_id("lane-8")
+        task_store.add_chat_message("lane-8", "user", "also the docs", event_data=meta)
+        assert lanes.user_rows_after("lane-8", c8) is False
+
+    def test_a_persons_identical_row_is_kept_once_the_run_wrote_its_own(self, temp_db):
+        task_store.create_chat("lane-9", "user-1", "pa")
+        own = task_store.add_chat_message(
+            "lane-9", "user", "do the work",
+            event_data=json.dumps(lanes.prompt_row_meta("boss", "pa")))
+        task_store.add_chat_message("lane-9", "assistant", "answer")
+        task_store.add_chat_message("lane-9", "user", "do the work")     # a person echoing
+        assert scheduler._collect_lane_output_since("lane-9", 0, own, "do the work") == (
+            "answer\n\n[User interjected]: do the work")
+
+    def test_prompt_row_meta_names_the_agent_and_the_badge(self, temp_db):
+        assert lanes.prompt_row_meta("boss", "pa") == {
+            "agent_slug": "boss", "agent_display_name": "boss", "agent_color": "",
+            "badge": "delegated by"}
+        assert lanes.prompt_row_meta("", "pa") == {
+            "agent_slug": "pa", "agent_display_name": "pa", "agent_color": "",
+            "badge": "task prompt"}
+        _owner()
+        assert lanes.prompt_row_meta(None, "pa")["agent_display_name"] == "PA"
+
 
 class TestLaneQuiescence:
     def test_quiet_lane_returns_immediately(self, temp_db):
@@ -1930,3 +1974,58 @@ class TestReportMissing:
         assert event["report_missing"] is True and event["background_pending"] == 2
         # A result without the flag keeps its old shape.
         assert "report_missing" not in result_event_from_notify({"task_id": "t", "status": "completed"})
+
+
+class TestWorkerChatOnTheResult:
+    """The worker's own chat rides the result for the card's link to the
+    lane: the persisted row, the notify payload the socket's rung rebuilds
+    the event from, and that rebuild; a run with no chat keeps the old shape
+    (``chat_id`` on the frame stays the delegating chat's)."""
+
+    def test_the_worker_chat_rides_every_path(self, temp_db, monkeypatch):
+        from core.session.session_state import _dashboard_notify_queues
+        from ws.dashboard_server_events import result_event_from_notify
+        _owner()
+        task_store.create_chat("chat-wc", "user-1", "pa")
+
+        async def _fail(*a, **k):
+            return None
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
+        asyncio.run(scheduler._do_deliver(
+            "sess-wc", "pa", "echo", _task(), chat_id="chat-wc", output_text="done",
+            worker_chat_id="task-run-w1",
+        ))
+        data = json.loads(_delegate_events("chat-wc")[0]["event_data"])
+        assert data["worker_chat_id"] == "task-run-w1"
+        assert "chat_id" not in data
+
+        task_store.create_chat("chat-wc2", "user-1", "pa")
+        q: asyncio.Queue = asyncio.Queue()
+        _dashboard_notify_queues["sess-wc2"] = q
+        try:
+            with _alive_cli_session("sess-wc2"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-wc2", "pa", "echo", _task(), chat_id="chat-wc2", output_text="done",
+                    worker_chat_id="task-run-w1",
+                ))
+            payload = q.get_nowait()
+        finally:
+            _dashboard_notify_queues.pop("sess-wc2", None)
+        assert payload["worker_chat_id"] == "task-run-w1"
+        assert payload["chat_id"] == "chat-wc2"
+        assert result_event_from_notify(payload)["worker_chat_id"] == "task-run-w1"
+        assert "worker_chat_id" not in result_event_from_notify({"task_id": "t", "status": "completed"})
+
+    def test_a_run_with_no_chat_keeps_the_old_shape(self, temp_db, monkeypatch):
+        _owner()
+        task_store.create_chat("chat-wc3", "user-1", "pa")
+
+        async def _fail(*a, **k):
+            return None
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
+        asyncio.run(scheduler._do_deliver(
+            "sess-wc3", "pa", "echo", _task(), chat_id="chat-wc3", output_text="done",
+        ))
+        assert "worker_chat_id" not in json.loads(_delegate_events("chat-wc3")[0]["event_data"])

@@ -135,3 +135,47 @@ describe('QuestionDialog — option preview content', () => {
     expect(onAnswer).toHaveBeenCalledWith('Version 2')
   })
 })
+
+// Codex's request_user_input_async: `title` and plain string options; the
+// card has no request id, so the answer is the person's next message.
+describe('QuestionDialog — codex async question', () => {
+  it('draws the title and the string options, and answers as a message', () => {
+    const onAnswer = vi.fn()
+    render(
+      <QuestionDialog
+        toolInput={{ questions: [{ title: 'Which colour for the button?', options: ['Green', 'Blue'] }] }}
+        onAnswer={onAnswer}
+      />,
+    )
+    expect(screen.getByText('Which colour for the button?')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Green'))
+    fireEvent.click(screen.getByText('Submit'))
+    expect(onAnswer).toHaveBeenCalledWith('Green')
+  })
+
+  it('labels each answer of several questions by its question', () => {
+    const onAnswer = vi.fn()
+    render(
+      <QuestionDialog
+        toolInput={{ questions: [
+          { title: 'Which colour?', options: ['Green', 'Blue'] },
+          { title: 'Which size?', options: ['Small', 'Large'] },
+        ] }}
+        onAnswer={onAnswer}
+      />,
+    )
+    fireEvent.click(screen.getByText('Green'))
+    fireEvent.click(screen.getByText('Q2'))
+    fireEvent.click(screen.getByText('Large'))
+    fireEvent.click(screen.getByText('Submit'))
+    expect(onAnswer).toHaveBeenCalledWith('**Which colour?**:\nGreen\n**Which size?**:\nLarge')
+  })
+
+  it('takes free text for a question with no options', () => {
+    const onAnswer = vi.fn()
+    render(<QuestionDialog toolInput={{ questions: [{ title: 'What should it be called?' }] }} onAnswer={onAnswer} />)
+    fireEvent.change(screen.getByPlaceholderText('Type your answer...'), { target: { value: 'Atlas' } })
+    fireEvent.click(screen.getByText('Submit'))
+    expect(onAnswer).toHaveBeenCalledWith('Atlas')
+  })
+})

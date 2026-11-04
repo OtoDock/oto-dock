@@ -129,6 +129,7 @@ export default function TopBar({
         />
         <Link
           to="/agents"
+          state={{ fromAgent: agentName }}
           title={displayName || agentName}
           className="min-w-0 truncate text-sm font-medium text-primary focus-visible:outline-none
                      after:absolute after:inset-0 after:content-['']"

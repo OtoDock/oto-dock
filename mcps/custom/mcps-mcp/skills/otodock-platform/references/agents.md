@@ -32,10 +32,12 @@ as the agent; **manager** = + knowledge and config RW.
 ## Visibility & workspace modes (Agent Settings → Configuration, manager)
 
 - **Personal + shared** — private space per person *and* a shared workspace; agent works
-  in the personal space by default. Good default for collaborative agents.
-- **Shared + personal** — same two spaces, shared is home base.
-- **Personal only** — fully private per person (own files, chats, memory).
-- **Shared only** — one space, one shared chat history for the whole team. Everything
+  in the personal space by default. Project work whose finals are handed to the team.
+- **Shared + personal** — same two spaces, shared is home base. A department head's desk.
+- **Personal only** — fully private per person (own files, chats, memory). A whole team
+  working privately, or one person.
+- **Shared only** — one space, one shared chat history for the whole team: a desk the
+  team runs together. Everything
   there runs as the agent itself, which takes **editor+**, so the agent holds **editor**
   and **manager** assignments only: Admin → Users offers nothing lower for it (a newly
   ticked one starts at editor), and so do the agent's Default-for-new-users setting and
@@ -51,13 +53,20 @@ as the agent; **manager** = + knowledge and config RW.
   chat privately, pick a mode with personal chats instead.
 
 Switching modes never deletes files. Chats on shared agents are visible per mode; on a
-colleague's live interactive terminal you get read-only + a **Take over** button.
+colleague's live interactive terminal you get read-only + a **Take over** button. Which
+mode fits which team, the three kinds of people on a project agent and where each
+artifact lives: company-management.md "Setting a team up".
 
 ## Engines, models, effort (Agent Settings → Configuration, manager)
 
-- Enable one or more **AI Engines** per agent (an engine needs a platform subscription
-  to be enabled), pick a **Default Model** (or Auto), a **Default Session Mode**
-  (headless vs interactive terminal), and a **Default Effort** (thinking depth).
+- The **AI Engines** switches are the engines the agent MAY run on (every engine on for
+  a new agent; engines resolve per person, so each person's chats and tasks run on their
+  own engine among them). The agent's **default engine** is the one its own tasks, calls
+  and meetings run on, and it needs a platform subscription (a move of the default onto
+  an engine the platform lacks is refused). Below a ticked Codex or Direct LLM card,
+  **Only allow local models** limits that engine to a local model server. Pick a
+  **Default Model** (or Auto), a **Default Session Mode** (headless vs interactive
+  terminal), and a **Default Effort** (thinking depth).
 - **Auto** (no pinned model) runs the engine's own default, chosen by tier: Claude Opus
   5.5 on Claude Code, GPT-6.1 Sol on Codex, Sonnet 5.5 on Direct LLM. A pin on a retired
   model runs on its successor.
@@ -75,9 +84,10 @@ colleague's live interactive terminal you get read-only + a **Take over** button
   silent past the ceiling (10 minutes with no tool running, `TURN_SILENCE_S`), or its
   machine was lost. When the turn had started its work (an error, an exit, a silence, a
   lost machine, a server restart), the card offers **Resume**: it asks the agent to carry
-  on from where it stopped, and after an exit, a silence or a lost machine it carries the
-  turn's photos and files again. When nothing of the turn ran (an error, an exit, a
-  silence or a lost machine), or the message met a stopped engine, the card offers **Send
+  on from where it stopped, without sending its photos and files again. The message it
+  was working on keeps them, and after an exit, a silence or a lost machine the agent is
+  told what came with it. When nothing of the turn ran (an error, an exit, a silence or a
+  lost machine), or the message met a stopped engine, the card offers **Send
   again**, which sends that turn's messages again as a new turn. A decline, a usage limit
   and a restart that cut nothing offer no button. The agent then sees the answer so far
   but not the tools it called, so after either button a tool the turn already ran can run
@@ -96,6 +106,8 @@ colleague's live interactive terminal you get read-only + a **Take over** button
   - **Don't Ask**: everything runs without asking.
   - **Plan**: the agent only reads and writes a plan; you then start it in Auto or Ask,
     ask for changes, or cancel. This works the same on Claude Code and Codex.
+  A question the agent asks ends its turn, on Claude Code and Codex: the notice reads
+  "<agent> needs your input", and the person's next message is the answer.
   Tools follow their own labels. A tool marked as only reading runs without asking, in
   Ask too. Every other tool asks in Ask. In Auto, one that says it changes nothing it
   cannot undo and stays inside its own service runs, and the engine's review judges the
@@ -117,9 +129,17 @@ colleague's live interactive terminal you get read-only + a **Take over** button
 - Claude Code and Codex read the instruction file at the top of each repository in the
   person's own workspace (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex), in that
   person's chats only: never in tasks, triggers or a Shared only agent's chats.
-- Users switch models per chat from the picker; when a chat's session has ended, other
-  enabled engines appear too — picking one restarts the chat on that engine from saved
-  history (works on finished task chats as well, with editor access).
+- A new chat opens on the person's engine (the allowed one they use most on that agent,
+  else the one they use most on every agent, else the agent's default, else one they
+  hold); the picker lists only the allowed engines the person can run on this agent,
+  the most used first. An engine whose accounts all rest on a usage limit stays listed,
+  and a new chat with no pick opens on another engine the person holds until it is
+  back; when every account rests, it opens there anyway and the first message shows
+  the usage limit.
+  Users switch models per chat from the picker; when a chat's session has
+  ended, the other engines they can run appear too — picking one restarts the chat on
+  that engine from saved history (works on finished task chats as well, with editor
+  access).
 - Both pickers order models by capability tier and mark each with four dots (●●●●
   frontier … ●○○○ fast; none = untiered); hover for the tier word and what the model
   is good at.
@@ -196,9 +216,20 @@ Three paths from the **Agents** page:
    disabled since the install (a task, a check, a context file, an MCP, a hidden app
    copy) stays that way — the report lists it as left out. An agent made by "Ask an
    agent" never updates.
-3. **Ask an agent** — any agent with the agent-creation tool interviews the user, writes
-   the template, and installs it with the user as manager; un-installed tools go through
-   the admin request queue.
+   Browse Community also lists **department sets**: several agents installed as one
+   department in one step, each at its level, the head's library shared and the
+   schedules paused (company-management.md). A template's card lists the apps it brings
+   and the set it belongs to.
+3. **Ask an agent**. An agent with the Agent Creator tool searches the community catalog
+   first. When a template or a department set fits, it proposes it as a card in the chat.
+   Nothing is installed until the person presses the card's button, and the platform
+   installs with that person's own role. Only when nothing fits does the agent interview
+   the user, write a template and install it with the user as manager. Tools not
+   installed yet go through the admin request queue. The same tool proposes moving an
+   agent into a department as a card *(an admin, or a creator who manages the agent,
+   presses it)*. A team of agents (a department, several project agents) is proposed
+   only when the person asks to automate a company function, a department or several
+   projects with different people. An idea, a research task or one job gets one agent.
 
 Round out a new agent with: knowledge files, `config/context/` rules, a department +
 delegation targets, schedules, checks where the work has a standard to meet, and a
@@ -214,26 +245,40 @@ computer) exist only on remote machines with the matching grant.
 **Runs on.** Every chat shows where it runs in the **Runs on** pill, a computer icon
 beside the model; its tooltip names the place. Its menu lists the places the person may
 pick: the OtoDock platform, their own paired computers and, for an admin, the admin
-machines. An editor never runs a chat on an admin machine: an editor's message in a
-shared chat there first moves it to the OtoDock platform or the editor's own computer.
+machines. Below manager (editor, contributor, viewer) a chat runs on an admin machine
+only when it is the agent's default place and its admin turned on **Every role of its
+agents runs here** (Admin → Remote Machines, the machine's card). Otherwise an editor's
+message in a shared chat there first moves it to the OtoDock platform or the editor's own
+computer. To an admin who asks why a contributor's chat does not run on the machine, say
+that the machine has no sandbox, so the platform keeps those roles on its own host, and
+name the switch with its caveat (their chats get the machine's own access).
 A viewer or contributor on a Shared only agent sees the place with no menu, and a Direct
 LLM chat always runs on the platform. A pick asks for confirmation, then
 moves the chat, and the icon shows the copy's progress. The chat keeps its memory when
 both places are online. When the current place is offline it continues there from a
 summary of the conversation. Working files stay where they are. A move is refused while
-a turn runs, so finish or stop the turn first. On a new chat the same menu picks where
+a turn runs, so finish or stop the turn first. When the computer a chat was moved to is
+offline, the chat runs where the agent usually runs, and a notice above the message box
+says so (its × closes it). On a new chat the same menu picks where
 it starts, before the first message. A person can also ask the agent to move the chat.
 Its `move_chat` tool lists the places, the move happens when the agent's turn ends, and
 the agent then continues on the new place by itself.
 
 A task or a delegated job can name its own machine too (see Automation). When that
-machine is offline at run time, the run uses the agent's usual place and says so.
+machine is offline at run time, the run uses the agent's usual place and says so. A
+chat lane a person hands out to their own computer waits for it instead. There it works
+as that person, with their role and their own AI account. While it runs there, everyone
+else sees its chat read only, as for a moved chat.
 
 **Shared only agents.** A member with the editor role or above can move a shared chat
-to their own computer. While it runs there, everyone else sees it read only with "This chat is
+to their own computer. A chat lane they hand out can run there too. While it runs
+there, everyone else sees it read only with "This chat is
 running on <name>'s computer." Once that session closes, the next person's message
 first moves the chat to that person's usual place. The agent's own accounts stay on the
-server, so tools that sign in with them are not available on a personal computer.
+server, so tools that sign in with them are not available on a personal computer. An
+account that person connected for this agent goes along, and so does the computer's
+browser. An account they connected only for themselves does not. A tool that signs in
+with a file or a key, such as Google Workspace, stays on the server even then.
 
 In the server sandbox, packages installed into HOME vanish when the session ends. An
 agent keeps Python packages across sessions in a virtualenv inside its workspace

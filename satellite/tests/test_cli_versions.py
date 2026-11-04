@@ -528,3 +528,29 @@ def test_report_fires_even_when_pass_crashes(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         cli_versions.reconcile_cli_versions(pins, reports.append)
     assert reports == [{"claude": {"version": None, "path": None}}]
+
+
+def test_darwin_tool_dirs_come_first_as_one_block(monkeypatch, tmp_path):
+    brew, local, home_bin = tmp_path / "brew" / "bin", tmp_path / "usrlocal", tmp_path / "home" / ".local" / "bin"
+    for d in (brew, local, home_bin):
+        d.mkdir(parents=True)
+    monkeypatch.setattr(cli_versions, "_DARWIN_TOOL_DIRS",
+                        (str(brew), str(tmp_path / "brew" / "sbin"), str(local), "~/.local/bin"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli_versions.config, "HOST", cli_versions.config.of("darwin"))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(local), "/usr/bin", "/bin"]))
+
+    cli_versions.ensure_darwin_tool_dirs_on_path()
+    # A folder already on PATH stays where it is; a missing folder is skipped.
+    assert os.environ["PATH"].split(os.pathsep) == [str(brew), str(home_bin), str(local), "/usr/bin", "/bin"]
+    cli_versions.ensure_darwin_tool_dirs_on_path()
+    assert os.environ["PATH"].count(str(brew)) == 1
+
+
+def test_darwin_tool_dirs_leave_other_hosts_alone(monkeypatch, tmp_path):
+    (tmp_path / "bin").mkdir()
+    monkeypatch.setattr(cli_versions, "_DARWIN_TOOL_DIRS", (str(tmp_path / "bin"),))
+    monkeypatch.setattr(cli_versions.config, "HOST", cli_versions.config.of("linux"))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    cli_versions.ensure_darwin_tool_dirs_on_path()
+    assert os.environ["PATH"] == "/usr/bin"

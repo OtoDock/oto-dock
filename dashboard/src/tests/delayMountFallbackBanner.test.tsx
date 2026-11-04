@@ -1,8 +1,9 @@
 // The delayed mount and the fallback banner keep their timing: true only
 // after the delay has fully elapsed, back to false the moment the condition
-// drops; the banner shows for its window and shows again for a new reason.
+// drops; the banner shows for its window or until dismissed, and shows again
+// for a new reason.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, renderHook, screen } from '@testing-library/react'
+import { act, fireEvent, render, renderHook, screen } from '@testing-library/react'
 import { useDelayMount } from '@/hooks/useDelayMount'
 import RemoteFallbackBanner from '@/components/chat/RemoteFallbackBanner'
 
@@ -39,6 +40,15 @@ describe('RemoteFallbackBanner', () => {
     const { rerender } = render(<RemoteFallbackBanner fallbackReason="user-override-offline" machineName="lab" durationMs={1000} />)
     expect(screen.getByText(/lab/)).toBeInTheDocument()
     act(() => { vi.advanceTimersByTime(1000) })
+    expect(screen.queryByText(/lab/)).toBeNull()
+    rerender(<RemoteFallbackBanner fallbackReason={null} machineName="lab" durationMs={1000} />)
+    rerender(<RemoteFallbackBanner fallbackReason="user-override-offline" machineName="lab" durationMs={1000} />)
+    expect(screen.getByText(/lab/)).toBeInTheDocument()
+  })
+
+  it('hides at once when dismissed, and shows again for the next override reason', () => {
+    const { rerender } = render(<RemoteFallbackBanner fallbackReason="user-override-offline" machineName="lab" durationMs={1000} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(/lab/)).toBeNull()
     rerender(<RemoteFallbackBanner fallbackReason={null} machineName="lab" durationMs={1000} />)
     rerender(<RemoteFallbackBanner fallbackReason="user-override-offline" machineName="lab" durationMs={1000} />)

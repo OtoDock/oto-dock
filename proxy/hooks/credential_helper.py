@@ -21,7 +21,9 @@ Two modes, both reached from the session's shell, never by the engine:
   broker is told the command's arguments and the working directory's git
   remotes, which a narrowed reach is judged by). When
   the session holds no account for the host (the broker's quiet 404) the
-  command runs plainly, as it would without the platform; every other
+  command runs plainly, as it would without the platform, after one line
+  with the broker's reason (left out when the command's own login is on the
+  machine, which it then uses: ``_own_login``); every other
   refusal (an account that needs a reconnect, a platform that cannot be
   reached, a satellite that needs its update) is printed and the command
   does not run, so an account the platform holds but refuses is never
@@ -191,6 +193,27 @@ def _remotes() -> list[str]:
     return [line.split(None, 1)[1] for line in out.splitlines() if " " in line][:16]
 
 
+def _own_login(command: str, host: str) -> bool:
+    """Whether ``gh`` holds its own login for ``host`` on this machine: a
+    token in its environment, or its hosts file naming the host (the token
+    itself may sit in the system keyring)."""
+    if command != "gh":
+        return False
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_ENTERPRISE_TOKEN"):
+        return True
+    # gh keeps its config under %AppData% where the OS has one (Windows).
+    config = os.environ.get("GH_CONFIG_DIR") or (
+        os.path.join(os.environ["APPDATA"], "GitHub CLI") if os.environ.get("APPDATA")
+        else os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "gh"))
+    try:
+        with open(os.path.join(config, "hosts.yml"), encoding="utf-8") as f:
+            names = [line.strip().rstrip(":").strip("'\"") for line in f
+                     if line.strip() and not line[0].isspace()]
+    except OSError:
+        return False
+    return host.lower() in (n.lower() for n in names)
+
+
 def _real_dir(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
@@ -233,6 +256,8 @@ def _run(host: str, command: str, args: list[str]) -> int:
         if not (isinstance(e, _Refused) and e.quiet):
             sys.stderr.write(f"otodock credential helper: {_reason(e)}\n")
             return 1
+        if not _own_login(command, host):
+            sys.stderr.write(f"otodock credential helper: {_reason(e)}\n")
     else:
         for name in answer.get("env") or []:
             if isinstance(name, str) and name:
@@ -262,4 +287,11 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    # PROXY_URL is a loopback address (the platform's own listener, or a
+    # satellite's tunnel): no proxy may stand between. urllib's default
+    # opener takes the environment's proxy and, on Windows, Internet
+    # Options' (whose <local> exemption skips only dotless hosts, never
+    # 127.0.0.1). Installed here, never at import: a test that loads the
+    # script keeps its own opener.
+    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
     sys.exit(main(sys.argv[1:]))

@@ -9,6 +9,7 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from auth import roles
 from storage.automation import run_status
 from storage.pg import get_conn
 
@@ -241,7 +242,8 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
               created_by: str | None = None,
               exclude_task_type: str | None = None,
               agents_filter: list[str] | None = None,
-              edge_agents_filter: list[str] | None = None) -> list[dict]:
+              edge_agents_filter: list[str] | None = None,
+              shared_agents: list[str] | None = None) -> list[dict]:
     """List task runs with optional scope filtering.
 
     scope_user_sub: when set, only returns runs where scope='agent' OR
@@ -257,6 +259,9 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
     delegation edges — agent-scope rows only (never other users' user-scope
     runs), OR-ed onto agents_filter in the same paged query. Only
     meaningful alongside agents_filter.
+    shared_agents: with scope_user_sub, the agents whose agent-scope runs the
+    caller sees (the editor tier, ``UserContext.sees_agent_automations``);
+    None = every agent's.
 
     Each row carries a computed ``unread`` bool — the run chat's last response
     landed after its read marker (same rule as ``list_chats``; the marker is
@@ -266,7 +271,7 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
     """
     conditions, params = _run_conditions(
         "tr.", agent, status, scope_user_sub, created_by, exclude_task_type,
-        agents_filter, edge_agents_filter,
+        agents_filter, edge_agents_filter, shared_agents,
     )
     if task_id:
         conditions.append("tr.task_id=%s")
@@ -301,6 +306,7 @@ def _run_conditions(prefix: str, agent: str | None, status: str | None,
                     scope_user_sub: str | None, created_by: str | None,
                     exclude_task_type: str | None, agents_filter: list[str] | None,
                     edge_agents_filter: list[str] | None,
+                    shared_agents: list[str] | None = None,
                     ) -> tuple[list[str], list[Any]]:
     """The WHERE terms the run listing and its count share, so a page and
     its total always agree. A reach of exactly one agent is an equality
@@ -334,7 +340,12 @@ def _run_conditions(prefix: str, agent: str | None, status: str | None,
     if status:
         conditions.append(f"{prefix}status=%s")
         params.append(status)
-    if scope_user_sub is not None:
+    if scope_user_sub is not None and shared_agents is not None:
+        conditions.append(
+            f"(({prefix}scope='agent' AND {prefix}agent = ANY(%s))"
+            f" OR ({prefix}scope='user' AND {prefix}created_by=%s))")
+        params += [list(shared_agents), scope_user_sub]
+    elif scope_user_sub is not None:
         conditions.append(
             f"({prefix}scope='agent' OR ({prefix}scope='user' AND {prefix}created_by=%s))")
         params.append(scope_user_sub)
@@ -391,6 +402,24 @@ def count_active_delegate_runs(created_by: str) -> int:
         return row["cnt"] if row else 0
 
 
+def live_delegate_run_ids_for_chat(chat_id: str) -> list[str]:
+    """The live (pending/running) delegated-worker runs tied to one chat:
+    those driving it (``task_runs.chat_id``) and those that will (their
+    task's ``target_chat_id``: a run waiting at the lane gate has no
+    ``chat_id`` yet)."""
+    from services.scheduler import task_kinds
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT tr.id FROM task_runs tr "
+            "LEFT JOIN dynamic_tasks dt ON dt.id = tr.task_id "
+            "WHERE tr.task_type=%s AND tr.status = ANY(%s) "
+            "AND (tr.chat_id=%s OR dt.target_chat_id=%s) "
+            "ORDER BY tr.id",
+            (task_kinds.RUN_DELEGATE, sorted(run_status.LIVE), chat_id, chat_id),
+        ).fetchall()
+    return [row["id"] for row in rows]
+
+
 def count_runs_by_task(task_ids: list[str]) -> dict[str, int]:
     """Runs recorded in ``task_runs`` per task id — what a task view shows as
     its run count. The ``dynamic_tasks.run_count`` column is a continuation's
@@ -413,10 +442,11 @@ def get_run_count(agent: str | None = None, status: str | None = None,
                   created_by: str | None = None,
                   exclude_task_type: str | None = None,
                   agents_filter: list[str] | None = None,
-                  edge_agents_filter: list[str] | None = None) -> int:
+                  edge_agents_filter: list[str] | None = None,
+                  shared_agents: list[str] | None = None) -> int:
     conditions, params = _run_conditions(
         "", agent, status, scope_user_sub, created_by, exclude_task_type,
-        agents_filter, edge_agents_filter,
+        agents_filter, edge_agents_filter, shared_agents,
     )
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     with get_conn() as conn:
@@ -479,7 +509,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                         app_id: str | None = None,
                         app_handler: str | None = None,
                         checks: str = "",
-                        target_machine: str = "") -> None:
+                        target_machine: str = "",
+                        notify_audience: str = roles.EDITOR) -> None:
     """Insert a dynamic_tasks row.
 
     ``app_id`` + ``app_handler`` mark an app handler's schedule row
@@ -504,6 +535,9 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
     ``target_machine`` is the machine the task's runs use: "" for the
     agent's default, ``local`` for the server, else a machine id; the
     caller validates it for the task's run person before writing.
+
+    ``notify_audience`` is who is told: the lowest per-agent role an
+    agent-scope task's notifications reach (``editor`` for a new task).
     """
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
@@ -517,8 +551,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                 community_template, community_template_item_slug,
                 target_chat_id, max_runs, until_at,
                 override_model, override_execution_path, permission_mode, app_id, app_handler,
-                checks, target_machine)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                checks, target_machine, notify_audience)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (task_id, agent, name, prompt, llm_mode, task_type, schedule, run_at,
              delay_seconds, interval_seconds, timeout_seconds, now, created_by,
              on_complete_agent, on_complete_prompt, on_complete_session_id,
@@ -527,7 +561,7 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
              community_template, community_template_item_slug,
              target_chat_id, max_runs, until_at,
              override_model or "", override_execution_path or "", permission_mode or "",
-             app_id, app_handler, checks or "", target_machine or ""),
+             app_id, app_handler, checks or "", target_machine or "", notify_audience or roles.EDITOR),
         )
         conn.commit()
 
@@ -606,32 +640,85 @@ def count_dynamic_tasks_by_agent() -> dict[str, int]:
         return {r["agent"]: r["cnt"] for r in rows}
 
 
-def count_user_visible_dynamic_tasks_by_agent(user_sub: str) -> dict[str, int]:
+def audience_of_session(session_id: str) -> str | None:
+    """Who is told for an agent-scope notification a session sends: the
+    ``notify_audience`` of the task behind its running run (the narrowest of
+    several); with no running run (a continuation's wake, a worker's report
+    delivered after the run ended), the latest run of the session's chat, of
+    any status. ``editor`` for a run whose task row is gone; None for a
+    session whose chat carries no run (a person's chat, a meeting)."""
+    if not session_id:
+        return None
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT dt.notify_audience FROM task_runs tr "
+            "LEFT JOIN dynamic_tasks dt ON dt.id = tr.task_id "
+            "WHERE tr.session_id = %s AND tr.status = ANY(%s)",
+            (session_id, sorted(run_status.LIVE)),
+        ).fetchall()
+        if not rows:
+            rows = conn.execute(
+                "SELECT dt.notify_audience FROM task_runs tr "
+                "LEFT JOIN dynamic_tasks dt ON dt.id = tr.task_id "
+                "WHERE tr.chat_id = (SELECT id FROM chats WHERE session_id = %s "
+                "ORDER BY updated_at DESC LIMIT 1) "
+                "ORDER BY COALESCE(tr.started_at, '') DESC LIMIT 1",
+                (session_id,),
+            ).fetchall()
+    if not rows:
+        return None
+    return max((r["notify_audience"] or roles.EDITOR for r in rows), key=roles.rank)
+
+
+def chat_ids_with_agent_runs(chat_ids: list[str]) -> set[str]:
+    """The chats among ``chat_ids`` that carry an agent-scope run (a task
+    run's chat, a delegated worker's): one indexed read."""
+    ids = [c for c in dict.fromkeys(chat_ids) if c]
+    if not ids:
+        return set()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT chat_id FROM task_runs WHERE chat_id = ANY(%s) "
+            "AND scope IS DISTINCT FROM 'user'", (ids,),
+        ).fetchall()
+    return {r["chat_id"] for r in rows}
+
+
+def count_user_visible_dynamic_tasks_by_agent(user_sub: str,
+                                              shared_agents: list[str] | None = None) -> dict[str, int]:
     """Return {agent_slug: task_count} of tasks ``user_sub`` may see: agent-scoped
-    (shared) + their OWN user-scoped. Never counts other users' user-scoped tasks.
-    Mirrors the Scheduled Tasks tab's filter (api/tasks/tasks.py::list_tasks)."""
+    (shared; on ``shared_agents`` when given, the agents whose own work the
+    viewer sees) + their OWN user-scoped. Never counts other users' user-scoped
+    tasks. Mirrors the Scheduled Tasks tab's filter (api/tasks/tasks.py::list_tasks)."""
+    shared = "scope='agent'" if shared_agents is None else "(scope='agent' AND agent = ANY(%s))"
+    params: tuple = (user_sub,) if shared_agents is None else (list(shared_agents), user_sub)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT agent, COUNT(*) AS cnt FROM dynamic_tasks "
-            "WHERE scope='agent' OR (scope='user' AND created_by=%s) "
+            f"WHERE {shared} OR (scope='user' AND created_by=%s) "
             "GROUP BY agent",
-            (user_sub,),
+            params,
         ).fetchall()
         return {r["agent"]: r["cnt"] for r in rows}
 
 
-def count_recent_runs_by_agent(since: str, user_sub: str) -> dict[str, int]:
+def count_recent_runs_by_agent(since: str, user_sub: str,
+                               shared_agents: list[str] | None = None) -> dict[str, int]:
     """{agent: run_count} for task runs started since ``since`` that this
-    user may see — agent-scoped (shared) + their OWN user-scoped, the same
+    user may see — agent-scoped (shared, on ``shared_agents`` when given: the
+    agents whose own work the viewer sees) + their OWN user-scoped, the same
     predicate as :func:`count_user_visible_dynamic_tasks_by_agent`. Feeds the
     agents-map heat (task half); ``idx_runs_started_at`` keeps it cheap."""
+    shared = "scope='agent'" if shared_agents is None else "(scope='agent' AND agent = ANY(%s))"
+    params: tuple = ((since, user_sub) if shared_agents is None
+                     else (since, list(shared_agents), user_sub))
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT agent, COUNT(*) AS cnt FROM task_runs "
             "WHERE started_at >= %s "
-            "AND (scope='agent' OR (scope='user' AND created_by=%s)) "
+            f"AND ({shared} OR (scope='user' AND created_by=%s)) "
             "GROUP BY agent",
-            (since, user_sub),
+            params,
         ).fetchall()
         return {r["agent"]: r["cnt"] for r in rows}
 
@@ -927,6 +1014,7 @@ _EDITABLE_TASK_COLUMNS = {
     "task_type",  # auto-derived by the service helper when timing fields change
     "user_tz",  # IANA timezone snapshot — change forces re-register with new trigger TZ
     "checks",  # CHECKS.md: the refs attached to the task's runs (a JSON list, '' = none)
+    "notify_audience",  # who is told: the lowest per-agent role its notifications reach
     # Per-task execution overrides — retune a live schedule onto another
     # model / engine, or pass "" to fall back to the agent's default. Both
     # are re-validated against the agent's envelope by the API layer.

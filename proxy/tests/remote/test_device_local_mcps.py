@@ -302,7 +302,7 @@ def test_hook_prompts_ungranted_device_tool(monkeypatch):
     # (NOT auto-approve). Stub the prompt machinery so the deny resolves
     # immediately instead of blocking on a real user.
     class _Q:
-        async def put(self, _):
+        def put_nowait(self, _):
             return None
     async def _wait(_request_id, _session_id="", timeout=0):
         return False
@@ -325,7 +325,7 @@ def test_hook_does_not_auto_approve_nondevice_mcp(monkeypatch):
     hooks_reg["slack"] = _mk("slack", server_name="slack")  # no device_capability
 
     class _Q:
-        async def put(self, _):
+        def put_nowait(self, _):
             return None
     async def _wait(_request_id, _session_id="", timeout=0):
         return False
@@ -406,7 +406,7 @@ def _prompts(monkeypatch, permission, answer):
     prompted = []
 
     class _Q:
-        async def put(self, item):
+        def put_nowait(self, item):
             prompted.append(item["tool_name"])
     async def _wait(_request_id, _session_id="", timeout=0):
         return answer

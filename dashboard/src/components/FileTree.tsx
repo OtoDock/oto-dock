@@ -4,7 +4,7 @@ import { formatFileSize } from '../lib/fileTypes'
 import { encodePathSegments, toSandboxVirtualPath } from '../lib/paths'
 import FileIcon, { FolderIcon } from './workspace/FileIcon'
 import { useLongPress } from '../hooks/useLongPress'
-import { POPOVER } from './ui/classes'
+import { HOVER_REVEAL_FLEX, POPOVER } from './ui/classes'
 
 const INTERNAL_PATHS_MIME = 'application/x-otodock-paths'
 const INTERNAL_PATH_MIME = 'application/x-otodock-path'
@@ -341,7 +341,7 @@ function TreeNode(props: TreeNodeProps) {
             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
             openMenuAt({ clientX: rect.right, clientY: rect.bottom })
           }}
-          className="shrink-0 flex md:hidden md:group-hover:flex items-center px-1 h-full text-tertiary hover:text-secondary"
+          className={`shrink-0 flex ${isSelected ? '' : HOVER_REVEAL_FLEX} items-center px-1 h-full text-tertiary hover:text-secondary`}
           aria-label="More actions"
         >
           <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">

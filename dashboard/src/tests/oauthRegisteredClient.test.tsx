@@ -93,12 +93,59 @@ describe('the connect form of a registered-client MCP', () => {
     expect(screen.getByRole('button', { name: 'Connect' })).toBeInTheDocument()
   })
 
+  it('says when the account was removed at the vendor', () => {
+    mockApi([], { '/accounts?mcp_name=notion-hosted-mcp': { accounts: [], has_service_credentials_only: false } })
+    const removed = { ...deadAccount, reconnect_reason: 'removed_at_vendor' }
+    wrap(<OAuthAccountForm integration={{ ...integration, accounts: [removed] }} account={removed} onDone={() => {}} />)
+    expect(screen.getByText(/Reconnect needed: OtoDock's app was removed from this account at the vendor\./)).toBeInTheDocument()
+  })
+
+  it('says when the MCP server no longer accepts the account', () => {
+    mockApi([], { '/accounts?mcp_name=notion-hosted-mcp': { accounts: [], has_service_credentials_only: false } })
+    const refused = { ...deadAccount, reconnect_reason: 'refused' }
+    wrap(<OAuthAccountForm integration={{ ...integration, accounts: [refused] }} account={refused} onDone={() => {}} />)
+    expect(screen.getByText(/Reconnect needed: the vendor no longer accepts its access\./)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  })
+
+  it('takes a new token for a personal access token the server refused', async () => {
+    const calls: Call[] = []
+    mockApi(calls, {
+      '/accounts?mcp_name=notion-hosted-mcp': { accounts: [], has_service_credentials_only: false },
+      '/pat/save': { status: 'ok', email: 'acme.com', account_label: 'ws-1' },
+    })
+    const refused = { ...deadAccount, reconnect_reason: 'refused', flow: 'personal_access_token' }
+    wrap(<OAuthAccountForm integration={{ ...integration, accounts: [refused] }} account={refused} onDone={() => {}} />)
+    expect(screen.getByText(/until you save a new token/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).toBeNull()
+    expect(screen.queryByPlaceholderText('Account label, optional')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Paste your token…'), { target: { value: ' tok-2 ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save token' }))
+    await waitFor(() => expect(calls.some((c) => c.url.endsWith('/v1/oauth/notion-hosted/pat/save'))).toBe(true))
+    expect(calls.find((c) => c.url.endsWith('/pat/save'))?.body).toMatchObject({ token: 'tok-2', account_label: 'ws-1' })
+  })
+
   it('shows the reconnect reason for a dead account', () => {
     mockApi([], { '/accounts?mcp_name=notion-hosted-mcp': { accounts: [], has_service_credentials_only: false } })
     wrap(<OAuthAccountForm integration={{ ...integration, accounts: [deadAccount] }} account={deadAccount} onDone={() => {}} />)
     expect(screen.getByText(/Reconnect needed: its access expired and the vendor gave no way to renew it/)).toBeInTheDocument()
     expect(screen.queryByPlaceholderText('Account label, optional')).toBeNull()
     expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  })
+})
+
+describe('a disconnect of a sign-in another MCP shares', () => {
+  it('says the account stays on the MCPs that share it', async () => {
+    const calls: Call[] = []
+    mockApi(calls, { '/disconnect': { status: 'ok', kept_for: ['Instagram', 'Meta Ads'] } })
+    const live = { ...deadAccount, needs_reconnect: false, reconnect_reason: '' }
+    wrap(<OAuthAccountForm integration={{ ...integration, accounts: [live] }} account={live} onDone={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+    await act(async () => { await answerDialog('Disconnect', /Disconnect acme.com/) })
+    await waitFor(() => expect(screen.getByText('acme.com is removed from Notion (hosted)')).toBeInTheDocument())
+    expect(screen.getByText('It stays connected for Instagram, Meta Ads, which use the same sign-in.')).toBeInTheDocument()
+    expect(calls.find((c) => c.url.endsWith('/disconnect'))?.body).toMatchObject({ account_label: 'ws-1' })
   })
 })
 

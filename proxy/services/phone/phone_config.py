@@ -102,14 +102,16 @@ def duplex_engine_available() -> bool:
     return pick_duplex_client() is not None
 
 
-def assemble_duplex_session_config(user_sub: str, browser_language: str = "") -> dict:
+def assemble_duplex_session_config(user_sub: str, browser_language: str = "", chat_id: str = "") -> dict:
     """Per-session config for one duplex session (rides ``duplex_open``).
 
     Identity-and-provider scope ONLY: the chat-context STT/TTS provider rows
-    with decrypted keys, the chat endpointing, and the user's dictation
-    language. Behaviour knobs (``phone_tts_buffer_chars``, ``phone_bargein_*``,
-    the turn-classifier language map + Groq credentials) ride the GLOBAL
-    config push — one source per knob, never duplicated here.
+    with decrypted keys, the chat endpointing, the user's dictation
+    language, and the chat and the speaker (``chat_id``, ``sub``) the
+    daemon's usage report names at the session's end. Behaviour knobs
+    (``phone_tts_buffer_chars``, ``phone_bargein_*``, the turn-classifier
+    language map + Groq credentials) ride the GLOBAL config push — one
+    source per knob, never duplicated here.
     """
     from storage.prefs import user_audio_prefs_store
 
@@ -155,6 +157,8 @@ def assemble_duplex_session_config(user_sub: str, browser_language: str = "") ->
         "language": (_detect_default(browser_language) if _is_auto(prefs.get("stt_language"))
                      else (prefs.get("stt_language") or "")),
         "language_detect": _is_auto(prefs.get("stt_language")),
+        "chat_id": chat_id,
+        "sub": user_sub,
     }
 
 

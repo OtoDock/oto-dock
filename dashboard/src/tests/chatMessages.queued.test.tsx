@@ -50,6 +50,22 @@ describe('the queued chip cancel', () => {
     expect(x.getAttribute('title')).toBe('Cancel')
   })
 
+  it('stays inside the clipped column: its overhang is the column\'s own padding', () => {
+    renderChips()
+    const [x] = screen.getAllByTestId('cancel-queued')
+    // The x stands 12 px past the chip's corner (-right-3); the column
+    // clips across at its padding edge, 12 px out (px-3), never at a margin
+    // Safari does not draw.
+    expect(x.className).toContain('-right-3')
+    const column = x.closest('.overflow-x-clip') as HTMLElement
+    expect(column).not.toBeNull()
+    expect(column.className).toMatch(/(^|\s)px-3(\s|$)/)
+    expect(column.className).not.toContain('overflow-clip-margin')
+    // The chip's row is the column's direct content, with no padding of its own.
+    const row = x.closest('.flex.justify-end') as HTMLElement
+    expect(column.contains(row)).toBe(true)
+  })
+
   it('shows only on a chip this person may cancel and fires its index', () => {
     const onCancel = renderChips((m) => m.authorSub === 'me')
     const xs = screen.getAllByTestId('cancel-queued')

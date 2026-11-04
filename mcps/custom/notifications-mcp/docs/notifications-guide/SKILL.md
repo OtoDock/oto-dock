@@ -25,7 +25,7 @@ Notifications support `run_at` (one-time future) and `schedule` (cron recurring)
 
 ## Managing existing notifications
 
-- **`list_notifications`** — shows all scheduled notifications for this agent with their current status (`active` or `paused`), severity, schedule, and ID. Always call this first to find the notification ID before pausing/resuming/cancelling.
+- **`list_notifications`** — shows the scheduled notifications for this agent your user may see (the agent's own from the editor role, plus their own) with their current status (`active` or `paused`), severity, schedule, and ID. Always call this first to find the notification ID before pausing/resuming/cancelling.
 - **`pause_notification(id)`** — stops a notification from firing on its schedule without deleting it. Can be resumed later. Use for "pause my reminders for X", "stop temporarily".
 - **`resume_notification(id)`** — re-enables a paused notification. For one-time notifications whose `run_at` has already passed, resume keeps the row active but does NOT auto-fire — the user can fire it manually from the dashboard if they want.
 - **`edit_notification(id, ...)`** — change the schedule, run time, title, body, or severity of an existing notification **without deleting and recreating it**. Pass only the fields you want to change. `schedule` and `run_at` are mutually exclusive — setting one switches the notification between recurring and one_time mode and clears the other. Use this whenever the user says "change the time of X", "update the message of X", "make the daily reminder weekly instead". Always prefer this over cancel+recreate — it preserves the notification ID and history.

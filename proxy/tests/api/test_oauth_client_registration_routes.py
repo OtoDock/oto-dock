@@ -161,3 +161,70 @@ class TestIntegrationsReconnect:
         (token_dir / "ws-1.json").write_text(json.dumps(raw))
         [entry] = [e for e in _client(me).get("/v1/users/me/integrations").json() if e["mcp_name"] == MCP]
         assert entry["accounts"][0]["needs_reconnect"] is False
+
+    def test_a_refusal_mark_reads_on_its_own_card_until_a_new_sign_in(self, registry, person, monkeypatch, tmp_path):
+        """The MCP's own server refused the token: its card asks for a
+        Reconnect with the reason, an MCP sharing the sign-in stays
+        connected, and a new sign-in writes the file without the mark."""
+        from auth.oauth_providers.base import TokenSet, UserInfo
+        sub, username = person
+        monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
+        m = registry(_manifest_data())
+        sibling = _manifest_data()
+        sibling["name"] = f"{MCP}-sibling"
+        m2 = registry(sibling)
+        for name in (MCP, m2.name):
+            credential_store.set_user_credentials(sub, name, {"NOTION-HOSTED_EMAIL": "acme.com",
+                                                              "NOTION-HOSTED_SERVICES": "read"}, account_label="ws-1")
+        token_dir = oauth_account_store.get_token_dir(username, provider_id=PROVIDER)
+        (token_dir / "ws-1.json").write_text(json.dumps({
+            "provider": PROVIDER, "account_id": "u", "access_token": "AT", "refresh_token": "",
+            "expires_at": "", "scopes": ["read"], "client_id": "cid", "client_secret": "",
+            "token_url": f"{ISSUER}/token",
+            "extra": {"flow": "mcp_authorization", "resource": RESOURCE,
+                      "refused_by": {MCP: {"at": "2026-11-03T10:00:00Z", "methods": ["tools/call"]}}}}))
+        monkeypatch.setattr(credentials_api.task_store, "get_user_agents", lambda s: ["pa"])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: [m, m2])
+        me = UserContext(sub=sub, email=f"{username}@t.example", name="T", role="creator",
+                         agents=["pa"], agent_roles={"pa": "manager"})
+
+        def accounts():
+            listed = _client(me).get("/v1/users/me/integrations").json()
+            return {e["mcp_name"]: e["accounts"][0] for e in listed if e["mcp_name"] in (MCP, m2.name)}
+        got = accounts()
+        assert got[MCP]["needs_reconnect"] is True and got[MCP]["reconnect_reason"] == "refused"
+        assert got[MCP]["missing_scopes"] == [] and got[MCP]["flow"] == "mcp_authorization"
+        assert got[m2.name]["needs_reconnect"] is False
+        oauth_account_store.persist_oauth_account(
+            user_sub=sub, mcp_name=MCP, provider_id=PROVIDER, account_label="ws-1", services=["read"],
+            token_set=TokenSet(access_token="AT-2", expires_in=0,
+                               raw={"flow": "mcp_authorization", "resource": RESOURCE}),
+            userinfo=UserInfo(email="acme.com", account_id="u"),
+            client_id="cid", client_secret="", token_url=f"{ISSUER}/token")
+        assert "refused_by" not in json.loads((token_dir / "ws-1.json").read_text())["extra"]
+        assert accounts()[MCP]["needs_reconnect"] is False
+
+    def test_an_account_removed_at_the_vendor_says_so_until_a_new_sign_in(self, registry, person, monkeypatch, tmp_path):
+        """The relay's notice deleted the file and marked the row: the card
+        asks for a Reconnect with that reason and no scope prompt; a new
+        sign-in rewrites the row's meta and the mark goes."""
+        from services.webhooks import relay_notices
+        sub, username = person
+        monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
+        m = registry(_manifest_data())
+        credential_store.set_user_credentials(sub, MCP, {"NOTION-HOSTED_EMAIL": "acme.com",
+                                                          "NOTION-HOSTED_SERVICES": "read"}, account_label="ws-1")
+        credential_store.update_account_meta(
+            sub, MCP, "ws-1", lambda meta: {**meta, relay_notices.REMOVED_REASON: {"reason": "deauthorized", "at": 1}})
+        monkeypatch.setattr(credentials_api.task_store, "get_user_agents", lambda s: ["pa"])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: [m])
+        me = UserContext(sub=sub, email=f"{username}@t.example", name="T", role="creator",
+                         agents=["pa"], agent_roles={"pa": "manager"})
+        [entry] = [e for e in _client(me).get("/v1/users/me/integrations").json() if e["mcp_name"] == MCP]
+        [account] = entry["accounts"]
+        assert account["needs_reconnect"] is True and account["reconnect_reason"] == "removed_at_vendor"
+        assert account["missing_scopes"] == []
+        from services.oauth import github_apps
+        github_apps.record_account_kind(sub, MCP, "ws-1", app_kind="", userinfo_raw={})
+        [entry] = [e for e in _client(me).get("/v1/users/me/integrations").json() if e["mcp_name"] == MCP]
+        assert entry["accounts"][0]["needs_reconnect"] is False

@@ -199,6 +199,12 @@ const baseComponents: Components = {
   },
 }
 
+// Code keeps its text whole: the code renderer reads its children as one
+// string, and a highlight element in there would print as an object.
+function isCode(el: React.ReactElement): boolean {
+  return el.type === 'code' || el.type === 'pre' || el.type === baseComponents.code
+}
+
 /** Recursively walk React children and wrap string nodes with SearchHighlight. */
 function highlightChildren(
   children: React.ReactNode,
@@ -206,6 +212,7 @@ function highlightChildren(
   counterRef: { current: number },
   order: number,
 ): React.ReactNode {
+  if (isValidElement(children) && isCode(children)) return children
   if (typeof children === 'string') {
     const id = `${idPrefix}-${counterRef.current++}`
     return <SearchHighlight text={children} matchId={id} order={order} />
@@ -218,7 +225,7 @@ function highlightChildren(
       }
       if (isValidElement<{ children?: React.ReactNode }>(child)) {
         const childProps = child.props
-        if (childProps?.children) {
+        if (childProps?.children && !isCode(child)) {
           return cloneElement(child, {
             ...childProps,
             key: child.key ?? i,

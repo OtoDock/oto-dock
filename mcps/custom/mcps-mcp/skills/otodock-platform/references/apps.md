@@ -120,6 +120,19 @@ at" and "Agents may open apps on my screen" (both on by default).
   whose session runs it (to move an app, copy the bundle into the other agent's
   workspace and import it there). An import always lands waiting for approval, with no
   secret set and no share.
+- **A copy follows its source** (a copy made before 1.9.1 has no source and follows
+  nothing): an app shared to another agent (the
+  `share_app` card, or `export_app` then `import_app` there) keeps where it came from.
+  When the source releases again, the copy's card offers **Update to release N** (its
+  files replaced, its data kept, the new release waiting for approval there) or, when
+  the copy released on its own since, **Ask the agent to merge** (the source's release
+  unpacked beside the copy's files, for the agent to merge into one release). From the
+  Apps panel the person gives the agent the request, which the notice and the card
+  offer to copy. From a card the agent drew, the agent reads `check_card`.
+  The copy's menu offers **Send this release to the source** (held for the source's
+  approval) and **Stop following**. The person needs editor or above on both sides
+  (the owner, for a personal app) to update, merge or send. Stop following needs that
+  right on the copy alone. The data never travels.
 
 ## Sharing apps and chats
 
@@ -153,8 +166,10 @@ Default visibility never changes; a share adds access on top.
   link and turning its buttons on ask the person to confirm who they are; a link without
   a password takes a second confirmation.
 - **A shared chat** is a read-only copy of the conversation as it stood when shared
-  (text, artifacts, images, media, files; tool calls only when asked, with tokens
-  redacted). Share again to send a newer copy.
+  (text, artifacts, images, media, files; a person's own photos and files show as a
+  count, never copied; tool calls only when asked, with tokens redacted). A settings card
+  shows as one line naming the setting, never its value. Share again to send a newer
+  copy.
 - **Admins**: **Admin → Shares** lists every share (to people, agents and departments,
   and every link) with its standing, filtered by kind, agent and standing, and revokes
   any; nobody is notified. **Setup → Security → Sharing** holds **Sharing to agents**, **Sharing to departments** (off refuses new

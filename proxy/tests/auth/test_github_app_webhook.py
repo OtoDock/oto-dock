@@ -162,7 +162,8 @@ class TestTheRoute:
         assert len(hook.fired) == 1
 
     def test_the_route_matrix(self, hook):
-        assert hook.client.post("/v1/webhooks/relay/app", content=b"{}").status_code == 404
+        # The relay route checks the forward's signature before anything.
+        assert hook.client.post("/v1/webhooks/relay/app", content=b"{}").status_code == 401
         assert hook.client.get(f"/v1/webhooks/{PROVIDER}/app").status_code == 404
         assert _deliver(hook, "issues", _issue_body(99)).json()["reason"] == "unknown_installation"
 
@@ -305,8 +306,10 @@ class TestLifecycle:
             "content-type": "application/json", "x-otodock-event-signature": sig,
             "x-otodock-event-timestamp": ts, "x-otodock-event-provider": PROVIDER,
             "x-github-event": "installation_repositories", "x-github-delivery": "f-1"})
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["reason"] == "unknown_installation"            # no relay row
+        # No relay row and no hosted account: nothing here takes the relayed
+        # events, the signed 410 says so (after the lifecycle ran).
+        assert resp.status_code == 410, resp.text
+        assert resp.headers["x-otodock-event-outcome"] == "gone"
         # The listing, never the body.
         assert _meta(hook)["installations"][0]["repositories"] == ["alice/repo"]
         assert relay_client.EVENTS_FORWARD_SECRET_SLUG

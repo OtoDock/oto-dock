@@ -31,6 +31,7 @@ from core.session import (
     visibility as _vis,
     warmup_registry,
 )
+from core.session.background_frames import running_background
 from core.session.session_manager import resolve_execution_path
 from core.session.session_state import (
     _chat_streaming_state,
@@ -59,6 +60,29 @@ logger = logging.getLogger("otodock")
 
 
 _NO_CUT = object()
+
+# A pump that reads done still writes: its tail saves the turn's rest, then
+# its end drains the chat's lane before the pump leaves _active_pumps. How
+# long a resume waits for that before it reads what has landed. Once the
+# pump is in its end every row is queued ahead of the read, so the wait
+# only has to outlast the tail.
+_TURN_END_SETTLE_S = 2.0
+
+
+async def _settle_turn_ends(pumps: list) -> None:
+    """Wait, bounded, until each pump's task has finished: every row of its
+    turn is committed then (``_end_turn`` drains its writes first)."""
+    tasks = [t for p in pumps if (t := getattr(p, "_task", None)) is not None and not t.done()]
+    if not tasks:
+        return
+    # asyncio.wait, never wait_for: a timeout must leave the pump's task
+    # running (its end sends the chat's ready and the alert).
+    _, pending = await asyncio.wait(tasks, timeout=_TURN_END_SETTLE_S)
+    if pending:
+        logger.warning(
+            "WS dashboard resume_chat: %d pump(s) still ending after %.0fs, "
+            "reading what has landed", len(pending), _TURN_END_SETTLE_S,
+        )
 
 
 def _cut_rows(rows: list[dict], cuts: dict[str, int | None], floors: dict[str, int],
@@ -128,6 +152,10 @@ class _ResumeRows:
     plans: list[dict]
     restore: dict
     held: dict[str, tuple]
+    # The pumps live at the snapshot, held or not (a pump whose start job
+    # had not landed is not held): one that ends before the frame is cut
+    # makes the resume read again.
+    live: list
     related_pumps: list
     active_task_pump: "ChatStreamPump | None"  # a sibling turn's live pump, else None
     as_delta: bool
@@ -158,6 +186,10 @@ class ChatResumeMixin(_Host):
     # {chat_id: (pump, blocks)}: the next attach to that pump replays the
     # ones a save persisted since (``_stream_via_pump``). One-shot.
     _resume_live: dict | None = None
+    # The live pump a resume attached to: the between-turns cards still
+    # waiting go out after that attach's live_state, which repaints the
+    # chat (``_stream_via_pump``). One-shot.
+    _resume_cards: "ChatStreamPump | None" = None
 
     async def _queue_snapshot(self, pump=None) -> dict:
         """The QUEUE_SNAPSHOT frame for the viewed chat: every message
@@ -174,13 +206,19 @@ class ChatResumeMixin(_Host):
             frame["queue_chat_id"] = cid
         return frame
 
-    async def _send_engine_prompts(self) -> None:
-        """The cards of the engine's own permission requests still waiting
-        on the viewed chat with no pump to show them (a background subagent
-        that asked after its turn ended): the viewer can answer them."""
+    async def _send_engine_prompts(self, pump: "ChatStreamPump | None" = None) -> None:
+        """The cards still waiting on the viewed chat that no turn shows (the
+        engine's own permission requests, the hook's cards, raised by a
+        background subagent after its turn ended): the viewer can answer
+        them. With a live ``pump``, the cards it holds are its live state's."""
         from core.session import engine_prompts
+        held: set[str] = set()
+        if pump is not None:
+            held.add(str((pump._permission_active or {}).get("request_id") or ""))
+            held.update(str(p.get("request_id") or "") for p in pump._permission_buffer)
         for p in engine_prompts.pending_for_chat(self.chat_id or ""):
-            await self._send(engine_prompts.card_frame(p))
+            if p.request_id not in held:
+                await self._send(engine_prompts.card_frame(p))
 
     def _viewer_context(self) -> UserContext:
         """The connection's viewer as the principal the REST rules judge:
@@ -200,6 +238,7 @@ class ChatResumeMixin(_Host):
         from ws.dashboard import _role_and_layer
         self.promised_pump_chat = None  # every resume resets the previous promise
         self._resume_live = None
+        self._resume_cards = None
         self._detach_pty_viewer()  # leaving any interactive chat we were viewing
 
         gated = await self._resume_gate(msg)
@@ -247,10 +286,6 @@ class ChatResumeMixin(_Host):
 
         r = await self._resume_rows(cid, msg)
 
-        # Restore plan filename from DB so subsequent pumps reuse it
-        if r.plans and not self.chat_plan_filename:
-            self.chat_plan_filename = r.plans[-1]["filename"]
-
         old_session_id = chat.get("session_id")
         perm_mode = chat.get("permission_mode") or ASK_MODE
         f = _ResumeFacts(
@@ -260,6 +295,24 @@ class ChatResumeMixin(_Host):
         )
 
         await self._reap_wedged_pump(cid, r.is_task_chat, msg)
+        # A turn live at the snapshot ended during the read (or the reap
+        # ended it): its last saves queued behind the read, and the frame
+        # would carry neither them nor a live state, since a done pump is not
+        # attached. The rows are read again once its writes have landed.
+        ended = [p for p in r.live
+                 if p.is_done or _active_pumps.get(p.chat_id) is not p]
+        if ended:
+            logger.info(
+                "WS dashboard resume_chat: chat=%s a turn ended during the read, "
+                "reading again", cid,
+            )
+            await _settle_turn_ends(ended)
+            r = await self._resume_rows(cid, msg, settle=False)
+
+        # Restore plan filename from DB so subsequent pumps reuse it
+        if r.plans and not self.chat_plan_filename:
+            self.chat_plan_filename = r.plans[-1]["filename"]
+
         pump, view_only_external, kind = await self._resume_history(cid, chat, r, locked, f)
 
         if view_only_external:
@@ -379,7 +432,7 @@ class ChatResumeMixin(_Host):
             cid, len(inflight_msgs), len(inflight.event_history)
         )
 
-    async def _resume_rows(self, cid: str, msg: dict) -> _ResumeRows:
+    async def _resume_rows(self, cid: str, msg: dict, *, settle: bool = True) -> _ResumeRows:
         """The rows of the view: the sibling turns, their lanes drained, the live
         pumps' snapshot held, then the page or the delta read behind the chat's
         lane. The awaits keep this order: the snapshot is taken after the drains
@@ -418,6 +471,13 @@ class ChatResumeMixin(_Host):
         for p in (_active_pumps.get(cid), *related_pumps):
             if p is not None and not p.is_done and getattr(p, "accepts_in_flight", False):
                 await chat_writer.drain(p.chat_id, timeout=2.0)
+        # A pump already past its turn's end is neither held nor attached,
+        # and its tail may still queue the turn's rest: the read waits for
+        # it, or the frame misses those rows with nothing to bring them.
+        # A second read (``settle=False``) has had its wait: one deadline.
+        if settle:
+            await _settle_turn_ends([p for p in (_active_pumps.get(cid), *related_pumps)
+                                     if p is not None and p.is_done])
         # Each live pump's cutoff and live blocks, taken together before any
         # read (no await in between). A save landing during the reads raises
         # the cutoff and trims the blocks it persisted: the cut below uses the
@@ -425,8 +485,10 @@ class ChatResumeMixin(_Host):
         # since, so a row the reads missed is in the live state instead. A
         # pump whose start job has not landed (cutoff None) is not held.
         held: dict[str, tuple] = {}
-        for p in (_active_pumps.get(cid), *related_pumps):
-            if p is not None and not p.is_done and p._db_msg_cutoff_id is not None:
+        live_pumps = [p for p in (_active_pumps.get(cid), *related_pumps)
+                      if p is not None and not p.is_done]
+        for p in live_pumps:
+            if p._db_msg_cutoff_id is not None:
                 live = _chat_streaming_state.get(p.chat_id) or {}
                 held[p.chat_id] = (p, p._db_msg_cutoff_id, list(live.get("live_blocks") or ()))
 
@@ -455,7 +517,7 @@ class ChatResumeMixin(_Host):
         active_task_pump = next((rp for rp in related_pumps if rp and not rp.is_done), None)
         return _ResumeRows(
             rows=rows, has_more=has_more, plans=plans, restore=restore, held=held,
-            related_pumps=related_pumps, active_task_pump=active_task_pump, as_delta=as_delta,
+            live=live_pumps, related_pumps=related_pumps, active_task_pump=active_task_pump, as_delta=as_delta,
             read_floors=read_floors, is_task_chat=is_task_chat, _cut_of=_cut_of,
         )
 
@@ -585,7 +647,11 @@ class ChatResumeMixin(_Host):
                                     completed_at=datetime.now(timezone.utc).isoformat(),
                                 )
                         await run_db(_fail_run)
-                _inject_lost_ending(_wedged, _reason)
+                # A pump whose producer finished on a usable session (a
+                # self-wake turn a reload met as it ended) lingers in its
+                # cleanup: reaped quietly, its turn ended well.
+                if _unusable:
+                    _inject_lost_ending(_wedged, _reason)
                 _wedged.abort()
                 if _wedged._task is not None:
                     # Wait WITHOUT cancelling — the pump's finally persists the
@@ -697,6 +763,11 @@ class ChatResumeMixin(_Host):
         # holds these rows and paints both at once.
         if pump and not pump.is_done and not view_only_external:
             frame["live_pending"] = True
+        # Background work still running: every stored spawn reads finished,
+        # so the page is told which ones are not (their badges).
+        running = running_background(r.read_floors or (cid,))
+        if running["agents"] or running["commands"]:
+            frame["running"] = running
         if r.as_delta:
             frame["since_id"] = min(r.read_floors.values())
         kind = ""
@@ -755,6 +826,7 @@ class ChatResumeMixin(_Host):
         await self._send(await self._queue_snapshot(pump))
         # live_state is sent from _stream_via_pump AFTER attach() to avoid race
         self.promised_pump_chat = cid  # consumed by _enter_pump_loop
+        self._resume_cards = pump
         logger.info("WS dashboard: active pump found for chat=%s, will attach", self.chat_id)
 
     async def _resume_session(self, chat: dict, old_session_id: str | None, f: _ResumeFacts) -> bool:

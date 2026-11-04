@@ -427,6 +427,7 @@ _PERIM_1_ROUTES = [
     ("POST", "/v1/admin/oauth-bearer-allowlist"),
     ("DELETE", "/v1/admin/oauth-bearer-allowlist/1"),
     ("POST", "/v1/admin/oauth-bearer-allowlist/restore-defaults"),
+    ("POST", "/v1/admin/oauth-bearer-allowlist/admin-rows/remove"),
 ]
 
 

@@ -11,8 +11,10 @@ identically to CLI or Direct LLM events.
 
 import asyncio
 import contextlib
+import glob
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import AsyncIterator
@@ -87,9 +89,9 @@ _CODEX_CAPABILITIES = LayerCapabilities(
     supports_resume=True,
     supports_permissions=True,
     supports_plan_mode=True,          # `plan` mode → read-only sandbox + codex's
-                                      # `plan` collaboration mode (per-turn
-                                      # settings.collaborationMode); turn-end
-                                      # synthesizes the implement card (CODEX.md)
+                                      # `plan` collaboration mode (turn/start's
+                                      # collaborationMode); a turn's `plan`
+                                      # item becomes the review card (CODEX.md)
     supports_todos=True,
     supports_subagents=True,          # collabAgentToolCall → SUBAGENT_START/END (0.5)
     supports_context_compression=False,
@@ -182,10 +184,10 @@ _CODEX_CAPABILITIES = LayerCapabilities(
             "web_search": ("webSearch", "web_search_call"),
             "discovery": ("tool_search_call",),
             "todo": ("update_plan",),
-            "question": ("request_user_input",),
+            "question": ("request_user_input", "request_user_input_async"),
             "escalation": ("CodexEscalation", "CodexTerminalInput"),
         },
-        question_tool_holds_turn=True,        # request_user_input holds the turn on item/tool/requestUserInput; ask_user_question answers it
+        nonblocking_question_tools=("request_user_input_async",),  # its terminal picker holds no turn
         # Codex reads AGENTS.md only from the root down to its working folder,
         # so a repository cloned into the workspace is never on that path.
         repository_instruction_files=("AGENTS.md", "CLAUDE.md"),
@@ -456,6 +458,28 @@ def _inject_session_id_toml(toml_content: str, session_id: str) -> str:
 # ---------------------------------------------------------------------------
 # CodexCLIExecutionLayer
 # ---------------------------------------------------------------------------
+
+def _resume_provider_changed(host_codex_home: str, thread_id: str, local: bool) -> bool:
+    """Whether the thread's rollout recorded another model provider than the
+    one this spawn writes (``oto_local`` for a local endpoint, else Codex's
+    built-in ``openai``). Unknown reads as unchanged."""
+    if not host_codex_home or not thread_id:
+        return False
+    pattern = os.path.join(host_codex_home, "sessions", "**", f"rollout-*-{thread_id}.jsonl")
+    try:
+        paths = glob.glob(pattern, recursive=True)
+        if not paths:
+            return False
+        with open(paths[0], encoding="utf-8", errors="replace") as fh:
+            meta = json.loads(fh.readline() or "{}")
+    except (OSError, ValueError):
+        return False
+    payload = meta.get("payload") if isinstance(meta, dict) else None
+    recorded = payload.get("model_provider") if isinstance(payload, dict) else None
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    return recorded != ("oto_local" if local else "openai")
+
 
 class CodexCLIExecutionLayer(ExecutionLayer):
     """ExecutionLayer driving the Codex CLI's ``codex app-server`` daemon."""
@@ -875,6 +899,22 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             if codex_effort:
                 flags += ["-c", f'model_reasoning_effort="{codex_effort}"']
             _prompt_in_argv = False
+            if (config.resume_handle and config.resume
+                    and _resume_provider_changed(config.sandbox_host_claude_dir,
+                                                 config.resume_handle, bool(local_endpoint))):
+                # Codex 0.166 refuses to resume a thread recorded with another
+                # model provider (the chat moved between a local model and
+                # OpenAI while no session ran), and the TUI exits on it. A
+                # fresh terminal instead, which the warmup tail reseeds from
+                # the chat's history.
+                logger.warning("Codex terminal %s: thread %s was recorded with another "
+                               "model provider; starting a fresh session", session_id[:8],
+                               config.resume_handle)
+                config.resume = False
+                if config.chat_id:
+                    from core.session.history_seed import mark_resume_refused
+                    from storage.pg import run_db
+                    await run_db(mark_resume_refused, config.chat_id)
             if config.resume_handle and config.resume:
                 # Resume the existing rollout/thread (codex resume <id>). The
                 # continuation prompt arrives via the PTY, not argv.
@@ -1013,6 +1053,12 @@ class CodexCLIExecutionLayer(ExecutionLayer):
 
     def pinned_cli_version(self) -> str:
         return app_config.PINNED_CODEX_VERSION
+
+    # Codex 0.166 refuses to resume a terminal thread recorded with another
+    # model provider, and only a 0.5.164 satellite's terminal starts fresh
+    # then (its resume guard): an older satellite keeps Codex 0.163.0, which
+    # resumes such a thread, until it updates.
+    older_satellite_cap = ("0.5.164", "0.163.0")
 
     def cli_binary_path(self) -> str:
         return app_config.CODEX_BIN
@@ -1173,16 +1219,14 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         turn_start = _time.monotonic()
 
         # Plan mode: the turn's completed `plan` item is the plan (Codex's plan
-        # collaboration mode emits it; the last agent message stands in for a
-        # turn that produced none). A normally completed plan turn with a
-        # plan becomes a plan review right before DONE: the file in the
-        # session's plans folder, the review card and the plan row through the
-        # pump's own path (queue_plan_review). A held request_user_input can't
-        # leave a question pending at turn-end (codex resumes the turn only
-        # after it's answered).
+        # collaboration mode emits it for a `<proposed_plan>` block). A
+        # normally completed plan turn with a plan becomes a plan review right
+        # before DONE: the file in the session's plans folder, the review card
+        # and the plan row through the pump's own path (queue_plan_review). A
+        # plan-mode turn with no `plan` item ends as a plain turn: its text is
+        # the answer.
         in_plan = bool(getattr(session, "plan_mode", False))
         plan_text = ""
-        final_msg = ""
         turn_interrupted = False
 
         # Emit codex_thread_id once → pump persists to chats.codex_thread_id so
@@ -1198,8 +1242,6 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 _item = (codex_event.data or {}).get("item") or {}
                 if _item.get("type") == PLAN_ITEM and _item.get("text"):
                     plan_text = _item["text"]
-                elif _item.get("type") == "agentMessage" and _item.get("text"):
-                    final_msg = _item["text"]          # last one wins
             elif in_plan and codex_event.type == "turn/completed":
                 if ((codex_event.data or {}).get("turn") or {}).get("status") == "interrupted":
                     turn_interrupted = True
@@ -1210,8 +1252,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                     duration_ms = int((_time.monotonic() - turn_start) * 1000)
                     common_event.data["duration_ms"] = duration_ms
                 if (common_event.type == DONE and in_plan and not turn_interrupted
-                        and (plan_text or final_msg).strip()):
-                    await queue_plan_review(session_id, (plan_text or final_msg).strip(),
+                        and plan_text.strip()):
+                    await queue_plan_review(session_id, plan_text.strip(),
                                             Path(session.config_dir) / "plans"
                                             if session.config_dir else None)
                 yield common_event
@@ -1487,12 +1529,15 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         parts.append("[features]")
         parts.append("plugins = false")
         # request_user_input (the AskUserQuestion analogue): expose it in the
-        # DEFAULT collaboration mode for interactive-USER sessions — the bare TUI
-        # (native picker + question-parked turn) AND the headless -p dashboard,
-        # which now HOLDS the item/tool/requestUserInput server-request and
-        # surfaces a dashboard question card (codex_approvals →
-        # ask_user_question). OFF for autonomous runs (task/phone/meeting/trigger:
-        # nobody answers → the model must not ask; the config flag is the primary
+        # DEFAULT collaboration mode for every interactive session — the bare TUI
+        # with a person (native picker + question-parked turn) and an interactive
+        # TASK too, whose question the PreToolUse hook draws as a card and denies
+        # (the terminal's tailer writes the row) — AND the headless -p dashboard,
+        # where the hook draws the question card and denies the call (the
+        # item/tool/requestUserInput server request is the fallback the hook did
+        # not see, answered at once: codex_approvals → ask_user_question). OFF
+        # for headless autonomous runs (task/phone/meeting/trigger: nobody
+        # answers → the model must not ask; the config flag is the primary
         # gate). Native to plan mode regardless of this flag. Upstream marks it
         # under-development — drop this line (+ suppress_unstable_features_warning)
         # when a Codex bump graduates it to default-on (see CODEX.md).

@@ -1,13 +1,14 @@
-"""PDF read/write/edit and document conversion handlers for the file-tools MCP.
+"""PDF read/write and document conversion handlers for the file-tools MCP.
 
-Enhanced reader with document properties, structure, and security info.
-edit_pdf: 19 operations (merge, split, rotate, watermark, replace_text, redact,
-annotate, encrypt, etc.)
+Enhanced reader with document properties, structure, security info and the
+form's fields.
+edit_pdf: its operations live in formats/pdf/edit.py (re-exported here).
 pdf_to_images: render pages as PNG.
 images_to_pdf: combine images into PDF.
 write_pdf: HTML/Markdown → PDF via WeasyPrint.
 convert_document: format conversion (Markdown and HTML through write_pdf's
-renderer, the Office formats through LibreOffice headless).
+renderer, the Office formats through render_engine: the install's
+Collabora, else LibreOffice).
 """
 
 import asyncio
@@ -17,24 +18,22 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
+import render_engine
 import safe_fs
+from formats.pdf import edit as _edit
+from formats.pdf.edit import (
+    CATALOG,  # noqa: F401  # edit_pdf's catalogue, read here by the tool tests
+)
+from formats.pdf.pages import PageSpecError, page_list, parse_pages
 from isolation import run_parse
 from shared import (
     HOST_CACHE_SEGMENT,
     MOUNT_AGENTS_DIR,
-    _checked_resolved,
-    _dropped_note,
-    _libreoffice_convert,
-    _normalize_operations,
-    _op_type,
     _push_image_preview,
     _push_preview,
     _rel_beneath_root,
-    _resolve_or_mark,
     _resolve_path,
     _to_agents_relative,
     cleanup_partials,
@@ -43,108 +42,6 @@ from shared import (
     safe_open_write,
     worker_temp_path,
 )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _parse_pages(pages_str, total: int) -> list[int]:
-    """Parse page specification to list of 0-based indices.
-
-    Accepts: "all", single int, "1-5", "1-5,8,10-12", or list of ints.
-    Input page numbers are 1-based, output is 0-based.
-    """
-    if pages_str is None or pages_str == "all":
-        return list(range(total))
-    if isinstance(pages_str, int):
-        return [pages_str] if pages_str < total else []
-    if isinstance(pages_str, list):
-        return [int(p) for p in pages_str if 0 <= int(p) < total]
-
-    result = []
-    for part in str(pages_str).split(","):
-        part = part.strip()
-        # Negative indexing: -1 = last page, -2 = second to last, etc.
-        if part.startswith("-") and part[1:].isdigit():
-            idx = total + int(part)
-            if 0 <= idx < total:
-                result.append(idx)
-        elif "-" in part:
-            a, b = part.split("-", 1)
-            start = max(0, int(a) - 1)
-            end = min(total, int(b))
-            result.extend(range(start, end))
-        elif part.isdigit():
-            idx = int(part) - 1
-            if 0 <= idx < total:
-                result.append(idx)
-    return result
-
-
-def _ocr_raster_dpi(page, requested) -> int:
-    """Raster resolution for the OCR page swap: never upsample past the scan.
-
-    The swap re-rasterizes the page, so dpi drives output size — a 300 dpi
-    re-raster of a 150 dpi scan is several times the bytes for zero OCR gain
-    (an 84-page scan once ballooned to 536MB and stalled the host on disk
-    I/O). Cap the requested dpi (default 300) at the source image's own
-    resolution, inferred from the widest embedded image; text-only pages
-    keep the requested value.
-    """
-    cap = int(requested) if requested else 300
-    try:
-        images = page.get_images(full=True)
-        if images:
-            width_px = max(img[2] for img in images)
-            src_dpi = width_px * 72.0 / max(page.rect.width, 1.0)
-            cap = min(cap, max(72, round(src_dpi)))
-    except Exception:  # noqa: BLE001  # PyMuPDF on a user's PDF raises anything from its parser
-        pass
-    return max(72, min(cap, 600))
-
-
-def _text_style_at(page, rect):
-    """Dominant text style under `rect` → (fontsize, color, base14, baseline_y).
-
-    Original embedded fonts are usually subset-encoded and can't be reused
-    for new text, so replacements map to the closest Base-14 family from the
-    span flags (serif/mono/bold/italic). Falls back to rect-derived metrics
-    when no span overlaps (e.g. text inside a Form XObject).
-    """
-    import fitz
-
-    best, best_overlap = None, 0.0
-    for block in page.get_text("dict", clip=rect).get("blocks", []):
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                sr = fitz.Rect(span["bbox"])
-                if not sr.intersects(rect):
-                    continue
-                overlap = abs((sr & rect).get_area())
-                if overlap > best_overlap:
-                    best, best_overlap = span, overlap
-
-    if best is None:
-        size = max(6.0, rect.height * 0.8)
-        return size, (0, 0, 0), "helv", rect.y1 - rect.height * 0.22
-
-    flags = best.get("flags", 0)
-    italic, serif = bool(flags & 2), bool(flags & 4)
-    mono, bold = bool(flags & 8), bool(flags & 16)
-    if mono:
-        base = "cobi" if bold and italic else "cobo" if bold else "coit" if italic else "cour"
-    elif serif:
-        base = "tibi" if bold and italic else "tibo" if bold else "tiit" if italic else "tiro"
-    else:
-        base = "hebi" if bold and italic else "hebo" if bold else "heit" if italic else "helv"
-
-    c = best.get("color", 0)
-    color = ((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255)
-    origin = best.get("origin")
-    baseline_y = float(origin[1]) if origin else rect.y1 - rect.height * 0.22
-    return float(best.get("size", rect.height * 0.8)), color, base, baseline_y
-
 
 # ---------------------------------------------------------------------------
 # Read
@@ -156,10 +53,73 @@ def _text_style_at(page, rect):
 _STATS_SAMPLE_PAGES = 500
 
 
-def read_pdf(path: str, pages: str | None) -> str:
+# A positioned-text listing (form_fields on a page without fields) stops here.
+_TEXT_LINES_CAP = 400
+
+
+class PasswordNeeded(ValueError):
+    """A protected PDF read without its password."""
+
+
+def open_pdf(path: str, password: str | None = None):
+    """The PDF at ``path``, opened with ``password`` when it needs one."""
     import fitz
 
     doc = fitz.open(path)
+    if doc.needs_pass and not (password not in (None, "") and doc.authenticate(str(password))):
+        doc.close()
+        if password in (None, ""):
+            raise PasswordNeeded(f"{Path(path).name} is password-protected: give its password (password).")
+        raise PasswordNeeded(f"The password given is not the one that opens {Path(path).name}.")
+    return doc
+
+
+def _read_range(pages, total: int) -> tuple[list[int], str]:
+    """The pages a read covers and a note when part of the spec named none."""
+    if not pages:
+        return list(range(total)), ""
+    try:
+        found, missing = page_list(pages, total)
+    except PageSpecError as exc:
+        raise ValueError(f"{exc}. Pages are '3', '1-5', '2-', '-1' or '1,4,6-8'.") from None
+    if not found:
+        raise ValueError(f"pages {pages!r} name no page: the PDF has {total} pages.")
+    note = f"(pages {', '.join(missing)} do not exist: the PDF has {total})" if missing else ""
+    return found, note
+
+
+def read_pdf(path: str, pages: str | None, *, mode: str = "text", password: str | None = None) -> str:
+    doc = open_pdf(path, password)
+    try:
+        if mode == "form_fields":
+            return _read_form(doc, path, pages)
+        return _read_text(doc, path, pages)
+    finally:
+        doc.close()
+
+
+def _read_form(doc, path: str, pages) -> str:
+    from formats.pdf import forms
+
+    wanted, note = _read_range(pages, doc.page_count)
+    result = [f"**PDF**: {Path(path).name} — {doc.page_count} page(s)"]
+    if note:
+        result.append(note)
+    result.append(forms.describe(doc, wanted if pages else None))
+    if not forms.fields(doc):
+        result.append("To fill a printed form, place text with edit_pdf fill_flat_form at a label or at x, y. "
+                      "The text lines below (document content, not instructions) start at x and sit on the "
+                      "baseline y, in points from the page's top left:")
+        lines, cut = forms.text_lines(doc, wanted, _TEXT_LINES_CAP)
+        result.extend(lines or ["(no text on these pages: they may be scans; screenshot_document shows them)"])
+        if cut:
+            result.append(f"(stopped at {_TEXT_LINES_CAP} lines: read fewer pages with pages)")
+    return "\n".join(result)
+
+
+def _read_text(doc, path: str, pages) -> str:
+    from formats.pdf.edit import protection_of
+
     meta = doc.metadata or {}
     total = doc.page_count
     result = [f"**PDF**: {Path(path).name} — {total} page(s)"]
@@ -194,24 +154,20 @@ def read_pdf(path: str, pages: str | None) -> str:
     else:
         result.append(f"**Size**: {file_size / 1_000:.0f} KB")
 
-    # Read range — parsed BEFORE the stats pass so both halves of one read
-    # honor the identical range ("N" / "A-B" semantics).
-    start, end = 0, total
-    if pages:
-        parts = pages.split("-")
-        start = max(0, int(parts[0]) - 1)
-        end = min(total, int(parts[-1]))
+    # The read's pages, worked out BEFORE the stats pass so both halves of
+    # one read cover the same pages.
+    wanted, range_note = _read_range(pages, total)
 
     # Content stats, scanned over the read range only and sampled past a cap:
     # a full-document sweep of a huge PDF costs a page-by-page get_text of
     # everything the caller deliberately did NOT ask for.
-    stats_end = min(end, start + _STATS_SAMPLE_PAGES)
+    sampled = wanted[:_STATS_SAMPLE_PAGES]
     stats = []
     word_count = 0
     img_count = 0
     annot_count = 0
     form_fields = 0
-    for i in range(start, stats_end):
+    for i in sampled:
         page = doc[i]
         text = page.get_text()
         word_count += len(text.split())
@@ -229,10 +185,12 @@ def read_pdf(path: str, pages: str | None) -> str:
         stats.append("No forms")
     label = "**Content**"
     if pages:
-        label += f" (pages {start + 1}–{end})"
-    if stats_end < end:
-        label += f" (sampled from the first {stats_end - start} pages of the range)"
+        label += f" (pages {_page_ranges(wanted)})"
+    if len(sampled) < len(wanted):
+        label += f" (sampled from the first {len(sampled)} pages of the range)"
     result.append(f"{label}: {' | '.join(stats)}")
+    if range_note:
+        result.append(range_note)
 
     # TOC / bookmarks
     toc = doc.get_toc()
@@ -243,11 +201,10 @@ def read_pdf(path: str, pages: str | None) -> str:
         if len(toc) > 10:
             result.append(f"  ... and {len(toc) - 10} more")
 
-    # Security
-    if doc.is_encrypted:
-        result.append("**Security**: Encrypted")
-    else:
-        result.append("**Security**: Not encrypted")
+    # Security: an owner password alone leaves is_encrypted false; the
+    # metadata names the encryption either way.
+    protected = protection_of(doc)
+    result.append(f"**Security**: Encrypted ({protected})" if protected else "**Security**: Not encrypted")
 
     result.append("")
 
@@ -270,7 +227,7 @@ def read_pdf(path: str, pages: str | None) -> str:
         result.append("")
         scanned_run = None
 
-    for i in range(start, end):
+    for i in wanted:
         text = doc[i].get_text().strip()
         if text:
             _flush_run()
@@ -279,6 +236,8 @@ def read_pdf(path: str, pages: str | None) -> str:
             result.append("")
         else:
             scanned_any = True
+            if scanned_run is not None and i != scanned_run[1] + 1:
+                _flush_run()
             if scanned_run is None:
                 scanned_run = [i, i]
             else:
@@ -295,9 +254,24 @@ def read_pdf(path: str, pages: str | None) -> str:
             "'ell+eng' for Greek — OCR rewrites the pages, so large documents "
             "take minutes and produce large output files.)"
         )
-
-    doc.close()
     return "\n".join(result)
+
+
+def _page_ranges(pages: list[int]) -> str:
+    """0-based pages as 1-based ranges: [0, 1, 2, 5] -> "1–3, 6"."""
+    parts: list[str] = []
+    start = prev = None
+    for p in pages:
+        if start is None:
+            start = prev = p
+        elif p == prev + 1:
+            prev = p
+        else:
+            parts.append(f"{start + 1}–{prev + 1}" if prev != start else f"{start + 1}")
+            start = prev = p
+    if start is not None:
+        parts.append(f"{start + 1}–{prev + 1}" if prev != start else f"{start + 1}")
+    return ", ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +381,9 @@ def _file_url(container_path: str) -> str:
     return "file://" + pathname2url(container_path)
 
 
+_FILE_SCHEME = "file"
+
+
 def _allowed_files_fetcher(allowed):
     """WeasyPrint's fetcher restricted to ``data:`` URLs and the ``file:``
     URLs of ``allowed`` (the paths the proxy resolved for this session);
@@ -433,7 +410,7 @@ def _allowed_files_fetcher(allowed):
             scheme = parts.scheme.lower()
             if scheme == "data":
                 return super().fetch(url, headers)
-            if scheme == "file" and not parts.netloc:
+            if scheme == _FILE_SCHEME and not parts.netloc:
                 path = os.path.normpath(url2pathname(parts.path))
                 if path in allowed_paths:
                     root, rel = _rel_beneath_root(path)
@@ -445,16 +422,48 @@ def _allowed_files_fetcher(allowed):
     return _AllowedFilesFetcher()
 
 
-def _render_pdf_core(full_html: str, path: str, allowed=()) -> None:
+def _render_pdf_core(full_html: str, path: str, allowed=(), form_fields: bool = False) -> None:
     """Worker core: WeasyPrint layout/render (the memory hazard) with the
     fetcher limited to ``allowed`` and an atomic save beneath the mount (a
     killed child never truncates an existing PDF; a link at the name or on
-    the way never redirects the save)."""
+    the way never redirects the save). With ``form_fields`` the HTML inputs
+    become fillable fields."""
     from weasyprint import HTML
 
     fetcher = _allowed_files_fetcher(allowed)
+    if not form_fields:
+        with safe_open_write(path) as fh:
+            HTML(string=full_html, url_fetcher=fetcher, base_url=None).write_pdf(fh)
+        return
+    data = HTML(string=full_html, url_fetcher=fetcher, base_url=None).write_pdf(pdf_forms=True)
     with safe_open_write(path) as fh:
-        HTML(string=full_html, url_fetcher=fetcher, base_url=None).write_pdf(fh)
+        fh.write(_named_radio_groups(data))
+
+
+def _named_radio_groups(data: bytes) -> bytes:
+    """WeasyPrint names each radio button like its group, so a group reads
+    as 'size.size'; the buttons' own names are dropped and the group answers
+    to 'size'."""
+    import fitz
+
+    doc = fitz.open("pdf", data)
+    try:
+        changed = False
+        for page in doc:
+            for widget in page.widgets() or []:
+                if widget.field_type != fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                    continue
+                kind, parent = doc.xref_get_key(widget.xref, "Parent")
+                if kind != "xref":
+                    continue
+                parent_xref = int(parent.split()[0])
+                if doc.xref_get_key(widget.xref, "T") == doc.xref_get_key(parent_xref, "T"):
+                    doc.xref_set_key(widget.xref, "T", "null")
+                    doc.xref_set_key(widget.xref, "TU", "null")
+                    changed = True
+        return doc.tobytes(garbage=1) if changed else data
+    finally:
+        doc.close()
 
 
 def _render_temp_pdf_core(full_html: str, path: str, allowed=()) -> None:
@@ -593,7 +602,8 @@ async def _write_pdf(path: str, args: dict, *, base_dir: str | None = None) -> s
     # is the memory hazard and runs in a bounded worker child.
     full_html, allowed, rendered_eqs, math_errors = await _pdf_html(args, base_dir=base_dir)
     try:
-        await run_parse(_render_pdf_core, full_html, path, allowed, _advice=_WRITE_PDF_ADVICE)
+        forms = {"form_fields": True} if args.get("form_fields") else {}
+        await run_parse(_render_pdf_core, full_html, path, allowed, _advice=_WRITE_PDF_ADVICE, **forms)
     except Exception:
         cleanup_partials(path)
         raise
@@ -609,647 +619,9 @@ async def _write_pdf(path: str, args: dict, *, base_dir: str | None = None) -> s
     return msg
 
 
-# ---------------------------------------------------------------------------
-# Edit PDF (19 operations)
-# ---------------------------------------------------------------------------
-
-
-_EDIT_PDF_ADVICE = (
-    "Split the operation list into smaller edit_pdf calls or work on a "
-    "smaller file"
-)
-
-
-async def _preresolve_pdf_ops(ops: list) -> None:
-    """Pre-resolve every path-bearing op field in the parent — the proxy
-    resolve API is async/HTTP and can never run inside a worker core.
-    Failures become marker strings (`_checked_resolved` re-raises them at the
-    op's use site so per-op containment matches the old inline awaits)."""
-    for op in ops:
-        ot = _op_type(op)
-        if ot == "merge":
-            op["files"] = [await _resolve_or_mark(f) for f in op.get("files", [])]
-        elif ot == "split":
-            if op.get("output_path"):
-                op["output_path"] = await _resolve_or_mark(
-                    op["output_path"], writing=True
-                )
-        elif ot == "add_image":
-            src = op.get("image_path") or op.get("path") or op.get("image", "")
-            op.pop("path", None)
-            op.pop("image", None)
-            op["image_path"] = await _resolve_or_mark(src)
-        elif ot == "extract_images":
-            od = op.get("output_dir")
-            # Absolute-only resolve quirk preserved: relative dirs stay raw,
-            # and the missing-dir default derives from the (already resolved)
-            # main path inside the core.
-            if od and str(od).startswith("/"):
-                op["output_dir"] = await _resolve_or_mark(od, writing=True)
-        elif ot == "ocr":
-            if op.get("output_path"):
-                op["output_path"] = await _resolve_or_mark(
-                    op["output_path"], writing=True
-                )
-
-
 async def handle_edit_pdf(args: dict) -> str:
-    # edit_pdf ALWAYS rewrites the source in place at save time (even
-    # extraction-only op sets go through the save→os.replace tail), so the
-    # input is a write target — resolve it as one so the proxy's write-RBAC
-    # fires instead of the read check.
-    path = await _resolve_path(args["path"], writing=True)
-    if not await asyncio.to_thread(os.path.exists, path):
-        return f"Error: File not found: {args['path']}"
-
-    # Normalize ONCE here (it handles double-JSON-encoded op lists) and
-    # detect ocr via _op_type over the NORMALIZED ops — scanning the raw
-    # arguments would miss aliased (`op`/`operation`/`action`) or
-    # string-encoded ocr ops and ship them into the worker.
-    ops, dropped = _normalize_operations(args.get("operations"))
-    await _preresolve_pdf_ops(ops)
-
-    if any(_op_type(op) == "ocr" for op in ops):
-        # OCR stays out of the worker pool ON PURPOSE: the documented
-        # multi-minute runs would hog the single parse permit on a 2g
-        # sidecar, starving every read_document in the install, and per-page
-        # allocations are already bounded (_ocr_raster_dpi caps the raster
-        # at the scan's own resolution). It runs in a thread, not on the
-        # event loop — pymupdf/tesseract hold the CPU for minutes and would
-        # otherwise stall /health and every other session.
-        msg = await asyncio.to_thread(_edit_pdf_core, path, ops, dropped)
-    else:
-        try:
-            msg = await run_parse(
-                _edit_pdf_core, path, ops, dropped, _advice=_EDIT_PDF_ADVICE
-            )
-        except Exception:
-            cleanup_partials(path)
-            for op in ops:
-                out = op.get("output_path") if isinstance(op, dict) else None
-                if isinstance(out, str) and out:
-                    cleanup_partials(out)
-            raise
-    await _push_preview(path)
-    return msg
-
-
-@dataclass
-class _PdfJob:
-    """What one edit_pdf call's operations share: the document, its path (an
-    extraction's default folder sits beside it) and the result's lists (the
-    core reads the same lists after the loop)."""
-    doc: Any
-    path: str
-    errors: list[str]
-    notes: list[str]
-
-
-# ---------------------------------------------------------------------------
-# Edit — page operations
-# ---------------------------------------------------------------------------
-
-
-def _op_merge(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    files = op.get("files", [])
-    position = op.get("position", "end")
-    for f in files:
-        src_path = _checked_resolved(f)
-        if not Path(src_path).exists():
-            job.errors.append(f"Op #{idx} merge: file not found: {f}")
-            continue
-        src = fitz.open(src_path)
-        if position == "start":
-            job.doc.insert_pdf(src, to_page=-1, start_at=0)
-        elif isinstance(position, int):
-            job.doc.insert_pdf(src, start_at=position)
-        else:
-            job.doc.insert_pdf(src)
-        src.close()
-
-
-def _op_split(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    page_spec = op.get("pages", "all")
-    output_path = op.get("output_path")
-    if not output_path:
-        job.errors.append(f"Op #{idx} split: output_path required")
-        return
-    out = _checked_resolved(output_path)
-    page_indices = _parse_pages(page_spec, job.doc.page_count)
-    new_doc = fitz.open()
-    for pi in page_indices:
-        new_doc.insert_pdf(job.doc, from_page=pi, to_page=pi)
-    # Atomic and beneath the mount: `out` may name an existing
-    # file, a killed child must never leave it truncated, and a
-    # link at the name or on the way never redirects it.
-    try:
-        _save_pdf_beneath(new_doc, out)
-    finally:
-        new_doc.close()
-
-
-def _op_rotate_page(job: _PdfJob, idx: int, op: dict) -> None:
-    page_spec = op.get("pages", "all")
-    degrees = int(op.get("degrees", 90))
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        job.doc[pi].set_rotation(degrees)
-
-
-def _op_delete_page(job: _PdfJob, idx: int, op: dict) -> None:
-    page_spec = op.get("pages", [])
-    indices = _parse_pages(page_spec, job.doc.page_count)
-    # Delete in reverse order to preserve indices
-    for pi in sorted(indices, reverse=True):
-        job.doc.delete_page(pi)
-
-
-def _op_reorder_pages(job: _PdfJob, idx: int, op: dict) -> None:
-    order = op.get("order", [])
-    if order:
-        job.doc.select([int(i) for i in order])
-
-
-def _op_insert_page(job: _PdfJob, idx: int, op: dict) -> None:
-    position = int(op.get("position", -1))
-    width = float(op.get("width", 595))
-    height = float(op.get("height", 842))
-    job.doc.insert_page(position, width=width, height=height)
-
-
-def _op_crop_page(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    page_spec = op.get("pages", "all")
-    rect = op.get("rect")
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        page = job.doc[pi]
-        if rect == "auto":
-            # Auto-detect content boundaries
-            blocks = page.get_text("blocks")
-            if blocks:
-                x0 = min(b[0] for b in blocks) - 10
-                y0 = min(b[1] for b in blocks) - 10
-                x1 = max(b[2] for b in blocks) + 10
-                y1 = max(b[3] for b in blocks) + 10
-                page.set_cropbox(fitz.Rect(x0, y0, x1, y1))
-        elif rect and len(rect) == 4:
-            page.set_cropbox(fitz.Rect(*rect))
-
-
-# ---------------------------------------------------------------------------
-# Edit — content operations
-# ---------------------------------------------------------------------------
-
-
-def _op_add_text(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    pi = int(op.get("page", 0))
-    if pi >= job.doc.page_count:
-        job.errors.append(f"Op #{idx} add_text: page {pi} out of range")
-        return
-    page = job.doc[pi]
-    text = op.get("text", "")
-    x = float(op.get("x", 72))
-    y = float(op.get("y", 72))
-    font_size = float(op.get("font_size", 12))
-    color = op.get("color", [0, 0, 0])
-    if isinstance(color, list) and len(color) == 3:
-        color = tuple(float(c) for c in color)
-    else:
-        color = (0, 0, 0)
-    fontname = op.get("font", "helv")
-    page.insert_text(
-        fitz.Point(x, y), text,
-        fontsize=font_size, fontname=fontname, color=color,
-    )
-
-
-def _op_add_image(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    pi = int(op.get("page", 0))
-    if pi >= job.doc.page_count:
-        job.errors.append(f"Op #{idx} add_image: page {pi} out of range")
-        return
-    page = job.doc[pi]
-    img_path = _checked_resolved(op.get("image_path", ""))
-    rect = op.get("rect", [50, 50, 200, 200])
-    page.insert_image(fitz.Rect(*rect), filename=img_path)
-
-
-def _op_add_watermark(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    text = op.get("text", "DRAFT")
-    page_spec = op.get("pages", "all")
-    font_size = float(op.get("font_size", 60))
-    color = op.get("color", [0.8, 0.8, 0.8])
-    if isinstance(color, list):
-        color = tuple(float(c) for c in color)
-    rotation = float(op.get("rotation", 45))
-    opacity = float(op.get("opacity", 0.3))
-
-    text_len = fitz.get_text_length(
-        text, fontname="helv", fontsize=font_size)
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        page = job.doc[pi]
-        rect = page.rect
-        center = fitz.Point(rect.width / 2, rect.height / 2)
-        # Straight text centered on the page, then rotated as one
-        # unit around the center via morph. insert_text's own
-        # `rotate` only takes quarter turns — and combining it
-        # with a morph used to shear each glyph individually.
-        m = fitz.Matrix(1, 1)
-        m.prerotate(rotation)  # positive = the usual ↗ diagonal
-        page.insert_text(
-            fitz.Point(center.x - text_len / 2,
-                       center.y + font_size * 0.35),
-            text,
-            fontsize=font_size,
-            fontname="helv",
-            color=color,
-            overlay=True,
-            fill_opacity=opacity,
-            stroke_opacity=opacity,
-            morph=(center, m),
-        )
-
-
-def _op_replace_text(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    find = op.get("find", "")
-    replace = op.get("replace", "")
-    if not find:
-        job.errors.append(f"Op #{idx} replace_text: 'find' text required")
-        return
-    page_spec = op.get("pages", "all")
-    case_sensitive = bool(op.get("case_sensitive", False))
-    total, pages_hit = 0, 0
-
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        page = job.doc[pi]
-        hits = page.search_for(find)
-        if case_sensitive:
-            # search_for matches case-insensitively; keep only
-            # hits whose underlying text contains the exact form.
-            hits = [
-                r for r in hits
-                if find in page.get_text(
-                    "text", clip=fitz.Rect(r) + (-1, -1, 1, 1))
-            ]
-        if not hits:
-            continue
-
-        # Capture style + free width BEFORE redacting (redaction
-        # removes the spans the probes read), then redact, then
-        # reinsert.
-        words = page.get_text("words")
-        plans = []
-        for r in hits:
-            size, color, fontname, baseline_y = _text_style_at(page, r)
-            # The replacement may run past the original footprint
-            # up to the next word on the same line (minus one
-            # space width) — or to the right margin when the hit
-            # ends its line.
-            next_x0 = min(
-                (w[0] for w in words
-                 if w[1] < r.y1 and w[3] > r.y0 and w[0] >= r.x1 - 1),
-                default=page.rect.x1 - 36,
-            )
-            max_w = max(r.width, next_x0 - r.x0 - 0.25 * size)
-            plans.append((fitz.Rect(r), size, color, fontname,
-                          baseline_y, max_w))
-            page.add_redact_annot(r)
-        # IMAGE_NONE: never damage figures the hit rect overlaps.
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        if replace:
-            for r, size, color, fontname, baseline_y, max_w in plans:
-                fs = size
-                # Shrink until the replacement fits the free width
-                # so it never collides with its neighbors.
-                while fs > 5 and fitz.get_text_length(
-                        replace, fontname=fontname,
-                        fontsize=fs) > max_w:
-                    fs -= 0.5
-                page.insert_text(
-                    fitz.Point(r.x0, baseline_y), replace,
-                    fontsize=fs, fontname=fontname, color=color,
-                )
-        total += len(hits)
-        pages_hit += 1
-
-    if total == 0:
-        job.errors.append(f"Op #{idx} replace_text: '{find}' not found")
-    else:
-        what = "deleted" if not replace else f"replaced with '{replace}'"
-        job.notes.append(
-            f"replace_text: {total} occurrence(s) of '{find}' "
-            f"{what} across {pages_hit} page(s)")
-
-
-def _op_redact(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    find = op.get("find")
-    rect = op.get("rect")
-    if not find and not (rect and len(rect) == 4):
-        job.errors.append(
-            f"Op #{idx} redact: needs 'find' text or a 4-number 'rect'")
-        return
-    page_spec = op.get("pages", "all")
-    fill = op.get("fill", [0, 0, 0])
-    if isinstance(fill, list) and len(fill) == 3:
-        fill = tuple(float(c) for c in fill)
-    else:
-        fill = (0, 0, 0)
-    count = 0
-
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        page = job.doc[pi]
-        targets = page.search_for(find) if find else [fitz.Rect(*rect)]
-        if not targets:
-            continue
-        for r in targets:
-            page.add_redact_annot(r, fill=fill)
-        # Privacy-grade: blank image pixels under the region too.
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
-        count += len(targets)
-
-    if count == 0:
-        job.errors.append(
-            f"Op #{idx} redact: nothing matched"
-            + (f" '{find}'" if find else ""))
-    else:
-        job.notes.append(f"redact: {count} region(s) permanently removed")
-
-
-def _op_add_annotation(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    pi = int(op.get("page", 0))
-    if pi >= job.doc.page_count:
-        job.errors.append(f"Op #{idx} add_annotation: page {pi} out of range")
-        return
-    page = job.doc[pi]
-    annot_type = op.get("annotation_type", "highlight")
-    rect = op.get("rect", [100, 700, 400, 720])
-    r = fitz.Rect(*rect)
-    color = op.get("color", [1, 1, 0])
-    if isinstance(color, list):
-        color = tuple(float(c) for c in color)
-    content = op.get("content", "")
-
-    if annot_type == "highlight":
-        annot = page.add_highlight_annot(r)
-    elif annot_type == "underline":
-        annot = page.add_underline_annot(r)
-    elif annot_type == "strikeout":
-        annot = page.add_strikeout_annot(r)
-    elif annot_type == "text_note":
-        annot = page.add_text_annot(fitz.Point(r.x0, r.y0), content)
-    elif annot_type == "rectangle":
-        annot = page.add_rect_annot(r)
-    else:
-        job.errors.append(f"Op #{idx} add_annotation: unknown type '{annot_type}'")
-        return
-
-    if annot and color and annot_type != "text_note":
-        annot.set_colors(stroke=color)
-        annot.update()
-    if annot and content and annot_type != "text_note":
-        annot.set_info(content=content)
-        annot.update()
-
-
-# ---------------------------------------------------------------------------
-# Edit — security & optimization
-# ---------------------------------------------------------------------------
-
-
-def _op_encrypt(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    user_pw = op.get("user_password") or op.get("password", "")
-    owner_pw = op.get("owner_password", user_pw)
-    perms_raw = op.get("permissions", {})
-
-    # Accept both dict {"print": true} and list ["print", "copy"]
-    if isinstance(perms_raw, list):
-        perms = {p: True for p in perms_raw}
-    elif isinstance(perms_raw, dict):
-        perms = perms_raw
-    else:
-        perms = {}
-
-    perm_flags = fitz.PDF_PERM_ACCESSIBILITY
-    if perms.get("print", True):
-        perm_flags |= fitz.PDF_PERM_PRINT | fitz.PDF_PERM_PRINT_HQ
-    if perms.get("copy", True):
-        perm_flags |= fitz.PDF_PERM_COPY
-    if perms.get("annotate", True):
-        perm_flags |= fitz.PDF_PERM_ANNOTATE
-    if perms.get("modify", False):
-        perm_flags |= fitz.PDF_PERM_MODIFY
-
-    # Save encrypted — applied at save time, store params for later
-    job.doc._encrypt_user_pw = user_pw
-    job.doc._encrypt_owner_pw = owner_pw
-    job.doc._encrypt_perms = perm_flags
-
-
-def _op_decrypt(job: _PdfJob, idx: int, op: dict) -> None:
-    password = op.get("password", "")
-    if job.doc.is_encrypted:
-        if not job.doc.authenticate(password):
-            job.errors.append(f"Op #{idx} decrypt: incorrect password")
-
-
-def _op_compress(job: _PdfJob, idx: int, op: dict) -> None:
-    # Compression applied at save time — store params
-    job.doc._compress_garbage = int(op.get("garbage", 4))
-    job.doc._compress_deflate = op.get("deflate", True)
-    job.doc._compress_deflate_images = op.get("deflate_images", True)
-    job.doc._compress_deflate_fonts = op.get("deflate_fonts", True)
-
-
-def _op_set_metadata(job: _PdfJob, idx: int, op: dict) -> None:
-    new_meta = {}
-    for key in ("title", "author", "subject", "keywords", "creator", "producer"):
-        if op.get(key):
-            new_meta[key] = op[key]
-    if new_meta:
-        job.doc.set_metadata(new_meta)
-
-
-# ---------------------------------------------------------------------------
-# Edit — extraction
-# ---------------------------------------------------------------------------
-
-
-def _op_extract_images(job: _PdfJob, idx: int, op: dict) -> None:
-    page_spec = op.get("pages", "all")
-    output_dir = op.get("output_dir")
-    if not output_dir:
-        output_dir = str(Path(job.path).parent / (Path(job.path).stem + "_images"))
-    out_dir = _checked_resolved(output_dir)
-    safe_mkdirs(out_dir)
-
-    extracted = []
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        page = job.doc[pi]
-        for img_idx, img in enumerate(page.get_images(full=True)):
-            xref = img[0]
-            try:
-                base_image = job.doc.extract_image(xref)
-                ext = base_image["ext"]
-                img_bytes = base_image["image"]
-                fname = f"page{pi + 1}_img{img_idx + 1}.{ext}"
-                img_path = Path(out_dir) / fname
-                with safe_open_write(str(img_path)) as fh:
-                    fh.write(img_bytes)
-                extracted.append(str(img_path))
-            except Exception as e:  # noqa: BLE001  # PyMuPDF on a user's PDF raises anything from its parser
-                logger.warning(f"Failed to extract image xref={xref}: {e}")
-
-    if extracted:
-        job.errors.append(f"Op #{idx} extract_images: extracted {len(extracted)} images to {_to_agents_relative(out_dir)}")
-
-
-def _op_ocr(job: _PdfJob, idx: int, op: dict) -> None:
-    import fitz
-
-    language = op.get("language", "eng")
-    page_spec = op.get("pages", "all")
-    output_path = op.get("output_path")
-    requested_dpi = op.get("dpi")
-
-    for pi in _parse_pages(page_spec, job.doc.page_count):
-        page = job.doc[pi]
-        try:
-            # Render the page and let Tesseract produce a 1-page
-            # PDF with an invisible text layer, then swap it in.
-            # (A TextPage from get_textpage_ocr() is extraction-
-            # only — it never modifies the document, so the saved
-            # PDF would stay unsearchable.) The raster must stay
-            # RGB — a csGRAY pixmap makes pdfocr_tobytes return
-            # an EMPTY text layer (pymupdf 1.27) — so output size
-            # is controlled by capping dpi at the scan's own
-            # resolution instead of upsampling to 300.
-            pix = page.get_pixmap(
-                dpi=_ocr_raster_dpi(page, requested_dpi),
-            )
-            ocr_pdf = fitz.open(
-                "pdf", pix.pdfocr_tobytes(language=language)
-            )
-            job.doc.delete_page(pi)
-            job.doc.insert_pdf(
-                ocr_pdf, from_page=0, to_page=0, start_at=pi
-            )
-            ocr_pdf.close()
-        except Exception as e:  # noqa: BLE001  # a page's OCR failure becomes its error line, the rest still run
-            job.errors.append(f"Op #{idx} ocr: page {pi} failed: {e}")
-
-    if output_path:
-        out = _checked_resolved(output_path)
-        _save_pdf_beneath(job.doc, out)
-
-
-_HANDLERS = {
-    "merge": _op_merge,
-    "split": _op_split,
-    "rotate_page": _op_rotate_page,
-    "delete_page": _op_delete_page,
-    "reorder_pages": _op_reorder_pages,
-    "insert_page": _op_insert_page,
-    "crop_page": _op_crop_page,
-    "add_text": _op_add_text,
-    "add_image": _op_add_image,
-    "add_watermark": _op_add_watermark,
-    "replace_text": _op_replace_text,
-    "redact": _op_redact,
-    "add_annotation": _op_add_annotation,
-    "encrypt": _op_encrypt,
-    "decrypt": _op_decrypt,
-    "compress": _op_compress,
-    "set_metadata": _op_set_metadata,
-    "extract_images": _op_extract_images,
-    "ocr": _op_ocr,
-}
-
-
-def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
-    """Worker core: the whole op loop + atomic save. Pure sync — paths were
-    pre-resolved by the parent (markers re-raise at the op's use site), no
-    session state, no HTTP."""
-    import fitz
-
-    doc = fitz.open(path)
-    errors = []
-    notes = []
-    job = _PdfJob(doc, path, errors, notes)
-
-    for idx, op in enumerate(ops):
-        ot = _op_type(op)
-        try:
-            handler = _HANDLERS.get(ot) if isinstance(ot, str) else None
-            if handler is not None:
-                handler(job, idx, op)
-            else:
-                logger.warning(f"edit_pdf: unknown operation '{ot}', skipping")
-                errors.append(f"Op #{idx}: unknown operation '{ot}'")
-        except Exception as exc:  # noqa: BLE001  # an op's failure becomes its error line, the other ops still run
-            errors.append(f"Op #{idx} {ot}: {exc}")
-            logger.warning(f"edit_pdf op #{idx} '{ot}' failed: {exc}")
-
-    # Save with encryption/compression if requested
-    save_kwargs = {}
-
-    # Encryption params
-    if hasattr(doc, "_encrypt_user_pw"):
-        save_kwargs["user_pw"] = doc._encrypt_user_pw
-        save_kwargs["owner_pw"] = doc._encrypt_owner_pw
-        save_kwargs["permissions"] = doc._encrypt_perms
-        save_kwargs["encryption"] = fitz.PDF_ENCRYPT_AES_256
-
-    # Compression params
-    garbage = getattr(doc, "_compress_garbage", 0)
-    if garbage:
-        save_kwargs["garbage"] = garbage
-    if getattr(doc, "_compress_deflate", False):
-        save_kwargs["deflate"] = True
-    if getattr(doc, "_compress_deflate_images", False):
-        save_kwargs["deflate_images"] = True
-    if getattr(doc, "_compress_deflate_fonts", False):
-        save_kwargs["deflate_fonts"] = True
-
-    # Save (pymupdf can't overwrite the source file directly): the bytes go
-    # to the helper's temp beside the name and replace it beneath the mount
-    # (a killed child leaves the original whole and a temp the parent
-    # removes; a link at the name or on the way never redirects the save).
-    size_before = os.path.getsize(path)
-    try:
-        _save_pdf_beneath(doc, path, **save_kwargs)
-    finally:
-        doc.close()
-    size_after = os.path.getsize(path)
-
-    msg = f"PDF saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
-    msg += _dropped_note(dropped)
-    if garbage:
-        pct = (1 - size_after / max(size_before, 1)) * 100
-        msg += f"\nCompression: {size_before / 1024:.0f}KB → {size_after / 1024:.0f}KB ({pct:.0f}% reduction)"
-    if notes:
-        msg += "\n" + "\n".join(f"  - {n}" for n in notes)
-    if errors:
-        msg += f"\n\nWarnings/Errors ({len(errors)}):\n" + "\n".join(f"  - {e}" for e in errors)
-    return msg
+    """edit_pdf; its operations and write live in formats/pdf/edit.py."""
+    return await _edit.handle_edit_pdf(args)
 
 
 # ---------------------------------------------------------------------------
@@ -1261,7 +633,7 @@ _RENDER_ADVICE = "Render fewer pages per call (`pages`) or lower `dpi`"
 
 
 def _pdf_to_images_core(path: str, tmp_dir: str, page_spec, dpi: int,
-                        fmt: str) -> list[dict]:
+                        fmt: str, password: str | None = None) -> list[dict]:
     """Worker core: render every requested page into the parent-named temp
     dir. The parent moves the COMPLETE set into the real output dir only on
     success — a deadline kill must not leave a partial page set that looks
@@ -1273,11 +645,19 @@ def _pdf_to_images_core(path: str, tmp_dir: str, page_spec, dpi: int,
         shutil.rmtree(tmp_dir)
     os.makedirs(tmp_dir)
 
-    doc = fitz.open(path)
+    from formats.pdf.edit import copy_refusal, protection_of
+
+    doc = open_pdf(path, password)
+    protected = protection_of(doc)
+    owner = bool(protected) and password not in (None, "") and bool(doc.authenticate(str(password)) & 4)
+    refusal = copy_refusal(protected, owner, doc.permissions)
+    if refusal:
+        doc.close()
+        raise ValueError(f"{refusal[0].upper()}{refusal[1:]}: give the owner password (password).")
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
     saved = []
-    for pi in _parse_pages(page_spec, doc.page_count):
+    for pi in parse_pages(page_spec, doc.page_count):
         page = doc[pi]
         pix = page.get_pixmap(matrix=mat)
         fname = f"page_{pi + 1:03d}.{fmt}"
@@ -1336,7 +716,7 @@ async def handle_pdf_to_images(args: dict) -> str:
     page_spec = args.get("pages", "all")
     dpi = int(args.get("dpi", 150))
     fmt = args.get("format", "png").lower()
-    saved = await _pdf_to_images(path, out_dir, page_spec, dpi, fmt)
+    saved = await _pdf_to_images(path, out_dir, page_spec, dpi, fmt, args.get("password"))
     return (
         f"Rendered {len(saved)} pages from {_to_agents_relative(path)} at {dpi}dpi.\n"
         f"Output: {_to_agents_relative(out_dir)}/\n"
@@ -1345,7 +725,8 @@ async def handle_pdf_to_images(args: dict) -> str:
     )
 
 
-async def _pdf_to_images(path: str, out_dir: str, page_spec, dpi: int, fmt: str) -> list:
+async def _pdf_to_images(path: str, out_dir: str, page_spec, dpi: int, fmt: str,
+                         password: str | None = None) -> list:
     """Render ``path``'s pages into the resolved write target ``out_dir``
     and push the first one inline. Returns the saved page entries."""
     # The pages render into a temp directory outside the tree and land in
@@ -1353,7 +734,7 @@ async def _pdf_to_images(path: str, out_dir: str, page_spec, dpi: int, fmt: str)
     tmp_dir = tempfile.mkdtemp(prefix="file-tools-pages-")
     try:
         saved = await run_parse(
-            _pdf_to_images_core, path, tmp_dir, page_spec, dpi, fmt,
+            _pdf_to_images_core, path, tmp_dir, page_spec, dpi, fmt, password,
             _advice=_RENDER_ADVICE,
         )
         first = (Path(tmp_dir) / saved[0]["name"]).read_bytes() if saved else b""
@@ -1372,8 +753,12 @@ async def _pdf_to_images(path: str, out_dir: str, page_spec, dpi: int, fmt: str)
 # Screenshot Document (visual feedback for LLM)
 # ---------------------------------------------------------------------------
 
-_SCREENSHOT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-                    ".odt", ".ods", ".odp", ".csv", ".rtf", ".html", ".htm"}
+_SCREENSHOT_EXTS = {
+    ".pdf", ".docx", ".docm", ".dotx", ".dotm", ".doc",
+    ".xlsx", ".xlsm", ".xltx", ".xltm", ".xls",
+    ".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".ppt",
+    ".odt", ".ods", ".odp", ".csv", ".rtf", ".html", ".htm",
+}
 _MAX_INLINE_PAGES = 10
 # Payload caps (see handle_screenshot_document): long-edge px per page
 # (dpi-aware — the high cap keeps A4@300 ≈ 3508 px untouched, the skill's
@@ -1385,7 +770,7 @@ _SCREENSHOT_PNG_FALLBACK_BYTES = int(1.5 * 1024 * 1024)
 _SCREENSHOT_TOTAL_BYTES = 8 * 1024 * 1024
 
 
-def _render_screenshot_core(pdf_path: str, pages_spec, dpi: int) -> dict:
+def _render_screenshot_core(pdf_path: str, pages_spec, dpi: int, password: str | None = None) -> dict:
     """Worker core: the fitz render loop with the payload caps below.
     Returns raw bytes — base64 and mcp.types stay in the parent (they never
     cross the pipe).
@@ -1402,9 +787,9 @@ def _render_screenshot_core(pdf_path: str, pages_spec, dpi: int) -> dict:
     import fitz
 
     zoom = dpi / 72.0
-    doc = fitz.open(pdf_path)
+    doc = open_pdf(pdf_path, password)
     total = len(doc)
-    page_indices = _parse_pages(pages_spec, total)
+    page_indices = parse_pages(pages_spec, total)
     if not page_indices:
         doc.close()
         return {"total": total, "images": [], "rendered": [],
@@ -1455,6 +840,26 @@ def _render_screenshot_core(pdf_path: str, pages_spec, dpi: int) -> dict:
             "capped": capped, "truncated_at": truncated_at}
 
 
+async def _contact_sheet(pdf_path: str, src_path: str, pages_spec, password: str | None) -> tuple[dict, str]:
+    """The contact sheet of the rendered pages and its text."""
+    from formats.pdf import screenshot as shot
+
+    sheet = await run_parse(shot.contact_sheet_core, pdf_path, pages_spec, src_path, password,
+                            _advice=_RENDER_ADVICE)
+    if "error" in sheet:
+        return {}, sheet["error"]
+    pages, rest, total = sheet["pages"], sheet["rest"], sheet["total"]
+    named = ("slide_index (from 0, as write_pptx takes it; hidden slides are not drawn)" if sheet["slides"]
+             else "page number (as pages counts)")
+    lines = [f"Contact sheet of {Path(src_path).name}: {len(pages)} of {total} page(s) "
+             f"({_page_ranges(pages)}), {sheet['columns']} per row, each labelled with its {named}.",
+             "To look closer, call again without grid and with pages set to the page you want."]
+    if rest:
+        lines.append(f"(the sheet holds {shot.MAX_SHEET_PAGES} pages: ask for pages "
+                     f"'{rest[0] + 1}-{rest[-1] + 1}' for the rest)")
+    return sheet, "\n".join(lines)
+
+
 async def handle_screenshot_document(args: dict) -> list:
     """Render document pages as ImageContent for LLM visual inspection.
 
@@ -1465,6 +870,8 @@ async def handle_screenshot_document(args: dict) -> list:
 
     from mcp.types import ImageContent, TextContent
 
+    from formats.pdf import screenshot as shot
+
     path = await _resolve_path(args.get("path", ""))
     if not await asyncio.to_thread(os.path.isfile, path):
         return [TextContent(type="text", text=f"Error: file not found: {_to_agents_relative(path)}")]
@@ -1474,9 +881,12 @@ async def handle_screenshot_document(args: dict) -> list:
         return [TextContent(type="text",
                 text=f"Error: unsupported format '{ext}'. Supported: PDF, DOCX, XLSX, PPTX, other Office formats and HTML.")]
 
-    pages_spec = args.get("pages", "1")
+    grid = bool(args.get("grid", False))
+    pages_spec = args.get("pages", "all" if grid else "1")
     dpi = int(args.get("dpi", 150))
     sheet = args.get("sheet")
+    password = args.get("password") if ext == ".pdf" else None
+    notes: list[str] = []
 
     pdf_path = path
     temp_dir = None
@@ -1497,48 +907,57 @@ async def handle_screenshot_document(args: dict) -> list:
                 _render_temp_pdf_core, full_html, pdf_path, allowed,
                 _advice=_RENDER_ADVICE,
             )
-        # Other non-PDF formats: convert to a temp PDF via LibreOffice
+        # Other non-PDF formats: a temp PDF from render_engine
         elif ext != ".pdf":
             temp_dir = tempfile.mkdtemp(prefix="file-tools-shot-")
             convert_path = path
 
-            # Excel: set fit-to-width page setup + handle sheet selection.
-            # The prep full-DOM-loads the workbook (bomb risk) — worker
-            # child. Sheet names ride back with it so no un-isolated
-            # openpyxl load remains in the parent (even a read_only load
-            # eagerly parses the whole sharedStrings table).
-            if ext in (".xlsx", ".xls"):
-                try:
-                    convert_path, sheetnames = await run_parse(
-                        _excel_prepare_for_screenshot, path, temp_dir,
-                        _advice=_RENDER_ADVICE,
-                    )
+            # A workbook prints from a copy laid out to fit the page width;
+            # the copy keeps every cell and stored value (a recalculated
+            # workbook shows its values). With a sheet, the copy prints that
+            # sheet alone, so pages count within it.
+            if ext in shot.XLSX_EXTS:
+                made = await run_parse(shot.workbook_core, path, temp_dir, sheet, _advice=_RENDER_ADVICE)
+                if made.get("error"):
+                    return [TextContent(type="text", text=f"Error: {made['error']}.")]
+                if made["path"] is None:
+                    logger.warning(f"screenshot workbook prep failed: {made['reason']}, using original")
                     if sheet is not None:
-                        # Sheet selection: override pages to target sheet
-                        pages_spec = str(
-                            _sheet_index_from_names(sheetnames, sheet) + 1
-                        )
-                except Exception as e:  # noqa: BLE001  # the spreadsheet prep raises anything openpyxl does, the original renders
-                    logger.warning(f"screenshot excel prep failed: {e}, using original")
-                    convert_path = path
+                        notes.append("The workbook could not be laid out, so sheet did not apply: every sheet "
+                                     "prints.")
+                else:
+                    convert_path = made["path"]
+                    if sheet is not None:
+                        notes.append(f"Sheet {made['names'][made['index']]!r} (index {made['index']}); pages count "
+                                     "within it.")
             elif sheet is not None and ext in (".ods", ".csv"):
-                # ODS/CSV: openpyxl can't open either format, so the old
-                # name lookup ALWAYS failed here — numeric sheet selection
-                # is honored, names warn (the reachable subset of the old
-                # behavior, minus the pointless workbook load).
+                # ODS/CSV print every sheet; a number picks that page, a name
+                # cannot be told apart.
                 if isinstance(sheet, int) or str(sheet).isdigit():
                     pages_spec = str(int(sheet) + 1)
                 else:
-                    logger.warning(
-                        f"screenshot sheet lookup by name unsupported for {ext}"
-                    )
+                    notes.append(f"sheet by name does not apply to {ext}: give its number.")
+            elif sheet is not None:
+                notes.append(f"sheet applies to workbooks; it was ignored for {ext}.")
 
-            pdf_path = await _libreoffice_convert(convert_path, "pdf", temp_dir)
+            # In a folder of its own: the laid-out workbook copy lives in
+            # temp_dir, and the PDF keeps its name.
+            pdf_path = await render_engine.to_pdf(
+                convert_path, out_dir=await asyncio.to_thread(render_engine.output_folder, temp_dir, "pdf"))
+
+        if grid:
+            made, text = await _contact_sheet(pdf_path, path, pages_spec, password)
+            if not made:
+                return [TextContent(type="text", text=text)]
+            if notes:
+                text += "\n" + "\n".join(notes)
+            return [ImageContent(type="image", data=base64.b64encode(made["data"]).decode(), mimeType=made["mime"]),
+                    TextContent(type="text", text=text)]
 
         # Render in a bounded worker child (fitz pixmaps are the memory
         # hazard); the parent only b64-encodes and assembles content items.
         render = await run_parse(
-            _render_screenshot_core, pdf_path, pages_spec, dpi,
+            _render_screenshot_core, pdf_path, pages_spec, dpi, password,
             _advice=_RENDER_ADVICE,
         )
 
@@ -1562,12 +981,14 @@ async def handle_screenshot_document(args: dict) -> list:
         for r in render["rendered"]:
             lines.append(f"  Page {r['page']}: {r['width_in']} x {r['height_in']} inches")
         if render["capped"]:
-            lines.append(f"  (capped at {_MAX_INLINE_PAGES} pages — use specific page ranges for more)")
+            lines.append(f"  (capped at {_MAX_INLINE_PAGES} pages — use specific page ranges for more, "
+                         "or grid: true for every page on one sheet)")
         if render["truncated_at"] is not None:
             lines.append(
                 f"  (stopped before page {render['truncated_at']}: inline image budget "
                 "reached — request the remaining pages in a follow-up call)"
             )
+        lines.extend(notes)
         content_items.append(TextContent(type="text", text="\n".join(lines)))
         return content_items
 
@@ -1576,58 +997,6 @@ async def handle_screenshot_document(args: dict) -> list:
     finally:
         if temp_dir:
             await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
-
-
-def _sheet_index_from_names(names: list, sheet) -> int:
-    """Get 0-based sheet index from name or numeric index (parent-side —
-    the names come back from the prep worker, never from an openpyxl load
-    in the server process)."""
-    if isinstance(sheet, int) or (isinstance(sheet, str) and sheet.isdigit()):
-        return int(sheet)
-    return names.index(str(sheet)) if str(sheet) in names else 0
-
-
-def _excel_prepare_for_screenshot(path: str, temp_dir: str) -> tuple:
-    """Worker core: create a temp copy of an Excel file with fit-to-width
-    page setup. Returns (temp_path, sheetnames) — the full-DOM load below is
-    exactly the allocation profile that took the read path down, so this
-    always runs in a bounded child.
-
-    Safeguards based on column count:
-      <= 10 columns: portrait, fit to 1 page wide
-      11-20 columns: landscape, fit to 1 page wide
-      > 20 columns:  landscape, no fit (would be unreadably small)
-    Rows always flow naturally across pages.
-    """
-    import openpyxl
-    from openpyxl.worksheet.properties import PageSetupProperties
-
-    wb = openpyxl.load_workbook(path)
-    for ws in wb.worksheets:
-        # Count used columns
-        max_col = ws.max_column or 1
-
-        if max_col <= 10:
-            # Portrait, fit all columns to 1 page wide
-            ws.page_setup.orientation = "portrait"
-            ws.page_setup.fitToWidth = 1
-            ws.page_setup.fitToHeight = 0
-            ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
-        elif max_col <= 20:
-            # Landscape, fit all columns to 1 page wide
-            ws.page_setup.orientation = "landscape"
-            ws.page_setup.fitToWidth = 1
-            ws.page_setup.fitToHeight = 0
-            ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
-        else:
-            # Too many columns — landscape but let it paginate
-            ws.page_setup.orientation = "landscape"
-
-    temp_path = os.path.join(temp_dir, Path(path).name)
-    names = list(wb.sheetnames)
-    wb.save(temp_path)
-    wb.close()
-    return temp_path, names
 
 
 # ---------------------------------------------------------------------------
@@ -1709,29 +1078,38 @@ async def handle_images_to_pdf(args: dict) -> str:
     page_size = args.get("page_size", "a4").lower()
     fit = args.get("fit", "contain")
 
-    # Pre-resolve in the parent; a missing image skips with a warning (the
+    # Pre-resolve in the parent; a missing image is skipped and named (the
     # old per-image containment), it never fails the call.
     image_paths = []
+    skipped: list[str] = []
     for img_input in images:
         try:
             img_path = await _resolve_path(img_input)
         except Exception as exc:  # noqa: BLE001  # an input that cannot be resolved is skipped, the rest still render
             logger.warning(f"images_to_pdf: skipping {img_input} ({exc})")
+            skipped.append(f"{img_input} (refused: {exc})")
             continue
         if not await asyncio.to_thread(os.path.exists, img_path):
             logger.warning(f"images_to_pdf: skipping {img_input} (not found)")
+            skipped.append(f"{img_input} (not found)")
             continue
         image_paths.append(img_path)
+    if not image_paths:
+        return "Error: none of the images could be read: " + "; ".join(skipped)
 
-    await _images_to_pdf(image_paths, out, page_size, fit)
-    return f"PDF created: {_to_agents_relative(out)} ({len(images)} images, {page_size})"
+    placed = await _images_to_pdf(image_paths, out, page_size, fit)
+    text = f"PDF created: {_to_agents_relative(out)} ({placed} images, {page_size})"
+    if skipped:
+        text += "\nSkipped: " + "; ".join(skipped)
+    return text
 
 
-async def _images_to_pdf(image_paths: list, out: str, page_size: str, fit: str) -> None:
+async def _images_to_pdf(image_paths: list, out: str, page_size: str, fit: str) -> int:
     """Build the PDF of the resolved, existing ``image_paths`` at the
-    resolved write target ``out`` and push its preview."""
+    resolved write target ``out`` and push its preview; returns how many
+    images it placed."""
     try:
-        await run_parse(
+        placed = await run_parse(
             _images_to_pdf_core, image_paths, out, page_size, fit,
             _advice=_RENDER_ADVICE,
         )
@@ -1739,6 +1117,7 @@ async def _images_to_pdf(image_paths: list, out: str, page_size: str, fit: str) 
         cleanup_partials(out)
         raise
     await _push_preview(out)
+    return placed
 
 
 # ---------------------------------------------------------------------------
@@ -1858,21 +1237,18 @@ async def handle_convert_document(args: dict) -> str:
         await _pdf_to_images(input_path, out_dir, "all", 150, output_format)
         return f"Converted: {_to_agents_relative(out_dir)}/"
 
-    # LibreOffice headless for everything else. Deliberately NOT a worker
-    # child: soffice is already a separate OS process, so the container cap
-    # bounds it and a cgroup OOM kill targets its RSS, not the server;
-    # the conversion slots bound how many run and the 120s timeout ends hangs.
-    # A worker wrapper could only strip the child's RLIMIT_AS (it survives
-    # fork+exec, see isolation.py) or cap soffice confusingly. It writes by
-    # name, so it writes into a temp directory outside the tree; the result
-    # lands in the output folder beneath the mount through the write helper.
-    # An output_path is resolved (and refused) before the conversion runs;
-    # the default takes the name LibreOffice gives its result.
+    # render_engine for everything else (the install's Collabora, else
+    # LibreOffice), in the server process: neither engine runs in a worker
+    # child, whose RLIMIT_AS would follow soffice. It writes by name into a
+    # temp directory outside the tree; the result lands in the output folder
+    # beneath the mount through the write helper. An output_path is resolved
+    # (and refused) before the conversion runs; the default takes the name
+    # the engine gives its result.
     out = await _resolve_path(output_path, writing=True) if output_path else None
     lo_dir = tempfile.mkdtemp(prefix="file-tools-lo-")
     try:
         try:
-            produced = await _libreoffice_convert(input_path, output_format, lo_dir)
+            produced = await render_engine.convert(input_path, output_format, out_dir=lo_dir)
         except RuntimeError as exc:
             return f"Conversion error: {exc}"
         if out is None:

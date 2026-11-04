@@ -111,6 +111,9 @@ _PR_SET_PDEATHSIG = 1
 # CHANGES before exec (true reparenting = the proxy died). Hard-coding "== 1"
 # is wrong in a container, where the proxy legitimately runs AS pid 1.
 _LAUNCH_PPID = os.getppid()
+# The hop a confined pasta may take (see main): sh resolves to its own binary
+# under /usr/bin on every distro, env does not on Ubuntu 26.04.
+_SH_HOP = ["/bin/sh", "-c", 'exec "$0" "$@"']
 
 # Ranges blackholed by --block-private. pasta NATs outbound by opening sockets
 # on the HOST side, so ANY address the host can route to is reachable from the
@@ -529,7 +532,15 @@ def main() -> None:
 
     pyshim = _build_pyshim(forwards, allow_hosts, dns_forward, block_private, egress_deny,
                            beneath)
-    cmd.extend(["--", python3, "-c", pyshim, *inner])
+    # Ubuntu 26.04 confines pasta with its own AppArmor profile (usr.bin.pasta,
+    # new in that passt package), whose exec rule is `/{usr/,}bin/** Ux` on the
+    # RESOLVED path: pasta may start a program whose file lives under /bin or
+    # /usr/bin. The shim's python3 is a venv's, and /usr/bin/env there is a
+    # link into the Rust coreutils under /usr/lib. /bin/sh resolves to its own
+    # binary under /usr/bin, leaves confinement at the exec and hands over to
+    # python3 (the loader's variables, LD_* and TMPDIR, are scrubbed on the
+    # way; the agent env is built explicitly and inherits none of them).
+    cmd.extend(["--", *_SH_HOP, python3, "-c", pyshim, *inner])
 
     # Preserve the kill chain (see module docstring). prctl survives execve
     # for non-setuid binaries; pasta's static build is plain. If the proxy died

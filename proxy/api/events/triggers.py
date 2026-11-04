@@ -293,7 +293,8 @@ def _can_view_trigger(trigger: dict, user: UserContext) -> bool:
             return False
     scope = trigger.get("scope")
     if scope == _vis.SCOPE_AGENT:
-        return True
+        # What the agent does on its own behalf: the editor tier.
+        return user.sees_agent_automations(trigger["agent"])
     if scope == _vis.SCOPE_USER:
         return trigger.get("created_by") == user.sub
     return False
@@ -429,6 +430,8 @@ class NotifyConfig(BaseModel):
     body: str | None = None
     target_scope: str | None = None  # 'user' | 'agent' | 'global'
     target: str | None = None        # username, agent name, or NULL
+    # Who is told by an agent-scope notify: the lowest per-agent role.
+    audience: str | None = None
 
 
 class CreateTriggerRequest(BaseModel):
@@ -460,6 +463,7 @@ class EditTriggerRequest(BaseModel):
     notify_body: str | None = None
     notify_target_scope: str | None = None
     notify_target: str | None = None
+    notify_audience: str | None = None
     debounce_seconds: int | None = None
     event_filter: dict | None = None
     app_slug: str | None = None
@@ -609,6 +613,8 @@ async def create_trigger_endpoint(
         scope=req.scope, agent=req.agent, user=u,
     )
     notify = req.notify or NotifyConfig()
+    from api.tasks.tasks import task_audience
+    audience = await task_audience(u, notify.audience)
     app_id = (_resolve_app_target(req.agent, req.scope, created_by, req.app_slug)
               if req.app_slug else None)
     try:
@@ -625,6 +631,7 @@ async def create_trigger_endpoint(
             notify_body=notify.body,
             notify_target_scope=notify.target_scope,
             notify_target=notify.target,
+            notify_audience=audience,
             debounce_seconds=req.debounce_seconds,
             enabled=req.enabled,
             subscription_id=req.subscription_id,
@@ -700,8 +707,9 @@ async def list_triggers_endpoint(
             edge_reach = nouser_read_targets(u)
             rows = [
                 r for r in rows
-                if u.can_access_agent(r["agent"])
-                or (r.get("scope") == _vis.SCOPE_AGENT and r["agent"] in edge_reach)
+                if (u.can_access_agent(r["agent"])
+                    or (r.get("scope") == _vis.SCOPE_AGENT and r["agent"] in edge_reach))
+                and (r.get("scope") != _vis.SCOPE_AGENT or u.sees_agent_automations(r["agent"]))
             ]
         return rows, _decoration_maps(rows)
 
@@ -749,6 +757,10 @@ async def _edit_impl(
         _check_trigger_mutation_authority(row, user)
 
     fields = req.model_dump(exclude_unset=True)
+    if "notify_audience" in fields:
+        # No null state, as on a task: omit the field to leave it.
+        from api.tasks.tasks import checked_audience
+        fields["notify_audience"] = await checked_audience(user, fields["notify_audience"] or "")
     if "app_slug" in fields:
         slug = fields.pop("app_slug")
         if slug:

@@ -72,26 +72,108 @@ def _task_items(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     return items, out
 
 
-def export_bundle(row: dict) -> tuple[bytes, dict]:
-    """``(archive bytes, blueprint)`` of the app's WORKING folder: the files
-    a release would take, ``app.json`` with its buttons by slug, and
-    ``blueprint.json`` naming the tasks."""
-    source = config.get_agent_dir(row["agent"]) / (row.get("rel_path") or "")
+# A bundle's origin reaches every session's prompt: a slug of the catalog's
+# shape and a release of at most four digits a part, matched whole.
+_ORIGIN_SLUG_RE = re.compile(r"[a-z][a-z0-9-]{1,38}[a-z0-9]")
+_ORIGIN_VERSION_RE = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}")
+# A bundle's source (the row it was exported from, services/apps/app_follow.py):
+# an agent slug of the shape agent_store.sanitize_slug makes (2 to 40
+# characters, a digit first allowed), the app slug's shape, a username of
+# word characters, a row id and a release number, each matched whole.
+_SOURCE_AGENT_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]")
+_SOURCE_USER_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_SOURCE_ID_RE = re.compile(r"[A-Za-z0-9-]{1,40}")
+
+
+def origin_of(row: dict) -> tuple[str, str]:
+    """Where a row's code came from: its origin columns, else, for a copy a
+    template seeded before the columns existed, the template of its
+    ``template_ref`` and the agent's installed version; ``("", "")`` for
+    the agent's own app."""
+    if row.get("from_template"):
+        return str(row["from_template"]), str(row.get("from_version") or "")
+    ref = str(row.get("template_ref") or "")
+    if ":" in ref:
+        from storage.agents import agent_store
+        agent = agent_store.get_agent(str(row.get("agent") or "")) or {}
+        return ref.split(":", 1)[0], str(agent.get("community_template_version") or "")
+    return "", ""
+
+
+def clean_origin(blueprint: dict) -> tuple[str, str] | None:
+    """A bundle's origin as the row keeps it: a template slug and a
+    release, else nothing (a bundle is the agent's own file: its words
+    never reach a prompt unchecked)."""
+    slug = str(blueprint.get("from_template") or "")
+    version = str(blueprint.get("from_version") or "")
+    if not _ORIGIN_SLUG_RE.fullmatch(slug):
+        return None
+    return slug, version if _ORIGIN_VERSION_RE.fullmatch(version) else ""
+
+
+def clean_source(blueprint: dict) -> dict | None:
+    """A bundle's source as the row keeps it (``follows``): the row's key,
+    its id and the release the bundle took, else nothing."""
+    raw = blueprint.get("source")
+    if not isinstance(raw, dict):
+        return None
+    from services.apps.slugs import APP_SLUG_RE
+    agent, slug = str(raw.get("agent") or ""), str(raw.get("slug") or "")
+    username, row_id = str(raw.get("username") or ""), str(raw.get("id") or "")
+    release = raw.get("release")
+    if not (_SOURCE_AGENT_RE.fullmatch(agent) and APP_SLUG_RE.fullmatch(slug) and _SOURCE_ID_RE.fullmatch(row_id)):
+        return None
+    if username and not _SOURCE_USER_RE.fullmatch(username):
+        return None
+    if not isinstance(release, int) or isinstance(release, bool) or not 0 <= release <= 999999:
+        return None
+    return {"id": row_id, "agent": agent, "username": username, "slug": slug, "release": release}
+
+
+def _release_files(release_dir: Path) -> list[str]:
+    """The files a release holds, from its manifest: never a walk of the
+    release folder, which also keeps the data snapshot taken before the
+    release went live."""
+    manifest = releases.read_manifest(release_dir)
+    if manifest is None:
+        raise BlueprintError("The list of the release's files is gone. Deploy the app again.")
+    return sorted(manifest["files"])
+
+
+def export_bundle(row: dict, *, release_dir: Path | None = None) -> tuple[bytes, dict]:
+    """``(archive bytes, blueprint)`` of the app's WORKING folder, or of one
+    release of it (``release_dir``, read by its manifest): the files a
+    release takes, ``app.json`` with its buttons by slug, and
+    ``blueprint.json`` naming the tasks, the row the bundle came from
+    (``source``: what a copy follows) and, for a template's copy, the
+    template and version the code came from."""
+    working = config.get_agent_dir(row["agent"]) / (row.get("rel_path") or "")
+    source = release_dir if release_dir is not None else working
     # The tree first (no link anywhere in it; the release caps are the
     # export's), then the manifest and the page, each read without following
     # a link.
     try:
-        files = releases.walk_tree(source)
+        rels = (_release_files(source) if release_dir is not None
+                else [rel for rel, _p in releases.walk_tree(source)])
     except releases.ReleaseInvalid as e:
         raise BlueprintError(str(e)) from e
-    if not any(rel == "app.json" for rel, _p in files):
+    if "app.json" not in rels:
         raise BlueprintError("only an app with a folder (app.json) can be exported")
     doc = app_deploy.read_app_json(source)
     app_deploy.require_entry_page(source)
     items, actions = _task_items(doc.get("actions") or [])
     doc["actions"] = actions
     blueprint = {"format": FORMAT, "slug": row["slug"], "title": doc.get("title") or row.get("title") or row["slug"],
-                 "tasks": items, "requires": doc.get("requires") or {}}
+                 "tasks": items, "requires": doc.get("requires") or {},
+                 "source": {"id": row["id"], "agent": row["agent"], "username": row.get("username") or "",
+                            # The live release, also for a working folder with
+                            # edits not released yet: a copy is never offered
+                            # an older release than the one it holds.
+                            "slug": row["slug"], "release": releases.current_number(row)}}
+    from_template, from_version = origin_of(row)
+    if from_template:
+        blueprint["from_template"] = from_template
+        blueprint["from_version"] = from_version
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tar:
         def _add(name: str, data: bytes) -> None:
@@ -101,12 +183,25 @@ def export_bundle(row: dict) -> tuple[bytes, dict]:
             tar.addfile(info, io.BytesIO(data))
         _add(BUNDLE_NAME, json.dumps(blueprint, indent=2, sort_keys=True).encode("utf-8"))
         total = 0
-        for rel, _path in files:
+        for rel in rels:
             if rel == "app.json":
                 _add(rel, json.dumps(doc, indent=2, sort_keys=True).encode("utf-8"))
                 continue
+            # A template's copy keeps the template's own blueprint in its
+            # folder; the one written above is the export's and a second
+            # entry would replace it at the import.
+            if rel == BUNDLE_NAME:
+                continue
             try:
-                data = releases.read_tree_file(source, rel, max_size=releases.MAX_RELEASE_FILE_BYTES)
+                if release_dir is not None:
+                    read = releases.read_release_file(source, rel)
+                    if read is None:
+                        raise BlueprintError(f"{rel} is missing from the release. Deploy the app again.")
+                    data = read
+                else:
+                    data = releases.read_tree_file(source, rel, max_size=releases.MAX_RELEASE_FILE_BYTES)
+            except releases.ReleaseDamaged as exc:
+                raise BlueprintError(f"{rel} no longer matches the release. Deploy the app again.") from exc
             except OSError as exc:
                 raise BlueprintError(f"{rel} changed while it was exported; export again") from exc
             total += len(data)
@@ -321,7 +416,11 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
                         source_dir: Path, *, template_slug: str, tasks: list[dict] | None,
                         cold: bool = False, approve_as: str = "",
                         template_ref: str | None = None,
-                        triggers: list[dict] | None = None) -> dict:
+                        triggers: list[dict] | None = None,
+                        origin: tuple[str, str] | None = None,
+                        follows: dict | None = None,
+                        voids_approval: bool = True, replace: bool = True,
+                        hold: bool = False, keep_tasks: dict[str, str] | None = None) -> dict:
     """Write ``source_dir`` as the scope's ``apps/<slug>/`` with its buttons
     pointing at freshly seeded tasks, void any approval the slug had, and
     run the deploy pipeline — release 1 lands pending unless the manifest
@@ -329,9 +428,21 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
     (``cold`` / ``approve_as`` / ``template_ref``: APPS.md "Blueprints and
     templates"); then the blueprint's ``triggers`` are seeded at the row
     (``_seed_trigger``; the result's ``triggers`` says what became of
-    each). ``DeployError`` and ``BlueprintError`` carry the reason."""
+    each). ``DeployError`` and ``BlueprintError`` carry the reason.
+
+    A release another agent's app sends (services/apps/app_follow.py) passes ``voids_approval=False`` (the deploy judges the standing
+    approval by the manifest's signature), ``replace=False`` (the bundle's
+    files are written over the folder and the files the folder's walk lists
+    that the bundle lacks are removed; dotfiles, ``node_modules`` and
+    ``data/`` are left alone), ``hold=True`` (the release waits for a
+    person whatever the manifest says) and ``keep_tasks`` (button id to task
+    id: a button the folder already binds keeps its task and the bundle's
+    item for it is not seeded). ``follows`` (``clean_source``) is written on
+    the row after the deploy when the row is another than the source and
+    the source row exists on this install."""
     from services.infra import file_bookkeeping
     shared = not username
+    keep = dict(keep_tasks or {})
     try:
         files = await asyncio_to_thread(releases.walk_tree, source_dir)
     except releases.ReleaseInvalid as e:
@@ -341,7 +452,7 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
         await asyncio_to_thread(app_deploy.require_entry_page, source_dir)
     except app_deploy.DeployError as e:
         raise BlueprintError(str(e)) from e
-    items = list(tasks or [])
+    items = [t for t in (tasks or []) if not (isinstance(t, dict) and str(t.get("slug") or "") in keep)]
     if len(items) > MAX_BUNDLE_TASKS:
         raise BlueprintError(f"at most {MAX_BUNDLE_TASKS} tasks in a bundle")
     trigger_items = list(triggers or [])
@@ -376,8 +487,21 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
             raise BlueprintError("bundle tasks must be objects")
         task_ids[str(item.get("slug") or "")] = await asyncio_to_thread(
             _seed_task, item, agent, created_by, scope, slug, template_slug)
-    _rewrite_actions(doc, task_ids)
+    _rewrite_actions(doc, {**keep, **task_ids})
     await asyncio_to_thread(app_deploy.validate_app_json, doc, agent, shared)
+    if not replace:
+        # The overlay: the files the folder holds and the bundle does not go
+        # through the files' own delete, so a paired machine drops them too.
+        wanted = {rel for rel, _path in files}
+
+        def _dropped() -> list[str]:
+            try:
+                return [rel for rel, _path in releases.walk_tree(root) if rel not in wanted]
+            except releases.ReleaseInvalid as exc:
+                raise BlueprintError(str(exc)) from exc
+
+        from services.apps import app_follow
+        await app_follow.delete_files(agent, root, await asyncio_to_thread(_dropped))
 
     def _write() -> None:
         # The folder is written beneath the agents tree and the files are read
@@ -386,7 +510,8 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
         agents_root, dest_rel = releases.agents_rel(root)
         src_root, src_base = releases.tree_root(source_dir)
         try:
-            safe_fs.rmtree_beneath(agents_root, dest_rel, missing_ok=True)
+            if replace:
+                safe_fs.rmtree_beneath(agents_root, dest_rel, missing_ok=True)
             for rel, _path in files:
                 if rel == "app.json":
                     safe_fs.atomic_write_beneath(
@@ -409,7 +534,7 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
     except Exception:
         logger.exception("App import %s: workspace push failed (continuing)", slug)
     existing = await asyncio_to_thread(task_store.get_app_by_slug, agent, username, slug)
-    if existing is not None and not template_ref:
+    if existing is not None and not template_ref and voids_approval:
         # A blueprint import is never pre-approved. A template seed's approval
         # is the consent's business instead: ``approve_as`` grants it and a
         # changed manifest stales it on its own (the signature moves), so a
@@ -417,8 +542,13 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
         await asyncio_to_thread(task_store.clear_app_approval, existing["id"])
     out = await app_deploy.deploy_folder(agent, username, owner_sub, slug, root, rel_dir,
                                          cold=cold, approve_as=approve_as,
-                                         template_ref=template_ref)
+                                         template_ref=template_ref, origin=origin, hold=hold)
     out["tasks"] = task_ids
+    if follows and out.get("app_id") and str(out.get("status") or "") not in (
+            app_deploy.RESULT_REFUSED, app_deploy.RESULT_REJECTED):
+        from services.apps import app_follow
+        await asyncio_to_thread(app_follow.record, str(out["app_id"]), (agent, username, slug), follows,
+                                int(out.get("release") or 0))
     out["triggers"] = {}
     if trigger_items and out.get("app_id") and str(out.get("status") or "") not in (
             app_deploy.RESULT_REFUSED, app_deploy.RESULT_REJECTED):

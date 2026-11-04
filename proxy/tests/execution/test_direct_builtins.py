@@ -276,6 +276,11 @@ def participant(monkeypatch):
     ))
     monkeypatch.setitem(session_state._sessions, sid, {"is_meeting": True, "client_type": "meeting"})
     session_state.set_meeting_session_info(sid, _HOST, _PUMP, AGENT, "direct-host-chat")
+    # Where a card lands is the meeting pump's queue, which a live pump
+    # reads (where a card shows with no pump is
+    # tests/hooks/test_hook_cards_between_turns.py's).
+    from core.session import engine_prompts
+    monkeypatch.setattr(engine_prompts, "queue_has_reader", lambda queue: True)
     yield sid
     session_state.cleanup_meeting_session_info(sid)
     session_state.cleanup_session_permission_state(sid)

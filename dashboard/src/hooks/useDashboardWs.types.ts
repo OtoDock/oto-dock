@@ -9,7 +9,8 @@ import type {
   LocationRequestFrame, McpCostFrame, MediaFailedFrame, MediaProcessingFrame, MetadataFrame,
   NotificationCountFrame, NotificationFrame, NotificationSilentFrame, PermissionPromptFrame,
   PermissionResolvedFrame, PromptRetiredFrame,
-  PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, QuestionFrame, ShareInboxFrame,
+  PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, QuestionFrame,
+  SettingsCardFrame, ActionCardFrame, ListCardFrame, ScheduleWakeFrame, ShareInboxFrame,
   QueueRemovedFrame, QueueSentFrame, QueuedFrame, SatelliteUpdateFailedFrame,
   SatelliteUpdatedFrame, SatelliteUpdatingFrame, ServerTurnStartFrame, SteeredFrame, SwitchEngineDeniedFrame,
   SystemFrame, TaskSpawnFrame, ThinkingFrame, TitleUpdatedFrame, TodoUpdateFrame,
@@ -60,6 +61,9 @@ export interface WsCallbacks {
   onTaskSpawn?: (data: TaskSpawnFrame) => void
   onDelegateSpawn?: (data: DelegateSpawnFrame) => void
   onDelegateResult?: (data: DelegateResultFrame) => void
+  /** The platform's own prompt into the viewed chat (a scheduled wake, the
+   *  resume after a move): the card, ahead of the turn it starts. */
+  onScheduleWake?: (data: ScheduleWakeFrame) => void
   // Per-subagent completion, keyed by tool_use_id (CLI: SubagentStop hook /
   // task_notification). Order-independent — no FIFO.
   onBgAgentDone?: (data: BgAgentDoneFrame) => void
@@ -155,6 +159,9 @@ export interface WsCallbacks {
   onQueueSent?: (data: QueueSentFrame) => void
   onSteered?: (data: SteeredFrame) => void
   onQuestion?: (data: QuestionFrame) => void
+  onSettingsCard?: (data: SettingsCardFrame) => void
+  onActionCard?: (data: ActionCardFrame) => void
+  onListCard?: (data: ListCardFrame) => void
   onToolResult?: (data: ToolResultFrame) => void
   onTitleUpdated?: (data: TitleUpdatedFrame) => void
   /** New history rows persisted for an interactive chat (transcript tail

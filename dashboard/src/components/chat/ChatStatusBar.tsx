@@ -6,6 +6,7 @@ import IconDropdown, { type IconDropdownGroup } from '../ui/IconDropdown'
 import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, POPOVER } from '../ui/classes'
 import { useDialogs } from '../ui/dialogs'
 import { emitAppToast } from '../../lib/appToasts'
+import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
 
 export interface ActiveAgent {
   id: string
@@ -269,9 +270,9 @@ export default function ChatStatusBar({
     return () => document.removeEventListener('mousedown', handler)
   }, [contextPopupOpen, costPopupOpen])
 
-  const fgAgents = activeAgents.filter(a => !a.background && a.type !== 'delegate' && a.type !== 'bgcommand')
-  const bgAgents = activeAgents.filter(a => a.background && a.type !== 'bgcommand')
-  const bgCommands = activeAgents.filter(a => a.type === 'bgcommand')
+  const fgAgents = activeAgents.filter(a => !a.background && a.type !== 'delegate' && a.type !== BG_COMMAND_BLOCK)
+  const bgAgents = activeAgents.filter(a => a.background && a.type !== BG_COMMAND_BLOCK)
+  const bgCommands = activeAgents.filter(a => a.type === BG_COMMAND_BLOCK)
   const delegatedAgents = activeAgents.filter(a => a.type === 'delegate')
   const hasActiveAgents = fgAgents.length > 0 || bgAgents.length > 0 || bgCommands.length > 0 || delegatedAgents.length > 0
 

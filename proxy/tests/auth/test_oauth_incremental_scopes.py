@@ -208,3 +208,51 @@ class TestPersistScopeUnion:
             label="alice@example.com",
         )
         assert data["scopes"] == _BASE + [_ANALYTICS]
+
+
+class TestAccumulatingGrants:
+    """A provider whose grants accumulate per app and person
+    (``grants_accumulate``): one login's file keeps the union its MCPs
+    asked for, and another login's file is never unioned."""
+
+    _OAUTH = {
+        "provider_id": "facebook",
+        "base_scopes": [],
+        "services": [{"key": "ads", "scopes": ["ads_read"]}],
+        "token_format": {"schema": "generic_oauth_v1"},
+    }
+
+    def _prior(self, tmp_path, account_id):
+        d = tmp_path / "facebook-tokens" / "alice"
+        d.mkdir(parents=True)
+        (d / "Ann.json").write_text(json.dumps({
+            "provider": "facebook", "account_id": account_id, "client_id": "cid",
+            "access_token": "at-old", "scopes": ["pages_show_list"], "extra": {},
+        }))
+
+    def _accumulating(self, monkeypatch):
+        from auth.oauth_providers.facebook import FacebookOAuthProvider
+        monkeypatch.setattr(FacebookOAuthProvider, "grants_accumulate", True, raising=False)
+
+    def test_the_same_login_keeps_the_union(self, monkeypatch, tmp_path):
+        self._accumulating(monkeypatch)
+        self._prior(tmp_path, "sub-1")
+        data = _persist(monkeypatch, tmp_path, provider_id="facebook", mcp_name="ads-mcp",
+                        services=["ads"], oauth_block=self._OAUTH, label="Ann")
+        assert data["scopes"] == ["ads_read", "pages_show_list"]
+
+    def test_another_login_is_never_unioned(self, monkeypatch, tmp_path):
+        self._accumulating(monkeypatch)
+        self._prior(tmp_path, "sub-other")
+        data = _persist(monkeypatch, tmp_path, provider_id="facebook", mcp_name="ads-mcp",
+                        services=["ads"], oauth_block=self._OAUTH, label="Ann")
+        assert data["scopes"] == ["ads_read"]
+
+    def test_without_the_trait_the_record_is_replaced(self, monkeypatch, tmp_path):
+        # A provider whose grants do not accumulate (Meta's do by default).
+        from auth.oauth_providers.facebook import FacebookOAuthProvider
+        monkeypatch.setattr(FacebookOAuthProvider, "grants_accumulate", False)
+        self._prior(tmp_path, "sub-1")
+        data = _persist(monkeypatch, tmp_path, provider_id="facebook", mcp_name="ads-mcp",
+                        services=["ads"], oauth_block=self._OAUTH, label="Ann")
+        assert data["scopes"] == ["ads_read"]

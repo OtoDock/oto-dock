@@ -6,3 +6,7 @@ proxy/core/layers/codex/codex_base_instructions.md -text
 # The vendored ONNX models: binary (an INT8 graph has no NUL in its first
 # bytes, so the text heuristic would diff and merge it line by line).
 *.onnx binary
+
+# The ECMA-376 schemas are copied unchanged from the standard (CRLF line
+# endings): byte-exact, and no whitespace check on them.
+mcps/custom/file-tools-mcp/ooxml/xsd/** -text -whitespace

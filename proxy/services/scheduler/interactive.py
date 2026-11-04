@@ -9,6 +9,7 @@ this package without the platform.
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 import config
 
@@ -48,6 +49,7 @@ async def _run_interactive_task(
     ``chat_messages`` by the time it fires, so the caller's ``lanes._collect_task_output``
     + ``update_run`` + delivery work unchanged."""
     from core.session import interactive_session
+    from core.session.transcript_tool_events import drop_sent_prompt, note_sent_prompt
 
     isess = interactive_session.get(session_id)
     if isess is None:
@@ -61,10 +63,15 @@ async def _run_interactive_task(
     # Register BEFORE injecting the prompt so no turn can complete unobserved.
     isess.on_turn_complete = _on_complete
     # Cold first prompt: Codex fresh delivered it via the launch argv (auto-runs
-    # after MCP warm); Claude needs the PTY flush (buffered behind the readiness
-    # gate until the TUI accepts input). A trailing CR submits.
+    # after MCP warm; noted where the argv was decided); Claude needs the PTY
+    # flush (buffered behind the readiness gate until the TUI accepts input).
+    # A trailing CR submits. The prompt's row is the run's, so the text is
+    # noted first and the transcript tailer skips the journaled copy; a write
+    # that did not happen takes the note back.
     if not first_prompt_in_argv:
-        isess.submit_prompt(prompt)
+        note_sent_prompt(chat_id, prompt, owner=session_id)
+        if not isess.submit_prompt(prompt):
+            drop_sent_prompt(chat_id, prompt, owner=session_id)
 
     # Wait for the turn-end signal — but FAIL FAST if the PTY dies (CLI crash /
     # idle reap) instead of hanging until the max-time backstop. Poll liveness
@@ -140,7 +147,9 @@ def borrow_terminal(chat_id: str):
     return live
 
 
-async def _run_borrowed_terminal_turn(isess, prompt: str) -> None:
+async def _run_borrowed_terminal_turn(
+    isess, prompt: str, *, persist_row: Callable[[], Awaitable[int]] | None = None,
+) -> int:
     """Drive a delegated follow-up through a LIVE interactive terminal the
     round did not spawn: queue the prompt for injection (steered into an
     open turn, pasted at quiescence otherwise) and wait for the first turn
@@ -148,20 +157,26 @@ async def _run_borrowed_terminal_turn(isess, prompt: str) -> None:
     satisfy it, since the waiter is armed by the injection hook, which the
     drain calls right after the paste with no yield in between. The tailer
     persists the turn, so the caller's output collection and delivery work
-    unchanged. A cancel drops the prompt if it is still queued and leaves
-    the terminal alone."""
+    unchanged; the prompt's own row (``persist_row``, the run's job) is
+    written from the same hook, after what the terminal produced before it
+    read the prompt, and the tailer skips the journaled copy (the queued
+    item is noted). Returns the row's id, 0 when none was written. A cancel
+    drops the prompt if it is still queued and leaves the terminal alone."""
     injected = asyncio.Event()
     done = asyncio.Event()
+    rows: list[Awaitable[int]] = []
 
     def _on_turn_end(_last_message: str) -> None:
         done.set()
 
     def _on_injected() -> None:
         injected.set()
+        if persist_row is not None:
+            rows.append(persist_row())
         isess.add_turn_end_waiter(_on_turn_end)
 
     item = isess.queue_prompt(
-        prompt, "delegate_continue", steer=True, chat_id=isess.chat_id,
+        prompt, "delegate_continue", steer=True, chat_id=isess.chat_id, note=True,
         on_injected=_on_injected,
     )
     if item is None:
@@ -175,7 +190,7 @@ async def _run_borrowed_terminal_turn(isess, prompt: str) -> None:
         while True:
             try:
                 await asyncio.wait_for(done.wait(), timeout=_STEP)
-                return
+                return (await rows[0]) if rows else 0
             except asyncio.TimeoutError as exc:
                 if not isess.alive:
                     raise _InteractiveSessionDied(

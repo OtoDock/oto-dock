@@ -27,28 +27,35 @@ def _key_sub(provider: str = "anthropic", **o) -> dict:
 
 
 @pytest.fixture
-def store(monkeypatch):
+def registry_store(monkeypatch):
+    """The mocked store with the registry's own providers."""
     m = MagicMock()
     m.get_user_allow_platform_auth.return_value = True
     m.get_credential_data.return_value = {}
     m.list_personal.return_value = []          # no personal sub unless a test sets one
     m.list_platform_pool.return_value = []     # tests populate the platform pool
     monkeypatch.setattr("services.engines.subscription_pool.subscription_store", m)
-    monkeypatch.setattr("config.get_model_provider", lambda model, layer="": {
-        "claude-sonnet-5": "anthropic",
-        "gpt-5.4-mini": "openai",
-        "qwen/qwen3.6-27b": "groq",
-    }.get(model, "anthropic"))
     monkeypatch.setattr("config.OTODOCK_RELAY_BASE", "https://api.otodock.io")
     from services.engines import subscription_pool
     subscription_pool._session_subscriptions.clear()
     return m
 
 
+@pytest.fixture
+def store(registry_store, monkeypatch):
+    m = registry_store
+    monkeypatch.setattr("config.get_model_provider", lambda model, layer="": {
+        "claude-sonnet-5": "anthropic",
+        "gpt-5.4-mini": "openai",
+        "qwen/qwen3.8-27b": "groq",
+    }.get(model, "anthropic"))
+    return m
+
+
 @pytest.mark.parametrize("model,provider,suffix", [
     ("claude-sonnet-5", "anthropic", "/v1/relay/anthropic"),
     ("gpt-5.4-mini", "openai", "/v1/relay/openai/v1"),
-    ("qwen/qwen3.6-27b", "groq", "/v1/relay/groq/v1"),
+    ("qwen/qwen3.8-27b", "groq", "/v1/relay/groq/v1"),
 ])
 def test_relay_resolves_per_provider_endpoint(store, monkeypatch, model, provider, suffix):
     from services.engines import subscription_pool
@@ -63,6 +70,40 @@ def test_relay_resolves_per_provider_endpoint(store, monkeypatch, model, provide
     assert env["_API_KEY"] == "TKN-user-1"            # minted per-user token
     assert env["_ENDPOINT_URL"] == "https://api.otodock.io" + suffix
     store.increment_active_sessions.assert_called_once_with(f"relay-{provider}")
+
+
+_RELAY_SUFFIX = {"anthropic": "/v1/relay/anthropic", "openai": "/v1/relay/openai/v1",
+                 "groq": "/v1/relay/groq/v1"}
+
+
+def _direct_builtins() -> list[str]:
+    import config
+    return [m for m, e in config.MODEL_REGISTRY.items() if "direct-llm" in e["layers"]]
+
+
+@pytest.mark.parametrize("model", _direct_builtins())
+def test_every_direct_builtin_resolves_to_its_relay_route(registry_store, monkeypatch, model):
+    # The registry's own provider for each Direct LLM builtin (GPT-6.1 Terra
+    # and Sol on OpenAI's route, Qwen 3.8 on Groq's): the hosted relay prices
+    # per model, so each one needs its relay row before a release lists it.
+    import config
+    from services.engines import subscription_pool
+    provider = config.MODEL_REGISTRY[model]["provider"]
+    registry_store.list_platform_pool.return_value = [_relay_sub(provider)]
+    monkeypatch.setattr("services.billing.relay_client.mint_session_token", lambda u: "TKN")
+
+    sub_id, env = subscription_pool.resolve_subscription_env("direct-llm", "user-1", model)
+
+    assert sub_id == f"relay-{provider}" and env["_PROVIDER"] == provider
+    assert env["_ENDPOINT_URL"] == "https://api.otodock.io" + _RELAY_SUFFIX[provider]
+
+
+def test_the_direct_builtins_are_exactly_the_relay_priced_set():
+    # a swap edits this set together with the relay's rows and the Direct LLM catalog table
+    assert set(_direct_builtins()) == {
+        "claude-sonnet-5-5", "claude-haiku-5-5", "gpt-6.1-sol", "gpt-6.1-terra",
+        "gpt-6-luna", "qwen/qwen3.8-27b", "openai/gpt-oss-120b",
+    }
 
 
 def test_byo_key_wins_over_relay(store, monkeypatch):

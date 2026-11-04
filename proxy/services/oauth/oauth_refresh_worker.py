@@ -378,14 +378,19 @@ def _user_sub_for(username: str) -> str:
 
 
 def _read_with_mtime(token_file: Path) -> tuple[dict | None, float]:
-    from services.oauth import oauth_account_store
-    raw = oauth_account_store._read_oauth_token(token_file)
-    if raw is None:
-        return None, 0.0
+    """The file and its mtime, both from one open file: a writer that
+    replaces the file between a read and a stat would pair the old content
+    with the new mtime, which ``_write_back``'s guard then accepts."""
     try:
-        return raw, token_file.stat().st_mtime
-    except OSError:
+        with open(token_file, encoding="utf-8") as fh:
+            mtime = os.fstat(fh.fileno()).st_mtime
+            raw = json.loads(fh.read())
+    except FileNotFoundError:
         return None, 0.0
+    except (OSError, ValueError):
+        logger.warning("Corrupt OAuth token file: %s", token_file)
+        return None, 0.0
+    return (raw, mtime) if isinstance(raw, dict) else (None, 0.0)
 
 
 def _write_back(token_file: Path, expected_mtime: float, payload: dict) -> float:
@@ -459,7 +464,122 @@ async def _maybe_refresh_token_file(
     return await _refresh_candidate(cand, _TickState())
 
 
-async def _refresh_candidate(cand: _Candidate, state: _TickState) -> bool:
+def renewable(raw: dict) -> bool:
+    """Whether the worker has a way to renew this file: an installation
+    (re-minted), client credentials with the client they were issued to
+    (re-exchanged), or a refresh token with its client (a hosted file or a
+    registered client needs no local secret); never a personal access
+    token. ``_refresh_locked`` returns early on the same rule; the relay's
+    availability is judged there at run time."""
+    extra = raw.get("extra") or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    flow = str(extra.get("flow") or "")
+    if flow == oauth_app_kinds.INSTALLATION_FLOW:
+        return True
+    if flow == "personal_access_token":
+        return False
+    from services.oauth import oauth_account_store
+    if flow != "client_credentials" and not raw.get("refresh_token"):
+        return False
+    if extra.get("via_relay") or flow == oauth_account_store.MCP_AUTHORIZATION_FLOW:
+        return True
+    return bool(raw.get("client_id") and raw.get("client_secret"))
+
+
+# What ``renew_now`` answers.
+RENEWED = "renewed"
+NOT_RENEWABLE = "not_renewable"
+GAVE_UP = "gave_up"
+NOT_NOW = "not_now"
+# One renewal out of turn per file at most this often: a server that refuses
+# a token its vendor has just issued costs 24 vendor calls a day at most.
+_FORCED_EVERY_S = 3600
+# path -> monotonic time of the last renewal out of turn (reserved before it runs)
+_forced_at: dict[str, float] = {}
+_FORCED_MEMO_MAX = 256
+
+
+def _token_file_parts(token_file: Path) -> tuple[str, str]:
+    """The username and the provider id a token file's path names
+    (``sessions/<provider>-tokens/<username>/<label>.json``)."""
+    return token_file.parent.name, token_file.parent.parent.name.removesuffix("-tokens")
+
+
+async def renew_now(token_file: Path, *, still) -> str:
+    """One renewal of ``token_file`` whatever its expiry, through the tick's
+    own path under the account lock: asked when the MCP server refused the
+    file's token. ``still(raw)`` must hold on the locked re-read (the file is
+    the one refused). Answers ``RENEWED``, ``NOT_RENEWABLE``, ``GAVE_UP``
+    (the worker marked the file dead) or ``NOT_NOW`` (no file, ``still``
+    failed, the backoff, the relay unreachable, a renewal out of turn of this
+    path within the hour, a failure, recorded in the backoff)."""
+    from services.oauth import oauth_account_store
+
+    key = str(token_file)
+    raw, mtime = await asyncio.to_thread(_read_with_mtime, token_file)
+    if raw is None or not still(raw):
+        return NOT_NOW
+    if oauth_account_store.token_dead_reason(raw):
+        return GAVE_UP
+    if not renewable(raw):
+        return NOT_RENEWABLE
+    now = _monotonic()
+    last = _forced_at.get(key)
+    if last is not None and now - last < _FORCED_EVERY_S:
+        return NOT_NOW
+    if len(_forced_at) >= _FORCED_MEMO_MAX:
+        for stale in [k for k, t in _forced_at.items() if now - t >= _FORCED_EVERY_S]:
+            _forced_at.pop(stale, None)
+    _forced_at[key] = now
+    username, provider_id = _token_file_parts(token_file)
+    cand = _Candidate(path=token_file, username=username, provider_id=provider_id,
+                      raw=raw, mtime=mtime, remaining=_parse_remaining(raw))
+    try:
+        done = await _refresh_candidate(cand, _TickState(), force=True, still=still)
+    except Exception as exc:  # noqa: BLE001  # as the tick's: any vendor failure backs off, never ends the caller
+        _record_refresh_failure(token_file, exc, mtime)
+        logger.warning("OAuth renewal after a refused call failed (provider %s): %s",
+                       provider_id, type(exc).__name__)
+        return NOT_NOW
+    if done:
+        logger.info("OAuth refresh worker renewed a token its MCP server refused (provider %s)",
+                    provider_id)
+        return RENEWED
+    after, _ = await asyncio.to_thread(_read_with_mtime, token_file)
+    return GAVE_UP if after is not None and oauth_account_store.token_dead_reason(after) else NOT_NOW
+
+
+async def rewrite(token_file: Path, change) -> bool:
+    """Rewrite a token file under its account lock (the key the connect,
+    the disconnect and the refresh take): ``change(raw)`` returns the new
+    content, or ``None`` for no write. The re-read and the guarded write
+    are the refresh's own; nothing is written while a refreshed token waits
+    for its write (the rewrite would make the tick drop it). Returns whether
+    the file was written."""
+    from core.credentials import credential_locks
+    from storage.pg import run_db
+
+    username, provider_id = _token_file_parts(token_file)
+    user_sub = await run_db(_user_sub_for, username) if username else ""
+    async with credential_locks.get_lock(user_sub or "_service", provider_id, token_file.stem):
+        if str(token_file) in _pending_writes:
+            return False
+        raw, mtime = await asyncio.to_thread(_read_with_mtime, token_file)
+        if raw is None:
+            return False
+        payload = change(raw)
+        if payload is None:
+            return False
+        try:
+            await asyncio.to_thread(_write_back, token_file, mtime, payload)
+        except (_WriteAborted, OSError):
+            return False
+    return True
+
+
+async def _refresh_candidate(cand: _Candidate, state: _TickState, *, force: bool = False,
+                             still=None) -> bool:
     from core.credentials import credential_locks
     from storage.pg import run_db
 
@@ -477,7 +597,7 @@ async def _refresh_candidate(cand: _Candidate, state: _TickState) -> bool:
         async with credential_locks.get_lock(
             user_sub or "_service", cand.provider_id, cand.path.stem,
         ):
-            return await _refresh_locked(cand, user_sub, state)
+            return await _refresh_locked(cand, user_sub, state, force=force, still=still)
 
     task = asyncio.ensure_future(_under_lock())
     _inflight.add(task)
@@ -485,9 +605,12 @@ async def _refresh_candidate(cand: _Candidate, state: _TickState) -> bool:
     return await asyncio.shield(task)
 
 
-async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) -> bool:
+async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState, *,
+                          force: bool = False, still=None) -> bool:
     """Under the account lock: the re-read is the source of every field, a
-    pending write is retried first, the arms dispatch, the write-back."""
+    pending write is retried first, the arms dispatch, the write-back.
+    ``force`` renews a file far from its expiry (``renew_now``), as long as
+    ``still`` holds on the re-read."""
     from auth.oauth_providers import get_provider
     from services.billing import relay_client
     from services.mcp import mcp_registry
@@ -515,10 +638,12 @@ async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) ->
             return True
         _pending_writes.pop(key, None)
 
+    if still is not None and not still(raw2):
+        return False
     if oauth_account_store.token_dead_reason(raw2):
         return False
     remaining = _parse_remaining(raw2)
-    if remaining is None or remaining > _refresh_threshold_for(provider_id):
+    if not force and (remaining is None or remaining > _refresh_threshold_for(provider_id)):
         return False
     if _in_backoff(token_file, mtime2):
         return False
@@ -546,19 +671,16 @@ async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) ->
         # Hosted token but the relay isn't reachable yet — can't refresh
         # without OtoDock's secret. Skip quietly; retry once the relay is live.
         return False
-    if flow_marker == "personal_access_token":
+    if not renewable(raw2):
+        # A personal access token, or nothing to refresh with (the vendor
+        # never returned a refresh token, or the client is unknown). Skip:
+        # the card says reconnect once it expires or its server refuses it.
         return False
     is_s2s = flow_marker == "client_credentials"
     is_registered = flow_marker == oauth_account_store.MCP_AUTHORIZATION_FLOW
     refresh_token = raw2.get("refresh_token") or ""
-    if not is_s2s and not refresh_token:
-        # Nothing to refresh with (vendor never returned a refresh_token, or
-        # it was lost). Skip — the card says reconnect once it expires.
-        return False
     client_id = raw2.get("client_id", "")
     client_secret = raw2.get("client_secret", "")
-    if not is_relay and not is_registered and (not client_id or not client_secret):
-        return False
 
     manifests = mcp_registry.get_mcps_by_provider(provider_id)
     arm = "mcp_authorization" if is_registered else "relay" if is_relay else "s2s" if is_s2s else "standard"
@@ -678,8 +800,9 @@ async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) ->
         return False
 
     logger.debug(
-        "Refreshed token: provider=%s user=%s account=%s flow=%s remaining_before=%.0fs",
-        provider_id, (user_sub or "_service")[:8], token_file.stem, arm, remaining,
+        "Refreshed token: provider=%s user=%s account=%s flow=%s remaining_before=%ss",
+        provider_id, (user_sub or "_service")[:8], token_file.stem, arm,
+        "none" if remaining is None else f"{remaining:.0f}",
     )
     _failure_state.pop(key, None)
     return True

@@ -7,8 +7,11 @@ execution layer.  User endpoints for connecting personal subscriptions.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import cast
 
+import psycopg
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -219,6 +222,35 @@ def _attach_windows(subs: list[dict]) -> None:
         s["windows"] = subscription_windows.to_public(w) if w else None
 
 
+# Rows whose credential could not be read, warned about once per process: the
+# chat page reads the user list on every focus.
+_login_read_warned: set[str] = set()
+
+
+def _attach_login_expiry(subs: list[dict]) -> None:
+    """Each OAuth row's login grant end (``login_expires_at``, ISO 8601 UTC,
+    ``None`` when the credential holds none), for the "Login ends in 2 days"
+    chip on both AI Engines cards. One credential read per OAuth row, what the
+    grant-health sweep pays per row every 15 minutes. Callers pass only rows
+    whose end the caller may see: the owner's own rows, the admin's lists."""
+    from services.infra.subscription_health import login_expiry_ms
+    for s in subs:
+        if s.get("auth_type") != "oauth" or not s.get("id"):
+            continue
+        sub_id = cast("str", s["id"])
+        s["login_expires_at"] = None
+        try:
+            ms = login_expiry_ms(subscription_store.get_credential_data(sub_id))
+            if ms:
+                s["login_expires_at"] = datetime.fromtimestamp(
+                    ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
+        except (psycopg.Error, InvalidToken, ValueError, OverflowError, OSError):
+            first = sub_id not in _login_read_warned
+            _login_read_warned.add(sub_id)
+            logger.log(logging.WARNING if first else logging.DEBUG,
+                       "login expiry: the credential of %s could not be read", sub_id[:8])
+
+
 @router.get("/v1/admin/execution-layers")
 async def admin_list_layers(user: UserContext = Depends(get_current_user)):
     """List all execution layers with subscriptions, models, and pool stats."""
@@ -241,6 +273,7 @@ async def admin_list_layers(user: UserContext = Depends(get_current_user)):
             for s in platform_subs:
                 s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
             _attach_windows(platform_subs)
+            _attach_login_expiry(platform_subs)
             # Count personal accounts (without exposing details)
             personal_subs = subscription_store.list_subscriptions(
                 layer=path, use_personal=True, include_disabled=True,
@@ -290,6 +323,7 @@ async def admin_list_subscriptions(
         for s in subs:
             s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
         _attach_windows(subs)
+        _attach_login_expiry(subs)
         return subs
 
     return {"subscriptions": await run_db(_job)}
@@ -905,6 +939,7 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
                 layer=path, owner_sub=user.sub, include_disabled=True,
             )
             _attach_windows(user_subs)
+            _attach_login_expiry(user_subs)
             # "Platform available" = the user may borrow a platform API credential here
             # (Platform Auth on AND a borrowable admin sub exists — NOT admin OAuth).
             platform_available = subscription_pool.borrowable_pool_available(path, user.sub)
@@ -927,6 +962,16 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
         return layers
 
     return {"layers": await run_db(_job)}
+
+
+@router.put("/v1/users/me/preferred-engine")
+async def user_set_preferred_engine(user: UserContext | None = Depends(get_current_user)):
+    """Gone: the engines a person sees follow their use
+    (``services/engines/engine_resolution.py``). Answers 410 for a
+    dashboard loaded before the update; the route goes at the next minor."""
+    require_auth(user)
+    raise HTTPException(410, "The preferred engine setting is gone. The engine picker lists "
+                             "your engines by how much you use them on each agent.")
 
 
 @router.post("/v1/users/me/execution-layers/{layer}/subscriptions")

@@ -76,7 +76,7 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   const [problems, setProblems] = useState<string[]>([])
   // An install whose tasks lost their model choice holds the dialog on what
   // it did, so the notes are read before the agent's page opens.
-  const [installed, setInstalled] = useState<{ slug: string; notes: string[] } | null>(null)
+  const [installed, setInstalled] = useState<{ slug: string; pins: string[]; department: string[] } | null>(null)
   // The consent (COMMUNITY-AGENTS-REGISTRY.md "Consent"): approve the
   // template's apps and checks at install — for every member's copy when
   // an admin installs, for the shared apps and one's own copy otherwise.
@@ -84,6 +84,10 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   // waits on that owner's card; the dialog says so per app.
   const [approveAll, setApproveAll] = useState(true)
   const [openDetails, setOpenDetails] = useState<Record<string, boolean>>({})
+  // The offer (the proxy's department_set_installer.offer_for): the template belongs to a set whose
+  // other members this person holds as standalone agents.
+  const [takeOffer, setTakeOffer] = useState(true)
+  const [offerName, setOfferName] = useState('')
 
   // The dialog opening, or its template changing while open, starts the
   // form over (in render, on the transition).
@@ -103,6 +107,8 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
       setVisibilityMode('personal_shared')
       setApproveAll(true)
       setOpenDetails({})
+      setTakeOffer(true)
+      setOfferName('')
       setError('')
       setProblems([])
       setInstalled(null)
@@ -118,6 +124,8 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   const previewChecks = mode === 'install' ? (preview.data?.checks ?? []) : []
   const consentScope = preview.data?.consent_scope ?? 'everyone'
   const hasConsentItems = previewApps.length > 0 || previewChecks.length > 0
+  const offer = mode === 'install' ? preview.data?.set ?? null : null
+  const offerDepartmentName = offerName || offer?.name || ''
 
   const installing = createAgent.isPending || installAgent.isPending
 
@@ -182,10 +190,12 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
           target_slug: attemptSlug,
           display_name: cleanName,
           ...consent,
+          ...(offer && takeOffer ? { department_set: { slug: offer.slug, name: offerDepartmentName.trim() } } : {}),
         })
-        const notes = taskPinNotes(result)
-        if (notes.length > 0) {
-          setInstalled({ slug: result.agent_slug, notes })
+        const pins = taskPinNotes(result)
+        const department = result.department_lines ?? []
+        if (pins.length > 0 || department.length > 0) {
+          setInstalled({ slug: result.agent_slug, pins, department })
           return
         }
         openAgent(result.agent_slug)
@@ -220,12 +230,19 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
         panelClassName={`${DIALOG_PANEL} p-6 max-w-lg max-h-[90vh] overflow-y-auto`}
       >
         <h3 id="agent-install-title" className="text-sm font-semibold text-primary mb-3">Agent installed</h3>
-        <div className="text-xs mb-4" data-testid="install-pins-dropped">
-          <div className="font-medium text-primary mb-1">{TASK_PINS_HEADING}</div>
-          <ul className="list-disc pl-5 space-y-0.5 text-secondary">
-            {installed.notes.map((n, i) => <li key={i}>{n}</li>)}
+        {installed.department.length > 0 && (
+          <ul className="text-xs mb-4 space-y-0.5 text-secondary" data-testid="install-department">
+            {installed.department.map((n, i) => <li key={i}>{n}</li>)}
           </ul>
-        </div>
+        )}
+        {installed.pins.length > 0 && (
+          <div className="text-xs mb-4" data-testid="install-pins-dropped">
+            <div className="font-medium text-primary mb-1">{TASK_PINS_HEADING}</div>
+            <ul className="list-disc pl-5 space-y-0.5 text-secondary">
+              {installed.pins.map((n, i) => <li key={i}>{n}</li>)}
+            </ul>
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <Button variant="secondary" size="md" onClick={onClose}>
             Close
@@ -462,6 +479,35 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                 ? 'Unticked, each app waits for approval on its card. Each check is offered, not mandatory.'
                 : 'Each app will wait for approval on its card. Each check will be offered, not mandatory.'}
             </p>
+          </div>
+        )}
+
+        {/* The offer: the set's department for this agent and the standalone members */}
+        {mode === 'install' && offer && (
+          <div className="mb-4 rounded-card border border-subtle p-3 text-xs" data-testid="install-offer">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={takeOffer}
+                onChange={e => setTakeOffer(e.target.checked)}
+                className="mt-0.5 accent-action"
+                data-testid="install-offer-checkbox"
+              />
+              <span className="text-primary">
+                {offer.members.length === 1
+                  ? `Create the ${offer.name} department and add both agents to it?`
+                  : `Create the ${offer.name} department and add all ${offer.members.length + 1} agents to it?`}
+              </span>
+            </label>
+            <p className="mt-1 text-secondary">
+              {offer.members.map(m => m.display_name).join(', ')} {offer.members.length === 1 ? 'is' : 'are'} installed from the same set and in no department. The head&apos;s library is shared with the team.
+            </p>
+            {takeOffer && (
+              <div className="mt-2">
+                <label className="block font-medium text-secondary mb-1" htmlFor="offer-dept-name">Department name</label>
+                <Input id="offer-dept-name" type="text" value={offerDepartmentName} onChange={e => setOfferName(e.target.value)} />
+              </div>
+            )}
           </div>
         )}
 

@@ -142,7 +142,9 @@ describe('a background review in the history', () => {
       row('event', '', 'schedule_wake', { prompt: 'Check the log.' }),
       row('assistant', 'The log is clean.'),
     ], [])
-    expect(msgs.map((m) => !!m.continuation)).toEqual([false, false])
+    // The wake is its own card between the two replies, none joined.
+    expect(msgs.map((m) => !!m.continuation)).toEqual([false, false, false])
+    expect(msgs[1].delegateCard?.kind).toBe('wake')
   })
 
   it('reads the nudge in words by its kind and count', () => {

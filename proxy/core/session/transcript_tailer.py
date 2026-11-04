@@ -7,6 +7,11 @@ and appends new **user/assistant text, thinking and tool events** to
 ``chat_messages`` for dashboard visibility. (Resume itself uses the CLI's own
 ``--resume`` off the same JSONL, so it does not depend on this.)
 
+An assistant text written right before a tool call (its message stopped on
+``tool_use``) and a narration block (``_is_narration``) persist as progress
+notes: the assistant row with the pump's ``event_data`` (``NOTE_ROW``), so a
+terminal chat's history draws them as a standard chat's does.
+
 Tool events persist as the SAME ``role="event"`` rows the headless pump writes
 (``stream_pump._save_turn_blocks``) so the dashboard's existing cards re-render
 an interactive chat with no frontend changes: ``tool_use``/``tool_result``
@@ -46,6 +51,7 @@ usage is claimed once per message id.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -58,6 +64,7 @@ from typing import Any
 from core.session.history_seed import strip_seed_prefix
 from core.session.session_state import SubagentRegistry, get_subagent_registry
 from core.session.transcript_tool_events import (
+    NOTE_ROW,
     TailLocks,
     ToolEventBuffer,
     attach_result,
@@ -66,6 +73,12 @@ from core.session.transcript_tool_events import (
     persist_event,
     record_batch_usage,
     truncate_result,
+)
+from storage.chat.chat_titles import (
+    COMMAND_TAG_START_RE,
+    COMMAND_TAGS,
+    remove_tag_blocks,
+    title_from_prompt,
 )
 from ws import wire_events as wire
 
@@ -76,6 +89,8 @@ logger = logging.getLogger("otodock.transcript_tailer")
 # tailers report the same): a prompt opened one, or a tool call is under way.
 SIGNAL_PROMPT = "user"
 SIGNAL_TOOL_USE = "tool_use"
+# The API's stop reason of a message that ended on a tool call.
+_STOP_ON_TOOL = "tool_use"
 
 
 def line_time(obj: dict) -> float | None:
@@ -207,56 +222,14 @@ def resolve_and_tail(session_id: str, chat_id: str) -> dict:
     return tail_transcript(session_id, chat_id, path)
 
 
-# Injected prelude line(s) — the `[Current time: ...]` stamp, the viewer
-# focus line (APPS.md "Live apps") and the parallel-activity line
-# (``sibling_awareness``) the platform prepends to interactive prompts; the
-# PTY transcript persists them verbatim. Twin of the dashboard's
-# transcriptCleanup.ts matcher: start-anchored exact shapes only, ending in
-# a line break or, on a single-lined satellite prompt, in spaces.
-_TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
-    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]'
-    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
-)
-
-# Twin of ``ws/dashboard_chat._APP_ACTION_HEADER_RE`` — see there.
-_APP_ACTION_HEADER_RE = re.compile(
-    r'^\[action from (?:mini-)?app "(.{1,200}?)" — (.{1,80}?)\]'
-)
-
-
 def _title_from_prompt(text: str) -> str:
-    """Deterministic chat title from the first user message — mirrors
-    ``ws/dashboard.py:_deterministic_title`` (first ~6 words / 48 chars,
-    whitespace-collapsed, ellipsis if truncated). Interactive chats can't title
-    at send-time (the prompt rides the PTY, not the pump's ``_persist_first_prompt``),
-    so the tailer backfills it from the transcript on the first read. Injected
-    ``[Current time: ...]`` stamps are dropped first; a prompt with nothing
-    user-authored left returns "" so the chat stays untitled for the next real
-    prompt (callers skip the empty title)."""
-    out = text or ""
-    while True:
-        stripped = _TIME_PRELUDE_RE.sub("", out, count=1)
-        if stripped == out:
-            break
-        out = stripped
-    # Mini-app action framing (typed into interactive terminals by the
-    # dashboard) titles as "App — Label" — twin of the recognizer in
-    # ``ws/dashboard_chat._APP_ACTION_HEADER_RE``.
-    m = _APP_ACTION_HEADER_RE.match(out)
-    if m:
-        out = f"{m.group(1)} — {m.group(2)}"
-    cleaned = " ".join(out.split())
-    if not cleaned:
-        return ""
-    words = cleaned.split(" ")
-    title = " ".join(words[:6])
-    cut = len(words) > 6
-    if len(title) > 48:
-        title = title[:48].rstrip()
-        cut = True
-    return title + ("…" if cut else "")
+    """The default title of an interactive chat from its first user row:
+    the chat can't title at send time (the prompt rides the PTY, not the
+    pump's ``_persist_first_prompt``), so the tailer backfills it from the
+    transcript on the first read. "" when the row holds nothing a person
+    wrote, so the chat stays untitled for the next real prompt (callers skip
+    the empty title)."""
+    return title_from_prompt(text)
 
 
 def _extract_text(content) -> str:
@@ -272,6 +245,95 @@ def _extract_text(content) -> str:
     return ""
 
 
+# A narration block (the server's summary of the prose the model wrote
+# between tool calls, sent as a thinking block) is tagged inside its
+# signature: base64 of a protobuf whose field 2 holds a field 1 holding the
+# block kind as field 8. Claude Code reads it this very way to fill the
+# stream's ``narration_block_indexes`` (its ``atob``, a walk that answers no
+# on a message that does not parse whole, the last occurrence of a field
+# winning), so the transcript says what the stream said. Real signatures run
+# about 1,000 to 1,400 characters; the cap bounds the walk under the lock.
+_SIGNATURE_MAX_CHARS = 16 * 1024
+_SIGNATURE_KIND_PATH = (2, 1, 8)
+_NARRATION_KIND = b"narration"
+_ATOB_SPACE_RE = re.compile(r"[\t\n\f\r ]")
+_ATOB_ALPHABET_RE = re.compile(r"[A-Za-z0-9+/]*")
+
+
+def _atob(text: str) -> bytes | None:
+    """``atob`` (the forgiving base64 decode), or None where it throws."""
+    s = _ATOB_SPACE_RE.sub("", text)
+    if len(s) % 4 == 0:
+        s = s[:-2] if s.endswith("==") else s[:-1] if s.endswith("=") else s
+    if len(s) % 4 == 1 or not _ATOB_ALPHABET_RE.fullmatch(s):
+        return None
+    try:
+        return base64.b64decode(s + "=" * (-len(s) % 4), validate=True)
+    except ValueError:
+        return None
+
+
+def _varint(buf: memoryview, i: int) -> tuple[int, int] | None:
+    """A protobuf varint at ``i`` (ten bytes at most): (value, next index)."""
+    value = 0
+    for n in range(10):
+        if i >= len(buf):
+            return None
+        byte = buf[i]
+        i += 1
+        value |= (byte & 0x7F) << (7 * n)
+        if not byte & 0x80:
+            return value, i
+    return None
+
+
+def _proto_field(buf: memoryview, number: int) -> memoryview | None:
+    """The last length-delimited value of field ``number`` in one protobuf
+    message, or None when the message does not parse whole."""
+    found = None
+    i = 0
+    while i < len(buf):
+        key = _varint(buf, i)
+        if key is None:
+            return None
+        tag, i = key
+        wire_type = tag & 7
+        if wire_type == 0:
+            value = _varint(buf, i)
+            if value is None:
+                return None
+            i = value[1]
+        elif wire_type == 2:
+            length = _varint(buf, i)
+            if length is None or length[0] > len(buf) - length[1]:
+                return None
+            size, i = length
+            if tag >> 3 == number:
+                found = buf[i:i + size]
+            i += size
+        elif wire_type in (1, 5):
+            i += 8 if wire_type == 1 else 4
+            if i > len(buf):
+                return None
+        else:
+            return None
+    return found
+
+
+def _is_narration(block: dict) -> bool:
+    """A thinking block whose signature names it a narration block."""
+    sig = block.get("signature")
+    if not isinstance(sig, str) or not sig or len(sig) > _SIGNATURE_MAX_CHARS:
+        return False
+    raw = _atob(sig)
+    if raw is None:
+        return False
+    part: memoryview | None = memoryview(raw)
+    for number in _SIGNATURE_KIND_PATH:
+        part = _proto_field(part, number) if part is not None else None
+    return part is not None and part.tobytes() == _NARRATION_KIND
+
+
 def _tool_result_blocks(content) -> list[dict]:
     """The tool_result blocks of a user message's content (empty for prompts)."""
     if not isinstance(content, list):
@@ -282,29 +344,23 @@ def _tool_result_blocks(content) -> list[dict]:
     ]
 
 
-# Slash-command noise: Claude Code writes local command invocations and their
-# output into the transcript as user messages wrapped in these tags, and
-# ``/context`` reports as a raw ``## Context Usage`` markdown dump. Twin of the
-# dashboard's transcriptCleanup.ts matcher (which hides pre-existing rows
-# render-side): recognized only when the message STARTS with a wrapper tag or
-# is a structural context report — pasted markdown mid-message never matches.
-_COMMAND_TAG_RE = re.compile(
-    r"<(command-name|command-message|command-args|local-command-stdout)>"
-    r"[\s\S]*?</\1>"
-)
-_COMMAND_TAG_START_RE = re.compile(
-    r"^<(command-name|command-message|command-args|local-command-stdout)>"
-)
-
-
 def _strip_command_noise(text: str) -> str | None:
     """Filter slash-command noise from a user message before it persists.
+
+    Claude Code writes local command invocations and their output into the
+    transcript as user messages wrapped in ``chat_titles.COMMAND_TAGS``, and
+    ``/context`` reports as a raw ``## Context Usage`` markdown dump. Twin of
+    the dashboard's transcriptCleanup.ts matcher (which hides pre-existing rows
+    render-side): recognized only when the message STARTS with a wrapper tag
+    or is a structural context report — pasted markdown mid-message never
+    matches. The blocks go through the linear ``remove_tag_blocks``: every
+    terminal user row passes here.
 
     Returns the text to persist, or ``None`` when nothing user-authored
     remains (pure command record / context report) and the row is skipped."""
     trimmed = (text or "").strip()
-    if _COMMAND_TAG_START_RE.match(trimmed):
-        remainder = _COMMAND_TAG_RE.sub("", trimmed).strip()
+    if COMMAND_TAG_START_RE.match(trimmed):
+        remainder = remove_tag_blocks(trimmed, COMMAND_TAGS).strip()
         return remainder or None
     if trimmed.startswith("## Context Usage") and "**Tokens:**" in trimmed:
         return None
@@ -506,7 +562,7 @@ class _LineBatch:
     # dedup guard, so pre-existing history never counts.
     assistant_chars: int = 0
     tool_rows: int = 0  # persisted "tool"/"task_spawn" event rows (result-paired)
-    first_user_text: str | None = None  # for the chat-title backfill (below)
+    first_user_text: str | None = None  # the first row that titles: the chat-title backfill (below)
     # Turn-end signal for the interactive completion watcher: an assistant
     # message with stop_reason=="end_turn" is the turn
     # boundary (vs "tool_use" = more tools coming). Track the LAST assistant
@@ -762,11 +818,14 @@ def _user_line(b: _LineBatch, obj: dict, content) -> None:
         _drop_dialogs(b)
         b.last_signal = "user"
         b.last_signal_at = line_time(obj)
-        if b.first_user_text is None:
+        # The batch's first user row that titles anything: a photo alone
+        # (marks and the attachments block) leaves the title to the next.
+        if b.first_user_text is None and _title_from_prompt(cleaned):
             b.first_user_text = cleaned
         if consume_sent_prompt(b.chat_id, cleaned):
-            # The dashboard warmup already persisted this exact prompt
-            # at send-time — skip the row, keep the turn signal/title.
+            # A prompt whose row exists (the dashboard's own send, a
+            # prompt the platform typed), matched by its typed key: skip
+            # the journaled copy, keep the turn signal and the title.
             return
         b.task_store.add_chat_message(
             b.chat_id, "user", cleaned,
@@ -805,6 +864,11 @@ def _assistant_line(b: _LineBatch, obj: dict, msg: dict, content: list) -> None:
         acc["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
         acc["cache_write"] += int(usage.get("cache_creation_input_tokens") or 0)
     msg_text_parts: list[str] = []
+    # The CLI writes a message's lines once the message has ended, each with
+    # its stop reason: a text of a message that stopped on a tool call is the
+    # words right before that call, a progress note (the translator's note
+    # mark, ``_handle_content_block_start``). Any other text stays the answer.
+    note = msg.get("stop_reason") == _STOP_ON_TOOL
     for bi, block in enumerate(content):
         if not isinstance(block, dict):
             continue
@@ -823,7 +887,8 @@ def _assistant_line(b: _LineBatch, obj: dict, msg: dict, content: list) -> None:
                 if luid and not b.buf.claim(f"text:{luid}:{bi}"):
                     continue
                 b.task_store.add_chat_message(b.chat_id, "assistant", text,
-                                            sync_search=False)
+                                              event_data=NOTE_ROW if note else "",
+                                              sync_search=False)
                 b.persisted += 1
                 b.message_rows += 1
                 b.assistant_chars += len(text)
@@ -839,8 +904,18 @@ def _assistant_line(b: _LineBatch, obj: dict, msg: dict, content: list) -> None:
                 luid = obj.get("uuid") or ""
                 if luid and not b.buf.claim(f"think:{luid}:{bi}"):
                     continue
-                persist_event(b.task_store, b.chat_id,
-                              {"type": wire.THINKING, "content": t})
+                if _is_narration(block):
+                    # The translator re-sends a narration block as note
+                    # text and the pump keeps no thinking row for it. Its
+                    # words stay out of the batch's last message, which
+                    # is the answer's.
+                    b.task_store.add_chat_message(b.chat_id, "assistant", t,
+                                                  event_data=NOTE_ROW, sync_search=False)
+                    b.message_rows += 1
+                    b.assistant_chars += len(t)
+                else:
+                    persist_event(b.task_store, b.chat_id,
+                                  {"type": wire.THINKING, "content": t})
                 b.persisted += 1
         elif btype == "tool_use":
             b.persisted += _on_tool_use(b.buf, b.reg, b.task_store, b.chat_id,
@@ -880,15 +955,16 @@ def _finish_batch(b: _LineBatch) -> dict:
     # Backfill the chat title from the first user prompt — interactive chats
     # can't title at send-time (the prompt rides the PTY). Only when still
     # untitled, so we never overwrite an existing title and it's idempotent
-    # across batches (a later batch finds the title already set).
+    # across batches (a later batch finds the title already set). The write
+    # is conditional itself: a rename landing between the read and the write
+    # wins. The read stays for the broadcast's owner and agent.
     title_set = False
     if b.first_user_text and b.chat_id:
         try:
             rec = b.task_store.get_chat(b.chat_id)
             if rec and not (rec.get("title") or "").strip():
                 new_title = _title_from_prompt(b.first_user_text)
-                if new_title:
-                    b.task_store.update_chat(b.chat_id, title=new_title)
+                if new_title and b.task_store.set_chat_title_if_unset(b.chat_id, new_title):
                     title_set = True
                     # Push to the user's dashboards so the sidebar updates now
                     # (vs waiting for a navigation refetch). Best-effort.

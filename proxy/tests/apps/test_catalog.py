@@ -156,7 +156,10 @@ def test_tasks_and_trigger_fires_snapshots_hide_other_users_personal_rows():
     private_task = str(uuid.uuid4())
     task_store.create_dynamic_task(private_task, AGENT, "Private T", "do", "auto", "trigger", None,
                                    None, None, 300, OTHER, scope="user", notification_mode="none")
+    # Below the editor tier the agent's own rows are not in the slice.
     _as(_user(VIEWER, agent_roles={AGENT: "viewer"}))
+    assert client.get(f"/v1/apps/{row['id']}/catalog/tasks").json()["rows"] == []
+    _as(_user(VIEWER, agent_roles={AGENT: "editor"}))
     rows = client.get(f"/v1/apps/{row['id']}/catalog/tasks").json()["rows"]
     assert [t["name"] for t in rows] == ["Shared T"]
     assert rows[0]["last_run"] is None
@@ -472,13 +475,17 @@ def test_checks_snapshot_lists_the_checks_with_their_last_verdict_in_the_viewers
     assert coding["last_verdict"]["status"] == "fail" and coding["last_verdict"]["chat_id"] == "chat-1"
     assert "doc" not in coding and "script" not in coding and "problems" not in coding
     assert by_id["agent:broken"]["broken"] is True and by_id["agent:broken"]["last_verdict"] is None
-    # A member sees the agent's sound checks and their own private one, with
-    # the agent-scope verdict as the last (the other person's is not theirs).
-    _as(_user(VIEWER, agent_roles={AGENT: "viewer"}))
+    # An editor sees the agent's sound checks and their own private one, with
+    # the agent-scope verdict as the last (the other person's is not theirs);
+    # below the editor tier the agent's own verdicts are not theirs either.
+    _as(_user(VIEWER, agent_roles={AGENT: "editor"}))
     rows = client.get(f"/v1/apps/{row['id']}/catalog/checks").json()["rows"]
     by_id = {r["id"]: r for r in rows}
     assert set(by_id) == {"agent:coding", "user:coding"}
     assert by_id["agent:coding"]["last_verdict"]["status"] == "pass"
+    _as(_user(VIEWER, agent_roles={AGENT: "viewer"}))
+    by_id = {r["id"]: r for r in client.get(f"/v1/apps/{row['id']}/catalog/checks").json()["rows"]}
+    assert by_id["agent:coding"]["last_verdict"] is None
     assert by_id["user:coding"]["owner"] == "catviewer" and by_id["user:coding"]["mandatory"] is False
     assert by_id["user:coding"]["last_verdict"] is None
 
@@ -539,11 +546,70 @@ def test_agent_feeds_answer_nothing_to_a_grantee_who_is_not_a_member():
         r = client.get(f"/v1/apps/{row['id']}/catalog/{feed}")
         assert r.status_code == 200, r.text
         assert r.json()["rows"] == [], feed
-    # A member reads the members' slice as before.
+    # A member reads the members' slice: the pool's human chats, and the
+    # agent's own tasks and triggers at the editor tier only.
     _as(_user(VIEWER, agent_roles={AGENT: "viewer"}))
     assert [c["id"] for c in client.get(f"/v1/apps/{row['id']}/catalog/sessions").json()["rows"]] \
         == [pool_chat]
+    assert client.get(f"/v1/apps/{row['id']}/catalog/tasks").json()["rows"] == []
+    _as(_user(VIEWER, agent_roles={AGENT: "editor"}))
     assert [t["name"] for t in client.get(f"/v1/apps/{row['id']}/catalog/tasks").json()["rows"]] \
         == ["Shared T"]
     assert [t["name"] for t in client.get(f"/v1/apps/{row['id']}/catalog/trigger_fires").json()["rows"]] \
         == ["Hook"]
+
+
+def test_the_agents_own_work_reaches_the_editor_tier_through_the_feeds(monkeypatch):
+    """A socket subscribes to any (agent, feed) pair without an app, so the
+    floor is on the deltas' targets: an agent-scope run's ``tasks`` delta, a
+    trigger's fire and an agent-scope verdict reach the editor tier, never a
+    viewer subscribed to the same feeds. ``tasks.run_result`` refuses an
+    agent-scope run below the tier, and the ``sessions`` snapshot leaves a
+    Shared-only pool's delegated workers out of a viewer's slice."""
+    from storage.agents import agent_store
+    task_store.add_user_agent(OTHER, AGENT, "editor", "test")
+    nm.reset_audience_cache()
+    feeds = ("tasks", "trigger_fires", "check_verdicts")
+    viewer, editor = _connect(VIEWER, feeds), _connect(OTHER, feeds)
+    catalog.install(asyncio.new_event_loop())  # the run hook, whichever worker runs this
+    catalog._loop = None
+    tid = str(uuid.uuid4())
+    task_store.create_dynamic_task(tid, AGENT, "T", "do", "auto", "trigger", None, None, None, 300,
+                                   OWNER, scope="agent", notification_mode="none")
+    task_store.create_run("run-own", tid, AGENT, "manual", None, "do", scope="agent", created_by=OWNER)
+    nm.agent_audience(AGENT)  # the cache filled off the loop (a test has none)
+    task_store.update_run("run-own", status="completed", completed_at="2026-10-27T00:00:00+00:00")
+    catalog.trigger_fired({"id": "trg-1", "agent": AGENT, "scope": "agent", "name": "Hook"}, None)
+    catalog.verdict_landed({"id": "v-1", "check_name": "coding", "status": "pass"}, AGENT, "")
+
+    def _feeds(q):
+        return {f["feed"] for f in _drain(q) if f["type"] == "catalog"}
+    assert _feeds(editor) == set(feeds)
+    assert _feeds(viewer) == set()
+    # The method answers as the viewer: an agent-scope run is not theirs.
+    row = _shared_app([_method("tasks.run_result"), _feed("sessions")])
+    apps_api._fire_rate.clear()
+    _as(_user(VIEWER, agent_roles={AGENT: "viewer"}))
+    out = client.post(f"/v1/apps/{row['id']}/catalog/tasks.run_result",
+                      json={"args": {"run_id": "run-own"}}).json()
+    assert out["ok"] is False and "not your run" in out["reason"]
+    _as(_user(OTHER, agent_roles={AGENT: "editor"}))
+    apps_api._fire_rate.clear()
+    out = client.post(f"/v1/apps/{row['id']}/catalog/tasks.run_result",
+                      json={"args": {"run_id": "run-own"}}).json()
+    assert out["ok"] is True and out["result"]["status"] == "completed"
+    # A Shared-only pool: a delegated worker (an agent-scope run) is the
+    # agent's work, the human chat is every member's.
+    from core.session.visibility import shared_chat_owner
+    agent_store.create_agent(AGENT, "Catalog", collaborative=False, default_scope="agent")
+    human, worker = str(uuid.uuid4()), str(uuid.uuid4())
+    task_store.create_chat(human, shared_chat_owner(AGENT), AGENT)
+    task_store.create_chat(worker, shared_chat_owner(AGENT), AGENT)
+    task_store.create_run("run-w", tid, AGENT, "delegate", None, "do", scope="agent", created_by=OWNER)
+    task_store.update_run("run-w", chat_id=worker)
+    _as(_user(VIEWER, agent_roles={AGENT: "viewer"}))
+    ids = {c["id"] for c in client.get(f"/v1/apps/{row['id']}/catalog/sessions").json()["rows"]}
+    assert human in ids and worker not in ids
+    _as(_user(OTHER, agent_roles={AGENT: "editor"}))
+    ids = {c["id"] for c in client.get(f"/v1/apps/{row['id']}/catalog/sessions").json()["rows"]}
+    assert {human, worker} <= ids

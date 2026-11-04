@@ -149,6 +149,117 @@ class TestUnauthorizedRegistryListing:
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Registry: the platform-attached mode (call-control on every call)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestPlatformAttachedMode:
+    """``assignment_mode: "platform"``: the platform attaches the MCP to the
+    sessions that need it (``extra_mcps``); nobody assigns, enables or
+    requests it."""
+
+    def _manifests(self):
+        from services.mcp import mcp_registry
+        mcp_registry.scan_manifests()
+        real = mcp_registry.get_manifest("call-control-mcp")
+        if real is None:
+            pytest.skip("call-control-mcp manifest not present in this checkout")
+        return real, {
+            "call-control-mcp": real,
+            "schedules-like": _stub_manifest("schedules-like", "auto", "core"),
+        }
+
+    def test_the_shipped_call_control_manifest_is_platform_attached(self):
+        from services.mcp import mcp_manifest_types as mt
+        real, _ = self._manifests()
+        assert real.assignment_mode == mt.ASSIGNMENT_PLATFORM
+
+    def test_it_is_not_a_core_mcp_every_agent_gets(self):
+        from services.mcp import mcp_registry
+        _, manifests = self._manifests()
+        with patch.object(mcp_registry, "_manifests", manifests):
+            assert mcp_registry.core_mcp_names() == ["schedules-like"]
+
+    def test_it_is_neither_visible_nor_requestable(self, temp_db):
+        from services.mcp import mcp_registry
+        from storage.mcp import mcp_store
+        _, manifests = self._manifests()
+        mcp_store.set_mcp_enabled("call-control-mcp", True)
+        mcp_store.set_mcp_enabled("schedules-like", True)
+        with patch.object(mcp_registry, "_manifests", manifests):
+            visible = [m.name for m in mcp_registry.get_visible_mcps_for_agent("a1")]
+            requestable = mcp_registry.get_unauthorized_explicit_mcps_for_agent("a1")
+        assert visible == ["schedules-like"]
+        assert requestable == []
+
+    def test_a_stray_agent_row_never_loads_it(self, temp_db):
+        from services.mcp import mcp_registry
+        from storage.mcp import mcp_store
+        _, manifests = self._manifests()
+        _seed_agent("a1")
+        mcp_store.set_mcp_enabled("call-control-mcp", True)
+        mcp_store.add_agent_mcp("a1", "call-control-mcp")
+        with patch.object(mcp_registry, "_manifests", manifests):
+            assert [m.name for m in mcp_registry.get_agent_mcps("a1")] == []
+
+    def test_a_call_session_still_attaches_it_by_name(self):
+        from core.placement import LOCAL_PLACEMENT
+        from services.mcp import mcp_registry
+        real, manifests = self._manifests()
+        assigned: list = []
+        reasons: dict = {}
+        with patch.object(mcp_registry, "_manifests", manifests):
+            mcp_registry._force_include(assigned, ["call-control-mcp"], reasons, LOCAL_PLACEMENT)
+        assert assigned == [real] and reasons == {}
+
+
+class TestPlatformAttachedRequests:
+    """Nobody requests a platform-attached MCP: the request route refuses it,
+    and a request made before (1.9.0 offered call-control as requestable)
+    stays pending when the admin approves it, with no row and no notice."""
+
+    def test_the_request_route_refuses_it(self, temp_db):
+        _seed_agent()
+        from api.mcp.community import CreateRequestBody, create_mcp_request
+        from services.mcp import mcp_manifest_types as mt
+        from storage.mcp import mcp_request_store
+
+        with patch(
+            "services.mcp.mcp_registry.get_manifest",
+            side_effect=lambda n: _stub_manifest(n, "platform", "core") if n == "call-control-mcp" else None,
+        ):
+            with pytest.raises(HTTPException) as refused:
+                asyncio.run(create_mcp_request(
+                    "test-agent",
+                    CreateRequestBody(mcp_name="call-control-mcp", reason="calls"),
+                    user=_manager_ctx(),
+                ))
+        assert refused.value.status_code == 409
+        assert refused.value.detail == mt.PLATFORM_NOT_REQUESTABLE
+        assert mcp_request_store.list_requests_for_agent("test-agent") == []
+
+    def test_an_old_request_is_not_approved(self, temp_db):
+        _seed_agent()
+        from services.community import community_installer
+        from services.mcp import mcp_manifest_types as mt
+        from storage.mcp import mcp_request_store, mcp_store
+
+        row = mcp_request_store.create_request("call-control-mcp", "test-agent", REQUESTER_SUB)
+        notify = AsyncMock()
+        with patch(
+            "services.community.community_installer.mcp_registry.get_manifest",
+            return_value=_stub_manifest("call-control-mcp", "platform", "core"),
+        ), patch("services.notifications.notification_manager.fire_notification", new=notify):
+            with pytest.raises(HTTPException) as refused:
+                asyncio.run(community_installer.approve_request(row["id"], ADMIN_SUB))
+        assert refused.value.status_code == 409
+        assert refused.value.detail == mt.PLATFORM_NOT_REQUESTABLE
+        assert mcp_request_store.get_request(row["id"])["status"] == "pending"
+        assert "call-control-mcp" not in mcp_store.get_manager_enabled_mcps("test-agent")
+        notify.assert_not_called()
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Endpoint: include_unauthorized param
 # ───────────────────────────────────────────────────────────────────────────
 

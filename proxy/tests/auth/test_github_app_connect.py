@@ -717,8 +717,8 @@ class FakeRelay:
             return {"ok": True}
         raise relay_client.RelayError("http_404")
 
-    async def post(self, path: str, payload: dict) -> dict:
-        return self.answer(path, payload)
+    async def post(self, path: str, payload: dict, *, sign_with: str = "") -> dict:
+        return self.answer(path, {**payload, "signed": bool(sign_with)})
 
     def bodies(self, path: str) -> list[dict]:
         return [body for p, body in self.calls if p == path]
@@ -736,6 +736,7 @@ def hosted(rig, monkeypatch):
     monkeypatch.setattr(relay_client, "_relay_identity", lambda: {"install_id": "inst-1", "license": ""})
     monkeypatch.setattr(relay_client, "_relay_post", relay.post)
     monkeypatch.setattr(relay_client, "_relay_post_sync", relay.answer)
+    monkeypatch.setattr(relay_client, "is_available", lambda: True)
     relay_client._app_info_cache.clear()
     slug = relay_client.EVENTS_FORWARD_SECRET_SLUG
     saved = credential_store.get_infra_credentials(slug) or {}
@@ -767,16 +768,20 @@ class TestHostedConnect:
         assert raw["extra"]["via_relay"] is True and raw["client_secret"] == ""
         meta = credential_store.get_account_meta(hosted.sub, MCP, "alice")
         assert meta["hosted"] is True and [i["id"] for i in meta["installations"]] == [10]
-        assert credential_store.any_hosted_app_account([MCP]) is True
+        assert MCP in credential_store.hosted_app_account_mcps()
         registered = hosted.relay.bodies("/v1/events/register")
-        assert len(registered) == 1 and registered[0]["provider_id"] == PROVIDER
+        # The first register mints the secret; the next, signed with it,
+        # marks the install at the relay.
+        assert len(registered) == 2 and registered[0]["provider_id"] == PROVIDER
         assert registered[0]["events_url"] == f"{DASH}/v1/webhooks/relay/{PROVIDER}"
         assert registered[0]["enabled"] is True and registered[0]["rotate_secret"] is True
+        assert registered[0]["signed"] is False and registered[1]["signed"] is True
+        assert registered[1]["rotate_secret"] is False and "installation" in registered[1]["kinds"]
         assert _forward_secret() == "fwd-secret"
-        # A reconnect registers again, keeping the secret it holds.
+        # A reconnect registers again, signed with the secret it holds.
         _connect(hosted)
         again = hosted.relay.bodies("/v1/events/register")
-        assert len(again) == 2 and again[1]["rotate_secret"] is False
+        assert len(again) == 3 and again[2]["rotate_secret"] is False and again[2]["signed"] is True
         assert credential_store.get_account_meta(hosted.sub, MCP, "alice")["hosted"] is True
         # The connect asked the relay for no re-list: it re-lists at the redeem itself.
         assert hosted.relay.bodies("/v1/oauth/app-relist") == []
@@ -789,16 +794,13 @@ class TestHostedConnect:
         assert _forward_secret() == ""
 
     def test_a_self_managed_connect_registers_nothing(self, rig, monkeypatch):
-        from services.webhooks import subscription_manager
+        from services.webhooks import relay_events
         asked: list[str] = []
-
-        async def register(*, provider_id):
-            asked.append(provider_id)
-        monkeypatch.setattr(subscription_manager, "_relay_register_events", register)
+        monkeypatch.setattr(relay_events, "sync_provider_soon", asked.append)
         _connect(rig)
         meta = credential_store.get_account_meta(rig.sub, MCP, "alice")
         assert meta["kind"] == kinds.KIND_GITHUB_APP and meta["hosted"] is False
-        assert asked == [] and credential_store.any_hosted_app_account([MCP]) is False
+        assert asked == [] and MCP not in credential_store.hosted_app_account_mcps()
 
     def test_a_hosted_oauth_app_connect_names_no_kind_and_registers_nothing(self, hosted):
         hosted.relay.kind = kinds.KIND_OAUTH_APP

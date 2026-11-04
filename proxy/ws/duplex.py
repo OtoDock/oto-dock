@@ -226,9 +226,10 @@ async def ws_duplex_handler(websocket: WebSocket):
         return
     # The browser's language rides the init frame: on the Automatic pick
     # the session starts in it when the install lists it, else in the first
-    # listed one (``phone_config._detect_default``).
+    # listed one (``phone_config._detect_default``). The chat and the
+    # speaker ride along for the daemon's usage report.
     session_config = await asyncio.to_thread(
-        phone_config.assemble_duplex_session_config, sub, str(init.get("language") or ""))
+        phone_config.assemble_duplex_session_config, sub, str(init.get("language") or ""), chat_id)
     try:
         await mgmt_ws.send_json({
             "type": "duplex_open",

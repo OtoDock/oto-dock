@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import {
-  areaEntryBehind, currentIdx, fallbackChat, planBackToChat, readTrail, saveEntry,
+  areaEntryBehind, currentIdx, currentKey, fallbackChat, planBackToChat, readTrail, saveEntry,
 } from './history'
 import { isNarrowViewport, useNarrow } from './useNarrow'
 
@@ -54,21 +54,23 @@ export function useSettingsArea(base: string, agent?: string): SettingsAreaNav {
     const trail = readTrail()
     if (areaEntryBehind(trail, idx, base)) return
     const here = location.pathname + location.search
+    // Each injected entry is never rendered: its key is read right after
+    // its navigation (synchronous under the browser router).
     if (idx === 0) {
       // Nothing behind at all (the Setup wizard's replace landing): the
       // root goes first, so back from the list reaches the chat.
       navigate('/', { replace: true })
-      saveEntry(0, '/', 'REPLACE')
+      saveEntry(0, '/', 'REPLACE', currentKey())
       navigate(base)
-      saveEntry(1, base, 'PUSH')
+      saveEntry(1, base, 'PUSH', currentKey())
       navigate(here, { state: location.state })
-      saveEntry(2, location.pathname, 'PUSH')
+      saveEntry(2, location.pathname, 'PUSH', currentKey())
       return
     }
     navigate(base, { replace: true })
-    saveEntry(idx, base, 'REPLACE')
+    saveEntry(idx, base, 'REPLACE', currentKey())
     navigate(here, { state: location.state })
-    saveEntry(idx + 1, location.pathname, 'PUSH')
+    saveEntry(idx + 1, location.pathname, 'PUSH', currentKey())
   }, [location.key, location.pathname, location.search, location.state, action, base, navigate])
 
   const goBack = useCallback(() => {
@@ -87,43 +89,46 @@ export function useSettingsArea(base: string, agent?: string): SettingsAreaNav {
       return
     }
     const plan = planBackToChat(trail, idx, target)
-    if (plan.kind === 'pop') {
-      travellingRef.current = true
-      navigate(plan.delta)
-      return
-    }
-    if (plan.delta === 0) {
+    if (plan.kind !== 'pop' && plan.delta === 0) {
       navigate(plan.target, { replace: plan.kind === 'replace' })
       return
     }
-    // Travel to the entry under the areas first. The cold root is replaced
-    // by the chat, so it stays entry 0 and the Android back gesture on it
-    // minimizes the app as before the settings were opened; any other page
-    // stays behind the chat, pushed over the areas. If the browser never
-    // arrives (an entry the tab no longer holds), the chat is pushed from
-    // the entry the tap was made on, and nothing is erased; after a move
-    // of the person's own meanwhile, nothing happens at all.
+    // Travel to the entry under the areas first. A chat there is the
+    // arrival itself. The cold root is replaced by the chat, so it stays
+    // entry 0 and the Android back gesture on it minimizes the app as
+    // before the settings were opened; any other page stays behind the
+    // chat, pushed over the areas. An arrival on an entry the trail did not
+    // record there (another page life's, at the same number) pushes the
+    // chat from where the browser landed. If the browser never arrives (an
+    // entry the tab no longer holds), the chat is pushed from the entry the
+    // tap was made on, and nothing is erased; after a move of the person's
+    // own meanwhile, nothing happens at all.
     const at = idx + plan.delta
     const keyAtTap = (window.history.state as { key?: string } | null)?.key
     travellingRef.current = true
     let done = false
-    const finish = (arrived: boolean) => {
+    const finish = (arrived: 'there' | 'elsewhere' | 'never') => {
       if (done) return
       done = true
       window.removeEventListener('popstate', onPop)
       window.clearTimeout(timer)
-      if (arrived) {
-        navigate(plan.target, { replace: plan.kind === 'replace' })
+      if (arrived === 'there') {
+        if (plan.kind !== 'pop') navigate(plan.target, { replace: plan.kind === 'replace' })
+        return
+      }
+      if (arrived === 'elsewhere') {
+        navigate(target)
         return
       }
       const st = window.history.state as { key?: string } | null
-      if (st?.key === keyAtTap) navigate(plan.target)
+      if (st?.key === keyAtTap) navigate(target)
     }
     const onPop = () => {
-      const st = window.history.state as { idx?: number } | null
-      if (st?.idx === at) finish(true)
+      const st = window.history.state as { idx?: number; key?: string } | null
+      if (st?.idx !== at) return
+      finish(plan.key === undefined || (st.key ?? '') === plan.key ? 'there' : 'elsewhere')
     }
-    const timer = window.setTimeout(() => finish(false), TRAVEL_WAIT_MS)
+    const timer = window.setTimeout(() => finish('never'), TRAVEL_WAIT_MS)
     window.addEventListener('popstate', onPop)
     navigate(plan.delta)
   }, [location.key, agent, navigate])

@@ -3,11 +3,66 @@
  * slash-command transcript noise. Fixtures mirror real chat_messages rows
  * (interactive tailer output); the stored data itself is never modified.
  */
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { stripInjectedPreludes, cleanUserMessageText } from '@/lib/transcriptCleanup'
+import { stripInjectedPreludes, cleanUserMessageText, stripPlatformWrappers, removeTagBlocks } from '@/lib/transcriptCleanup'
 import { dbMessagesToDisplay } from '@/lib/messageBlocks'
 
 const STAMP = '[Current time: Tuesday, July 07, 2026 17:23 (5:23 PM) Europe/Athens (UTC+03:00)]'
+const here = path.dirname(fileURLToPath(import.meta.url))
+
+// The platform's wrappers, pinned case by case against the proxy's title
+// stripper through the one fixture both sides read
+// (proxy/tests/fixtures/chat_wrappers.json): `stripped` is what a reader
+// shows of the row, null when the row is not drawn.
+describe('the platform wrappers fixture', () => {
+  const { cases } = JSON.parse(
+    readFileSync(path.resolve(here, '../../../proxy/tests/fixtures/chat_wrappers.json'), 'utf8'),
+  ) as { cases: { name: string; input: string; stripped: string | null }[] }
+  it('has every shape', () => {
+    expect(cases.length).toBeGreaterThanOrEqual(20)
+  })
+  it.each(cases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+    expect(cleanUserMessageText(c.input)).toBe(c.stripped)
+  })
+})
+
+// Every viewer runs the stripper on every person's row, a shared chat's
+// rows included: a quadratic pattern made a 40 KB row take seconds.
+describe('a crafted row cleans in linear time', () => {
+  const MB = 1_000_000
+  it.each([
+    ['a paste open then 1 MB of spaces', '<pasted_content>' + ' '.repeat(MB) + 'x'],
+    ['unclosed reminders', '<system-reminder>'.repeat(Math.floor(MB / 17))],
+    ['unclosed command tags', '<command-name>'.repeat(Math.floor(MB / 14))],
+    ['plain long text', 'word '.repeat(MB / 5)],
+    ['unterminated close tags', '<pasted_content>' + '</pasted_content'.repeat(MB / 16)],
+    ['stacked preludes', '[Current time: x] '.repeat(Math.floor(MB / 18)) + 'hi'],
+    ['a run of image marks', '[Image #1] '.repeat(Math.floor(MB / 11)) + 'x'],
+  ])('%s', (_name, row) => {
+    const started = performance.now()
+    cleanUserMessageText(row)
+    expect(performance.now() - started).toBeLessThan(1000)
+  })
+
+  it('removes tag blocks as the lazy pattern would', () => {
+    expect(removeTagBlocks('a<x>1</x>b<y>2</y>c<x>open', ['x', 'y'])).toBe('abc<x>open')
+    expect(removeTagBlocks('<y>no close <x>in</x> after', ['x', 'y'])).toBe('<y>no close  after')
+    expect(removeTagBlocks('<x><y></x></y>', ['x', 'y'])).toBe('</y>')
+  })
+})
+
+describe('stripPlatformWrappers', () => {
+  it('drops a leading, closed wrapper and keeps everything else', () => {
+    expect(stripPlatformWrappers('[DELEGATED_WORK]x[/DELEGATED_WORK]\n\n[TASK_OUTPUT_DIR]y[/TASK_OUTPUT_DIR]\n\nthe task'))
+      .toBe('the task')
+    expect(stripPlatformWrappers('[TASK_OUTPUT_DIR]y[/TASK_OUTPUT_DIR] [DELEGATED_WORK]x[/DELEGATED_WORK] odd order'))
+      .toBe('[DELEGATED_WORK]x[/DELEGATED_WORK] odd order')
+    expect(stripPlatformWrappers('[DELEGATED_WORK] open only')).toBe('[DELEGATED_WORK] open only')
+  })
+})
 
 describe('stripInjectedPreludes', () => {
   it('strips a leading time stamp + blank line', () => {
@@ -147,6 +202,19 @@ describe('cleanUserMessageText', () => {
 
   it('keeps a message starting with the tag but never closing it', () => {
     const text = '<task-notification> is a tag the harness uses'
+    expect(cleanUserMessageText(text)).toBe(text)
+  })
+
+  it("strips the TUI's paste tags only when they wrap the whole row", () => {
+    expect(cleanUserMessageText(`<pasted_content id="12">\n${STAMP}\n\nhello\n</pasted_content>`)).toBe('hello')
+    const open = '<pasted_content id="12">\nno close tag'
+    expect(cleanUserMessageText(open)).toBe(open)
+    const close = 'no open tag\n</pasted_content>'
+    expect(cleanUserMessageText(close)).toBe(close)
+  })
+
+  it('keeps a row that mentions the report envelope mid-text', () => {
+    const text = 'the callback starts with [BACKGROUND_TASK_RESULT], then the output'
     expect(cleanUserMessageText(text)).toBe(text)
   })
 })

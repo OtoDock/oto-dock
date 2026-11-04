@@ -29,6 +29,33 @@ and reachable teammates.
 Managing: **admins** manage all departments, **creators** the ones they created — from
 the Agents page's **Departments** tab or the map's ⋯ menu. Everyone sees only
 departments they're part of.
+
+**Department sets (1.9.1).** The community catalog also offers whole departments:
+a set names its agent templates with their levels, the delegation wiring, the head's
+shared library and the briefing schedules. **Browse Community Agents → Department sets**
+(or the Departments tab's "Browse the department sets" link) installs one in one step
+*(admin/creator)*: the department with its levels, every agent at its level (an agent
+you manage that was installed from the same template and sits in no department is used,
+not copied, and the dialog and the card name it), the head's knowledge folder shared as a
+library named after the department to the others (read only unless the set says
+otherwise), and the schedules listed, paused. A member installed alone stays a standalone
+agent; when a second member of the set is installed later, the install dialog offers
+"Create the <set> department and add both agents to it?". The Agent Creator tool
+(`search_community_agents`, `propose_install`, `propose_department_install`,
+`propose_move`) proposes the same as a **card in the chat**: the person presses the
+button, the platform acts with their role. One set ships first: Yacht office (five agents
+for a yacht management office). The Settings tool's `show_card` draws the other
+department cards the same way: `create_department` (admins and creators) and
+`set_department` (its mode and reach, the admin or the creator who made it). The
+team's cards: `hand_files` (a person's finished files from their space to the team's
+workspace, offered when the conversation says the work is final), `promote_memory` (a
+topic of a person's memory shared with everyone on the agent, editors and above),
+`share_app` (an app copied to another agent, editors on both sides; its first release
+waits for approval there), `attach_library` (admins and creators, a creator also
+manager on the target), and, for an app that follows its source ("Setting a team up"
+below), `update_followed_app` and `send_release_to_source`. Nothing happens until the
+person presses the button.
+
 An admin can also share a team app with a department: it appears in the Apps panel of
 every agent in it, follows the department as agents join or leave, and ends when the
 department is deleted (apps.md).
@@ -36,9 +63,10 @@ department is deleted (apps.md).
 **The company map**: the Agents page renders departments as a 3D map — amphitheater
 seating by level, activity-heat borders, a pulse on agents responding right now (both
 follow the sessions the viewer may see, their own Active now list), delegation lines
-between agents. Zoom navigates (out = whole company, in = enter a
-department); Grid view groups by department with level badges; the choice roams across
-devices.
+between agents. Opened from a chat's agent pill, the map starts on that agent's
+department. From elsewhere it starts on the department of the person's favorite agent
+(★). Zoom navigates (out = whole company, in = enter a department). Grid view groups by
+department with level badges, and the choice roams across devices.
 
 ## Delegation
 
@@ -47,11 +75,18 @@ An agent hands work to another agent on its **Delegation Targets** roster (Agent
 wires (locked, "via <Department>") plus the targets a manager ticks by hand *(manager)*;
 the agent's prompt lists them. A worker that runs as the target agent (agent scope) needs
 the person behind the chat to be an **editor+** there; a personal worker runs as that
-person and needs only access. Workers are visible, first-class sessions — a chat lane the
+person and needs only access. A chat lane may also run on the delegating person's own
+computer when they ask (`machine` on `delegate`). There it works as that person, with
+their role and their own AI account, even when it works for the whole agent. It stops
+when they lose the editor role on the agent. Workers are visible, first-class sessions —
+a chat lane the
 user can watch and steer, or a background task — and results report back to the delegating
-chat. A worker's report shows in the delegating chat as a collapsed card with a short
-preview and its files as chips (a click opens it whole), and the task a lane receives
-shows the same way in the worker's chat. A worker that stopped before writing its report
+chat. A worker's report shows in the delegating chat as a collapsed card on the right,
+where the person's own messages sit. It has a short preview, the task's name, its files
+as chips and an "Open lane" link to the worker's chat. A click on the card opens it
+whole. The task a lane receives, a follow-up into it, a task run's own prompt and a
+scheduled wake show the same way, and the platform's framing text around them is
+hidden. A worker that stopped before writing its report
 gets a card that reads "ended without a report". Multi-lane jobs turn the delegating chat
 into an **orchestrator** with a dock of live lane cards and a board file. Agents can also
 pass real files: deliverables copy into the target's `workspace/inbox/<sender>/` (passive
@@ -94,13 +129,19 @@ machine is gone everywhere within a turn, with the source copy kept in the sourc
 Recover bin; a file deleted at the source disappears from every copy). Agents
 with self-config tools can wire libraries from chat — every change confirmed in-chat.
 
-**Bulletins**: a `bulletin/<library name>.md` file inside a library is auto-injected
-into the context of every attached agent (and the source) — a runtime broadcast channel
-for daily/weekly progress and "what changed" notes, not a memory. The source's writers
-AND writable attachments can author it (since 1.5 a RW mirror edit is adopted into the
-source like any other library content); renaming the library renames the bulletin. Keep
-it short — only the first 4 KB is injected, and past 3 KB the injected copy carries a
-prune reminder every attached agent sees.
+**The Notebook** (since 1.9.1): a dated, append-only record between
+agents. Library bulletins no longer load, and their files stay. Each
+agent posts short entries about its own work with `notebook_post`: an
+editor or a manager in a person's chat, or a run of the agent itself. A
+viewer's or a contributor's chat only reads, and an agent that keeps each
+person's chats private (Personal only) never posts. Every session loads
+the latest entries of its agent and of every agent one delegation step
+away, in either direction. So a department's mode decides who reads
+whom: `down` the head and each member, `down_across` and `both` the
+siblings too, `off` none. A manual edge counts the same. People read the
+entries on the agent's Overview and in the department's card, and a
+manager of the posting agent deletes one. The share of each prompt is set
+in Setup → System Settings *(admin)*.
 
 **Who writes knowledge**: managers (dashboard + machines); manager sessions in chat;
 and agent-scope scheduled/delegated runs **created by a manager or admin** (editor-made
@@ -110,20 +151,91 @@ library. `config/` stays human-manager-only everywhere.
 ## Memory
 
 Topic-file memory, maintained by agents as they work. Two scopes: **agent memory**
-(shared by everyone using the agent) and **user memory** (private per person). Loaded
-automatically each session (full content while compact, index + on-demand reads once it
-grows). Distinct from persona (identity/working style) and from knowledge (curated
-reference): facts about people/projects/state go to memory. Controls: per-agent memory
-toggles + "Clear shared agent memory" (Agent Settings → Configuration, *manager*);
-"Clear my memory across all agents" (User Settings → General, *any user*); tuning knobs
-in Setup → System Settings *(admin)*.
+(shared by everyone using the agent) and **user memory** (private per person). The rule
+for which: about a person, their preferences, their situation, user memory; about the
+work, the systems, the decisions, the traps, agent memory; when a fact is both, the fact
+goes shared and the preference personal. Loaded automatically each session: the newest
+topics in full until the inline budget is used, the rest listed with their size, newest
+date and sections for on-demand reads. Distinct from persona (identity/working style)
+and from knowledge (curated reference): facts about people/projects/state go to memory.
+A topic over the growth cap (32 KB by default) no longer grows until the agent shrinks
+it, one edit adds at most the entry cap (2 KB by default), and an edit that makes a topic
+smaller always works. An editor or a manager can share one of their personal topics with
+the agent (the memory tool's rename from the personal to the shared scope); the other
+direction is refused. Controls: per-agent memory toggles + "Clear shared agent memory"
+(Agent Settings → Configuration, *manager*); "Clear my memory across all agents" (User
+Settings → General, *any user*); the inline budget, the nudge, the growth cap and the
+entry cap in Setup → System Settings *(admin)*.
+
+## Setting a team up
+
+**The mode fits the team.** *Personal only* for a whole team working privately (each
+person their own files, chats and memory, nothing shared), or for one person. *Personal +
+shared* for project work: each person drafts in their own space and hands finals to the
+team's workspace. *Shared + personal* for a department head's desk: the shared workspace
+is home and each person keeps private notes beside it. *Shared only* for one desk the
+team runs together, with one chat history (editors and managers only).
+
+**The three kinds of people on a project agent.** A **contributor** from the field (a
+site engineer) posts photos and reports: the agent saves them to the shared workspace as
+they arrive, and the contributor reads the shared memory.
+**Editors** in the office (an architect) draft in their own space, hand finals over, and
+act as the agent (schedules, triggers, shared apps, shared memory). The **manager**
+curates the persona, the context files, the knowledge and the members. A platform admin
+acts as admin everywhere. When the agent has the delegation tools, its prompt says how
+many people it serves and in which roles, their names for a platform admin or for an
+editor and above while the user directory is open to members, and the role of the
+person in the chat.
+
+**Where each artifact lives.** Content decides, never the default alone. A draft, an
+exploration and one person's own work stay in their personal space. A final, and anything
+that defines how the team works (a process, a template, a checklist, an app the team
+uses, the agents' own setup), goes to the shared workspace or a knowledge library. A
+process the team follows is knowledge, not memory: memory holds facts, decisions and
+traps (shared ones in the agent's memory, a person's own in theirs). The Notebook holds
+what the agents tell each other across delegation edges. An app the team uses is a
+shared app. An app another agent should run too is shared to it and follows its source
+(apps.md). The agent says where it saved every document it creates.
+
+**The hand to the team.** The agent never moves or copies a person's files on its own,
+except a contributor's photos and reports, which it saves to the team as they arrive. When the
+conversation says the work is final (final, done, send it to the team, the client's copy,
+the finished drawings), it draws the `hand_files` card: a move, or a copy when the person
+still works on the files. A card answered Not now is asked again later with a new card.
+
+**One agent or several.** A multi-agent setup is proposed only when the person asks to
+automate a company function, a department or several projects with different people. An
+idea, a research task or one job gets one agent. When a team of agents is right, the
+setup goes in order: the `create_department` card (the levels, `mode` `down` or
+`down_across`, the reach), `list_departments` for its ids (the card's outcome does not
+give them), the agents (the `propose_install` card from the catalog, or the `create_agent`
+tool, which installs at once), a `move_agent` card for each agent including the head at
+its Head level, the head's method shared as a library (`share_knowledge_folder` or Agent
+Settings → Configuration → Shared Knowledge, an admin or a creator), the `attach_library`
+card (read-only), the `share_app` card (the project app as a followed copy), then
+`hand_files` in daily work. A project persona draws the `hand_files` card when work is
+final and never moves a document itself. Each card is the person's click with their own
+role. The agent only proposes. The agent-creation skill has the steps per pattern.
+
+**An app that follows its source.** A copy shared to another agent keeps where it came
+from. When the source releases again, the copy's card offers *Update to release N* (the
+files replaced, the data kept, the release held for approval there) or, when the copy
+released on its own since, *Ask the agent to merge*: the source's release is unpacked
+beside the copy's files and the agent merges the two and deploys one release. Nothing
+reaches the agent by the press alone. From the Apps panel, the person gives the agent
+the request (the notice has it to copy, and the card keeps it while the merge waits).
+From a card the agent drew, the agent reads `check_card`. The copy's side can *Send this release
+to the source*, which waits for the source's approval. *Stop following* ends it. The
+person needs editor or above on both sides (the owner, for a personal app) to update,
+merge or send. Stop following needs that right on the copy alone. The data never
+travels.
 
 ## A working pattern for a company
 
 1. Departments mirror the org chart; each department's agents get level-appropriate
    delegation automatically.
 2. One agent per team owns that team's knowledge; share it as a named library; attach it
-   to whoever needs it; put the "what matters now" in its bulletin.
+   to whoever needs it. The team's lead agent posts the "what matters now" to the Notebook.
 3. Department heads get a scheduled morning briefing that reads the roster's overnight
    activity.
 4. A shared app on each team's lead agent gives the team an at-a-glance board, kept

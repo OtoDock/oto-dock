@@ -102,6 +102,30 @@ def ensure_user_npm_bin_on_path() -> None:
     os.environ["PATH"] = bin_dir + os.pathsep + path
 
 
+# The Mac's tool folders, in the order a login shell's `brew shellenv` puts
+# them first: launchd starts the login item with only the system folders on
+# PATH, so without these no CLI, npm, node or git of Homebrew's resolves.
+_DARWIN_TOOL_DIRS = ("/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin",
+                     "~/.local/bin")
+
+
+def ensure_darwin_tool_dirs_on_path() -> None:
+    """On a Mac, put the tool folders that exist and are missing in front of
+    this process's PATH, as one block in ``_DARWIN_TOOL_DIRS``'s order.
+
+    Called once at startup with the npm one, before any spawn. The installer
+    writes the same folders into the login item; a Mac paired before it did
+    gets them with the update alone. No-op off macOS."""
+    if config.HOST.name != config.DARWIN:
+        return
+    path = os.environ.get("PATH", "")
+    have = set(path.split(os.pathsep))
+    add = [d for d in (os.path.expanduser(x) for x in _DARWIN_TOOL_DIRS)
+           if d not in have and os.path.isdir(d)]
+    if add:
+        os.environ["PATH"] = os.pathsep.join([*add, path] if path else add)
+
+
 def _normalize_pins(cli_pins: dict) -> dict[str, str]:
     """``{"claude_code": "x.y.z", ...}`` → ``{"claude": "x.y.z", ...}``, empties dropped."""
     out: dict[str, str] = {}

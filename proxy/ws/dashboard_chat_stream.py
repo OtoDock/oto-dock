@@ -103,6 +103,7 @@ class ChatStreamMixin(_Host):
     # The connection state this mixin assigns, declared where it assigns it:
     # the type checker reads an attribute a mixin assigns from the mixin
     # first. Annotations only (strings), no class attributes.
+    _resume_cards: "ChatStreamPump | None"
     _resume_live: "dict | None"
     chat_id: "str | None"
     chat_plan_filename: "str"
@@ -355,8 +356,8 @@ class ChatStreamMixin(_Host):
         # at each message drain.
         stop_flags: dict = {"fired": False, "note": False}
 
-        # Memory-capture nudge: after N user turns without a memory tool
-        # call, one reminder line rides this turn's outgoing message. The
+        # Memory-capture nudge: after N user turns without a memory write
+        # that landed, one reminder line rides this turn's outgoing message. The
         # user message was already persisted above — the reminder never
         # renders in the chat UI or DB. Layer-agnostic (CLI/Codex/Direct).
         if is_viewed:
@@ -611,6 +612,11 @@ class ChatStreamMixin(_Host):
         if snapshot is not None:
             await self._send_text(snapshot)
             logger.info("WS dashboard: sent live_state after attach for chat=%s", pump.chat_id)
+        # A resume's attach: the cards a between-turns ask still waits on
+        # go out after the live state, whose paint would drop them.
+        if self._resume_cards is pump:
+            self._resume_cards = None
+            await self._send_engine_prompts(pump)
 
         recv_task = get_task = live_task = notify_task = None
         # The notify queue's items read during the turn that must wait for
@@ -737,6 +743,7 @@ class ChatStreamMixin(_Host):
             if not isinstance(client_msg, dict):
                 await self._send_error("Invalid message")
                 return False
+            client_msg = wire.client_frame(client_msg)
             # The between-turn multiplex's revalidation, here too: a turn
             # can last as long as its viewer keeps it going.
             if not await self._session_still_holds():
@@ -1266,7 +1273,9 @@ class ChatStreamMixin(_Host):
             prompt, consumed = probe["text"], None
             if batch is not None:
                 prompt, consumed = await self._prepared_prompt(cid, probe["text"],
-                                                               new_text=batch.text)
+                                                               new_text=batch.text,
+                                                               layer=self.layer,
+                                                               session_id=self.session_id or "")
             rows_first = asyncio.get_running_loop().create_future() if batch is not None else None
             try:
                 pump = await self._start_new_stream(

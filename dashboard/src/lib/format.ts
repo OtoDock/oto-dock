@@ -69,13 +69,15 @@ export function formatCronDescription(cron: string): string {
   }
 
   if (cron === '* * * * *') return 'Every minute'
+  // A step on every day, or on weekdays only ("1-5").
+  const stepDays = isEvery(dow) ? '' : dow === '1-5' ? ' on weekdays' : null
   const everyMin = min.match(/^\*\/(\d+)$/)
-  if (everyMin && isEvery(hour) && isEvery(dom) && isEvery(dow)) return `Every ${everyMin[1]} minutes`
+  if (everyMin && isEvery(hour) && isEvery(dom) && stepDays !== null) return `Every ${everyMin[1]} minutes${stepDays}`
   const everyHour = hour.match(/^\*\/(\d+)$/)
-  if (isFixed(min) && everyHour && isEvery(dom) && isEvery(dow)) {
+  if (isFixed(min) && everyHour && isEvery(dom) && stepDays !== null) {
     return min === '0'
-      ? `Every ${everyHour[1]} hours`
-      : `Every ${everyHour[1]} hours at :${min.padStart(2, '0')}`
+      ? `Every ${everyHour[1]} hours${stepDays}`
+      : `Every ${everyHour[1]} hours at :${min.padStart(2, '0')}${stepDays}`
   }
 
   if (time && isEvery(dom) && isEvery(dow)) return `Daily at ${time}`
@@ -219,6 +221,14 @@ export function scheduleHasClock(task: ScheduleRef): boolean {
   if (task.run_at) return true
   const cron = task.schedule || ''
   return !!cron && cronHasClock(cron) && formatCronDescription(cron) !== cron
+}
+
+// A cron the words do not describe, shown as it is: drawn in a fixed-width
+// font, since a proportional one all but hides the spaces between its
+// fields (an hourly step on weekdays read as "0*/2**1-5").
+export function rawCron(task: ScheduleRef): boolean {
+  return !!task.schedule && !task.interval_seconds && task.task_type !== TASK_KIND.TRIGGER
+    && formatCronDescription(task.schedule) === task.schedule
 }
 
 /** The schedule in words, without the zone. */

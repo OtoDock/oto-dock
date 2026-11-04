@@ -7,6 +7,7 @@ instead of ClaudeStreamChunk, making it execution-layer agnostic.
 This is the contract between execution layers and the pump.
 """
 
+import json
 import time
 from dataclasses import dataclass, field
 
@@ -28,6 +29,12 @@ BG_COMMAND_END = "bg_command_end"      # background command finished (CLI task_u
 DELEGATE_SPAWN = "delegate_spawn"  # delegate_task MCP tool
 DELEGATE_RESULT = "delegate_result"
 CHECK_VERDICT = "check_verdict"    # a check's verdict on the turn (CHECKS.md), injected by the evaluator
+
+# The roles of a stored chat row (``chat_messages.role``): the person's (or
+# another agent's) message, the agent's text, an event row.
+ROW_USER = "user"
+ROW_ASSISTANT = "assistant"
+ROW_EVENT = "event"
 WORKFLOW_START = "workflow_start"      # dynamic-workflow tool spawned (CLI task_started:local_workflow)
 WORKFLOW_PROGRESS = "workflow_progress"  # live phase/agent tree snapshot (CLI task_progress.workflow_progress)
 WORKFLOW_END = "workflow_end"          # workflow finished (CLI task_notification / task_updated)
@@ -252,6 +259,10 @@ class TurnInput:
     ``chat_id`` is set on a message the connection itself holds (the
     implement-plan message, ``implement_queue``): the chat it was meant
     for, drained as that chat's next turn.
+
+    ``card`` marks a message a card's ``say`` button sent for the person
+    (``{card_id, button}``, services/cards): the server alone sets it, and
+    it rides the row and the queue frames so the bubble says so.
     """
 
     text: str
@@ -260,6 +271,7 @@ class TurnInput:
     image_meta: list[dict] = field(default_factory=list)
     files: list[dict] = field(default_factory=list)
     chat_id: str = ""
+    card: dict | None = None
 
     def __post_init__(self) -> None:
         if not self.cli_text:
@@ -273,6 +285,8 @@ class TurnInput:
             meta["images"] = list(self.image_meta)
         if self.files:
             meta["files"] = list(self.files)
+        if self.card:
+            meta["card"] = dict(self.card)
         return meta
 
     def frame_fields(self) -> dict:
@@ -283,13 +297,16 @@ class TurnInput:
     @classmethod
     def combine(cls, items: "list[TurnInput]") -> "TurnInput":
         """A drained batch as ONE turn: texts joined with a blank line (the
-        user row and the engine prompt alike), attachments concatenated."""
+        user row and the engine prompt alike), attachments concatenated.
+        A batch of several messages carries no card mark: the one row
+        would name a typed message as a card's."""
         return cls(
             text="\n\n".join(i.text for i in items),
             cli_text="\n\n".join(i.cli_text for i in items),
             images=[b for i in items for b in i.images],
             image_meta=[m for i in items for m in i.image_meta],
             files=[f for i in items for f in i.files],
+            card=items[0].card if len(items) == 1 else None,
         )
 
 
@@ -303,3 +320,48 @@ def goal_payload_to_state(data: dict) -> dict | None:
     return {k: data.get(k) for k in (
         "objective", "status", "token_budget", "tokens_used",
         "time_used_seconds")}
+
+
+# ---------------------------------------------------------------------------
+# A person's attachments: what a send asked for, what reached the agent
+# ---------------------------------------------------------------------------
+
+def carries_prompt(msg: dict) -> bool:
+    """Whether a send (a warm-up's first message, a kick) carries a message:
+    text, a photo (an entry with ``data`` or a ``path``) or a file (an entry
+    with a ``path``). A message of photos alone is a message; an entry that
+    names nothing is not."""
+    return bool(
+        msg.get("text")
+        or any(isinstance(i, dict) and (i.get("data") or i.get("path")) for i in msg.get("images") or ())
+        or any(isinstance(f, dict) and f.get("path") for f in msg.get("files") or ()))
+
+
+def photos_not_attached(images: list[dict], image_meta: list[dict]) -> int:
+    """How many of the photos a send asked for (an entry with ``data`` or a
+    ``path``) did not reach the agent: one that did not decode, or one saved
+    earlier that could not be read back (deleted since, outside the chat's
+    scope)."""
+    asked = sum(1 for i in images or () if isinstance(i, dict) and (i.get("data") or i.get("path")))
+    return max(0, asked - len(image_meta or ()))
+
+
+def row_attachments(event_data: "str | dict | None") -> tuple[list[str], list[str]]:
+    """A person's stored row's attachments: its photos' and its files'
+    agent-relative paths (``event_data`` ``images`` and ``files``, the shape
+    ``TurnInput.event_meta`` writes). Empty for a row with none, or another
+    kind of ``event_data``."""
+    data = event_data
+    if isinstance(data, str):
+        try:
+            data = json.loads(data) if data else {}
+        except ValueError:
+            return [], []
+    if not isinstance(data, dict):
+        return [], []
+
+    def _paths(key: str) -> list[str]:
+        return [str(item["path"]) for item in data.get(key) or ()
+                if isinstance(item, dict) and item.get("path")]
+
+    return _paths("images"), _paths("files")

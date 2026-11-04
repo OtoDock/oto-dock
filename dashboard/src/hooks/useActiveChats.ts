@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { fetchActiveChats, type ActiveChat, type Chat } from '../api/chats'
+import { fetchActiveChats, type ActiveChat, type ChatList } from '../api/chats'
 import { useChatStore, NEW_CHAT_PREFIX } from '../store/chatStore'
 import { chatKind, isTaskChatId, SOURCE_TYPE, type SourceType } from '../lib/session/kind'
 import {
@@ -202,9 +202,9 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
     // lists only chats whose turn the BACKEND sees open, and an interactive
     // turn the CLI has not journaled yet is invisible there.
     const cachedTitles = new Map<string, string>()
-    for (const [, list] of queryClient.getQueriesData<Chat[]>({ queryKey: ['chats'] })) {
-      if (!Array.isArray(list)) continue
-      for (const c of list) if (c?.id && c.title) cachedTitles.set(c.id, c.title)
+    for (const [, list] of queryClient.getQueriesData<ChatList>({ queryKey: ['chats'] })) {
+      if (!Array.isArray(list?.chats)) continue
+      for (const c of list.chats) if (c?.id && c.title) cachedTitles.set(c.id, c.title)
     }
     const add = (id: string, phase: ActiveChatRow['phase']) => {
       const meta = metaById.get(id)

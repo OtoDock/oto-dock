@@ -1,4 +1,6 @@
-"""``GET /v1/mcps/{name}/icon.png``: an MCP's icon for the dashboard.
+"""``GET /v1/mcps/{name}/icon.png``: an MCP's icon for the dashboard;
+``GET /v1/community/agents/{slug}/pictures/{app}.png``: a template app's
+picture from the agents catalog (the Browse page's "Apps it brings").
 
 The installed folder's ``icon.png`` first (any category), then, for the
 Browse dialog's audience (creators and admins), the community catalog's
@@ -54,6 +56,30 @@ async def mcp_icon(
     if body is None:
         raise HTTPException(404, "No icon", headers=_MISS_HEADERS)
 
+    etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={**_CACHE_HEADERS, "ETag": etag})
+    return Response(content=body, media_type="image/png", headers={**_CACHE_HEADERS, "ETag": etag})
+
+
+@router.get("/v1/community/agents/{slug}/pictures/{app}.png")
+async def template_app_picture(
+    slug: str,
+    app: str,
+    request: Request,
+    user: UserContext | None = Depends(get_current_user),
+) -> Response:
+    """A template app's picture, for the Browse page's audience (creators
+    and admins at the dashboard)."""
+    from services.community import community_agents_catalog
+    user = require_auth(user)
+    if user.is_api_key:
+        raise HTTPException(403, "Dashboard sessions only")
+    if not roles.is_creator_or_above(user.role):
+        raise HTTPException(403, "Admin or creator only")
+    body = await community_agents_catalog.fetch_picture(slug, app)
+    if body is None:
+        raise HTTPException(404, "No picture", headers=_MISS_HEADERS)
     etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={**_CACHE_HEADERS, "ETag": etag})

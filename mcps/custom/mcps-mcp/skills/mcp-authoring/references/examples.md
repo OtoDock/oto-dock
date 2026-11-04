@@ -210,9 +210,11 @@ notion-hosted-mcp/
 
 Nothing runs locally and no admin creates an app: the platform reads the
 server's metadata, registers the install at the authorization server it
-names, and sends each person to the vendor's consent page with PKCE. An
-admin adds `(notion-hosted, mcp.notion.com)` to the OAuth Bearer Allowlist
-in Admin Setup → Security (until then a connect answers 400), and the token
+names, and sends each person to the vendor's consent page with PKCE.
+Installed from the community catalog, `mcp.notion.com` (the server's own
+https host) becomes the MCP's own row on the OAuth Bearer Allowlist by
+itself; from a ZIP, an admin presses Allow on the install card or in the
+MCP's row on MCP Servers (until then a connect answers 400), and the token
 reaches the MCP server as its bearer and nowhere else. A server that also
 accepts the vendor's own app tokens (Linear's) declares
 `"accepts_app_tokens": true` and keeps the app flow's URLs and `app_credential`
@@ -261,11 +263,11 @@ Nothing runs locally. Each person pastes their key in Settings; the platform
 adds `X-Goog-Api-Key: <key>` to each request as it leaves and never writes
 the key into a config file or hands it to the agent. `value_from` must name
 a `credentials.fields` password key (as here) or an env-delivered
-`instances.fields` key. An admin approves `(google-maps-grounding-mcp,
-mapstools.googleapis.com)` on the OAuth Bearer Allowlist in Admin Setup →
-Security — a header-style key is approved under the MCP's own `name`, not a
-provider id — and until then the MCP is left out of sessions with a clear
-reason. The header name may not be one the platform owns (`Authorization`, a
+`instances.fields` key. `(google-maps-grounding-mcp,
+mapstools.googleapis.com)` applies by itself from the catalog, under the
+MCP's own `name` (a header-style key is approved under the MCP's own `name`,
+not a provider id); from a ZIP an admin presses Allow, and until then the
+MCP is left out of sessions with a clear reason. The header name may not be one the platform owns (`Authorization`, a
 transport header, and the rest the manifest reference lists).
 
 ## A `replaces` declaration

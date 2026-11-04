@@ -24,7 +24,8 @@ class TestRegistry:
     def test_the_ranking_the_registry_comments_describe(self):
         tier = {m: e["tier"] for m, e in app_config.MODEL_REGISTRY.items()}
         assert tier["claude-fable-5-1"] < tier["claude-opus-5-5"] < tier["claude-sonnet-5-5"] < tier["claude-haiku-5-5"]
-        assert tier["gpt-6-astra"] < tier["gpt-6.1-sol"] < tier["gpt-5.6-terra"] < tier["gpt-6-luna"]
+        assert tier["gpt-6-astra"] < tier["gpt-6.1-sol"] < tier["gpt-6.1-terra"] < tier["gpt-6-luna"]
+        assert tier["qwen/qwen3.8-27b"] == tier["openai/gpt-oss-120b"] == 4
         assert tier["claude-fable-5-1"] == tier["gpt-6-astra"] == 1
 
     def test_get_model_tier_reads_the_registry_first(self):

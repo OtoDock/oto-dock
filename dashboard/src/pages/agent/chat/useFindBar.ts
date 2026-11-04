@@ -27,8 +27,13 @@ export function useFindBar({ searchParams, setSearchParams }: {
     const q = searchParams.get('q')
     if (q) {
       pendingFindQueryRef.current = q
-      // Remove ?q from URL without re-navigation
-      setSearchParams({}, { replace: true })
+      // Remove ?q from URL without re-navigation; the rest stays (`message`
+      // is the search result's anchor, read by useMessageAnchor).
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('q')
+        return next
+      }, { replace: true })
     }
   }, [searchParams, setSearchParams])
 

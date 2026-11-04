@@ -44,6 +44,7 @@ audio/
     turn/ { base, smart_turn, groq, dispatcher }
     lid/  { base, ecapa (the ONNX identifier), rule (the language rule), tracker (the driver), evidence (two streams' words compared over the audio both covered) }
     stt/streams.py    LanguageStreams: one STT provider over the default, the active and at most one more stream
+    stt/relisten.py   the second listen: a window the live stream answered without words heard again through the batch endpoint (dictation's FIFO Relisten; the turn's TurnRelisten, narrow on calls and wide on live voice)
   streaming/          lang.py (language registry, the candidate list, the TTS detector), text_chunks.py (sentence chunking), tts_stream.py (streaming-TTS orchestration)
   models/             smart-turn-v3.2-cpu.onnx, silero_vad.onnx, lang-id-ecapa-voxlingua107.onnx + vendored whisper feature-extractor config (README.md: origin + licences)
 ```

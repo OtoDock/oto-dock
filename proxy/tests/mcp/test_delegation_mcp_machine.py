@@ -229,7 +229,7 @@ def test_every_tool_is_annotated_and_move_chat_stays_sensitive():
     assert tiers == {
         "delegate": "standard", "send_files": "sensitive", "attach_result_files": "standard",
         "list_sessions": "open", "peek_session": "open", "move_chat": "standard",
-        "adopt_project": "standard",
+        "adopt_project": "standard", "notebook_post": "standard", "notebook_read": "open",
     }
     rules = json.loads(Path(_MCP_DIR, "manifest.json").read_text())["permissions"]["rules"]
     assert {"tool": "move_chat", "tier": "sensitive"} in rules

@@ -311,6 +311,16 @@ class PtyViewerController(_Host):
                 if item.get("meeting_agent"):
                     frame["meeting_agent"] = item["meeting_agent"]
                 await self._send(frame)
+            elif et in interactive_session.CARD_ITEMS:
+                # A card over the terminal: a floating window like an
+                # artifact's, its row already persisted by the drainer.
+                card = interactive_session.CARD_ITEMS[et](item)
+                if item.get("db_message_id") is not None:
+                    card["db_message_id"] = item["db_message_id"]
+                await self._send({
+                    "type": wire.PTY_ARTIFACT, "chat_id": vcid,
+                    "session_id": vsid, "event": card,
+                })
             elif et in (wire.ITEM_PLAN_REVIEW, wire.ITEM_QUESTION):
                 # Neither reaches a human-driven interactive session any
                 # more: the hook lets AskUserQuestion run natively and

@@ -7,11 +7,13 @@ Auth: API key (server-to-server) OR OAuth2 session cookie (dashboard users).
 import asyncio
 import logging
 import zoneinfo
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel
 
 import config
+from auth import roles
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -23,7 +25,8 @@ from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
 from services.notifications import notification_manager
 from services.notifications.push_sender import NATIVE_PUSH_PLATFORMS
-from storage.automation import notification_store
+from storage import database as task_store
+from storage.automation import notification_severity, notification_store
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock.notification-api")
@@ -51,10 +54,14 @@ def _clamp_text(value: str, limit: int) -> str:
     return v[: limit - 1].rstrip() + "…"
 
 
+# A severity outside the vocabulary is stored as info, as an app handler's is.
+_Severity = Annotated[str, AfterValidator(notification_severity.normalize)]
+
+
 class CreateNotificationRequest(BaseModel):
     title: str
     body: str
-    severity: str = "info"
+    severity: _Severity = "info"
     scope: str = "user"
     target: str | None = None
     notification_type: str = "one_time"  # one_time | recurring
@@ -239,6 +246,11 @@ async def create_notification(
             raise HTTPException(status_code=400, detail=err)
 
     user_tz = _resolve_user_tz(req.user_tz, u, acting)
+    # Who is told: an agent-scope send from a task run's session takes the
+    # run's task audience, read from the token's session, never the body.
+    audience = roles.VIEWER
+    if req.scope == _vis.SCOPE_AGENT and u.is_session and u.session_id:
+        audience = await run_db(task_store.audience_of_session, u.session_id) or roles.VIEWER
     notif = await asyncio.to_thread(
         notification_store.create_notification,
         title=req.title,
@@ -255,6 +267,7 @@ async def create_notification(
         agent_slug=req.agent_slug,
         chat_id=req.chat_id,
         user_tz=user_tz,
+        audience=audience,
     )
 
     # If it has a schedule, register with APScheduler
@@ -272,6 +285,7 @@ async def create_notification(
             notification_id=notif["id"],
             agent_slug=req.agent_slug,
             chat_id=req.chat_id,
+            audience=audience,
         )
 
     return {"status": "created", "notification": notif}
@@ -341,7 +355,8 @@ def _definitions_view(u: UserContext, scope: str | None, source: str | None,
                 n_target = n.get("target", "") or ""
                 if agent and n_target != agent:
                     continue
-                if u.can_access_agent(n_target) or n_target in edge_reach:
+                if ((u.can_access_agent(n_target) or n_target in edge_reach)
+                        and u.sees_agent_automations(n_target)):
                     filtered.append(n)
             elif n["scope"] == "global":
                 filtered.append(n)
@@ -440,6 +455,7 @@ async def fire_notification_now(
         target=notif.get("target"),
         source=notif["source"],
         notification_id=notification_id,
+        audience=notif.get("audience"),
     )
     return {"status": "fired", "targets": len(deliveries)}
 
@@ -516,7 +532,7 @@ async def resume_notification(
 class EditNotificationRequest(BaseModel):
     title: str | None = None
     body: str | None = None
-    severity: str | None = None
+    severity: _Severity | None = None
     schedule: str | None = None
     run_at: str | None = None
     interval_seconds: int | None = None

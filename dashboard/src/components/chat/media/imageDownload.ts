@@ -1,6 +1,7 @@
-// Saving a chat image to the device: the Android app's Downloads bridge for an
-// inline image, else a browser download (an external image fetched as a blob
-// first, since a cross-origin <a download> is ignored).
+// Saving a chat image to the device: the apps' save channel for an inline
+// image (Android's Downloads folder, the iOS app's Files), else a browser
+// download (an external image fetched as a blob first, since a cross-origin
+// <a download> is ignored).
 
 import { saveNativeFile } from '../../../lib/nativeBridge'
 import type { LightboxImage } from './ImageLightbox'
@@ -32,7 +33,7 @@ function downloadFilename(img: LightboxImage, index: number): string {
 export async function triggerDownload(img: LightboxImage, index: number) {
   const filename = downloadFilename(img, index)
 
-  // Native Android: route base64 through the app's channel if available.
+  // In the apps: route base64 through the app's channel if available.
   if (img.imageData) {
     if (saveNativeFile(img.imageData, filename, img.mimeType || 'image/jpeg')) return
     const byteChars = atob(img.imageData)

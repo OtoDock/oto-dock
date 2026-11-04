@@ -1,0 +1,107 @@
+{
+ "source": "WebKit, from its source (SpeechRecognition.cpp, WebSpeechRecognizerTask.mm): one recognition task per recognizer, every hypothesis one interim carrying the task's whole text so far, revised across a pause, one final at the task's end, then end; the restart is this session's.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "γεια"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "γεια σου"
+    }
+   ]
+  },
+  {
+   "event": "wait",
+   "ms": 2000
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "γεια σου, τι κάνεις"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "Γεια σου, τι κάνεις;"
+    }
+   ]
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 150
+  },
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "καλά"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "Καλά."
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "Γεια σου, τι κάνεις;",
+   "Καλά."
+  ],
+  "replaces": [],
+  "interims": [
+   "γεια",
+   "γεια σου",
+   "γεια σου, τι κάνεις",
+   "καλά"
+  ],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 2
+ }
+}

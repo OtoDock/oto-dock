@@ -5,6 +5,8 @@ description: Professional Lightroom-style photo editing workflow and parameter r
 
 ## Photo Editing Guidelines
 
+**Keep the original:** `edit_image` overwrites the input unless you give `output_path`, so save the edit beside it.
+
 When editing photos, **always call `analyze_image` first** to see the histogram, zone balance, and color data before choosing adjustment values. This prevents over-editing.
 
 Then apply edits with `edit_image` following this professional Lightroom-style workflow in order:

@@ -169,7 +169,7 @@ class TestLocalEndpointPayload:
 
     @pytest.mark.asyncio
     async def test_hosted_session_carries_no_provider(self, layer):
-        config = _config(model="gpt-5.6-terra", extra_env={"CODEX_API_KEY": "sk-test"})
+        config = _config(model="gpt-6.1-terra", extra_env={"CODEX_API_KEY": "sk-test"})
         payload = await _build(layer, config)
         assert "local_model_provider" not in payload
         assert LOCAL_ENDPOINT_KEY_ENV not in payload["env"]
@@ -265,7 +265,7 @@ class TestProviderSwitchBlockerOnRemote:
             dashboard_chat.config, "get_model_provider",
             lambda model, layer="": wanted_provider,
         )
-        return dashboard_chat._provider_switch_blocker("sess-remote", "gpt-5.6-terra", layer="codex-cli")
+        return dashboard_chat._provider_switch_blocker("sess-remote", "gpt-6.1-terra", layer="codex-cli")
 
     def test_cross_provider_switch_is_refused(self, monkeypatch):
         msg = self._blocker(monkeypatch, "openai_compatible", "openai")

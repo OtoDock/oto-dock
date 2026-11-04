@@ -16,7 +16,8 @@ import {
   useFinishOpenAIOAuth,
   loginAlreadyFinished,
   useBulkAddModels,
-  alreadyConnectedMessage,
+  accountEmail,
+  renewedMessage,
   ClaudeExchangeError,
   CLAUDE_SECOND_ACCOUNT_HINT,
   type DiscoveredModel,
@@ -160,13 +161,14 @@ export function ConnectOAuth({ engine, ownerType, onDone }: { engine: EngineDesc
         onDone()
         return
       }
-      // A match: the same account again, or an expired row revived through
-      // this same button (the Setup form has no Reconnect of its own).
-      const email = result.subscription?.oauth_email || ''
+      // A match: the same account again, which renews its login (the way an
+      // admin renews a login that ends soon), or an expired row revived
+      // through this same button (the Setup form has no Reconnect of its own).
+      const email = accountEmail(result.subscription?.oauth_email)
       setCode('')
       setNotice(
         result.previous_status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE
-          ? alreadyConnectedMessage(email)
+          ? renewedMessage(email)
           : `Reconnected ${email || 'the account'}: its login is fresh again.`,
       )
       setStep('done')

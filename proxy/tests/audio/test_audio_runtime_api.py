@@ -115,6 +115,24 @@ def test_capability_endpoint(client):
     body = r.json()
     assert body["icons_enabled"] is True
     assert body["tts"] == "native_only"
+    assert body["stt_automatic"] in ("platform", "device")
+
+
+def test_capability_endpoint_reads_the_apple_webkit_flag(client):
+    from storage.identity import credential_store
+    from storage.prefs import audio_provider_store
+    _set("audio_chat_user_policy", "native_preferred")
+    p = audio_provider_store.create_provider({
+        "provider_type": "stt", "provider_name": "deepgram", "credential_key": "audio-deepgram",
+    })
+    credential_store.set_infra_credentials("audio-deepgram", {"API_KEY": "dg-x"})
+    audio_provider_store.set_default(p["id"], "chat")
+    body = client.get("/v1/audio/capability?has_native_stt=true&apple_webkit=true").json()
+    # A usable chat STT provider: Apple's recognizer is offered beside it.
+    assert body["stt"] == "either" and body["stt_provider_id"] == p["id"]
+    assert body["stt_automatic"] == "platform"
+    body = client.get("/v1/audio/capability?has_native_stt=true").json()
+    assert body["stt"] == "native_only"
 
 
 # --- TTS ------------------------------------------------------------------

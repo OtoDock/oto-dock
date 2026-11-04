@@ -29,7 +29,7 @@ import { SearchProvider } from '../../contexts/SearchContext'
 import { useAgents, useExecutionLayers, useAgentTargetStatus } from '../../api/agents'
 import { engineLabels, runsInteractive, supportsCompact } from '../../lib/engines'
 import { seedMode } from '../../lib/engines/modes'
-import { useChats, useTaskChats } from '../../api/chats'
+import { useChatListPaging, useChats, useTaskChats } from '../../api/chats'
 import { useRunByChat } from '../../api/runs'
 import ChatMessages from '../../components/chat/ChatMessages'
 import { ChatFileProvider } from '../../components/chat/ChatFileContext'
@@ -61,7 +61,6 @@ import ChatDocumentPane from './chat/ChatDocumentPane'
 import { useDocumentPaneForm } from './chat/useDocumentPaneForm'
 import AppsOverlay from '../../components/apps/AppsOverlay'
 import ProjectsOverlay from '../../components/projects/ProjectsOverlay'
-import { setNativeSwitchBusy } from '../../lib/nativeBridge'
 import { useChatStore, newChatKey } from '../../store/chatStore'
 import { useAgentPrefsStore } from '../../store/agentPrefsStore'
 import { useHydrateUiPrefs } from '../../api/userUiPrefs'
@@ -71,11 +70,13 @@ import { useArtifactWindows } from '../../hooks/useArtifactWindows'
 import { notePushedDocument, pushedDocumentFromFrame, useDocumentPaneStore } from '../../store/documentPaneStore'
 import { useAgentChatStream } from './chat/useAgentChatStream'
 import { useFindBar } from './chat/useFindBar'
+import { useMessageAnchor } from './chat/useMessageAnchor'
 import { useChatAttachments } from './chat/useChatAttachments'
 import {
   useModelEngineSelection, useModelEngineReconcile, useModelEngineHandlers, usePermissionModeInvariant,
 } from './chat/useModelEngineSelection'
 import { useChatDuplexVoice, useDuplexWakeArm, useDuplexVoiceProp } from './chat/useChatDuplexVoice'
+import { useNativeSwitchBusy } from './chat/useNativeSwitchBusy'
 import { useOverlayPanels, useAppSendPrompt, usePendingAppAction } from './chat/useOverlayPanels'
 import { useInteractiveHandlers } from './chat/useInteractiveHandlers'
 import { isTaskChatId } from '../../lib/session/kind'
@@ -83,6 +84,7 @@ import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { canEditAgent, isAdmin } from '../../lib/permissions'
 import { useDocumentChips } from './chat/useDocumentChips'
 import { isNativePlatform } from '../../audio/types'
+import { noteTurnSent } from '../../lib/device/storeReview'
 
 // The agent reads this note, never a person: its words are the model's cue.
 const DUPLEX_EXIT_NOTE = '[The user left the live spoken conversation mode — this is normal typed chat again; respond normally in text.]\n\n'
@@ -144,7 +146,10 @@ export default function AgentChat() {
     pendingEngineSwitch, setPendingEngineSwitch,
     engineSwitchBusy, setEngineSwitchBusy, engineSwitchError, setEngineSwitchError,
     parseModelValue,
-  } = useModelEngineSelection({ agentExecutionPaths, agentExecutionPath })
+  } = useModelEngineSelection({
+    agentExecutionPaths, agentExecutionPath,
+    enginesForMe: currentAgent?.engines_for_me, engineForMe: currentAgent?.engine_for_me || '',
+  })
 
   // Find bar — state, the ?q= deep link, the debounce, the Ctrl+F intercept
   // and closeFindBar (see chat/useFindBar.ts).
@@ -305,12 +310,6 @@ export default function AgentChat() {
       : ''))
   usePermissionModeInvariant(mode, permissionModes, setMode)
 
-  // A live meeting/voice session would be lost on an install switch — flag the
-  // native switcher so it confirms first (LLM streaming is reported separately).
-  useEffect(() => {
-    setNativeSwitchBusy(meetingActive)
-    return () => setNativeSwitchBusy(false)
-  }, [meetingActive])
   // Which agent's NEW-chat view already had its exec-mode reset+seed (the
   // lastResumedChatIdRef twin for the !urlChatId branch). Guards the URL
   // effect's reset to once per new-chat visit; handleNewChat — which
@@ -345,6 +344,8 @@ export default function AgentChat() {
     layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model,
     setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError, chatId, agentName, sessionId, setProcessAlive,
     urlChatId, agentDefaultModel, setModel, setMode, selectedLayer, setSelectedLayer, currentAgent,
+    engineForMe: currentAgent?.engine_for_me || '', modelForMe: currentAgent?.model_for_me || '',
+    localOnly: currentAgent?.local_only_engines,
   })
 
   // Read tracking for the sidebar unread dot: the viewer has SEEN this chat
@@ -373,6 +374,10 @@ export default function AgentChat() {
     wakeRequested, setWakeRequested, wakeInitiatedRef,
   } = useChatDuplexVoice({ chatId, warming, duplexActiveRef, searchParams, setSearchParams, chatNotif })
   const { sendTyped: duplexSendTyped } = duplexVoice
+  // A live meeting or voice conversation would be lost on an install switch:
+  // flag the native switcher so it confirms first. A generating chat is not
+  // flagged: its turn runs on the server.
+  useNativeSwitchBusy(meetingActive, duplexVoice.active)
   const setDraftInput = useCallback(
     (text: string) => {
       if (!draftKey) return
@@ -430,8 +435,9 @@ export default function AgentChat() {
   // feed the render burst that starves TTS scheduling; turn end refetches
   // via speechIdle anyway).
   const [renameEditing, setRenameEditing] = useState(false)
-  const { data: chats, refetch: refetchChats } = useChats(
-    agentName, renameEditing || duplexVoice.active)
+  const listPollPaused = renameEditing || duplexVoice.active
+  const { data: chats, refetch: refetchChats } = useChats(agentName, listPollPaused)
+  const chatPaging = useChatListPaging('chats', agentName)
   // The stream callbacks read these late-bound values through `latestRef`
   // (chat/useAgentChatStream.ts), written at every commit, right after the
   // last of them exists.
@@ -456,9 +462,11 @@ export default function AgentChat() {
     if (tasksParam) setTasksMode(true)
   }
   // The task-chat list also backs the row lookups below (origin / delegation
-  // markers) — task chats never appear in the chat-mode list.
-  const { data: taskChats } = useTaskChats(
-    agentName, tasksMode || isTaskChat, duplexVoice.active)
+  // markers) — task chats never appear in the chat-mode list. The sidebar
+  // shows this one instance: one poll, paused for a rename as for a duplex
+  // session.
+  const { data: taskChats } = useTaskChats(agentName, tasksMode || isTaskChat, listPollPaused)
+  const taskPaging = useChatListPaging('tasks', agentName)
 
   // ---- Overlays: workspace, pinned apps, Dock (see chat/useOverlayPanels.ts) ----
   const {
@@ -472,6 +480,13 @@ export default function AgentChat() {
   let slotOverlay = workspace.state.open || appsActive
   slotOverlay = slotOverlay || projectsActive
   const documentChips = useDocumentChips(chatId, slotOverlay)
+  // ?message=<id>: the chat opened at a reply (a report's notice, the
+  // Reports page), scrolled to it and marked (see chat/useMessageAnchor.ts).
+  const listShown = !interactive.sessionInteractive || interactive.showRichView
+  const anchor = useMessageAnchor({
+    searchParams, setSearchParams, urlChatId, chatId, messages, loadOlder, hasMoreOlder, loadingOlder,
+    listShown,
+  })
   // The composer's shrink and regrow animate only over the message list:
   // every row the slot gains or loses during an animation re-lays out what
   // else fills it (a live terminal resizes its PTY and redraws, an overlay or
@@ -596,6 +611,7 @@ export default function AgentChat() {
       }
       abortedRef.current = false  // Reset abort guard on new send
       discardingRef.current = false  // User is sending — accept events
+      noteTurnSent(chatIdRef.current)  // the store rating counts only this page's turns
       erroredRef.current = false  // a new turn: its own done refetches as usual
       // Draft persisted only as long as it's unsent. Clear immediately so a
       // tab crash mid-streaming doesn't leave the just-sent text dangling.
@@ -748,7 +764,10 @@ export default function AgentChat() {
         // the TUI dark — a light dashboard then gets a dark terminal (the
         // e88020d attach ack makes the xterm follow the baked theme). Ignored
         // for -p spawns.
-        sentWithBubbleIdRef.current = ws.warmup(agentName, chatId || undefined, mode, model, chatActiveLayer ?? selectedLayer ?? undefined, { text, images: wsImages, files: wsFiles }, chatExecMode || undefined, currentDashboardTheme()) ?? null
+        // A new chat always names its engine (the committed one, the
+        // person's pick, else the one resolved for them): the server would
+        // fall back to the agent's default otherwise.
+        sentWithBubbleIdRef.current = ws.warmup(agentName, chatId || undefined, mode, model, chatActiveLayer ?? selectedLayer ?? (urlChatId ? undefined : preWarmPath), { text, images: wsImages, files: wsFiles }, chatExecMode || undefined, currentDashboardTheme()) ?? null
       } else {
         // A send while the chat gets ready: kept, in order, behind its
         // first message (chat/useWarmupSends.ts).
@@ -757,8 +776,9 @@ export default function AgentChat() {
     },
     [agentName, sessionId, chatId, mode, model, chatActiveLayer, selectedLayer, ws, warmingUp, agents, agentsLoadFailed,
       routeSend, setShowRichView, chatExecMode, pendingImages, pendingFiles, workspace, draftKey, duplexSendTyped,
+      urlChatId, preWarmPath,
       warmupSends, setMessages, setAppsOpen, setTurnStartTime, abortedRef, currentMsgRef, discardingRef, erroredRef,
-      duplexExitNoteRef, sentWithBubbleRef, sentWithBubbleIdRef, serverKickPendingRef],
+      chatIdRef, duplexExitNoteRef, sentWithBubbleRef, sentWithBubbleIdRef, serverKickPendingRef],
   )
 
   // Flush a send held above once the agents query settles: route it with the
@@ -914,10 +934,14 @@ export default function AgentChat() {
     const willBeInteractive =
       (stickyInteractive || (currentAgent?.default_execution_mode || '')) === 'interactive'
     // Eager only for the favorite — others warm lazily on first interaction.
+    // The pair the server resolved for this person (engine_for_me,
+    // model_for_me) when there is one; the seed effect reconciles the
+    // page's own pick moments later.
     if (ws.connected && !willBeInteractive && isFavoriteAgent) {
-      ws.preWarmup(agentName, agentDefaultModel, nextMode, preWarmPath)
+      ws.preWarmup(agentName, currentAgent?.model_for_me || agentDefaultModel, nextMode, preWarmPath)
     }
   }, [agentName, agentDefaultModel, preWarmPath, navigate, ws, workspace, currentAgent?.default_execution_mode,
+    currentAgent?.model_for_me,
     seedExecMode, resetSession, isFavoriteAgent, warmupSends, setWarmingUp,
     setMessages, setChatId, setSessionId, setChatActiveLayer, setSelectedLayer, setTotalCost, setBilledCost, setToolCost, setLimitReached,
     setLimitWarning, setContextUsed, setContextMax, setSessionPlans, setCurrentTodos, setCurrentGoal,
@@ -960,8 +984,24 @@ export default function AgentChat() {
   }, [agentName, pickNewChatPlace, ws, urlChatId, model, mode, preWarmPath])
 
   const handleSelectChat = useCallback(
-    (selectedChatId: string, searchQuery?: string) => {
+    (selectedChatId: string, searchQuery?: string, messageId?: number) => {
       if (selectedChatId === chatId && !searchQuery) return
+      // The open chat picked from search keeps its history and its session
+      // (a live turn, a terminal): the find bar opens on the query, and the
+      // message anchor scrolls to the match.
+      if (selectedChatId === chatId && searchQuery) {
+        if (messageId) {
+          setSearchParams((prev) => {
+            const next = new URLSearchParams(prev)
+            next.set('message', String(messageId))
+            return next
+          }, { replace: true })
+        }
+        setFindInput(searchQuery)
+        setFindQuery(searchQuery)
+        setFindBarOpen(true)
+        return
+      }
       // Discard stale in-flight WS events from old chat (cleared in onChatHistory)
       discardingRef.current = true
       if (workspace.state.open) workspace.closeWorkspace()
@@ -1005,12 +1045,17 @@ export default function AgentChat() {
       setWorkflows([])
       setPermissionPending(false)
       setAborting(false)
-      // Close find bar when switching chats (reopened by ?q= param if from search)
+      // Close find bar when switching chats (reopened below if from search)
       setFindBarOpen(false)
       setFindInput('')
       setFindQuery('')
-      const qParam = searchQuery ? `?q=${encodeURIComponent(searchQuery)}` : ''
-      navigate(`/chat/${agentName}/${selectedChatId}${qParam}`)
+      // A search pick's find query waits here for the history
+      // (onChatHistoryLoaded), set before the resume below: the history can
+      // land before a `?q=` on the URL would be read. The URL carries only
+      // the anchor.
+      if (searchQuery) pendingFindQueryRef.current = searchQuery
+      const anchorParam = searchQuery && messageId ? `?message=${messageId}` : ''
+      navigate(`/chat/${agentName}/${selectedChatId}${anchorParam}`)
       if (selectedChatId !== chatId) {
         // Mark loaded so the URL-change effect doesn't double-resume on next render.
         lastResumedChatIdRef.current = selectedChatId
@@ -1022,7 +1067,7 @@ export default function AgentChat() {
       setContextUsed, setContextMax, setSessionPlans, setTurnStartTime, setThinkingActive, setCompressingActive,
       setWorkflows, setPermissionPending, setAborting, setModel, setMode, setFindBarOpen, setFindInput, setFindQuery,
       currentMsgRef, discardingRef, thinkingBufRef, keepAppsOnChatEntryRef, lastResumedChatIdRef, preWarmedRef,
-      serverKickPendingRef],
+      serverKickPendingRef, setSearchParams, pendingFindQueryRef],
   )
 
   // App send_prompt router (see chat/useOverlayPanels.ts).
@@ -1119,6 +1164,9 @@ export default function AgentChat() {
       <ResponsiveDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} width="w-64" widthPx={256}>
         <ChatHistory
           chats={chats || []}
+          chatPaging={chatPaging}
+          taskChats={taskChats}
+          taskPaging={taskPaging}
           activeChatId={chatId}
           agentName={agentName}
           onSelect={handleSelectChat}
@@ -1172,7 +1220,11 @@ export default function AgentChat() {
 
         {/* Find bar */}
         {findBarOpen && (
-          <FindBar value={findInput} onChange={setFindInput} onClose={closeFindBar} />
+          <FindBar
+            value={findInput} onChange={setFindInput} onClose={closeFindBar}
+            canLoadOlder={hasMoreOlder && listShown} loadingOlder={loadingOlder} onLoadOlder={loadOlder}
+            anchorPending={anchor.pending} anchorLanded={anchor.landed}
+          />
         )}
 
         <ChatSidePanels

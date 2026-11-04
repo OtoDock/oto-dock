@@ -56,8 +56,10 @@ export default function ChatBanners({
   layers, engineSwitchBusy, engineSwitchError,
   handleEngineSwitchConfirm, handleEngineSwitchCancel,
 }: Props) {
+  // The same horizontal inset as the composer below (ChatInput's root), so
+  // a banner's edges line up with the message box on a phone.
   return (
-    <>
+    <div className="px-3">
       <MachineUpdateBanner
         machineId={machineOf(sessionExecutionTarget) || null}
       />
@@ -140,6 +142,6 @@ export default function ChatBanners({
         onConfirm={handleEngineSwitchConfirm}
         onCancel={handleEngineSwitchCancel}
       />
-    </>
+    </div>
   )
 }

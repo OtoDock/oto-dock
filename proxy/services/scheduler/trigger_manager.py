@@ -21,11 +21,12 @@ import re
 import time
 from typing import TYPE_CHECKING
 
+from auth import roles
 from core.session import visibility as _vis
 from services.infra import external_data
 from services.scheduler import task_kinds
 from storage import database as task_store, db_apps
-from storage.automation import notification_store, trigger_store
+from storage.automation import notification_severity, notification_store, trigger_store
 
 if TYPE_CHECKING:
     from auth.webhook_providers.base import NormalizedEvent
@@ -43,7 +44,7 @@ _last_triggered: dict[str, float] = {}
 
 
 VALID_SCOPES = {"user", "agent"}
-VALID_SEVERITIES = {"info", "success", "warning", "danger"}
+VALID_SEVERITIES = frozenset(notification_severity.SEVERITIES)
 VALID_NOTIFY_TARGET_SCOPES = {"user", "agent", "global"}
 
 
@@ -415,6 +416,16 @@ def _validate_event_filter(
 # =====================================================================
 
 
+def _audience_word(value: str | None) -> str:
+    """Who is told, validated: one of the per-agent roles; a new trigger
+    without one tells the editor tier."""
+    word = (value or roles.EDITOR).strip()
+    if word not in roles.AGENT_ROLES:
+        raise TriggerValidationError(
+            f"notify_audience must be one of: {', '.join(roles.AGENT_ROLES)}")
+    return word
+
+
 def register_trigger(
     *,
     name: str,
@@ -440,6 +451,7 @@ def register_trigger(
     community_template: str | None = None,
     community_template_item_slug: str | None = None,
     caller_is_admin: bool = False,
+    notify_audience: str = roles.EDITOR,
 ) -> dict:
     """Create a trigger row after validating all business rules.
 
@@ -545,6 +557,7 @@ def register_trigger(
         event_filter=event_filter or {},
         app_id=app_id or None,
         handler=(handler or None) if app_id else None,
+        notify_audience=_audience_word(notify_audience),
     )
     logger.info(
         "Trigger created: id=%s scope=%s agent=%s "
@@ -582,6 +595,8 @@ def update_trigger(
     final = {**existing, **payload}
 
     try:
+        if "notify_audience" in payload:
+            payload["notify_audience"] = _audience_word(payload.get("notify_audience"))
         if "notify_severity" in payload:
             payload["notify_severity"] = _validate_severity(payload.get("notify_severity"))
             final["notify_severity"] = payload["notify_severity"]
@@ -1106,5 +1121,6 @@ async def _fire_inline_notification(
         source="trigger",
         source_id=trigger_row["id"],
         agent_slug=trigger_row.get("agent"),
+        audience=trigger_row.get("notify_audience"),
     )
     return len(deliveries)

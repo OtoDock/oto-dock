@@ -37,6 +37,7 @@ import {
   type DepartmentReach,
 } from '../../lib/kinds/department'
 import { ModeDiagram, ReachDiagram } from './WiringDiagrams'
+import NotebookSection from './NotebookSection'
 import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, CARD as UI_CARD } from '../ui/classes'
 import { SaveState } from '../ui/SettingsControls'
 import { useSaveState, type SaveStateApi, type SaveStatus } from '../../hooks/useSaveState'
@@ -863,6 +864,7 @@ function DepartmentCard({
             {"Each agent's department is set in its settings, in the Department field."}
           </p>
         </div>
+        <NotebookSection departmentId={department.id} />
           </div>
         </div>
       )}
@@ -874,7 +876,7 @@ function DepartmentCard({
 // Main component
 // ---------------------------------------------------------------------------
 
-export default function DepartmentsEditor() {
+export default function DepartmentsEditor({ onInstallFromCommunity }: { onInstallFromCommunity?: () => void } = {}) {
   const { user } = useAuth()
   const canCreate = isCreatorOrAbove(user)
   const { data: departments, isLoading } = useDepartments()
@@ -911,6 +913,14 @@ export default function DepartmentsEditor() {
       </div>
       {canCreate && showCreate && (
         <CreateDepartmentCard onDone={() => setShowCreate(false)} />
+      )}
+      {canCreate && onInstallFromCommunity && (
+        <p className="text-xs text-secondary" data-testid="departments-install-line">
+          Or install a ready-made department from the community.{' '}
+          <button type="button" className="underline text-primary" onClick={onInstallFromCommunity}>
+            Browse the department sets
+          </button>
+        </p>
       )}
 
       {deletedUnassigned.length > 0 && (

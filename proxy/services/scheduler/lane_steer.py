@@ -13,12 +13,13 @@ Every ``core.*`` import stays function-local so the standalone scheduler can
 import this package without the platform.
 """
 
+import functools
+import json
 import logging
 from typing import TYPE_CHECKING, cast
 
-from services.scheduler import task_kinds
+from services.scheduler import lanes, task_kinds
 from storage import database as task_store
-from storage.agents import agent_store
 from storage.automation import run_status
 
 if TYPE_CHECKING:
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("otodock.scheduler")
 
 
-def _running_delegate_run(chat_id: str) -> dict | None:
+def running_delegate_run(chat_id: str) -> dict | None:
     """The delegate run currently driving ``chat_id``, or None."""
     runs = task_store.list_runs(limit=5, chat_id=chat_id, status=run_status.RUNNING)
     for run in runs:
@@ -50,7 +51,7 @@ async def try_steer_continue(
     (``steered: True``) or None, in which case the caller queues a run
     exactly as before. Accept is exactly-once: an accepted steer never also
     creates a run."""
-    from core.events import input_queue
+    from core.events import chat_writer, input_queue
     from core.events.common_events import TurnInput
     from core.events.stream_pump import _active_pumps
     from core.session import interactive_session, session_kind
@@ -73,18 +74,33 @@ async def try_steer_continue(
         terminal = interactive_session.find_live_for_chat(chat_id)
         if terminal is None or not terminal.alive:
             return None
-    run = await run_db(_running_delegate_run, chat_id)
+    run = await run_db(running_delegate_run, chat_id)
     if not run:
         return None
     task_row = await run_db(task_store.get_dynamic_task, run.get("task_id") or "")
     if not task_row or (task_row.get("on_complete_chat_id") or "") != parent_chat_id:
         return None
+    # The row and the live bubble, in the shape the runner gives a run's
+    # prompt: the user row wears the delegating agent's badge.
+    meta = await run_db(lanes.prompt_row_meta, source_agent, chat.get("agent") or "")
     if terminal is not None:
-        # Steered into an open turn, pasted at quiescence otherwise; the
-        # transcript tailer persists the prompt row (no badge, as every
-        # terminal row) and the terminal itself shows it, so no frame.
+        # Steered into an open turn, pasted at quiescence otherwise. The
+        # row (the card the lane shows) is written from the injection, after
+        # what the terminal produced before it read the prompt, and the
+        # tailer skips the journaled copy (the item is noted); a refused
+        # queue writes nothing, the run the caller then starts does. No
+        # frame: the terminal shows the text, the rich view gets the row
+        # with the next history delta.
+        def _persist_row() -> None:
+            chat_writer.submit(
+                chat_id,
+                functools.partial(task_store.add_chat_message, chat_id, "user", prompt,
+                                  event_data=json.dumps(meta)),
+                label="lane_steer_prompt",
+            )
         if terminal.queue_prompt(
-            prompt, "delegate_continue", steer=True, chat_id=chat_id,
+            prompt, "delegate_continue", steer=True, chat_id=chat_id, note=True,
+            on_injected=_persist_row,
         ) is None:
             return None
         logger.info(
@@ -115,18 +131,9 @@ async def try_steer_continue(
     if not accepted:
         return None
 
-    # The row and the live bubble, in the shape the runner gives a run's
-    # prompt: the user row wears the delegating agent's badge; the frame fans
-    # to every viewer of the lane through the pump.
-    delegating = await run_db(agent_store.get_agent, source_agent) or {}
-    meta = {
-        "agent_slug": source_agent,
-        "agent_display_name": delegating.get("display_name") or source_agent,
-        "agent_color": delegating.get("color", ""),
-        "badge": "delegated by",
-    }
-    # Recorded by the pump in stream order: the blocks the worker produced
-    # before it are saved first, so the row sorts where the engine read it.
+    # The frame fans to every viewer of the lane through the pump. Recorded
+    # by the pump in stream order: the blocks the worker produced before it
+    # are saved first, so the row sorts where the engine read it.
     qi = input_queue.QueuedInput(queue_id="", chat_id=chat_id, author_sub="",
                                  item=TurnInput(prompt))
     if not pump.record_steer(qi, extra_meta=meta, frame_extra={"event_data": meta}):

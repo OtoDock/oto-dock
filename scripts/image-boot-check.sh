@@ -183,14 +183,15 @@ fi
 # breaks this part (the 2026 builds clone the command into new mount and pid
 # namespaces and mount /proc themselves), and /health never reaches it. The
 # proxy's own nested probe (bwrap in bwrap) stays a warning: a GitHub arm64
-# runner cannot start the second level. pasta prints several lines, and on an
-# AVX2 host without the passt.avx2 build a warning line comes first ("Can't
-# run AVX2 build, using non-AVX2 version"), so the version is the line that
-# starts with "pasta ". The whole output is read and the line picked in the
-# shell: a reader that closes early kills the writer with a broken pipe, and
-# pipefail makes that the script's own exit.
+# runner cannot start the second level. pasta's FIRST line must be its
+# version: the image carries the passt.avx2 build beside passt, so an AVX2
+# host (the GitHub amd64 runner) runs it with no warning ahead, and a missing
+# one ("Can't run AVX2 build, using non-AVX2 version" first) fails here. The
+# whole output is read and the first line cut in the shell: a reader that
+# closes early kills the writer with a broken pipe, and pipefail makes that
+# the script's own exit.
 got="$(docker exec "$PROXY" pasta --version 2>&1)"
-got="$(awk '/^pasta /{print; exit}' <<<"$got")"
+got="${got%%$'\n'*}"
 [ "$got" = "pasta $PASST_PIN" ] || fail "the proxy image's pasta says '$got', VERSIONS.md pins $PASST_PIN"
 if ! out="$(timeout 60 docker exec "$PROXY" /opt/otodock/proxy/scripts/oto-sandbox-net --block-private -- \
         bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --share-net \

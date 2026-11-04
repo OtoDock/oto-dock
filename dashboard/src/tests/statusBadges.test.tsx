@@ -67,6 +67,26 @@ describe('RemoteBadge', () => {
     fireEvent.touchStart(screen.getByText('Elsewhere'))
     expect(screen.queryByRole('tooltip')).toBeNull()
   })
+
+  it('says why a chat below manager runs on the platform, or on the machine by its switch', () => {
+    const { rerender } = render(
+      <RemoteBadge state="online" machineName="laptop" fallbackReason="viewer-on-admin-remote" />)
+    fireEvent.click(dot())
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Sessions below manager run locally')
+    rerender(<RemoteBadge state="online" machineName="laptop" fallbackReason="all-roles-on-admin-remote" />)
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Its admin lets every role run here')
+  })
+
+  it('an online machine whose local link is down reads amber and says what its row says', () => {
+    const { rerender } = render(<RemoteBadge state="online" machineName="laptop" linkDown linkDownS={12} />)
+    fireEvent.click(dot())
+    expect(screen.getByRole('tooltip')).toHaveTextContent(
+      'laptop: Connected, local link down · Its sessions cannot reach OtoDock. The satellite is restoring the link.')
+    expect(dot().querySelector('.bg-status-warning-solid')).not.toBeNull()
+    rerender(<RemoteBadge state="online" machineName="laptop" linkDown linkDownS={300} />)
+    expect(screen.getByRole('tooltip')).toHaveTextContent(
+      'laptop: Connected, local link down · Its sessions cannot reach OtoDock. Restart the satellite on that machine.')
+  })
 })
 
 // ─── StatusBadge: one tone per meaning ─────────────────────────────────────

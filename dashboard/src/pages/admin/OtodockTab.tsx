@@ -103,12 +103,12 @@ function LicenseBillingCard() {
         )}
         {data?.license_status === 'lapsed' && (
           <div className="mb-3 text-xs px-3 py-2 rounded-card bg-status-danger-bg text-status-danger-fg">
-            Your subscription lapsed. New users are blocked. Existing users keep working. Renew, then press &quot;Re-check now&quot;.
+            Your subscription lapsed. New users are blocked. Existing users keep working. When the subscription is current again, press Re-check now.
           </div>
         )}
         {data?.license_status === 'grace' && (
           <div className="mb-3 text-xs px-3 py-2 rounded-card bg-status-warning-bg text-status-warning-fg">
-            Expired {data?.license_days_since_expiry}d ago. New users are blocked, so renew soon.
+            Expired {data?.license_days_since_expiry}d ago. New users are blocked.
           </div>
         )}
         {data?.license_status === 'expired' && (

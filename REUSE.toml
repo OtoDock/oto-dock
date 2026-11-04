@@ -113,3 +113,65 @@ path = ["dashboard/android/gradlew", "dashboard/android/gradlew.bat", "dashboard
 precedence = "override"
 SPDX-FileCopyrightText = "Gradle contributors"
 SPDX-License-Identifier = "Apache-2.0"
+
+# The ECMA-376 5th edition Part 4 transitional XML schemas the file tools
+# check documents against, copied unchanged (the NOTICE beside them names
+# the source and each file's sha256).
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/ooxml/xsd/ecma/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Ecma International"
+SPDX-License-Identifier = "LicenseRef-Ecma-text-copyright"
+
+# The licence texts the file tools' image carries for their third-party
+# notices, each the project's own text unchanged (THIRD-PARTY-NOTICES.md
+# beside them names each one).
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/licenses/Open-XML-SDK-MIT.txt"
+precedence = "override"
+SPDX-FileCopyrightText = ".NET Foundation and Contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/licenses/ppt-master-MIT.txt"
+precedence = "override"
+SPDX-FileCopyrightText = "2025-2026 Hugo He"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/licenses/theme-factory-Apache-2.0.txt"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Anthropic, PBC"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/licenses/Caladea-Apache-2.0.txt"
+precedence = "override"
+SPDX-FileCopyrightText = "2012 Huerta Tipografia"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/licenses/ECMA-376-LicenseRef-Ecma-text-copyright.txt"
+precedence = "override"
+SPDX-FileCopyrightText = "Ecma International"
+SPDX-License-Identifier = "LicenseRef-Ecma-text-copyright"
+
+# The file tools' files that carry another project's material
+# (THIRD-PARTY-NOTICES.md says what each one took).
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/ooxml/order_table.json"
+precedence = "override"
+SPDX-FileCopyrightText = ["2026 Dimitrios Mourtzis <legal@otodock.io>", ".NET Foundation and Contributors"]
+SPDX-License-Identifier = "FSL-1.1-ALv2 AND MIT"
+
+[[annotations]]
+path = ["mcps/custom/file-tools-mcp/formats/pptx/pptx_transitions.py", "mcps/custom/file-tools-mcp/formats/pptx/pptx_animation_presets.json"]
+precedence = "override"
+SPDX-FileCopyrightText = ["2026 Dimitrios Mourtzis <legal@otodock.io>", "2025-2026 Hugo He"]
+SPDX-License-Identifier = "FSL-1.1-ALv2 AND MIT"
+
+[[annotations]]
+path = "mcps/custom/file-tools-mcp/formats/pptx/pptx_theme.py"
+precedence = "override"
+SPDX-FileCopyrightText = ["2026 Dimitrios Mourtzis <legal@otodock.io>", "2026 Anthropic, PBC"]
+SPDX-License-Identifier = "FSL-1.1-ALv2 AND Apache-2.0"

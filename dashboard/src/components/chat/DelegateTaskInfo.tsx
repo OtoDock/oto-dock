@@ -5,8 +5,9 @@ import type { DelegateResultFile, DelegateResultSkipped } from '../../api/wireEv
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from '../../lib/status/run'
 
 import ChatFilePreview from './ChatFilePreview'
-import { resultFileLabel } from '../../lib/chat/delegateFiles'
+import { resultFileChipLabelParts, resultFileLabel } from '../../lib/chat/delegateFiles'
 import { delegatePreviewText } from '../../lib/messageBlocks'
+import { cleanUserMessageText } from '../../lib/transcriptCleanup'
 import { useChatFileContext } from '../../lib/chat/chatFileContext'
 
 interface Props {
@@ -26,9 +27,11 @@ export default function DelegateTaskInfo({ taskName, agent, promptPreview, statu
   const fullPrompt = prompt || ''
   const expandable = !!fullPrompt
   // The worker's task, not the platform's wrapper around it (the full
-  // prompt when the spawn carried it; older rows have the 100-char head).
+  // prompt when the spawn carried it; older rows have the 100-char head):
+  // the text as the worker's card shows it, in the preview and expanded.
+  const shownPrompt = fullPrompt ? (cleanUserMessageText(fullPrompt) ?? fullPrompt) : ''
   const shownPreview = fullPrompt
-    ? delegatePreviewText('prompt', [{ type: 'text', content: fullPrompt }])
+    ? delegatePreviewText('prompt', [{ type: 'text', content: shownPrompt }])
     : promptPreview
 
   // Rendered twice: inline on sm+, on its own row below the name on narrow
@@ -97,7 +100,7 @@ export default function DelegateTaskInfo({ taskName, agent, promptPreview, statu
         <div className="border-t border-subtle px-3 py-2 text-xs font-mono text-primary">
           <div className="text-secondary font-sans font-medium mb-1">Prompt</div>
           <pre className="whitespace-pre-wrap bg-surface-sunken rounded-sm px-2 py-1.5 max-h-80 overflow-y-auto">
-            {fullPrompt}
+            {shownPrompt}
           </pre>
         </div>
       )}
@@ -121,6 +124,20 @@ const NOT_FOUND_REVERT_MS = 2500
  * this chat's tree. Without a chat context (a chat with no id yet) the rows
  * are inert text. Skipped entries show muted with the proxy's reason.
  */
+/** A chip's file name, cut in the middle when the card is narrow: the end
+ * of the name stays whole. A file gone since reads not found a moment. */
+function ChipLabel({ path, missing }: { path: string; missing: boolean }) {
+  const gone = missing ? 'not found' : null
+  if (gone) return <span className="min-w-0 truncate font-mono">{gone}</span>
+  const { head, tail } = resultFileChipLabelParts(path)
+  return (
+    <span className="flex min-w-0 font-mono" data-testid="delegate-file-chip-label">
+      <span className="min-w-0 truncate">{head}</span>
+      <span className="shrink-0 whitespace-pre">{tail}</span>
+    </span>
+  )
+}
+
 export function DelegateResultFiles({ files, skipped, compact = false }: {
   files: DelegateResultFile[]
   skipped: DelegateResultSkipped[]
@@ -160,7 +177,9 @@ export function DelegateResultFiles({ files, skipped, compact = false }: {
   if (compact) {
     if (files.length === 0) return null
     return (
-      <div className="flex flex-wrap gap-1.5" data-testid="delegate-file-chips">
+      // min-w-0 and max-w-full down the chain: a long path shortens inside
+      // the card, never widening it past the chat pane.
+      <div className="flex flex-wrap gap-1.5 min-w-0 max-w-full" data-testid="delegate-file-chips">
         {files.map((f) => (
           <button
             key={f.path}
@@ -168,12 +187,12 @@ export function DelegateResultFiles({ files, skipped, compact = false }: {
             onClick={() => open(f.path)}
             disabled={!ctx || busy === f.path}
             title={notFound === f.path ? 'File not found in this chat\'s workspace' : f.path}
-            className="inline-flex items-center gap-1 max-w-full rounded-control px-2 py-0.5 text-2xs font-medium
+            className="inline-flex items-center gap-1 min-w-0 max-w-full rounded-control px-2 py-0.5 text-2xs font-medium
                        bg-surface-card text-accent-agent-fg hover:underline disabled:opacity-60
                        focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
           >
-            <span aria-hidden="true">📄</span>
-            <span className="truncate font-mono">{notFound === f.path ? 'not found' : resultFileLabel(f.path)}</span>
+            <span aria-hidden="true" className="shrink-0">📄</span>
+            <ChipLabel path={f.path} missing={notFound === f.path} />
           </button>
         ))}
         {preview && <ChatFilePreview resolved={preview} onClose={() => setPreview(null)} />}
@@ -189,8 +208,8 @@ export function DelegateResultFiles({ files, skipped, compact = false }: {
       <ul className="px-2 pb-1.5 space-y-0.5">
         {files.map((f) => (
           <li key={f.path} className="flex items-center gap-2 min-w-0">
-            <span aria-hidden="true">📄</span>
-            <span className="truncate font-mono text-primary" title={f.path}>{resultFileLabel(f.path)}</span>
+            <span aria-hidden="true" className="shrink-0">📄</span>
+            <span className="min-w-0 font-mono text-primary [overflow-wrap:anywhere]" title={f.path}>{resultFileLabel(f.path)}</span>
             <span className="shrink-0 text-tertiary">{sizeText(f.bytes)}</span>
             {ctx && (
               <button
@@ -207,8 +226,8 @@ export function DelegateResultFiles({ files, skipped, compact = false }: {
         ))}
         {skipped.map((s, i) => (
           <li key={`skip-${i}`} className="flex items-center gap-2 min-w-0 text-tertiary">
-            <span aria-hidden="true">⊘</span>
-            <span className="truncate font-mono" title={s.path}>{s.path}</span>
+            <span aria-hidden="true" className="shrink-0">⊘</span>
+            <span className="min-w-0 font-mono [overflow-wrap:anywhere]" title={s.path}>{s.path}</span>
             <span className="shrink-0 truncate">{s.reason}</span>
           </li>
         ))}

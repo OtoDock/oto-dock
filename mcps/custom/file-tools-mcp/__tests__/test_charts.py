@@ -171,16 +171,55 @@ def test_doughnut_center_total_only_for_count_data(_capture_push):
 def test_hbar_first_category_at_top(_capture_push, monkeypatch):
     # invert_yaxis puts categories[0] at the top — assert on the axes state.
     captured = {}
-    import matplotlib.pyplot as plt
-    orig_subplots = plt.subplots
+    import charts
 
-    def spy_subplots(*a, **kw):
-        fig, ax = orig_subplots(*a, **kw)
+    original = charts._new_axes
+
+    def spy(*a, **kw):
+        fig, ax = original(*a, **kw)
         captured["ax"] = ax
         return fig, ax
 
-    monkeypatch.setattr(plt, "subplots", spy_subplots)
+    monkeypatch.setattr(charts, "_new_axes", spy)
     out = _run({"chart_type": "horizontal_bar", "categories": ["first", "second"],
                 "series": [{"name": "S", "values": [1, 2]}]})
     assert not out.startswith("Error:")
     assert captured["ax"].yaxis_inverted()
+
+
+@pytest.mark.parametrize("width, message", [(0.5, "width is 0.5 inches; give 1 to 40"),
+                                            (400, "width is 400 inches; give 1 to 40"),
+                                            ("wide", "width must be a number of inches")])
+def test_the_size_is_capped_before_any_drawing(width, message, monkeypatch):
+    import charts
+
+    def never(*a, **k):
+        raise AssertionError("the chart was drawn")
+
+    monkeypatch.setattr(charts, "render_png", never)
+    out = _run({"chart_type": "bar", "categories": ["a"], "series": [{"values": [1]}], "width": width})
+    assert out.startswith("Error: ") and message in out
+
+
+def test_a_chart_renders_in_a_worker_and_the_loop_stays_free(_capture_push, monkeypatch):
+    """matplotlib never runs on the server's event loop."""
+    monkeypatch.delenv("FILETOOLS_ISOLATION_INLINE", raising=False)
+    ticks = []
+
+    async def scenario():
+        async def ticker():
+            while True:
+                ticks.append(1)
+                await asyncio.sleep(0.01)
+
+        beat = asyncio.create_task(ticker())
+        out = await handle_create_chart({"chart_type": "line", "categories": list("abcdefgh"),
+                                         "series": [{"name": f"S{i}", "values": list(range(8))} for i in range(6)]})
+        beat.cancel()
+        return out
+
+    began = __import__("time").monotonic()
+    out = asyncio.run(scenario())
+    elapsed = __import__("time").monotonic() - began
+    assert out.startswith("line chart created") and _capture_push["bytes"].startswith(b"\x89PNG")
+    assert len(ticks) >= elapsed / 0.01 * 0.5, (len(ticks), elapsed)

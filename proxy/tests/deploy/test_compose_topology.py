@@ -271,6 +271,19 @@ def test_phone_ports_bind_loopback_by_default(phone):
         )
 
 
+def test_the_native_compose_publishes_only_on_loopback_by_default():
+    """The bare-metal file-tools compose: file-tools' port is loopback only,
+    and Collabora's native port follows COLLABORA_BIND_IP, loopback when it
+    is unset (the proxy reaches it on localhost; a LAN host must not reach
+    its convert-to)."""
+    native = _load("mcps/custom/file-tools-mcp/docker-compose.yml")
+    assert _svc(native, "file-tools")["ports"] == ["127.0.0.1:8932:8932"]
+    assert _svc(native, "collabora")["ports"] == ["${COLLABORA_BIND_IP:-127.0.0.1}:9981:9980"]
+    for name, svc in native["services"].items():
+        for port in svc.get("ports") or []:
+            assert str(port).startswith(("127.0.0.1:", "${COLLABORA_BIND_IP:-127.0.0.1}:")), (name, port)
+
+
 # --- resource floors --------------------------------------------
 
 def test_proxy_has_fd_and_pids_floors(base):

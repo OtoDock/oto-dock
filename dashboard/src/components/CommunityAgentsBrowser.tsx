@@ -12,11 +12,14 @@ import { useMemo, useState } from 'react'
 
 import {
   CommunityAgentRegistryEntry,
+  type CommunityDepartmentSet,
   useCommunityAgents,
+  useCommunitySets,
 } from '../api/communityAgents'
 import { safeHref } from '../lib/safeUrl'
 import AgentInstallModal from './AgentInstallModal'
 import AgentUpdateModal from './AgentUpdateModal'
+import DepartmentInstallModal from './departments/DepartmentInstallModal'
 import Dialog from './ui/Dialog'
 import Button from './ui/Button'
 import { Input, Select } from './ui/Field'
@@ -25,30 +28,53 @@ import { DIALOG_PANEL, BADGE_TONE } from './ui/classes'
 interface Props {
   open: boolean
   onClose: () => void
+  /** `sets`: open on the department sets (the Departments tab's link). */
+  section?: 'agents' | 'sets'
 }
 
-export default function CommunityAgentsBrowser({ open, onClose }: Props) {
+export default function CommunityAgentsBrowser({ open, onClose, section = 'agents' }: Props) {
   const { data, isLoading, isError } = useCommunityAgents(open)
+  const sets = useCommunitySets(open)
   const [search, setSearch] = useState('')
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [selectedTemplate, setSelectedTemplate] = useState<CommunityAgentRegistryEntry | null>(null)
+  const [selectedSet, setSelectedSet] = useState<CommunityDepartmentSet | null>(null)
   const [updateSlug, setUpdateSlug] = useState<string | null>(null)
+  const onlyInstalled = statusFilter === 'installed'
+  const onlyNew = statusFilter === 'not_installed'
+  const setsOf = useMemo(() => {
+    const out: Record<string, string[]> = {}
+    for (const s of sets.data?.departments ?? []) {
+      for (const m of s.members) (out[m.template] ??= []).push(s.name)
+    }
+    return out
+  }, [sets.data])
+  const setList = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    return (sets.data?.departments ?? []).filter((s) => {
+      if (onlyInstalled && s.installed.length === 0) return false
+      if (onlyNew && s.installed.length > 0) return false
+      if (!q) return true
+      const hay = `${s.slug} ${s.name} ${s.description} ${s.tags.join(' ')} ${s.members.map((m) => m.display_name).join(' ')}`.toLowerCase()
+      return hay.includes(q)
+    })
+  }, [sets.data, search, onlyInstalled, onlyNew])
 
   const filtered = useMemo(() => {
     const agents = data?.agents ?? []
     const q = search.trim().toLowerCase()
     return agents.filter(a => {
       if (categoryFilter !== 'all' && a.category !== categoryFilter) return false
-      if (statusFilter === 'installed' && (a.installed_as ?? []).length === 0) return false
-      if (statusFilter === 'not_installed' && (a.installed_as ?? []).length > 0) return false
+      if (onlyInstalled && (a.installed_as ?? []).length === 0) return false
+      if (onlyNew && (a.installed_as ?? []).length > 0) return false
       if (q) {
         const hay = `${a.slug} ${a.display_name} ${a.description} ${a.tags.join(' ')} ${a.author}`.toLowerCase()
         if (!hay.includes(q)) return false
       }
       return true
     })
-  }, [data, search, categoryFilter, statusFilter])
+  }, [data, search, categoryFilter, onlyInstalled, onlyNew])
 
   const categories = useMemo(() => {
     const seen = new Set<string>()
@@ -132,6 +158,21 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
               <div className="text-sm text-tertiary">No agents match the current filters.</div>
             )}
 
+            {setList.length > 0 && (
+              <section className="mb-5" data-testid="community-sets" aria-labelledby="community-sets-heading">
+                <h4 id="community-sets-heading" className="text-sm font-semibold text-primary">Department sets</h4>
+                <p className="text-xs text-tertiary mt-0.5 mb-2">
+                  Several agents installed as one department. Each sits at its level. The head&apos;s library is shared with the team. The schedules stay paused.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
+                  {setList.map(s => (
+                    <SetCard key={s.slug} set={s} onInstall={() => setSelectedSet(s)} />
+                  ))}
+                </div>
+                {section === 'sets' && <h4 className="text-sm font-semibold text-primary mt-5 mb-2">Agents</h4>}
+              </section>
+            )}
+
             {/* items-start: an expanded card grows on its own — its row-mates
                 keep their natural height instead of stretching to match. */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
@@ -139,6 +180,7 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
                 <AgentCard
                   key={agent.slug}
                   agent={agent}
+                  sets={setsOf[agent.slug] ?? []}
                   onInstall={() => setSelectedTemplate(agent)}
                   onUpdate={slug => setUpdateSlug(slug)}
                 />
@@ -177,7 +219,61 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
       {updateSlug && (
         <AgentUpdateModal open agentSlug={updateSlug} onClose={() => setUpdateSlug(null)} />
       )}
+      <DepartmentInstallModal
+        open={!!selectedSet}
+        set={selectedSet}
+        onClose={() => setSelectedSet(null)}
+      />
     </>
+  )
+}
+
+
+// ---------------------------------------------------------------------------
+// A department set's card
+// ---------------------------------------------------------------------------
+
+function SetCard({ set, onInstall }: { set: CommunityDepartmentSet; onInstall: () => void }) {
+  const blocked = set.problems.length > 0 || set.missing_members.length > 0 || !set.platform_compat_ok
+  return (
+    <div className="rounded-card border border-subtle p-4 flex flex-col gap-3 hover:border-default transition-colors" data-testid={`set-card-${set.slug}`}>
+      <div className="flex items-start gap-3">
+        <div
+          // eslint-disable-next-line otodock/no-raw-palette -- white initial on the set's own colour
+          className="w-11 h-11 rounded-card shrink-0 flex items-center justify-center text-white text-base font-semibold"
+          style={{ background: set.color || set.members[0]?.color || 'var(--ot-action)' }}
+        >
+          {set.name.charAt(0)}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-primary truncate">{set.name}</div>
+          <div className="text-2xs text-tertiary">v{set.version} · {set.members.length} agents · {set.author}</div>
+        </div>
+      </div>
+      <p className="text-xs text-secondary line-clamp-3">{set.description}</p>
+      <ul className="flex flex-wrap gap-1">
+        {set.members.map(m => (
+          <li key={m.template} className="px-1.5 py-0.5 rounded-sm text-3xs bg-surface-muted text-secondary">
+            {m.display_name} <span className="text-tertiary">· {m.level}</span>
+          </li>
+        ))}
+      </ul>
+      {set.installed.length > 0 && (
+        <div className="text-2xs text-status-success-fg truncate">✓ Installed as: {set.installed.map(d => d.name).join(', ')}</div>
+      )}
+      {blocked && (
+        <div className="text-2xs text-status-danger-fg">
+          {!set.platform_compat_ok ? 'Needs a newer OtoDock.'
+            : set.problems.length > 0 ? 'This set has errors in the catalog.'
+            : 'A template of this set is not in the catalog.'}
+        </div>
+      )}
+      <div className="flex items-center gap-2 mt-auto">
+        <Button variant="primary" size="xs" className="flex-1" onClick={onInstall} disabled={blocked}>
+          Install the department
+        </Button>
+      </div>
+    </div>
   )
 }
 
@@ -188,10 +284,12 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
 
 function AgentCard({
   agent,
+  sets,
   onInstall,
   onUpdate,
 }: {
   agent: CommunityAgentRegistryEntry
+  sets: string[]
   onInstall: () => void
   onUpdate: (agentSlug: string) => void
 }) {
@@ -271,6 +369,32 @@ function AgentCard({
         {agent.has_checks && <span>· checks</span>}
         {agent.has_context && <span>· auto-context files</span>}
       </div>
+
+      {/* The apps it brings, one line each, with a picture when there is one */}
+      {(agent.apps?.length ?? 0) > 0 && (
+        <ul className="space-y-1.5" data-testid={`apps-of-${agent.slug}`}>
+          {agent.apps!.map(app => (
+            <li key={app.slug} className="flex items-start gap-2 text-xs">
+              {app.picture_url ? (
+                <img
+                  src={`/v1/community/agents/${agent.slug}/pictures/${app.slug}.png`}
+                  alt=""
+                  className="w-12 h-8 rounded-sm object-cover shrink-0 bg-surface-muted"
+                />
+              ) : null}
+              <span className="min-w-0">
+                <span className="font-medium text-primary">{app.title}</span>
+                {app.description ? <span className="text-secondary"> {app.description}</span> : null}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {sets.length > 0 && (
+        <div className="text-2xs text-tertiary" data-testid={`sets-of-${agent.slug}`}>
+          Part of the {sets.join(', ')} department {sets.length === 1 ? 'set' : 'sets'}.
+        </div>
+      )}
 
       {/* Expanded section */}
       {expanded && (

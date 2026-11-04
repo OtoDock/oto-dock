@@ -218,8 +218,11 @@ async def deliver_prompt(
             # steer-first semantics for headless. With the turn closed, or on
             # a satellite-attached PTY (turn-end inject by design), the flag
             # is inert and the item waits for quiescence as before.
+            # note=True: the prompt's row is the caller's event row (the
+            # result's, the wake's), so the transcript tailer skips the
+            # journaled copy once the bytes are in the terminal.
             queued = isess.queue_prompt(
-                text, source, steer=True,
+                text, source, steer=True, note=True,
                 chat_id=target_chat_id or "",
                 agent=agent, user_sub=user_sub, role=role, hops=hops,
                 persistent_fn=persistent_fn, oneshot_fn=oneshot_fn,
@@ -484,7 +487,7 @@ async def _queue_on_pty_after_warmup(
     isess = interactive_session.find_live_for_chat(chat_id)
     if isess is None or not isess.alive:
         return None
-    if not isess.queue_prompt(text, source, chat_id=chat_id, **context):
+    if not isess.queue_prompt(text, source, chat_id=chat_id, note=True, **context):
         return None
     logger.info(
         "deliver_prompt[%s]: one-shot refusal recovered — queued on the "

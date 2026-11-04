@@ -157,6 +157,10 @@ TOOL_NAME_AUTHORITY = (
     "proxy/hooks/tool_result_forwarder.py",
 )
 KNOWN_TOOL_NAME_SITES: dict[str, tuple[str, dict[str, int]]] = {
+    "mcps/custom/file-tools-mcp/__tests__/test_pptx_measure.py": (
+        "a slide's own text in a measuring test, not a tool", {"Read": 1}),
+    "mcps/custom/file-tools-mcp/formats/xlsx/refshift.py": (
+        "the reference-shift module's Edit class in its __all__, not a tool", {"Edit": 1}),
     "proxy/auth/path_policy.py": (
         "the deny message's user-facing verbs (\"Write denied\" / \"Read denied\"), not tools",
         {"Write": 1, "Read": 1}),

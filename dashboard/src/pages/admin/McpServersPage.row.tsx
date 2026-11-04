@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useUpdateMcp, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, automaticUpdateNote, McpServer, McpUpdateInfo, McpSourceChange, McpSourceEnd } from '../../api/mcps'
+import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useStartMcpUpdate, UPDATE_JOB_END, ASSIGNMENT_PLATFORM, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, automaticUpdateNote, McpServer, McpUpdateInfo, McpUpdateJob, McpUpdateFinished, McpSourceChange, McpSourceEnd } from '../../api/mcps'
 import { INPUT_MULTILINE_SECRET, isGitHubApp } from '../../lib/kinds/oauthApp'
 import { useAgents } from '../../api/agents'
 import { useSetInfraCredentials, useCredentialSchema } from '../../api/credentials'
-import { useClientRegistrations, useForgetClientRegistration, ClientRegistration } from '../../api/oauth'
+import { useClientRegistrations, useForgetClientRegistration, ClientRegistration, type BearerPending } from '../../api/oauth'
+import AllowMcpHosts from '../../components/admin/AllowMcpHosts'
 import McpInstanceManager, { ApiKeyRelayInfo } from '../../components/admin/McpInstanceManager'
 import McpIcon from '../../components/McpIcon'
 import { useAuth } from '../../contexts/AuthContext'
@@ -288,8 +289,23 @@ function SwitchedCard({ mcp, change }: { mcp: McpServer; change: McpSourceChange
   )
 }
 
-export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
-  mcp: McpServer; updateInfo?: McpUpdateInfo; autoUpdateEnabled?: boolean
+// An update job's phase, where its button was.
+function UpdateProgress({ job }: { job: McpUpdateJob }) {
+  return (
+    <p role="status" className="flex items-center gap-1.5 text-2xs text-secondary">
+      <svg className="w-3.5 h-3.5 animate-spin shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      </svg>
+      {job.detail}
+    </p>
+  )
+}
+
+// `waiting`: the addresses this MCP sends people's sign-in to that wait for
+// an admin's Allow (the allowlist's pending list, read once by the page).
+export function McpRow({ mcp, updateInfo, job, finished, autoUpdateEnabled = true, waiting }: {
+  mcp: McpServer; updateInfo?: McpUpdateInfo; job?: McpUpdateJob; finished?: McpUpdateFinished
+  autoUpdateEnabled?: boolean; waiting?: BearerPending
 }) {
   const dialogs = useDialogs()
   const [expanded, setExpanded] = useState(false)
@@ -314,7 +330,9 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
   const setNetworkAccess = useSetNetworkAccess()
   const { authConfig } = useAuth()
   const deleteMcp = useDeleteMcp()
-  const updateMcp = useUpdateMcp()
+  const startUpdate = useStartMcpUpdate()
+  // An update runs: the controls that would touch the MCP or its container wait.
+  const updating = !!job || startUpdate.isPending
   // Hosted OAuth: effective mode = admin override (_hosted_service_mode)
   // or the manifest default. It only takes effect (relay-routed, no install-side
   // credential) when the install is relay-licensed — mirrors the server-side
@@ -346,6 +364,16 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
     />
   )
   const [updateLog, setUpdateLog] = useState('')
+  // The end of an update job, read once per end: its log shows.
+  const [seenEnd, setSeenEnd] = useState('')
+  if (finished && finished.ended_at !== seenEnd) {
+    setSeenEnd(finished.ended_at)
+    setUpdateLog(finished.status === UPDATE_JOB_END.FAILED ? `Error: ${finished.log}` : (finished.log || 'Updated.'))
+  }
+  const update = () => {
+    setUpdateLog('')
+    startUpdate.mutate(mcp.name, { onError: (e: Error) => setUpdateLog(`Error: ${e.message}`) })
+  }
   const [toolFilterRegex, setToolFilterRegex] = useState(mcp.tool_filter_regex || '')
   const [toolFilterError, setToolFilterError] = useState('')
 
@@ -360,8 +388,9 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
   const hasConfig = mcp.config_fields.length > 0
   const hasSkills = mcp.skills.length > 0
   const dockerInfo = isDocker ? DOCKER_STATUS[mcp.docker_status || DOCKER.NOT_CHECKED] : null
-  // An update replaced the image but the container still serves the old one.
-  const restartToSwitch = isDocker && mcp.docker_status === DOCKER.RUNNING && !!mcp.docker_image_stale
+  // An update replaced the image but the container still serves the old one
+  // (never while an update runs: it starts the container itself).
+  const restartToSwitch = !job && isDocker && mcp.docker_status === DOCKER.RUNNING && !!mcp.docker_image_stale
   // What the last check says about this MCP: a pending source change
   // replaces the ordinary offer; a finished switch rides beside one; an
   // install ahead of the catalog is a note, not an offer.
@@ -419,7 +448,7 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
             aria-label={`${mcp.label} enabled`}
             checked={mcp.enabled}
             onChange={() => handleToggle()}
-            disabled={lockedOn || enable.isPending || disable.isPending}
+            disabled={lockedOn || enable.isPending || disable.isPending || updating}
             title={lockedOn ? 'Core MCP, always on' : mcp.enabled ? 'Disable' : 'Enable'}
             // A core MCP is on and locked: dimmed less, so it still reads as on.
             className={lockedOn ? 'disabled:opacity-70' : ''}
@@ -436,12 +465,22 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                 Explicit assignment
               </span>
             )}
+            {mcp.assignment_mode === ASSIGNMENT_PLATFORM && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>
+                Attached by the platform
+              </span>
+            )}
             {pendingChange && (
               <span className={`${BADGE_BASE} ${BADGE_TONE[pendingChange.declared ? 'info' : 'warning']} animate-pulse`}>
                 {pendingChange.status === 'switching' ? 'Switching source…' : 'Source changed'}
               </span>
             )}
-            {ordinaryUpdate && (
+            {waiting && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.warning}`}>Addresses wait</span>
+            )}
+            {job ? (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}>Updating</span>
+            ) : ordinaryUpdate && (
               <span className={`${BADGE_BASE} ${BADGE_TONE.info} animate-pulse`}>
                 {ordinaryUpdate.reason === 'manifest' ? 'Integration update' : `${ordinaryUpdate.latest} available`}
               </span>
@@ -465,6 +504,8 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
       {/* Expanded detail */}
       {expanded && (
         <div className="border-t border-subtle">
+          {/* The addresses that wait for an admin's Allow come first, at every width */}
+          {waiting && <div className="px-4 pt-4"><AllowMcpHosts pending={waiting} /></div>}
           {/* Two-column grid on desktop, single on mobile */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-0 md:gap-4 p-4">
             {/* LEFT: Info */}
@@ -500,15 +541,19 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                 </div>
               </div>
 
-              {/* Agents */}
-              {mcp.agents.length > 0 && (
+              {/* Agents: an MCP the platform attaches is on every call, nobody's to enable */}
+              {(mcp.agents.length > 0 || mcp.assignment_mode === ASSIGNMENT_PLATFORM) && (
                 <div className={`${CARD_BORDERED} p-3`}>
                   <p className="text-2xs font-semibold text-tertiary uppercase tracking-wide mb-2">Enabled for</p>
-                  <div className="flex gap-1.5 flex-wrap">
-                    {mcp.agents.map(a => (
-                      <span key={a} className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>{a}</span>
-                    ))}
-                  </div>
+                  {mcp.assignment_mode === ASSIGNMENT_PLATFORM ? (
+                    <p className="text-xs text-secondary">Every call</p>
+                  ) : (
+                    <div className="flex gap-1.5 flex-wrap">
+                      {mcp.agents.map(a => (
+                        <span key={a} className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>{a}</span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -547,38 +592,31 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                     <p className="text-2xs text-secondary">
                       Installed {ahead.current} is newer than the community version {ahead.latest}. Automatic updates leave it alone.
                     </p>
-                    <Button variant="secondary" size="xs"
-                      onClick={async () => {
-                        if (!(await dialogs.confirm({
-                          title: `Revert "${mcp.label}" to the community version ${ahead.latest}?`,
-                          body: 'Its settings, credentials and agent assignments are kept.',
-                          confirmLabel: 'Revert',
-                        }))) return
-                        setUpdateLog('')
-                        updateMcp.mutate(mcp.name, {
-                          onSuccess: (data) => setUpdateLog(data.install_log || 'Reverted.'),
-                          onError: (e: Error) => setUpdateLog(`Error: ${e.message}`),
-                        })
-                      }}
-                      disabled={updateMcp.isPending}
-                      className="shrink-0"
-                    >
-                      {updateMcp.isPending ? 'Reverting…' : `Revert to ${ahead.latest}`}
-                    </Button>
+                    {job ? <UpdateProgress job={job} /> : (
+                      <Button variant="secondary" size="xs"
+                        onClick={async () => {
+                          if (!(await dialogs.confirm({
+                            title: `Revert "${mcp.label}" to the community version ${ahead.latest}?`,
+                            body: 'Its settings, credentials and agent assignments are kept.',
+                            confirmLabel: 'Revert',
+                          }))) return
+                          update()
+                        }}
+                        disabled={updating}
+                        className="shrink-0"
+                      >
+                        {startUpdate.isPending ? 'Reverting…' : `Revert to ${ahead.latest}`}
+                      </Button>
+                    )}
                   </div>
-                  {updateLog && (
-                    <details open={updateLog.startsWith('Error')} className="mt-1.5">
-                      <summary className="text-2xs text-tertiary cursor-pointer">Install log</summary>
-                      <pre className="mt-1 text-2xs text-tertiary bg-surface-muted rounded-control p-2 overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">{updateLog}</pre>
-                    </details>
-                  )}
                 </div>
               )}
 
               {/* Update available */}
               {ordinaryUpdate && (
                 <div className="rounded-card border border-status-info-border bg-status-info-bg p-3">
-                  <div className="flex items-center justify-between mb-2">
+                  {/* Wraps on a phone: an update's sentence goes under the version */}
+                  <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 mb-2">
                     <div>
                       <p className="text-xs font-medium text-status-info-fg">Update Available</p>
                       <p className="text-2xs text-secondary">
@@ -596,28 +634,21 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                       )}
                     </div>
                     {/* A catalog git+ source at a tag or a branch: the catalog install refuses it. */}
-                    {!(ordinaryUpdate.registry === 'git' && ordinaryUpdate.pinned_commit === false) && (
-                      <Button variant="primary" size="xs"
-                        onClick={() => {
-                          setUpdateLog('')
-                          updateMcp.mutate(mcp.name, {
-                            onSuccess: (data) => setUpdateLog(data.install_log || 'Updated successfully'),
-                            onError: (e: Error) => setUpdateLog(`Error: ${e.message}`),
-                          })
-                        }}
-                        disabled={updateMcp.isPending}
-                      >
-                        {updateMcp.isPending ? 'Updating...' : 'Update'}
+                    {job ? <UpdateProgress job={job} /> : !(ordinaryUpdate.registry === 'git' && ordinaryUpdate.pinned_commit === false) && (
+                      <Button variant="primary" size="xs" onClick={update} disabled={updating}>
+                        {startUpdate.isPending ? 'Starting…' : 'Update'}
                       </Button>
                     )}
                   </div>
-                  {updateLog && (
-                    <details open={updateLog.startsWith('Error')}>
-                      <summary className="text-2xs text-secondary cursor-pointer">Install log</summary>
-                      <pre className="mt-1 text-2xs text-tertiary bg-surface-muted rounded-control p-2 overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">{updateLog}</pre>
-                    </details>
-                  )}
                 </div>
+              )}
+
+              {/* The last update's log: under the offer, or alone once the update cleared it */}
+              {updateLog && (
+                <details open={updateLog.startsWith('Error')} className={`${CARD_BORDERED} p-3`}>
+                  <summary className="text-2xs text-secondary cursor-pointer">Install log</summary>
+                  <pre className="mt-1 text-2xs text-tertiary bg-surface-muted rounded-control p-2 overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">{updateLog}</pre>
+                </details>
               )}
 
               {/* Delete MCP (community only — custom MCPs ship with the platform and aren't re-installable) */}
@@ -626,20 +657,20 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-xs font-medium text-status-danger-fg">Delete MCP</p>
-                      <p className="text-2xs text-secondary">Removes its folder, settings, credentials and agent assignments. Reinstall it later from Browse Community MCPs.</p>
+                      <p className="text-2xs text-secondary">Removes its folder, settings, credentials, event subscriptions and agent assignments. Reinstall it later from Browse Community MCPs.</p>
                     </div>
                     <Button variant="danger" size="xs"
                       onClick={async () => {
                         if (await dialogs.confirm({
                           title: `Delete "${mcp.label}"?`,
-                          body: 'This removes the MCP folder, settings, credentials and agent assignments. This cannot be undone.',
+                          body: 'This removes the MCP folder, settings, credentials, event subscriptions and agent assignments. This cannot be undone.',
                           confirmLabel: 'Delete',
                           tone: 'danger',
                         })) {
                           deleteMcp.mutateAsync(mcp.name).catch(toastError('The MCP was not deleted'))
                         }
                       }}
-                      disabled={deleteMcp.isPending}
+                      disabled={deleteMcp.isPending || updating}
                     >
                       {deleteMcp.isPending ? 'Deleting...' : 'Delete'}
                     </Button>
@@ -663,19 +694,19 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                   <div className="flex items-center gap-2">
                     <Button variant="secondary" size="xs"
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'start' })}
-                      disabled={dockerAction.isPending || mcp.docker_status === DOCKER.RUNNING}
+                      disabled={dockerAction.isPending || updating || mcp.docker_status === DOCKER.RUNNING}
                     >
                       Start
                     </Button>
                     <Button variant="danger" size="xs"
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'stop' })}
-                      disabled={dockerAction.isPending || mcp.docker_status === DOCKER.STOPPED}
+                      disabled={dockerAction.isPending || updating || mcp.docker_status === DOCKER.STOPPED}
                     >
                       Stop
                     </Button>
                     <Button variant="secondary" size="xs"
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'restart' })}
-                      disabled={dockerAction.isPending}
+                      disabled={dockerAction.isPending || updating}
                     >
                       Restart
                     </Button>
@@ -755,68 +786,52 @@ export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
                 </div>
               )}
 
-              {/* Tool Filter. Generic per-MCP
-                  runtime tool restriction — rendered for every MCP, but
-                  enabled only when manifest declares `tool_filter`. */}
+              {/* Tool Filter: a per-MCP runtime tool restriction, shown only
+                  when the manifest declares `tool_filter`. */}
+              {mcp.tool_filter_supported && (
               <div className={`${CARD_BORDERED} p-3`}>
                 <div className="flex items-center justify-between mb-1.5">
                   <div className="min-w-0">
                     <p className="inline text-2xs font-semibold text-tertiary uppercase tracking-wide">Tool Filter</p>
-                    {mcp.tool_filter_supported && <InfoTip label="Tool Filter">Limit which tools this MCP gives agents.</InfoTip>}
+                    <InfoTip label="Tool Filter">Limit which tools this MCP gives agents.</InfoTip>
                   </div>
-                  {!mcp.tool_filter_supported && (
-                    <span
-                      className="text-3xs text-tertiary italic"
-                      title="This MCP does not support a tool filter."
-                    >
-                      Not supported by this MCP
-                    </span>
-                  )}
                 </div>
                 <p className="text-xs text-secondary mb-2">
-                  {mcp.tool_filter_supported
-                    ? <>Leave empty to allow every tool. Or enter a pattern for the tool names to keep. For example, <code className="font-mono">mail</code> keeps any tool whose name contains “mail”. And <code className="font-mono">^(mail|calendar)_.*</code> keeps only the mail and calendar tools.</>
-                    : 'This MCP always gives agents all of its tools.'}
+                  Leave empty to allow every tool. Or enter a pattern for the tool names to keep. For example, <code className="font-mono">mail</code> keeps any tool whose name contains “mail”. And <code className="font-mono">^(mail|calendar)_.*</code> keeps only the mail and calendar tools.
                 </p>
                 <Input compact
                   type="text"
                   value={toolFilterRegex}
                   onChange={(e) => setToolFilterRegex(e.target.value)}
-                  disabled={!mcp.tool_filter_supported}
-                  placeholder={
-                    mcp.tool_filter_supported
-                      ? "^(mail|calendar)_.*"
-                      : 'Not supported'
-                  }
+                  placeholder="^(mail|calendar)_.*"
                   className="font-mono"
                 />
-                {mcp.tool_filter_supported && isDocker && (
+                {isDocker && (
                   <p className="text-xs text-tertiary mt-1">Saving the filter restarts its container.</p>
                 )}
-                {mcp.tool_filter_supported && (
-                  <div className="flex items-center gap-2 pt-2">
-                    <Button variant="primary" size="xs"
-                      onClick={() => {
-                        setToolFilterError('')
-                        void run('tool_filter', () => saveToolFilter.mutateAsync({ name: mcp.name, regex: toolFilterRegex }),
-                          { onFail: (e) => setToolFilterError(e instanceof Error ? e.message : 'The filter was not saved') })
-                      }}
-                      disabled={
-                        saveToolFilter.isPending ||
-                        toolFilterRegex === (mcp.tool_filter_regex || '')
-                      }
-                    >
-                      {saveToolFilter.isPending ? 'Saving...' : 'Save filter'}
-                    </Button>
-                    <SaveState state={stateOf('tool_filter')} besideButton />
-                    {toolFilterError && (
-                      <span className="text-xs text-status-danger-fg">
-                        {toolFilterError}
-                      </span>
-                    )}
-                  </div>
-                )}
+                <div className="flex items-center gap-2 pt-2">
+                  <Button variant="primary" size="xs"
+                    onClick={() => {
+                      setToolFilterError('')
+                      void run('tool_filter', () => saveToolFilter.mutateAsync({ name: mcp.name, regex: toolFilterRegex }),
+                        { onFail: (e) => setToolFilterError(e instanceof Error ? e.message : 'The filter was not saved') })
+                    }}
+                    disabled={
+                      saveToolFilter.isPending || updating ||
+                      toolFilterRegex === (mcp.tool_filter_regex || '')
+                    }
+                  >
+                    {saveToolFilter.isPending ? 'Saving...' : 'Save filter'}
+                  </Button>
+                  <SaveState state={stateOf('tool_filter')} besideButton />
+                  {toolFilterError && (
+                    <span className="text-xs text-status-danger-fg">
+                      {toolFilterError}
+                    </span>
+                  )}
+                </div>
               </div>
+              )}
 
               {/* Infrastructure credentials */}
               {mcp.credential_type === 'infra' && mcp.credential_fields && mcp.credential_fields.length > 0 && (

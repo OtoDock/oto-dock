@@ -1,4 +1,70 @@
 {
+  "1.9.1": {
+    "everyone": [
+      {
+        "icon": "key",
+        "title": "Settings from the chat",
+        "text": "Ask an agent where a setting is. Its card changes yours right there, and the agent never sees the value. A manager turns the tool on per agent."
+      },
+      {
+        "icon": "chat",
+        "title": "Cards with buttons",
+        "text": "An agent can offer you a choice as buttons in the chat. A button does one thing with your own permissions, and nothing happens until you press it."
+      },
+      {
+        "icon": "mobile",
+        "title": "The iOS app",
+        "text": "OtoDock is on TestFlight for iPhone and iPad. One app reaches more than one OtoDock, with dictation, notifications and alarms with sound."
+      },
+      {
+        "icon": "sparkle",
+        "title": "Your subscription on every agent",
+        "text": "Your own AI subscription now works on every agent that allows its engine. A new chat opens on the engine you use most there."
+      },
+      {
+        "icon": "document",
+        "title": "Documents, checked as they go",
+        "text": "Agents check the Word, Excel, PowerPoint and PDF files they make before you get them. Word gets tracked changes, slides themes, sheets their formula values."
+      },
+      {
+        "icon": "app",
+        "title": "Chat windows and the company map",
+        "text": "A terminal chat's windows fold into icons you can reorder, and the chat remembers them. The company map opens on the agent you came from."
+      }
+    ],
+    "admins": [
+      {
+        "icon": "shield",
+        "title": "Read the upgrade notes first",
+        "text": "Macs paired before 1.9.1 pair again. DSA keys and Python 3.11 stop working. Two models swap, engine limits lift, dictation may bill. Each note says what to do."
+      },
+      {
+        "icon": "app",
+        "title": "A department in one step",
+        "text": "Install a whole department from the community. Its agents, shared library and paused schedules arrive together."
+      },
+      {
+        "icon": "key",
+        "title": "Sign-in addresses follow their tools",
+        "text": "Each MCP adds the sign-in addresses it needs and takes over a matching row of yours. A new address waits under Admin, MCP Servers until you allow it."
+      },
+      {
+        "icon": "key",
+        "title": "Reconnect needed, with the reason",
+        "text": "An account's card under User Settings, Integrations says Reconnect needed and why: the vendor removed OtoDock or refuses its access. Open it, press Reconnect."
+      },
+      {
+        "icon": "calendar",
+        "title": "Who sees an agent's own tasks",
+        "text": "Only editors and managers now see an agent's own tasks, triggers and runs, in apps too. Who is told on a shared task picks who hears of its runs."
+      },
+      {
+        "icon": "phone",
+        "title": "Platform only, for voice",
+        "text": "The chat audio policy gains Platform only: all voice and dictation go through your speech provider, which bills it. Safari and iPhone dictation do too."
+      }
+    ]
+  },
   "1.9.0": {
     "everyone": [
       {

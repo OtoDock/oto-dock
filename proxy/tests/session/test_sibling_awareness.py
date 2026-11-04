@@ -95,10 +95,18 @@ class TestPreludeLine:
         _running_task(task_id="dyn-bob1", created_by="user-bob")
         assert sa._line_for_chat_sync(own) == ""
 
-    def test_agent_scope_task_visible_to_all(self, temp_db):
+    def test_agent_scope_task_listed_from_the_editor_tier(self, temp_db):
+        # What the agent runs on its own behalf is named to an editor's own
+        # chat, never to a person below the editor tier.
+        from storage.identity import db_users
+        task_store.upsert_user(OWNER, "alice@test.com", "Alice", "member")
+        db_users.add_user_agent(OWNER, AGENT, "viewer", "user-admin")
         own = _mk_chat()
         _running_task(task_id="dyn-ag1", scope="agent", created_by="pa")
-        assert "dyn-ag1" in sa._line_for_chat_sync(own)
+        assert "dyn-ag1" not in sa._line_for_chat_sync(own)
+        task_store.set_user_agent_role(OWNER, AGENT, "editor")
+        sa._snapshot["ts"] = 0.0
+        assert "dyn-ag1" in sa._line_for_chat_sync(_mk_chat())
 
     def test_worker_lane_not_double_listed_as_task(self, temp_db, streaming_state):
         own = _mk_chat()

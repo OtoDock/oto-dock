@@ -111,6 +111,20 @@ class TestResponseKeyFallback:
         })
         assert posted and posted[0]["result_content"] == "hi\n"
 
+    def test_a_sub_agents_call_carries_its_agent_id(self, monkeypatch):
+        # Claude Code sets the hook's agent_id on a sub-agent's call only.
+        sub = _run_main(monkeypatch, {
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "toolu_2",
+            "agent_id": "a363e519c4e437799", "agent_type": "general-purpose",
+            "tool_response": {"stdout": "", "stderr": ""},
+        })
+        main = _run_main(monkeypatch, {
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "toolu_3",
+            "tool_response": {"stdout": "", "stderr": ""},
+        })
+        assert sub[0]["agent_id"] == "a363e519c4e437799"
+        assert main[0]["agent_id"] == ""
+
     def test_missing_result_still_posts_ok_summary(self, monkeypatch):
         posted = _run_main(monkeypatch, {
             "tool_name": "Bash",

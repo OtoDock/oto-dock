@@ -4,6 +4,7 @@ import Dialog from '../../components/ui/Dialog'
 import Button from '../../components/ui/Button'
 import { DIALOG_PANEL } from '../../components/ui/classes'
 import InfoTip from '../../components/ui/InfoTip'
+import AllowMcpHosts from '../../components/admin/AllowMcpHosts'
 
 // ---------------------------------------------------------------------------
 // Install / Update Modal
@@ -127,6 +128,9 @@ export function InstallModal({ onClose }: { onClose: () => void }) {
                 </p>
                 <p><span className="text-secondary">Runtime:</span> {result.runtime}</p>
               </div>
+              {result.hosts_to_confirm && (
+                <div className="mt-3"><AllowMcpHosts pending={result.hosts_to_confirm} /></div>
+              )}
               {result.install_log && (
                 <details className="mt-3">
                   <summary className="text-xs text-tertiary cursor-pointer hover:text-secondary">Install log</summary>

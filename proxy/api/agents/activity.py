@@ -21,7 +21,12 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends
 
 from api.agents._router import router
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import (
+    UserContext,
+    automation_agents,
+    get_current_user,
+    require_auth,
+)
 from storage import database as task_store
 from storage.agents import agent_store
 from ws import chat_phase
@@ -40,8 +45,10 @@ async def agents_activity(user: UserContext | None = Depends(get_current_user)):
     def _counts() -> tuple[dict, dict]:
         from core.session.visibility import is_shared_only
         shared = [a for a in (u.agents or ()) if is_shared_only(a)]
-        return (task_store.get_agent_activity_counts(start, end, u.sub, shared),
-                task_store.count_recent_runs_by_agent(start, u.sub))
+        # The agent's own work warms the map only where the viewer sees it.
+        own_work = automation_agents(u)
+        return (task_store.get_agent_activity_counts(start, end, u.sub, shared, own_work),
+                task_store.count_recent_runs_by_agent(start, u.sub, own_work))
 
     usage_counts, run_counts = await asyncio.to_thread(_counts)
 

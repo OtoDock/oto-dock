@@ -307,7 +307,7 @@ class TestWakeAdmission:
         seen: list = []
 
         async def _fake_rewarm(layer, session_id, agent, result_prompt,
-                               *, chat_id, base_cfg, chat_row, note_prompt=False):
+                               *, chat_id, base_cfg, chat_row):
             seen.append(ledger["C"]._sessions.get(session_id))
             return ""
         monkeypatch.setattr(delivery, "_rewarm_interactive_and_wake", _fake_rewarm)
@@ -649,7 +649,7 @@ class TestInteractiveRouting:
         rewarm_calls: list[dict] = []
 
         async def _fake_rewarm(layer, session_id, agent, result_prompt,
-                               *, chat_id, base_cfg, chat_row, note_prompt=False):
+                               *, chat_id, base_cfg, chat_row):
             rewarm_calls.append({
                 "chat_id": chat_id, "prompt": result_prompt,
                 "interactive": base_cfg.interactive, "resume": base_cfg.resume,
@@ -692,23 +692,27 @@ class TestInteractiveRouting:
 
 class TestRewarmInteractiveAndWake:
     class _FakeIsess:
-        def __init__(self, *, opens_on_submit=True):
+        def __init__(self, *, opens_on_submit=True, refuses=False):
             self.alive = True
             self.has_viewer = False
             self.turn_open = False
-            self.opens_on_submit = opens_on_submit
+            self.opens_on_submit = opens_on_submit and not refuses
+            self.refuses = refuses              # the bytes go nowhere (a dead PTY)
             self.on_turn_complete = None
             self.submitted: list[tuple[str, bool]] = []
 
-        def submit_prompt(self, text, *, settle=False):
+        def submit_prompt(self, text, *, settle=False) -> bool:
             self.submitted.append((text, settle))
+            if self.refuses:
+                return False
             if not self.opens_on_submit:
-                return  # the paste never landed — turn_open stays False
+                return True  # the paste landed but never submitted — turn_open stays False
             # A landed submit opens the turn (transcript-derived) and the
             # tailer fires turn-complete once the wake turn ends.
             self.turn_open = True
             if self.on_turn_complete:
                 self.on_turn_complete("done")
+            return True
 
     def _run(self, monkeypatch, isess, *, start_raises=False):
         from core.execution_layer import AgentConfig
@@ -773,6 +777,20 @@ class TestRewarmInteractiveAndWake:
         out, _cfg, closed = self._run(monkeypatch, isess, start_raises=True)
         assert out is None
         assert isess.submitted == []
+
+    def test_the_wake_is_noted_for_the_tailer_and_dropped_when_refused(self, temp_db, monkeypatch):
+        # The wake's row is the ladder's event row: the typed text is noted
+        # with the terminal's session as owner, so the tailer skips the
+        # journaled copy, once; a submit the PTY refused takes the note back.
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        self._run(monkeypatch, self._FakeIsess())
+        assert TE._sent_prompts["chat-r"][0].owner == "sess-r"
+        assert TE.consume_sent_prompt("chat-r", "WAKE") is True
+        assert TE.consume_sent_prompt("chat-r", "WAKE") is False
+        out, _cfg, closed = self._run(monkeypatch, self._FakeIsess(refuses=True))
+        assert out is None and closed == ["delegate_wake_unsubmitted"]
+        assert TE.consume_sent_prompt("chat-r", "WAKE") is False
 
 
 class TestSettleSubmit:
@@ -1602,7 +1620,7 @@ class TestWakeRespawnConfig:
         seen: list = []
 
         async def _fake_rewarm(layer, session_id, agent, result_prompt,
-                               *, chat_id, base_cfg, chat_row, note_prompt=False):
+                               *, chat_id, base_cfg, chat_row):
             seen.append(base_cfg)
             return ""
         monkeypatch.setattr(delivery, "_rewarm_interactive_and_wake", _fake_rewarm)
@@ -2167,15 +2185,15 @@ class TestFreshSpawnRung:
         spawned = []
 
         async def _spawn(layer, session_id, agent, prompt, **kw):
-            spawned.append((session_id, kw["fresh"], kw["fresh_from"], kw["note_prompt"]))
+            spawned.append((session_id, kw["fresh"], kw["fresh_from"]))
             return True, ""
         monkeypatch.setattr(dl, "_spawn_wake_session", _spawn)
         task_store.create_chat("chat-f8", "user-1", "pa")
         assert asyncio.run(scheduler._deliver_via_oneshot(
             "", "pa", "NUDGE", user_sub=None, role="manager", chat_id="chat-f8",
-            fresh_without_session=True, note_prompt=True)) == ""
-        [(sid, fresh, fresh_from, noted)] = spawned
-        assert sid and fresh and fresh_from == "" and noted
+            fresh_without_session=True)) == ""
+        [(sid, fresh, fresh_from)] = spawned
+        assert sid and fresh and fresh_from == ""
 
     def test_a_fresh_start_from_no_session_given_back_restores_its_seed(self, temp_db, ledger,
                                                                          monkeypatch):
@@ -2254,6 +2272,8 @@ class TestTheWakeBuildsAsItsKind:
                 where=placement.LOCAL_PLACEMENT, browser=None, mcp_format=None,
                 session_id="s1", targets=["pa"], kind=kind)
         assert [k["task_mode"] for k in seen] == [True, True, False]
+        # Nobody drives a respawned session: never the person's own chat.
+        assert [k["shared_chat"] for k in seen] == [True, True, True]
 
     def test_the_prompt(self, monkeypatch):
         import config

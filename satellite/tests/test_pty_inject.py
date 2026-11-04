@@ -286,3 +286,32 @@ def test_the_payload_env_reaches_the_terminal_as_sent(tmp_path, monkeypatch):
     assert env["PROXY_API_KEY"] == "session-token"
     assert env["OTO_CLI_TOKEN"] == "cli-token"
     assert env["OTO_SESSION_ID"] == "sess-env"
+
+
+@pytest.mark.asyncio
+async def test_the_claude_terminal_turns_the_advisor_tool_off(tmp_path, monkeypatch):
+    """The terminal spawn sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL as the
+    headless twin does (the advisor is a model call the platform can
+    neither meter nor show)."""
+    from satellite.host import cli_versions
+    from satellite.terminal.pty_session import PtySession
+
+    agent_dir = tmp_path / "agents" / "test-agent"
+    agent_dir.mkdir(parents=True)
+    sess = PtySession(
+        "sess-adv", agent_dir,
+        sat_config=SimpleNamespace(bin_hint=lambda name: ""), ws=_CapturingWS(),
+        config={"claude_dir_relative": ".claude", "cwd_relative": "workspace", "system_prompt": "p"},
+    )
+    seen: dict = {}
+
+    async def _bin(*_a, **_k):
+        return "claude"
+
+    async def _spawn(cmd, env, cwd):
+        seen["env"] = env
+
+    monkeypatch.setattr(cli_versions, "resolve_spawn_bin_async", _bin)
+    monkeypatch.setattr(sess, "_wire_and_spawn", _spawn)
+    await sess.start()
+    assert seen["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"

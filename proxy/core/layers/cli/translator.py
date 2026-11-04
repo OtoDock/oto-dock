@@ -59,12 +59,76 @@ RESUME_HANDSHAKE_RESULT = "No response requested."
 # it becomes a LIVE-ONLY thinking progress gauge (see `_handle_system`).
 _SILENT_SYSTEM_SUBTYPES = frozenset({
     "status",           # CLI heartbeat / state ping
+    # 2.1.312, frames of cloud sessions, Remote Control and the self-hosted
+    # runner that a platform spawn does not emit: known, never chat content.
+    "checkpoint_done", "inherited_asks_settled", "turn_began_before_init",
+    "alive_before_init",
+    # 2.1.312, the transcript's stand-in record of a rewind.
+    "rewind_stand_in",
 })
 
 # Cap on per-agent preview strings inside a workflow_progress tree so a busy
 # workflow can't blow the satellite WS frame/queue caps.
 _WORKFLOW_PREVIEW_CAP = 500
 _WORKFLOW_PREVIEW_KEYS = ("resultPreview", "promptPreview", "result_preview", "prompt_preview")
+
+
+# What a stream-json line read between turns is (``background_frames``): a
+# background worker's (a sub-agent's own line, a task frame, the snapshot),
+# the main agent's (an answer nobody read), or neither (status, rate limits).
+FRAME_BACKGROUND = "background"
+FRAME_MAIN = "main"
+FRAME_NEUTRAL = "neutral"
+_BACKGROUND_SUBTYPES = frozenset({
+    "background_tasks_changed", "task_started", "task_progress", "task_updated",
+    "task_notification",
+})
+# Lines that are no one's answer: the account's limits, the control channel.
+_NEUTRAL_TYPES = frozenset({
+    "rate_limit_event", "control_request", "control_response", "control_cancel_request",
+})
+
+
+def frame_kind(data: dict) -> str:
+    """Whose a line read between turns is (``FRAME_*``): any other line of
+    the main thread (its messages, stream events, a result) is an answer
+    nobody read."""
+    if not isinstance(data, dict):
+        return FRAME_NEUTRAL
+    if data.get("parent_tool_use_id"):
+        return FRAME_BACKGROUND
+    msg_type = data.get("type")
+    if msg_type == "system":
+        return FRAME_BACKGROUND if data.get("subtype") in _BACKGROUND_SUBTYPES else FRAME_NEUTRAL
+    if msg_type in _NEUTRAL_TYPES or not msg_type:
+        return FRAME_NEUTRAL
+    return FRAME_MAIN
+
+
+def terminal_task_status(data: dict) -> str | None:
+    """The status a task frame ends its task with, however the line is
+    read: a ``task_updated`` whose patch carries a terminal status, or a
+    ``task_notification`` (``completed``); ``None`` for any other line."""
+    if not isinstance(data, dict) or data.get("type") != "system":
+        return None
+    subtype = data.get("subtype")
+    if subtype == "task_updated":
+        status = (data.get("patch") or {}).get("status", "")
+        return status if status in TERMINAL_STATUSES else None
+    return "completed" if subtype == "task_notification" else None
+
+
+def _subagent_owned(data: dict) -> bool:
+    """A task frame of a sub-agent's own command (Claude Code names the
+    owner: ``owned_by_subagent``, ``parent_task_id``)."""
+    return bool(data.get("owned_by_subagent") or data.get("parent_task_id"))
+
+
+def _main_background(data: dict) -> bool:
+    """A ``local_bash`` task that is the main agent's background command:
+    not a sub-agent's, and not announced in the foreground (an older CLI
+    sends no ``is_backgrounded``: background, as it only announced those)."""
+    return not _subagent_owned(data) and data.get("is_backgrounded") is not False
 
 
 def _tool_result_text(block: dict) -> str:
@@ -155,6 +219,7 @@ class ClaudeCLIEventTranslator:
         "_cc_tasks",
         "_pending_task_creates",
         "_bg_bash_commands",
+        "_foreground_bash",
         "_in_settle",
         "ending_emitted",
         "_limit_notice",
@@ -208,6 +273,10 @@ class ClaudeCLIEventTranslator:
         # expands to it) alongside the model-written description. Entries are
         # popped on spawn; stragglers (rejected commands) clear with the turn.
         self._bg_bash_commands: dict[str, str] = {}
+        # Main-agent shell tasks the CLI announced in the foreground (task id
+        # → their tool_use_id and description): one moved to the background
+        # later (``task_updated`` with ``is_backgrounded``) is registered then.
+        self._foreground_bash: dict[str, tuple[str, str]] = {}
 
         # True after reset_for_settle(): the model's final message is out, so
         # a bg-command completion observed from here on was never seen by the
@@ -244,6 +313,7 @@ class ClaudeCLIEventTranslator:
         # in-flight create staging is per-turn.
         self._pending_task_creates.clear()
         self._bg_bash_commands.clear()
+        self._foreground_bash.clear()
         self._in_settle = False
 
     # -----------------------------------------------------------------
@@ -365,6 +435,16 @@ class ClaudeCLIEventTranslator:
                     event_data={"tool_use_id": tuid},
                     session_id=self.actual_session_id,
                 )]
+            # A foreground command the CLI moved to the background (its
+            # timeout passed, a steer took the turn): registered now, and a
+            # patch that also ends it falls through to the end below.
+            moved = self._foreground_bash.pop(data.get("task_id", ""), None) \
+                if patch.get("is_backgrounded") is True else None
+            started = self._handle_task_started({
+                "task_type": "local_bash", "task_id": data.get("task_id", ""),
+                "tool_use_id": moved[0], "description": moved[1],
+                "is_backgrounded": True,
+            }) if moved is not None else []
             # A backgrounded shell command finished. This is the PRIMARY (and,
             # absent any completion hook, the only out-of-stdout) signal for
             # local_bash — matched by task_id (shell id), cleared on the
@@ -374,7 +454,7 @@ class ClaudeCLIEventTranslator:
                 bgreg = get_bg_command_registry(self.session_id)
                 if bgreg.mark_done(data.get("task_id", ""),
                                    surfaced=not self._in_settle):
-                    return [ClaudeStreamChunk(
+                    return [*started, ClaudeStreamChunk(
                         event_type="bg_command_end",
                         event_data={
                             "tool_use_id": bgreg.tuid_for(data.get("task_id", "")),
@@ -382,7 +462,7 @@ class ClaudeCLIEventTranslator:
                         },
                         session_id=self.actual_session_id,
                     )]
-            return []
+            return started
 
         # All other subtypes (compacting, compact_boundary, etc.) — yield
         return [ClaudeStreamChunk(
@@ -392,13 +472,15 @@ class ClaudeCLIEventTranslator:
         )]
 
     def _handle_task_started(self, data: dict) -> list[ClaudeStreamChunk]:
-        """Register a subagent spawn / start a dynamic workflow.
+        """Register a subagent spawn / a background command / start a
+        dynamic workflow.
 
-        Only ``local_agent`` enters the completion gate (it gets a
-        SubagentStop hook). ``local_bash`` is ignored — it has no SubagentStop
-        and would otherwise hang the wait. ``local_workflow`` is a dynamic
-        workflow; its internal agents live in ``task_progress`` and never
-        reach the gate.
+        ``local_agent`` enters the subagent registry (it gets a SubagentStop
+        hook). ``local_bash`` enters the background-command registry, never
+        the subagent gate (it has no SubagentStop and would hang the wait),
+        and only when it is the main agent's own background command
+        (``_main_background``). ``local_workflow`` is a dynamic workflow; its
+        internal agents live in ``task_progress`` and never reach the gate.
         """
         task_type = data.get("task_type", "")
         tool_use_id = data.get("tool_use_id", "")
@@ -421,7 +503,21 @@ class ClaudeCLIEventTranslator:
             # agentId the model already holds as its SendMessage handle.
             desc = shorten_label(data.get("description", ""))
             label = f'"{desc}" [{task_id}]' if desc else task_id
-            reg.register_spawn(task_id, tool_use_id, label=label)
+            reg.register_spawn(task_id, tool_use_id, label=label,
+                               description=data.get("description", ""),
+                               background=bool(data.get("is_backgrounded")))
+        elif task_type == "local_bash" and not _main_background(data):
+            # A sub-agent's command (``owned_by_subagent`` /
+            # ``parent_task_id``: the sub-agent reads its end and says so in
+            # its report) or a foreground one past a few seconds
+            # (``is_backgrounded`` false: its own tool card shows it) is no
+            # background command of the main agent. A foreground task the CLI
+            # moves to the background later is registered at that patch.
+            if data.get("is_backgrounded") is False and not _subagent_owned(data):
+                self._foreground_bash[data.get("task_id", "")] = (
+                    tool_use_id, data.get("description", ""))
+            self._bg_bash_commands.pop(tool_use_id, None)
+            return []
         elif task_type == "local_bash":
             # Backgrounded shell command: bind its shell id (task_id) to the
             # spawning Bash tool_use_id (gates the completion wait — task producer
@@ -440,7 +536,7 @@ class ClaudeCLIEventTranslator:
             text = shorten_label(command or desc)
             label = f"{task_id} — {text}" if text else task_id
             get_bg_command_registry(self.session_id).register_spawn(
-                task_id, tool_use_id, label=label,
+                task_id, tool_use_id, label=label, description=desc or command,
             )
             # An empty command miss is fine: the dashboard pill falls back to
             # the paired Bash tool card's input (pairBgCommandBlocks).

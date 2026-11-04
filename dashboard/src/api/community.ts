@@ -298,8 +298,8 @@ export interface McpRequest {
    *  batch_id into one collapsible card. */
   batch_id: string | null
   /** Derived at read time from the live registry (never persisted):
-   *  'auto' | 'explicit' when the MCP is installed, null when not. */
-  assignment_mode: 'auto' | 'explicit' | null
+   *  'auto' | 'explicit' | 'platform' when the MCP is installed, null when not. */
+  assignment_mode: 'auto' | 'explicit' | 'platform' | null
   /** True on an OPEN request for an installed explicit-mode MCP that no
    *  instance authorizes the agent for yet — the "not actually failed"
    *  face of install_failed. Renders as the amber "Needs instance" chip

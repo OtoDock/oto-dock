@@ -10,10 +10,13 @@ and callback URL (RFC 7591) as a public client unless the manifest asks for
 a confidential one. The code exchange, the refresh and the revocation carry
 the resource indicator (RFC 8707) and PKCE S256.
 
-Every URL fetched and every endpoint read is https, the metadata's issuer
-must equal the issuer the URL was built from, every endpoint sits on the
-issuer's origin, and nothing leaves the install before the start route has
-checked the MCP host against the admin's bearer allowlist.
+Every URL fetched and every endpoint read is https with no user name in
+it, the metadata's issuer must equal the issuer the URL was built from,
+every endpoint the install calls sits on the issuer's origin, and nothing
+leaves the install before the start route has checked the MCP host against
+the bearer allowlist. The consent page alone may sit on another origin: the
+person's browser goes there, the install sends nothing to it, and the code
+it returns is exchanged at the issuer's token endpoint with PKCE.
 """
 
 from __future__ import annotations
@@ -136,6 +139,10 @@ def _require_https(url: str, what: str) -> None:
     parts = urlsplit(url)
     if parts.scheme != "https" or not parts.netloc:
         raise AuthorizationError(f"{what} is not an https URL ({_host(url) or url})")
+    # A user name makes ``_origin`` differ from the host it reaches and puts
+    # a lookalike ``api.vendor.com@elsewhere`` into a consent URL.
+    if "@" in parts.netloc:
+        raise AuthorizationError(f"{what} carries a user name ({_host(url)})")
 
 
 def _well_known(issuer_or_resource: str, suffix: str, *, issuer: bool = False) -> list[str]:
@@ -184,8 +191,21 @@ def _resolve_addresses(host: str) -> list[str]:
     return sorted({info[4][0] for info in infos})  # type: ignore[misc]  # typeshed types getaddrinfo()[4][0] as str | int; it is a str for AF_INET and AF_INET6
 
 
+# Names a browser sends to its own loopback or LAN, which this machine may
+# not resolve at all (RFC 6761, RFC 6762, RFC 8375, the .internal TLD).
+_PRIVATE_NAMES = ("localhost",)
+_PRIVATE_SUFFIXES = (".localhost", ".local", ".home.arpa", ".internal")
+# Names no public server holds (RFC 6761, RFC 7686) and common router
+# names. The consent page alone is judged by them: the install never dials
+# it, so a name is its only backstop, while an issuer's dial is pinned.
+_UNSERVED_SUFFIXES = (".test", ".example", ".invalid", ".onion", ".lan", ".home", ".corp")
+
+
 async def _host_is_private(host: str) -> bool:
-    addresses = await asyncio.to_thread(_resolve_addresses, host)
+    name = host.rstrip(".").lower()
+    if name in _PRIVATE_NAMES or name.endswith(_PRIVATE_SUFFIXES):
+        return True
+    addresses = await asyncio.to_thread(_resolve_addresses, name)
     return any(_is_private(a) for a in addresses)
 
 
@@ -375,16 +395,32 @@ async def _server_metadata(issuer: str, policy: pinned_http.Policy | None = None
     raise AuthorizationError(f"{_host(issuer)} publishes no authorization server metadata")
 
 
-def _endpoint(doc: dict, key: str, issuer: str, *, required: bool) -> str:
+def _endpoint(doc: dict, key: str, issuer: str, *, required: bool, any_origin: bool = False) -> str:
     value = str(doc.get(key) or "")
     if not value:
         if required:
             raise AuthorizationError(f"{_host(issuer)}'s metadata names no {key}")
         return ""
     _require_https(value, f"the {key}")
-    if _origin(value) != _origin(issuer):
+    if not any_origin and _origin(value) != _origin(issuer):
         raise AuthorizationError(
             f"{_host(issuer)}'s {key} sits on another origin ({_host(value)})"
+        )
+    return value
+
+
+async def _authorize_endpoint(doc: dict, issuer: str, *, mcp_private: bool) -> str:
+    """The consent page, which may sit on another origin than the issuer (a
+    vendor whose sign-in page and API are two hosts): only the person's
+    browser goes there. Off the issuer's origin it is judged as the issuer
+    is: a private, loopback or link-local host is refused unless the MCP
+    host itself is one."""
+    value = _endpoint(doc, "authorization_endpoint", issuer, required=True, any_origin=True)
+    host = _host(value)
+    if _origin(value) != _origin(issuer) and not mcp_private and (
+            host.rstrip(".").endswith(_UNSERVED_SUFFIXES) or await _host_is_private(host)):
+        raise AuthorizationError(
+            f"{_host(issuer)}'s authorization_endpoint is on a private address ({host})"
         )
     return value
 
@@ -428,7 +464,7 @@ async def discover(resource_url: str, *, issuer_override: str = "") -> Authoriza
         raise AuthorizationError(f"{_host(issuer)} does not support PKCE S256")
     server = AuthorizationServer(
         issuer=issuer,
-        authorization_endpoint=_endpoint(meta, "authorization_endpoint", issuer, required=True),
+        authorization_endpoint=await _authorize_endpoint(meta, issuer, mcp_private=mcp_private),
         token_endpoint=_endpoint(meta, "token_endpoint", issuer, required=True),
         registration_endpoint=_endpoint(meta, "registration_endpoint", issuer, required=False),
         revocation_endpoint=_endpoint(meta, "revocation_endpoint", issuer, required=False),
@@ -803,6 +839,12 @@ def _dotted(data: dict, key: str) -> str:
     if isinstance(v, (dict, list)) or v is None:
         return ""
     return str(v)
+
+
+def identity_id(raw: dict, block: dict) -> str:
+    """The login's id the token response carries in the block's
+    ``identity.id_field``, ``""`` when the manifest names none."""
+    return _dotted(raw, str((block.get("identity") or {}).get("id_field") or ""))
 
 
 def identity_from_token_response(

@@ -50,7 +50,7 @@
   },
   "assignment_mode": "explicit",
   "exclude_from": [
-    "task"
+    "meeting"
   ],
   "tool_arg_paths": {
     "generate_video": {
@@ -200,7 +200,7 @@
       "file": "skills/video-gen-usage/SKILL.md",
       "description": "Generate AI videos, transitions between clips, and AI video edits. Use when a task needs new video footage, an AI transition bridge between two clips, or an object-level edit of an existing video.",
       "default_exclude_from": [
-        "task"
+        "meeting"
       ]
     }
   ],

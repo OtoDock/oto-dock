@@ -305,3 +305,67 @@ def test_the_argv_rule_and_the_capability(sat):
     assert step_runner.argv_for(b"echo\n", "/x.sh") == ["/bin/sh", "/x.sh"]
     caps = SessionManager(cfg).detect_capabilities()
     assert caps["steps"] is True
+
+
+# The Windows table, the same on the proxy's twin (proxy/tests/apps/test_app_steps.py).
+_WIN = {"bash": r"C:\Git\bin\bash.exe", "sh": r"C:\Git\bin\sh.exe",
+        "env": r"C:\Git\usr\bin\env.exe", "python": r"C:\Py\python.exe"}
+_WIN_PATH = r"C:\OtoDock\steps\d\check.sh"
+_WIN_CASES = [
+    (b"echo no shebang\n", [_WIN["sh"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/bin/sh -e\n", [_WIN["sh"], "-e", "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env bash\n", [_WIN["bash"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env -S bash -eu\n", [_WIN["bash"], "-eu", "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/python3 -u\n", [_WIN["python"], "-u", _WIN_PATH]),
+    (b"#!/usr/bin/env python\n", [_WIN["python"], _WIN_PATH]),
+    (b"#!/usr/bin/env LANG=C bash\n", [_WIN["env"], "LANG=C", _WIN["bash"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env -u FOO bash\n", [_WIN["env"], "-u", "FOO", _WIN["bash"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env node\n", [r"C:\Node\node.exe", _WIN_PATH]),
+]
+
+
+def _which(name):
+    return {"node": r"C:\Node\node.exe", "npx": r"C:\Node\npx.cmd"}.get(name)
+
+
+@pytest.mark.parametrize("script,argv", _WIN_CASES)
+def test_the_argv_rule_on_windows(script, argv):
+    """A Windows machine has no /bin/sh: a shell line and the default run
+    under Git Bash, a Python line under the machine's Python."""
+    assert step_runner.argv_for(script, _WIN_PATH, windows=_WIN, which=_which) == argv
+
+
+@pytest.mark.parametrize("script,word", [
+    (b"echo\n", "bash"), (b"#!/bin/bash\n", "bash"), (b"#!/usr/bin/env python3\n", "Python"),
+    (b"#!/usr/bin/env npx tsx\n", "npx"), (b"#!/usr/bin/env ruby\n", "ruby"), (b"#!/usr/bin/env\n", "env"),
+])
+def test_an_interpreter_the_machine_lacks_is_named(script, word):
+    """Without the baseline tools (no Git Bash, no Python) or with a word
+    that resolves to nothing or to a .cmd: the interpreter is named, never
+    the OS's error code."""
+    with pytest.raises(step_runner.MissingInterpreter) as e:
+        step_runner.argv_for(script, _WIN_PATH, windows=dict.fromkeys(_WIN, ""), which=_which)
+    assert str(e.value) == word
+
+
+def test_a_missing_interpreter_answers_its_sentence():
+    assert step_runner.missing_sentence("bash") == (
+        "Scripts need bash on this computer: install the baseline tools.")
+    assert step_runner.missing_sentence("Python").startswith("Scripts need Python on this computer")
+    assert step_runner.missing_sentence("ruby") == "Scripts need ruby on this computer."
+
+
+@pytest.mark.asyncio
+async def test_a_windows_machine_without_the_baseline_answers_the_sentence(sat, monkeypatch):
+    """The operator's script check on Windows ended "[WinError 2] The system
+    cannot find the file specified": now the ack names what is missing."""
+    from satellite import config as sat_config
+    cfg, _agents = sat
+    monkeypatch.setattr(step_runner.config, "HOST", sat_config._table()[sat_config.WINDOWS])
+    monkeypatch.setattr(step_runner, "windows_interpreters",
+                        lambda: dict.fromkeys(("bash", "sh", "env", "python"), ""))
+    ws = _WS()
+    await SessionManager(cfg).step_run(_frame("echo hi\n"), ws)
+    ack = ws.ack()
+    assert ack["status"] == "error"
+    assert ack["error"] == "Scripts need bash on this computer: install the baseline tools."

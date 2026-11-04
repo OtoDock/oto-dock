@@ -104,16 +104,19 @@ def _is_app_credential(name: str) -> bool:
 
 def _account_token_status(
     user_sub: str, mcp_name: str, account_label: str,
-) -> tuple[list[str], str]:
-    """The scopes recorded in an account's token file and the reason it
-    needs a reconnect (``""`` when it does not), read in one pass.
+) -> tuple[list[str], str, str]:
+    """The scopes recorded in an account's token file, the reason it needs
+    a reconnect (``""`` when it does not) and the way it was connected
+    (``extra.flow``, ``""`` for an OAuth sign-in), read in one pass.
 
     ``list_my_integrations`` computes ``missing_scopes`` from the scopes
     (the "Add additional access" affordance) and ``needs_reconnect`` from
     the reason (a grant the vendor ended, an expired token nobody can
-    refresh, a file the manifest's way of issuing tokens no longer covers).
-    A missing or corrupt file counts as no scopes granted, which surfaces
-    every required scope as missing: the UI prompts a reconnect.
+    refresh, a file the manifest's way of issuing tokens no longer covers,
+    the MCP's own server refusing the token). The flow lets the card offer
+    a new personal access token in place of a sign-in. A missing or corrupt
+    file counts as no scopes granted, which surfaces every required scope
+    as missing: the UI prompts a reconnect.
     """
     from services.oauth import credential_resolver, oauth_account_store
     manifest = mcp_registry.get_manifest(mcp_name)
@@ -122,20 +125,23 @@ def _account_token_status(
         if manifest else ""
     )
     if not provider_id:
-        return [], ""
+        return [], "", ""
     username = task_store.get_username_by_sub(user_sub)
     if not username:
-        return [], ""
+        return [], "", ""
     token_dir = oauth_account_store.get_token_dir(username, provider_id=provider_id)
     data = oauth_account_store.read_account_token(token_dir, account_label)
     if not data:
-        return [], ""
+        from services.webhooks import relay_notices  # a file the vendor's removal took
+        return [], relay_notices.removed_reason(user_sub, mcp_name, account_label), ""
     reason = credential_resolver.account_unusable_reason(data, manifest)
+    extra = data.get("extra") or {}
+    flow = str(extra.get("flow") or "") if isinstance(extra, dict) else ""
     raw = data.get("scopes", []) or []
     if isinstance(raw, str):
         # Some legacy formats stored as space-separated string.
-        return [s for s in raw.split() if s], reason
-    return list(raw), reason
+        return [s for s in raw.split() if s], reason, flow
+    return list(raw), reason, flow
 
 
 def _app_in_use_quietly(mcp_name: str) -> github_apps.AppInUse:
@@ -291,16 +297,16 @@ async def list_my_integrations(
             # surface a "Grant additional access" UI hint without forcing
             # a full reconnect.
             missing_scopes: list[str] = []
-            reconnect_reason = ""
+            reconnect_reason = flow = ""
             if cred_info and cred_info.get("oauth"):
                 required_scopes = await asyncio.to_thread(
                     mcp_registry.build_oauth_scopes, mcp_name, connected_services,
                 )
-                granted, reconnect_reason = await asyncio.to_thread(
+                granted, reconnect_reason, flow = await asyncio.to_thread(
                     _account_token_status,
                     user.sub, mcp_name, acc["account_label"],
                 )
-                missing_scopes = [s for s in required_scopes if s not in granted]
+                missing_scopes = [] if reconnect_reason else [s for s in required_scopes if s not in granted]
 
             meta = acc.get("meta") or {}
             accounts.append({
@@ -334,6 +340,9 @@ async def list_my_integrations(
                 # resolver leaves such an account out of new sessions.
                 "needs_reconnect": bool(reconnect_reason),
                 "reconnect_reason": reconnect_reason,
+                # How the account was connected (a personal access token's
+                # card takes a new token in place of a sign-in).
+                "flow": flow,
             })
 
         # Build user-overridable config fields with admin defaults
@@ -1322,73 +1331,6 @@ async def set_email_server_config(
             credential_store.set_infra_credentials, "email-server", creds
         )
     return {"status": "ok"}
-
-
-# --- OAuth Bearer-Allowlist (admin) ---
-
-
-class AddBearerAllowlistRequest(BaseModel):
-    provider_id: str
-    host_pattern: str
-
-
-@router.get("/v1/admin/oauth-bearer-allowlist")
-async def list_bearer_allowlist(
-    user: UserContext = Depends(get_current_user),
-):
-    """List approved (provider, host) pairs for OAuth bearer-token injection."""
-    require_admin(user)
-    from storage.identity import bearer_allowlist
-    rows = await asyncio.to_thread(bearer_allowlist.list_allowed)
-    return {"entries": rows}
-
-
-@router.post("/v1/admin/oauth-bearer-allowlist")
-async def add_bearer_allowlist(
-    body: AddBearerAllowlistRequest,
-    user: UserContext = Depends(get_current_user),
-):
-    """Approve a (provider, host_pattern) pair. Idempotent on conflict."""
-    require_admin(user)
-    from storage.identity import bearer_allowlist
-    if not body.provider_id.strip() or not body.host_pattern.strip():
-        raise HTTPException(400, "provider_id and host_pattern required")
-    added_by = "api-key" if user.is_api_key else user.sub
-    row_id = await asyncio.to_thread(
-        bearer_allowlist.add_allowed,
-        body.provider_id.strip(), body.host_pattern.strip(), added_by,
-    )
-    return {"status": "ok", "id": row_id}
-
-
-@router.delete("/v1/admin/oauth-bearer-allowlist/{row_id}")
-async def remove_bearer_allowlist(
-    row_id: int,
-    user: UserContext = Depends(get_current_user),
-):
-    """Revoke a (provider, host) pair. The gateway refuses the host at the
-    next request (the table's generation moved), and a paired machine
-    holding a pushed token for it is told now, not at the lease's end."""
-    require_admin(user)
-    from core.remote import mcp_gateway_push
-    from storage.identity import bearer_allowlist
-    ok = await asyncio.to_thread(bearer_allowlist.delete_allowed, row_id)
-    if not ok:
-        raise HTTPException(404, "Allowlist entry not found")
-    mcp_gateway_push.tick_soon()
-    return {"status": "ok"}
-
-
-@router.post("/v1/admin/oauth-bearer-allowlist/restore-defaults")
-async def restore_bearer_allowlist_defaults(
-    user: UserContext = Depends(get_current_user),
-):
-    """Re-add any deleted vendor-official defaults. Idempotent — admin-added
-    entries and existing defaults are untouched. Returns the refreshed list."""
-    require_admin(user)
-    from storage.identity import bearer_allowlist
-    rows = await asyncio.to_thread(bearer_allowlist.restore_defaults)
-    return {"entries": rows}
 
 
 # --- The OAuth clients the install registered at vendors (admin) ---------

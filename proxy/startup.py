@@ -234,6 +234,18 @@ async def _boot_wake_redelivery() -> None:
         logger.exception("Startup wake redelivery sweep failed")
 
 
+# One register per relay provider in use, once boot settles: an upgraded
+# install sends its event kinds and signs, a mistaken switch-off is healed,
+# and the unbinds left pending are sent.
+async def _boot_relay_events() -> None:
+    await asyncio.sleep(20)
+    try:
+        from services.webhooks import relay_events
+        await relay_events.sync_all()
+    except Exception:
+        logger.exception("Startup relay events registration failed (non-fatal)")
+
+
 # The 60 s sweep's items, each isolated (one that raises is logged and
 # the next runs) and run concurrently, _SWEEP_CONCURRENCY at a time: a
 # slow one no longer pushes the rest back, and an item still running
@@ -485,10 +497,16 @@ async def _boot_database() -> None:
     # (schema.platform_version_preflight), before any DDL of this release.
     with pg_pool.get_conn(timeout=60) as _pg_conn:
         _pg_conn.execute("SET LOCAL statement_timeout = 0")
+        from services.engines import engine_resolution
         pg_schema.migrate_database(
             _pg_conn, config.PINNED_OTODOCK_VERSION,
-            allow_newer=cast("bool", config.ALLOW_NEWER_DATABASE))  # default False: never None
+            allow_newer=cast("bool", config.ALLOW_NEWER_DATABASE),  # default False: never None
+            engines=engine_resolution.engine_order())
         _pg_conn.commit()
+        # The agent rows a migration rewrote (the allowlist widening) must
+        # not be served from a cache filled before the commit.
+        from storage.agents import agent_store
+        agent_store._invalidate_cache()
         # Drift guard: one loud ERROR when the live DB is missing columns the
         # code expects (a CREATE TABLE-only addition never reaches existing
         # installs) instead of scattered UndefinedColumn 500s at query time.
@@ -552,6 +570,14 @@ async def _boot_registrations() -> None:
         _edge_compiler.recompile()
     except Exception:
         logger.exception("startup department edge recompile failed (non-fatal)")
+    # A department set's install the last run was cut off in is marked so:
+    # its agents stand alone, the person installs the set again.
+    try:
+        from services.community import department_set_installer as _set_installer
+        for job_id in _set_installer.interrupt_at_boot():
+            logger.warning("set install %s was cut off by the restart", job_id)
+    except Exception:
+        logger.exception("startup set-install interrupt failed (non-fatal)")
     # Startup recovery: PARK recovery-eligible in-flight runs (remote CLI,
     # pinned target) for satellite re-adopt (Mode C) instead of blind-failing
     # them; every other orphaned run + all orphaned meetings are failed so
@@ -827,6 +853,7 @@ async def _boot_services() -> None:
     logger.info("Satellite heartbeat monitor started")
 
     _bg_tasks.append(asyncio.create_task(_boot_wake_redelivery()))
+    _bg_tasks.append(asyncio.create_task(_boot_relay_events()))
 
     # Start the HTTP-over-WS tunnel dispatcher (sweeps leaked streams,
     # owns the singleton httpx.AsyncClient).

@@ -3,7 +3,7 @@
   "server_name": "local",
   "label": "Local Browser",
   "description": "Drive a real, logged-in Chrome/Edge/Brave on this machine (Playwright). The agent navigates, reads the page's accessibility tree, clicks, types, and fills forms on sites you're signed into \u2014 by default in a DEDICATED browser profile you log into once; a machine can opt into \"Use my own browser\" instead, where the agent works in a tab group inside the browser you are signed into (Playwright Extension).",
-  "version": "0.0.79",
+  "version": "0.0.81",
   "category": "custom",
   "server": {
     "runtime": "node",

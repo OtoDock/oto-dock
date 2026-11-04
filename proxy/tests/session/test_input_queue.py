@@ -73,6 +73,29 @@ async def test_add_remove_and_snapshot_write_through(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_a_card_mark_rides_the_row_the_chip_and_never_a_batch(temp_db):
+    """A say button's message carries ``card`` (services/cards): the row
+    keeps it, the chip carries it, a restart restores it, and a batch of
+    several messages drops it (one row would name a typed message as the
+    card's). A text-only message's meta stays exactly empty."""
+    cid = _chat(temp_db)
+    q = await input_queue.loaded(cid)
+    marked = TurnInput("Yes, go on.", card={"card_id": "card-1", "button": "yes"})
+    assert marked.event_meta == {"card": {"card_id": "card-1", "button": "yes"}}
+    assert TurnInput("plain").event_meta == {} and TurnInput("plain").frame_fields() == {}
+    _status, qi, _index = await q.add("q1", "user-admin", marked)
+    assert qi.chip()["card"] == {"card_id": "card-1", "button": "yes"}
+    await chat_writer.drain(cid, timeout=5)
+    (row,) = task_store.list_chat_input_queue(cid)
+    assert json.loads(row["event_data"]) == {"card": {"card_id": "card-1", "button": "yes"}}
+    input_queue._registry.clear()
+    restored = await input_queue.loaded(cid)
+    assert restored.items[0].item.card == {"card_id": "card-1", "button": "yes"}
+    assert TurnInput.combine([marked]).card == marked.card
+    assert TurnInput.combine([marked, TurnInput("and this")]).card is None
+
+
+@pytest.mark.asyncio
 async def test_a_duplicate_is_acked_before_and_after_acceptance(temp_db):
     cid = _chat(temp_db)
     q = await input_queue.loaded(cid)
@@ -114,6 +137,18 @@ async def test_accept_writes_one_row_per_message_and_drops_the_queue_rows(temp_d
     assert json.loads(rows[1]["event_data"]) == {"files": [{"path": "u/a.pdf", "name": "a.pdf"}],
                                                 "queue_id": "q2"}
     assert {"q1", "q2"} <= set(q.accepted)
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_card_answer_keeps_the_cards_mark_on_its_row(temp_db):
+    cid = _chat(temp_db)
+    q = await input_queue.loaded(cid)
+    mark = {"card_id": "card-1", "button": "yes"}
+    await q.add("q1", "user-admin", TurnInput("Yes.", card=mark))
+    await q.accept_job(q.take())
+    row = next(m for m in task_store.get_chat_messages(cid) if m["role"] == "user")
+    assert row["content"] == "Yes."
+    assert json.loads(row["event_data"]) == {"card": mark, "queue_id": "q1"}
 
 
 @pytest.mark.asyncio
@@ -238,6 +273,88 @@ async def test_an_offboardings_return_leaves_the_card_for_an_unreached_teammate(
     assert [c["reason"] for c in cards] == [wire.UNDELIVERED_STOPPED]
 
 
+def _card_answer(cid: str, sub: str = "user-admin") -> dict:
+    """A card in the chat whose say button was pressed: its said click."""
+    from storage.cards import db_cards
+    card = db_cards.create_card(chat_id=cid, session_id="sid-x", agent="agent-a", person_sub=sub, title="Keep it?",
+                                text="", note="", buttons=[{"id": "yes", "label": "Yes", "kind": "say",
+                                                            "message": "Yes."}], options=[])
+    click = db_cards.claim_click(card["id"], "yes", sub, {}, resolves=True)
+    db_cards.finish_click(click["id"], db_cards.CLICK_SAID, "Yes.")
+    return {"card_id": card["id"], "button": "yes"}
+
+
+@pytest.mark.asyncio
+async def test_edit_takes_back_the_persons_own_messages_and_never_a_card_answer(temp_db, pushed):
+    from storage.cards import db_cards
+    cid = _chat(temp_db)
+    mark = _card_answer(cid)
+    q = await input_queue.loaded(cid)
+    await q.add("q-typed", "user-admin", TurnInput("typed"))
+    await q.add("q-card", "user-admin", TurnInput("Yes.", card=mark))
+    await q.add("q-mate", "user-viewer", TurnInput("teammate's"))
+    taken = await input_queue.cancel_own(cid, "user-admin")
+    assert [qi.queue_id for qi in taken] == ["q-typed"]
+    assert [qi.queue_id for qi in q.items] == ["q-card", "q-mate"]
+    # The card's click stays: its answer is still on its way.
+    assert [c["status"] for c in db_cards.clicks_of(mark["card_id"])] == [db_cards.CLICK_SAID]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["stopped", "drive_refused", "turn_failed"])
+async def test_a_card_answer_that_leaves_unsent_gives_its_click_back(temp_db, pushed, reason):
+    """A Stop, a failed turn and a sender gate (``return_items``) return a
+    card's answer unsent: the card opens again rather than reading "You
+    answered" for a message the agent never got."""
+    from storage.cards import db_cards
+    cid = _chat(temp_db)
+    mark = _card_answer(cid)
+    q = await input_queue.loaded(cid)
+    await q.add("q-card", "user-admin", TurnInput("Yes.", card=mark))
+    await q.add("q-typed", "user-admin", TurnInput("typed"))
+    pushed["reach"] = set()
+    await input_queue.return_all(cid, reason)
+    assert db_cards.clicks_of(mark["card_id"]) == []
+    assert db_cards.get_card(mark["card_id"])["resolved_at"] is None
+    # The answer goes back to its card alone: the chip clears for its author,
+    # the composer gets the typed message only, an undelivered card names
+    # the typed message only.
+    cleared = [f for sub, f in pushed["frames"] if sub == "user-admin" and f["type"] == wire.QUEUE_CLEARED]
+    assert cleared and cleared[-1]["queue_ids"] == ["q-card", "q-typed"]
+    assert cleared[-1]["text"] == "typed"
+    await chat_writer.drain(cid, timeout=5)
+    shelved = [json.loads(m["event_data"]) for m in task_store.get_chat_messages(cid)
+               if m["role"] == "event" and m.get("event_type") == wire.SYSTEM]
+    assert shelved and all("Yes." not in json.dumps(b) for b in shelved)
+    assert "typed" in json.dumps(shelved)
+
+
+@pytest.mark.asyncio
+async def test_a_card_answer_alone_returned_reaches_no_composer(temp_db, pushed):
+    cid = _chat(temp_db)
+    mark = _card_answer(cid)
+    q = await input_queue.loaded(cid)
+    await q.add("q-card", "user-admin", TurnInput("Yes.", card=mark))
+    await input_queue.return_all(cid, "turn_failed")
+    cleared = [f for sub, f in pushed["frames"] if sub == "user-admin" and f["type"] == wire.QUEUE_CLEARED]
+    assert cleared == [{"type": wire.QUEUE_CLEARED, "queue_ids": ["q-card"], "reason": "turn_failed",
+                        "chat_id": cid}]
+    await chat_writer.drain(cid, timeout=5)
+    assert [m for m in task_store.get_chat_messages(cid) if m["role"] == "event"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_card_answer_gives_its_click_back(temp_db, pushed):
+    from storage.cards import db_cards
+    cid = _chat(temp_db)
+    mark = _card_answer(cid)
+    q = await input_queue.loaded(cid)
+    await q.add("q-card", "user-admin", TurnInput("Yes.", card=mark), origin_conn="conn-1")
+    await chat_writer.drain(cid, timeout=5)
+    await input_queue.drop_where(conn_id="conn-1")
+    assert q.items == [] and db_cards.clicks_of(mark["card_id"]) == []
+
+
 @pytest.mark.asyncio
 async def test_take_up_to_a_sequence_leaves_the_later_items(temp_db):
     cid = _chat(temp_db)
@@ -285,8 +402,8 @@ async def test_a_returned_copy_carries_the_text_the_others_do_not(temp_db, pushe
     import unittest.mock as um
 
     from services.notifications import notification_manager
-    with um.patch.object(notification_manager, "agent_audience",
-                         return_value=["user-admin", "user-b"]):
+    with um.patch.object(notification_manager, "_audience_of",
+                         return_value=([("user-admin", "admin"), ("user-b", "editor")], True)):
         await q.add("q1", "user-b", TurnInput("b's"))
         await input_queue.return_all(cid, "cancel")
     frames = {sub: f for sub, f in pushed["frames"]}

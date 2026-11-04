@@ -1,6 +1,6 @@
 """Storage-quota measurement + threshold notifications (the soft-tier engine).
 
-Run as one pass of the ~60s registry sweep (``app.py::_registry_sweep_loop``).
+Run as one pass of the ~60s registry sweep (``startup.py::_registry_sweep_loop``).
 For every quota scope it measures usage and fires a 90/95/100 % **warning**
 notification when a threshold is newly crossed:
 

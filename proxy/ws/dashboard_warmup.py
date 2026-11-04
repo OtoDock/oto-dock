@@ -27,6 +27,7 @@ from core.config.config_builder import (
 )
 from core.config.task_config_builder import rewarm_task_identity
 from core.events import chat_writer, input_queue
+from core.events.common_events import carries_prompt
 from core.events.stream_pump import _active_pumps
 from core.execution_layer import ASK_MODE, ExecutionLayer, MachineReach, ResumeVerdict
 from core.sandbox.session_config_dir import (
@@ -165,8 +166,7 @@ class WarmupController(WarmupTail):
         verbatim), so the session's own resolved target can never disagree
         with the pin — the mismatch is computed against an INDEPENDENT
         resolve of the agent's CURRENT target for this user. Attached only
-        for the chat owner / a platform admin: a non-owner's resolve is
-        forced 'local', which would advertise a move the move op refuses.
+        for the chat owner or a platform admin.
         Best-effort — a lookup failure just means no banner."""
         try:
             chat = task_store.get_chat(chat_id) or {}
@@ -440,7 +440,7 @@ class WarmupController(WarmupTail):
         # The app on this screen at SEND time (APPS.md "Live apps"): the
         # first prompt runs as a server kick seconds later, after the overlay
         # closed on send, so the kick carries the line captured now.
-        if msg.get("text") and "_focus_line" not in msg:
+        if carries_prompt(msg) and "_focus_line" not in msg:
             try:
                 from services.apps.focus_context import focus_line
                 msg["_focus_line"] = await run_db(
@@ -477,8 +477,7 @@ class WarmupController(WarmupTail):
         # A cold send on a chat another page is warming, or whose turn runs:
         # this page joins the chat and its text waits behind the turn in
         # progress, never a second warmup or a second first prompt.
-        carries = bool(msg.get("text") or msg.get("images") or msg.get("files"))
-        if (_rebind_cid and carries and not input_queue.deleting(_rebind_cid)
+        if (_rebind_cid and carries_prompt(msg) and not input_queue.deleting(_rebind_cid)
                 and self._chat_in_progress(_rebind_cid)):
             await self._join_chat_in_progress(_rebind_cid, msg)
             return
@@ -520,7 +519,7 @@ class WarmupController(WarmupTail):
         finally:
             self._warmup_in_flight = False
             if early and (outcome != "bg" or self.chat_id != early):
-                if outcome == "inline" and msg.get("text") and self.chat_id == early:
+                if outcome == "inline" and carries_prompt(msg) and self.chat_id == early:
                     # The inline kick below registers its pump a few awaits
                     # from here: the hold keeps a joined page's delivery
                     # from starting its text first (the kick's end ends it).
@@ -542,14 +541,13 @@ class WarmupController(WarmupTail):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._warmup_task
 
-        # Server-owned first turn for the INLINE-ready paths: the
-        # session is live now, so kick the turn. The prompt was persisted at
-        # send-time in _do_warmup (server_kick skips re-persist). The
-        # backgrounded path enqueues its own _server_kick after warmup_ready.
-        if (outcome == "inline" and not msg.get("text") and self.chat_id
+        # Server-owned first turn for the INLINE-ready paths: the session is
+        # live, so kick the turn; its row was written at send-time
+        # (_persist_first_prompt). A backgrounded spawn enqueues its own kick.
+        if (outcome == "inline" and not carries_prompt(msg) and self.chat_id
                 and input_queue.peek(self.chat_id)):
             input_queue.arm(self.chat_id)
-        if outcome == "inline" and msg.get("text") and self.session_id and self.chat_id:
+        if outcome == "inline" and carries_prompt(msg) and self.session_id and self.chat_id:
             holder = grace_layer(self.session_id, self.layer) if self.layer else None
             await self._handle_chat({
                 "text": msg.get("text", ""),
@@ -558,6 +556,7 @@ class WarmupController(WarmupTail):
                 "chat_id": self.chat_id,
                 "_server_kick": True,
                 "_focus_line": msg.get("_focus_line", ""),
+                "_photos_dropped": msg.get("_photos_dropped", 0),
                 # The reuse above already waited out the machine's reconnect.
                 "_reconnect_waited": bool(holder and holder.is_session_grace_held(self.session_id)),
             })
@@ -725,7 +724,7 @@ class WarmupController(WarmupTail):
                 # Persist the prompt at send-time for an existing-chat cold send
                 # (resumed dead session): the frontend warmup carries the text
                 # when its session is cold, and the server-kick skips re-persist.
-                await self._persist_first_prompt(self.chat_id, p.msg.get("text", ""))
+                await self._persist_first_prompt(self.chat_id, p.msg)
                 p.old_session_id = p.chat.get("session_id")
                 p.permission_mode = p.chat.get("permission_mode", p.permission_mode)
                 p.chat_model = p.chat.get("model", "")
@@ -940,7 +939,7 @@ class WarmupController(WarmupTail):
                 p.permission_mode, model=p.chat_model, execution_path=p.effective_exec_path,
                 execution_mode=p.chat_exec_mode, placed=p.placed, actor=self.user_sub or "",
             ), label="create_chat")
-            await self._persist_first_prompt(self.chat_id, p.msg.get("text", ""))
+            await self._persist_first_prompt(self.chat_id, p.msg)
         return None
 
     async def _warm_announce(self, p: _WarmupPlan) -> None:
@@ -966,7 +965,7 @@ class WarmupController(WarmupTail):
             "chat_id": self.chat_id,
             "agent": self.agent_name,
             "execution_path": p.effective_exec_path,
-            "execution_target": self.session_execution_target,
+            "execution_target": (p.chat or {}).get("execution_target") or p.placed[0],
             "new_chat": p.minted,
         })
 
@@ -1010,7 +1009,7 @@ class WarmupController(WarmupTail):
             # A -p first turn is about to be kicked: what is sent before it
             # starts keeps waiting behind it (core/events/input_queue.py).
             # A stopped spawn kicks nothing and holds nothing.
-            if run.res is not None and not run.res.interactive and w.msg.get("text") and not run.aborted:
+            if run.res is not None and not run.res.interactive and carries_prompt(w.msg) and not run.aborted:
                 input_queue.hold_first_turn(w.wcid)
             # Terminal event emitted; drop the registry entry so the next
             # chat reusing this WS doesn't see stale state.

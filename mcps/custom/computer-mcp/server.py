@@ -38,10 +38,12 @@ from environment import (
     DeviceUnavailable,
     check_capture_supported,
     check_input_supported,
+    check_macos_grants,
     check_macos_permissions,
     check_session_active,
     display_backend,
     os_kind,
+    responsible_app,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -186,10 +188,12 @@ def _run_action(args: dict) -> list:
     if action == "screenshot":
         check_capture_supported()
         check_session_active()
+        check_macos_grants(input_needed=False)
         return _screenshot_blocks(display, "Captured the screen.", save=bool(args.get("save", False)))
 
     if action == "wait":
         check_capture_supported()
+        check_macos_grants(input_needed=False)
         try:
             duration = float(args.get("duration", 1.0))
         except (TypeError, ValueError) as exc:
@@ -199,6 +203,7 @@ def _run_action(args: dict) -> list:
 
     if action == "cursor_position":
         check_capture_supported()
+        check_macos_grants(input_needed=False)
         gx, gy = executor.cursor_position()
         mon = _monitor_under(gx, gy)
         scale = geometry.compute_scale(mon.phys_width, mon.phys_height, _coord_mode())
@@ -211,6 +216,7 @@ def _run_action(args: dict) -> list:
     # --- input actions: gate first ----------------------------------------
     check_input_supported()       # Wayland / no-display refusal (actionable)
     check_session_active()
+    check_macos_grants(input_needed=True)  # macOS drops input it was not allowed
 
     monitor = scale = None
     if action in _COORD_ACTIONS:
@@ -406,6 +412,9 @@ async def call_tool(name: str, arguments: dict) -> list:
                 perms = check_macos_permissions()
                 lines.append(f"Accessibility (input): {perms['accessibility']}")
                 lines.append(f"Screen Recording (capture): {perms['screen_recording']}")
+                app = responsible_app()
+                if app is not None:
+                    lines.append(f"macOS asks for these on behalf of: {app[0]} ({app[1]})")
                 if perms.get("notes"):
                     lines.append(perms["notes"])
             return [TextContent(type="text", text="\n".join(lines))]

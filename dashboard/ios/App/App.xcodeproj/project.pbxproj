@@ -1,0 +1,527 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0D0A010000000000000A0101 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0101 /* AppDelegate.swift */; };
+		0D0A010000000000000A0102 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0102 /* SceneDelegate.swift */; };
+		0D0A010000000000000A0103 /* ShellViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0103 /* ShellViewController.swift */; };
+		0D0A010000000000000A0104 /* NativeChannel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0104 /* NativeChannel.swift */; };
+		0D0A010000000000000A0105 /* SetupPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0105 /* SetupPage.swift */; };
+		0D0A010000000000000A0106 /* WebViewDelegates.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0106 /* WebViewDelegates.swift */; };
+		0D0A010000000000000A0107 /* AuthBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0107 /* AuthBrowser.swift */; };
+		0D0A010000000000000A0108 /* PushBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0108 /* PushBridge.swift */; };
+		0D0A010000000000000A0109 /* Downloads.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0109 /* Downloads.swift */; };
+		0D0A010000000000000A0110 /* BootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0110 /* BootView.swift */; };
+		0D0A010000000000000A0111 /* OtoDockNative.js in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0111 /* OtoDockNative.js */; };
+		0D0A010000000000000A0112 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0112 /* PrivacyInfo.xcprivacy */; };
+		0D0A010000000000000A0116 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0116 /* Assets.xcassets */; };
+		0D0A010000000000000A0117 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0117 /* LaunchScreen.storyboard */; };
+		0D0A010000000000000A0118 /* public in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0118 /* public */; };
+		0D0A010000000000000A0119 /* capacitor.config.json in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0119 /* capacitor.config.json */; };
+		0D0A010000000000000A0120 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0120 /* config.xml */; };
+		0D0A010000000000000A0201 /* notif_success.caf in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0201 /* notif_success.caf */; };
+		0D0A010000000000000A0202 /* notif_warning.caf in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0202 /* notif_warning.caf */; };
+		0D0A010000000000000A0203 /* notif_danger.caf in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0203 /* notif_danger.caf */; };
+		0D0A010000000000000A0204 /* notif_turn_done.caf in Resources */ = {isa = PBXBuildFile; fileRef = 0D0F010000000000000A0204 /* notif_turn_done.caf */; };
+		0D0A010000000000000A0301 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 0D0D010000000000000A0301 /* CapApp-SPM */; };
+		0D0A010000000000000A0302 /* OtoDockShell in Frameworks */ = {isa = PBXBuildFile; productRef = 0D0D010000000000000A0302 /* OtoDockShell */; };
+		0D0A010000000000000A0303 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 0D0D010000000000000A0303 /* FirebaseMessaging */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		0D0F010000000000000A0101 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0102 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0103 /* ShellViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellViewController.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0104 /* NativeChannel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeChannel.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0105 /* SetupPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupPage.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0106 /* WebViewDelegates.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewDelegates.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0107 /* AuthBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthBrowser.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0108 /* PushBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushBridge.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0109 /* Downloads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Downloads.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0110 /* BootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootView.swift; sourceTree = "<group>"; };
+		0D0F010000000000000A0111 /* OtoDockNative.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = OtoDockNative.js; sourceTree = "<group>"; };
+		0D0F010000000000000A0112 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		0D0F010000000000000A0113 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		0D0F010000000000000A0114 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
+		0D0F010000000000000A0115 /* GoogleService-Info.plist.example */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "GoogleService-Info.plist.example"; sourceTree = "<group>"; };
+		0D0F010000000000000A0116 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		0D0F010000000000000A0121 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
+		0D0F010000000000000A0118 /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
+		0D0F010000000000000A0119 /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
+		0D0F010000000000000A0120 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
+		0D0F010000000000000A0201 /* notif_success.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = notif_success.caf; sourceTree = "<group>"; };
+		0D0F010000000000000A0202 /* notif_warning.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = notif_warning.caf; sourceTree = "<group>"; };
+		0D0F010000000000000A0203 /* notif_danger.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = notif_danger.caf; sourceTree = "<group>"; };
+		0D0F010000000000000A0204 /* notif_turn_done.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = notif_turn_done.caf; sourceTree = "<group>"; };
+		0D0F010000000000000A0401 /* version.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = version.sh; sourceTree = "<group>"; };
+		0D0F010000000000000A0402 /* firebase-config.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "firebase-config.sh"; sourceTree = "<group>"; };
+		0D0F010000000000000A0403 /* ExportOptions.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = ExportOptions.plist; sourceTree = "<group>"; };
+		504EC3041FED79650016851F /* App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = App.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		504EC3011FED79650016851F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0D0A010000000000000A0301 /* CapApp-SPM in Frameworks */,
+				0D0A010000000000000A0302 /* OtoDockShell in Frameworks */,
+				0D0A010000000000000A0303 /* FirebaseMessaging in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		504EC2FB1FED79650016851F = {
+			isa = PBXGroup;
+			children = (
+				958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
+				0D0F010000000000000A0401 /* version.sh */,
+				0D0F010000000000000A0402 /* firebase-config.sh */,
+				0D0F010000000000000A0403 /* ExportOptions.plist */,
+				504EC3061FED79650016851F /* App */,
+				504EC3051FED79650016851F /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		504EC3051FED79650016851F /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				504EC3041FED79650016851F /* App.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		504EC3061FED79650016851F /* App */ = {
+			isa = PBXGroup;
+			children = (
+				0D0F010000000000000A0101 /* AppDelegate.swift */,
+				0D0F010000000000000A0102 /* SceneDelegate.swift */,
+				0D0F010000000000000A0103 /* ShellViewController.swift */,
+				0D0F010000000000000A0104 /* NativeChannel.swift */,
+				0D0F010000000000000A0105 /* SetupPage.swift */,
+				0D0F010000000000000A0106 /* WebViewDelegates.swift */,
+				0D0F010000000000000A0107 /* AuthBrowser.swift */,
+				0D0F010000000000000A0108 /* PushBridge.swift */,
+				0D0F010000000000000A0109 /* Downloads.swift */,
+				0D0F010000000000000A0110 /* BootView.swift */,
+				0D0F010000000000000A0111 /* OtoDockNative.js */,
+				0D0F010000000000000A0112 /* PrivacyInfo.xcprivacy */,
+				0D0F010000000000000A0113 /* Info.plist */,
+				0D0F010000000000000A0114 /* App.entitlements */,
+				0D0F010000000000000A0115 /* GoogleService-Info.plist.example */,
+				0D0F010000000000000A0116 /* Assets.xcassets */,
+				0D0F010000000000000A0117 /* LaunchScreen.storyboard */,
+				0D0G010000000000000A0200 /* Sounds */,
+				0D0F010000000000000A0118 /* public */,
+				0D0F010000000000000A0119 /* capacitor.config.json */,
+				0D0F010000000000000A0120 /* config.xml */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		0D0G010000000000000A0200 /* Sounds */ = {
+			isa = PBXGroup;
+			children = (
+				0D0F010000000000000A0201 /* notif_success.caf */,
+				0D0F010000000000000A0202 /* notif_warning.caf */,
+				0D0F010000000000000A0203 /* notif_danger.caf */,
+				0D0F010000000000000A0204 /* notif_turn_done.caf */,
+			);
+			path = Sounds;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		504EC3031FED79650016851F /* App */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */;
+			buildPhases = (
+				504EC3001FED79650016851F /* Sources */,
+				504EC3011FED79650016851F /* Frameworks */,
+				504EC3021FED79650016851F /* Resources */,
+				0D0S010000000000000A0501 /* Firebase config */,
+				0D0S010000000000000A0502 /* OtoDock version */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = App;
+			packageProductDependencies = (
+				0D0D010000000000000A0301 /* CapApp-SPM */,
+				0D0D010000000000000A0302 /* OtoDockShell */,
+				0D0D010000000000000A0303 /* FirebaseMessaging */,
+			);
+			productName = App;
+			productReference = 504EC3041FED79650016851F /* App.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		504EC2FC1FED79650016851F /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					504EC3031FED79650016851F = {
+						CreatedOnToolsVersion = 9.2;
+						LastSwiftMigration = 1100;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 504EC2FF1FED79650016851F /* Build configuration list for PBXProject "App" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 504EC2FB1FED79650016851F;
+			packageReferences = (
+				D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */,
+				0D0P010000000000000A0602 /* XCLocalSwiftPackageReference "../OtoDockShell" */,
+				0D0P010000000000000A0603 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
+			);
+			productRefGroup = 504EC3051FED79650016851F /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				504EC3031FED79650016851F /* App */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		504EC3021FED79650016851F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0D0A010000000000000A0117 /* LaunchScreen.storyboard in Resources */,
+				0D0A010000000000000A0118 /* public in Resources */,
+				0D0A010000000000000A0116 /* Assets.xcassets in Resources */,
+				0D0A010000000000000A0119 /* capacitor.config.json in Resources */,
+				0D0A010000000000000A0120 /* config.xml in Resources */,
+				0D0A010000000000000A0111 /* OtoDockNative.js in Resources */,
+				0D0A010000000000000A0112 /* PrivacyInfo.xcprivacy in Resources */,
+				0D0A010000000000000A0201 /* notif_success.caf in Resources */,
+				0D0A010000000000000A0202 /* notif_warning.caf in Resources */,
+				0D0A010000000000000A0203 /* notif_danger.caf in Resources */,
+				0D0A010000000000000A0204 /* notif_turn_done.caf in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0D0S010000000000000A0501 /* Firebase config */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Firebase config";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/firebase-config.sh\"\n";
+		};
+		0D0S010000000000000A0502 /* OtoDock version */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../../../VERSIONS.md",
+				"$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)",
+			);
+			name = "OtoDock version";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/version.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		504EC3001FED79650016851F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0D0A010000000000000A0101 /* AppDelegate.swift in Sources */,
+				0D0A010000000000000A0102 /* SceneDelegate.swift in Sources */,
+				0D0A010000000000000A0103 /* ShellViewController.swift in Sources */,
+				0D0A010000000000000A0104 /* NativeChannel.swift in Sources */,
+				0D0A010000000000000A0105 /* SetupPage.swift in Sources */,
+				0D0A010000000000000A0106 /* WebViewDelegates.swift in Sources */,
+				0D0A010000000000000A0107 /* AuthBrowser.swift in Sources */,
+				0D0A010000000000000A0108 /* PushBridge.swift in Sources */,
+				0D0A010000000000000A0109 /* Downloads.swift in Sources */,
+				0D0A010000000000000A0110 /* BootView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXVariantGroup section */
+		0D0F010000000000000A0117 /* LaunchScreen.storyboard */ = {
+			isa = PBXVariantGroup;
+			children = (
+				0D0F010000000000000A0121 /* Base */,
+			);
+			name = LaunchScreen.storyboard;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
+
+/* Begin XCBuildConfiguration section */
+		504EC3141FED79650016851F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		504EC3151FED79650016851F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		504EC3171FED79650016851F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 96TJQ346RH;
+				INFOPLIST_FILE = App/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.otodock;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		504EC3181FED79650016851F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Distribution";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 96TJQ346RH;
+				INFOPLIST_FILE = App/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.otodock;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "OtoDock App Store";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		504EC2FF1FED79650016851F /* Build configuration list for PBXProject "App" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				504EC3141FED79650016851F /* Debug */,
+				504EC3151FED79650016851F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				504EC3171FED79650016851F /* Debug */,
+				504EC3181FED79650016851F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "CapApp-SPM";
+		};
+		0D0P010000000000000A0602 /* XCLocalSwiftPackageReference "../OtoDockShell" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../OtoDockShell;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		0D0P010000000000000A0603 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/firebase/firebase-ios-sdk";
+			requirement = {
+				kind = exactVersion;
+				version = 13.1.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		0D0D010000000000000A0301 /* CapApp-SPM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
+			productName = "CapApp-SPM";
+		};
+		0D0D010000000000000A0302 /* OtoDockShell */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0D0P010000000000000A0602 /* XCLocalSwiftPackageReference "../OtoDockShell" */;
+			productName = OtoDockShell;
+		};
+		0D0D010000000000000A0303 /* FirebaseMessaging */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0D0P010000000000000A0603 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseMessaging;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 504EC2FC1FED79650016851F /* Project object */;
+}

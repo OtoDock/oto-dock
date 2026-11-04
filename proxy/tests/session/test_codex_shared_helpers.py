@@ -67,7 +67,10 @@ def test_map_effort_max_clamps_on_pre_56_models():
 
 
 def test_map_effort_max_unlocks_on_gpt56_family():
-    # The GPT-5.6 family's wire scale includes "max" (0.144+).
+    # The GPT-5.6 family's wire scale includes "max" (0.144+). The family is
+    # retired from the registry (5.6 Terra last, onto 6.1 Terra); its ids stay
+    # here on purpose: a custom re-add or a session adopted before its row
+    # remaps can still name one, and Codex 0.166.0 still serves them.
     assert map_effort_to_codex("max", "gpt-5.6-sol") == "max"
     assert map_effort_to_codex("max", "gpt-5.6-terra") == "max"
     assert map_effort_to_codex("max", "gpt-5.6-luna") == "max"
@@ -77,6 +80,9 @@ def test_map_effort_max_unlocks_on_gpt56_family():
 def test_map_effort_ultra_unlocks_on_sol_terra_and_astra():
     # "ultra" = max reasoning + Codex-native proactive multi-agent
     # orchestration; OpenAI's manifest supports it on Sol/Terra (and Astra).
+    assert map_effort_to_codex("ultra", "gpt-6.1-sol") == "ultra"
+    assert map_effort_to_codex("ultra", "gpt-6.1-terra") == "ultra"
+    # The retired 5.6 pair keeps it (a pin that still names one).
     assert map_effort_to_codex("ultra", "gpt-5.6-sol") == "ultra"
     assert map_effort_to_codex("ultra", "gpt-5.6-terra") == "ultra"
 
@@ -99,6 +105,12 @@ def test_map_effort_gpt61_sol_follows_the_0_160_catalog():
     # exact id: "gpt-6-sol" is not a prefix of "gpt-6.1-sol", so without its own
     # entry max and ultra would clamp to xhigh.
     assert map_effort_to_codex("max", "gpt-6.1-sol") == "max"
+    # GPT-6.1 Terra (Codex 0.166.0, ultra delegating at xhigh) by its exact
+    # id too, the tier-3 builtin on both engines since it replaced 5.6 Terra.
+    assert map_effort_to_codex("max", "gpt-6.1-terra") == "max"
+    assert map_effort_to_codex("ultra", "gpt-6.1-terra") == "ultra"
+    assert map_effort_to_codex("xhigh", "gpt-6.1-terra") == "xhigh"
+    assert map_effort_to_codex("low", "gpt-6.1-terra") == "low"
     assert map_effort_to_codex("ultra", "gpt-6.1-sol") == "ultra"
     assert map_effort_to_codex("xhigh", "gpt-6.1-sol") == "xhigh"
     assert map_effort_to_codex("high", "gpt-6.1-sol") == "high"
@@ -179,13 +191,14 @@ def test_supports_ultra_flags_match_openai_manifest():
     # manifest. These flags must stay in sync with helpers._ULTRA_EFFORT_MODEL_PREFIXES.
     import config as app_config
     assert app_config.get_model_supports_ultra("gpt-6.1-sol") is True
-    assert app_config.get_model_supports_ultra("gpt-5.6-terra") is True
+    assert app_config.get_model_supports_ultra("gpt-6.1-terra") is True
     assert app_config.get_model_supports_ultra("gpt-6-astra") is True
     assert app_config.get_model_supports_ultra("gpt-6-luna") is False
     assert app_config.get_model_supports_ultra("claude-opus-5-5") is False
-    # Registry-only gate: the retired 5.6 Sol and GPT-6 Sol have no row any
-    # more (the wire clamp in helpers still knows them).
+    # Registry-only gate: the retired 5.6 Sol and Terra and GPT-6 Sol have no
+    # row any more (the wire clamp in helpers still knows them).
     assert app_config.get_model_supports_ultra("gpt-5.6-sol") is False
+    assert app_config.get_model_supports_ultra("gpt-5.6-terra") is False
     assert app_config.get_model_supports_ultra("gpt-6-sol") is False
     assert app_config.get_model_supports_ultra("no-such-model") is False
 
@@ -204,15 +217,15 @@ def test_gpt6_astra_registry_entry():
     assert entry["pricing"] == (10.0, 50.0, 12.50, 1.00)
     assert entry["supports_xhigh"] and entry["supports_ultra"] and entry["supports_reasoning"]
     codex_ids = [m["value"] for m in app_config.get_layer_models("codex-cli")]
-    assert codex_ids.index("gpt-6.1-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-5.6-terra")
-    assert "gpt-6-sol" not in codex_ids
+    assert codex_ids.index("gpt-6.1-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-6.1-terra")
+    assert "gpt-6-sol" not in codex_ids and "gpt-5.6-terra" not in codex_ids
     assert "gpt-6-astra" not in {m["value"] for m in app_config.get_layer_models("direct-llm")}
     assert "gpt-6-astra" not in app_config.MODEL_SUCCESSORS
     assert app_config.get_model_supports_xhigh("gpt-6-astra") is True
 
 
 def test_layer_models_emit_ultra_only_on_codex_layer():
-    # Terra ships on codex-cli AND direct-llm — only the codex engine can run
+    # Sol and Terra ship on codex-cli AND direct-llm — only the codex engine can run
     # the multi-agent orchestration, so only its list may advertise the flag
     # (the dashboard's effort picker keys on this). The flag is per MODEL
     # (Luna never gets it) ANDed with the engine's offers_ultra — read from
@@ -222,7 +235,24 @@ def test_layer_models_emit_ultra_only_on_codex_layer():
     codex = {m["value"]: m for m in _CODEX_CAPABILITIES.models}
     direct = {m["value"]: m for m in _DIRECT_CAPABILITIES.models}
     assert codex["gpt-6.1-sol"]["supports_ultra"] is True
-    assert codex["gpt-5.6-terra"]["supports_ultra"] is True
+    assert codex["gpt-6.1-terra"]["supports_ultra"] is True
     assert codex["gpt-6-luna"]["supports_ultra"] is False
-    assert direct["gpt-5.6-terra"]["supports_ultra"] is False
+    assert direct["gpt-6.1-sol"]["supports_ultra"] is False
+    assert direct["gpt-6.1-terra"]["supports_ultra"] is False
     assert direct["gpt-6-luna"]["supports_ultra"] is False
+
+
+def test_the_effort_prefixes_name_only_registry_or_retired_ids():
+    # Each prefix names a current registry id or a retired one a pin can
+    # still name (a MODEL_SUCCESSORS key); every registry id that offers
+    # ultra maps to wire ultra, and every OpenAI builtin unlocks wire max.
+    import config as app_config
+    from core.layers.codex import helpers
+    nameable = set(app_config.MODEL_REGISTRY) | set(app_config.MODEL_SUCCESSORS)
+    for prefix in helpers._MAX_EFFORT_MODEL_PREFIXES + helpers._ULTRA_EFFORT_MODEL_PREFIXES:
+        assert any(m.startswith(prefix) for m in nameable), prefix
+    for model, entry in app_config.MODEL_REGISTRY.items():
+        if entry.get("supports_ultra"):
+            assert map_effort_to_codex("ultra", model) == "ultra", model
+        if entry["provider"] == "openai" and "codex-cli" in entry["layers"]:
+            assert map_effort_to_codex("max", model) == "max", model

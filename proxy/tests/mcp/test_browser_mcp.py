@@ -149,6 +149,8 @@ def test_apply_browser_mode_dedicated_leaves_nothing_but_strips_poison():
         "PLAYWRIGHT_MCP_USER_DATA_DIR": "/home/u/.config/google-chrome",
         "PLAYWRIGHT_MCP_BROWSER": "chrome", "PLAYWRIGHT_MCP_EXECUTABLE_PATH": "/x",
         "PLAYWRIGHT_MCP_CDP_ENDPOINT": "http://127.0.0.1:9222",
+        "OTO_BROWSER_TOKEN_WITHHELD": "1", "OTO_BROWSER_PROFILE": "Work",
+        "OTO_BROWSER_PROFILE_DIR": "Profile 9", "PLAYWRIGHT_MCP_PROFILE_DIR_NAME": "Profile 9",
     }
     bundles = {}
     for target in (None, BrowserTargetSettings()):
@@ -195,6 +197,31 @@ def test_apply_browser_mode_own_without_token_flags_unattended():
     reg._apply_browser_mode(entry, bundles, _own(), unattended=True)
     assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_UNATTENDED": "1"}
     assert bundles == {}
+
+
+def test_apply_browser_mode_carries_the_machines_profile_in_own_mode_only():
+    """``Browser profile`` rides the plain env (it is no secret) beside the
+    mode; the dedicated browser never gets it."""
+    from storage.remote_store import BrowserTargetSettings
+    entry = {"type": "stdio", "command": "node"}
+    own = BrowserTargetSettings(mode="own", extension_token="T" * 43, profile="Work")
+    reg._apply_browser_mode(entry, {}, own, unattended=False)
+    assert entry["env"]["OTO_BROWSER_PROFILE"] == "Work"
+    entry = {"type": "stdio", "command": "node"}
+    reg._apply_browser_mode(entry, {}, BrowserTargetSettings(profile="Work"), unattended=False)
+    assert "env" not in entry
+
+
+def test_apply_browser_mode_withheld_gives_no_token_and_says_so():
+    """An agent-scope session on a personal machine that does not run as
+    its owner: no token, no "expected", the withheld flag for the wrapper,
+    attended or not."""
+    for unattended in (False, True):
+        entry, bundles = {"type": "stdio", "command": "node"}, {}
+        reg._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=True),
+                                unattended=unattended, withheld=True)
+        assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_WITHHELD": "1"}
+        assert bundles == {}
 
 
 def test_apply_browser_mode_extends_an_existing_bundle():

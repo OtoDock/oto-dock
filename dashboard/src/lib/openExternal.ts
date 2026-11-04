@@ -1,8 +1,9 @@
 /**
- * Open a URL outside the dashboard. On web that's a new tab; inside the
- * Android app the WebView's window.open is a dead end, so links open in a
- * Chrome Custom Tab exactly like the OAuth flows (lib/oauth.ts). Only http(s)
- * ever opens — terminal- and agent-surfaced URLs are untrusted text.
+ * Open a URL outside the dashboard. On the web that is a new tab. Inside the
+ * apps the web view's window.open is a dead end, so links open in the
+ * system's browser view (Android's Custom Tab, the iOS Safari view), as a
+ * flow with no redirect does in lib/oauth.ts. Only http(s) ever opens. A URL
+ * from a terminal or an agent is untrusted text.
  */
 
 import { Capacitor } from '@capacitor/core'

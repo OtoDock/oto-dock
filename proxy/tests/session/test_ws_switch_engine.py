@@ -197,8 +197,8 @@ class TestSwitchEngineGates:
             run_ws_scenario(scenario)
 
     def test_task_chat_agent_scope_viewer_denied(self, temp_db, monkeypatch):
-        # Agent-scope task chats follow the continue tier: editor+ only. A
-        # per-agent viewer is denied even though the run is over.
+        # Agent-scope task chats are the agent's own work: below the editor
+        # tier a viewer cannot open one, so no switch is ever offered.
         from storage import database as task_store
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent(default_scope="agent", collaborative=False)
@@ -216,10 +216,8 @@ class TestSwitchEngineGates:
             async with dashboard_connection(cookie) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": cid})
-                await _drain_until(ws, "chat_history")
-                _switch(ws)
-                frame = await _drain_until(ws, "switch_engine_denied")
-                assert "editor" in frame["message"]
+                frame = await _drain_until(ws, "error")
+                assert frame["message"] == "Access denied"
         run_ws_scenario(scenario)
 
     def test_task_chat_agent_scope_needs_platform_pool(self, temp_db,

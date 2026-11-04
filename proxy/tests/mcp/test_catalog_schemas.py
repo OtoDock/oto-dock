@@ -30,6 +30,7 @@ from tests._paths import CUSTOM_MCPS, PROXY_DIR, REPO_ROOT
 
 TEMPLATE = cs.load_schema(cs.TEMPLATE_SCHEMA)
 SKILL = cs.load_schema(cs.SKILL_SCHEMA)
+SET = cs.load_schema(cs.SET_SCHEMA)
 SIBLINGS = REPO_ROOT.parent
 AGENT_CATALOGS = [SIBLINGS / "otodock-community-agents-prep", SIBLINGS / "otodock-community-agents"]
 SKILL_TREES = [CUSTOM_MCPS, SIBLINGS / "otodock-community-mcps-prep", SIBLINGS / "otodock-community-mcps",
@@ -55,7 +56,7 @@ def _template_problems(folder: Path) -> list[str]:
 
 # --- the schemas themselves -------------------------------------------------------
 
-@pytest.mark.parametrize("name", [cs.TEMPLATE_SCHEMA, cs.SKILL_SCHEMA])
+@pytest.mark.parametrize("name", [cs.TEMPLATE_SCHEMA, cs.SKILL_SCHEMA, cs.SET_SCHEMA])
 def test_the_schemas_are_valid_draft_2020_12_with_a_versioned_id(name):
     schema = cs.load_schema(name)
     Draft202012Validator.check_schema(schema)
@@ -94,7 +95,7 @@ def _hint_nodes(node, where: str, out: list[str]) -> None:
         _hint_nodes(node["allOf"], f"{where}/allOf", out)
 
 
-@pytest.mark.parametrize("schema", [TEMPLATE, SKILL], ids=["template", "skill"])
+@pytest.mark.parametrize("schema", [TEMPLATE, SKILL, SET], ids=["template", "skill", "set"])
 def test_every_rule_that_needs_words_has_a_hint(schema):
     missing: list[str] = []
     _hint_nodes(schema, "#", missing)
@@ -165,6 +166,11 @@ def test_the_enums_equal_the_vocabularies_they_mirror():
     annotation = tasks_api.CreateScheduledTaskRequest.model_fields["notification_mode"].annotation
     assert set(modes) == set(typing.get_args(annotation))
     assert store.DEFAULT_NOTIFICATION_MODE in modes
+    # A set's wiring words are the departments store's.
+    from storage.agents import db_departments
+    assert [m for m in SET["properties"]["mode"]["enum"] if m is not None] == list(db_departments.MODES)
+    assert tuple(r for r in SET["properties"]["reach"]["enum"] if r is not None) == db_departments.REACHES
+    assert SET["properties"]["levels"]["maxItems"] == db_departments.MAX_LEVELS
 
 
 # --- what the catalogs serve -------------------------------------------------------

@@ -68,6 +68,35 @@ describe('delegate cards: live and history build one shape', () => {
     }], AGENTS)
     expect(shape(live)).toEqual(shape(history))
     expect(live.delegateCard?.kind).toBe('result')
+    // The title fields ride the mark from the event on both sides.
+    expect(live.delegateCard).toMatchObject({ taskName: 'cards' })
+    expect(live.delegateCard?.workerChatId).toBeUndefined()
+  })
+
+  it('a result naming the worker chat carries it on both sides', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onDelegateResult({ ...RESULT, worker_chat_id: 'w-1' }))
+    const live = result.current.messages.find((m) => m.delegateCard)!
+    const { type: _type, chat_id: _chat, ...stored } = { ...RESULT, worker_chat_id: 'w-1' }
+    const [history] = dbMessagesToDisplay([{
+      id: 10, role: 'event', content: '', event_type: 'delegate_result',
+      event_data: JSON.stringify(stored), created_at: '2026-10-16T09:00:00+00:00',
+    }], AGENTS)
+    expect(shape(live)).toEqual(shape(history))
+    expect(live.delegateCard).toMatchObject({ kind: 'result', taskName: 'cards', workerChatId: 'w-1' })
+  })
+
+  it('a schedule_wake frame and its stored row', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onScheduleWake({ type: 'schedule_wake', chat_id: 'chat-1', prompt: 'Check the log.', task_id: 'dyn-c1' }))
+    const live = result.current.messages.find((m) => m.delegateCard)!
+    const [history] = dbMessagesToDisplay([{
+      id: 11, role: 'event', content: '', event_type: 'schedule_wake',
+      event_data: JSON.stringify({ prompt: 'Check the log.', task_id: 'dyn-c1' }),
+      created_at: '2026-10-16T09:00:00+00:00',
+    }], AGENTS)
+    expect(shape(live)).toEqual(shape(history))
+    expect(live.delegateCard).toEqual({ kind: 'wake', key: history.delegateCard!.key })
   })
 
   it('a continue steered into a running lane and its stored row', () => {
@@ -100,6 +129,19 @@ describe('a result pushed while the turn streams', () => {
     const after = msgs.slice(card + 1)
     expect(JSON.stringify(after)).toContain('The lane is back.')
     expect(after.some((m) => m.blocks.some((b) => b.type === 'permission'))).toBe(true)
+  })
+
+  it('a wake typed into the streaming turn: the turn goes on below the card', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onText('Still working.'))
+    act(() => captured.cb.onScheduleWake({ type: 'schedule_wake', chat_id: 'chat-1', prompt: 'Check the log.', task_id: 'dyn-c1' }))
+    act(() => captured.cb.onText('Checked.'))
+    const msgs = result.current.messages
+    const card = msgs.findIndex((m) => m.delegateCard?.kind === 'wake')
+    expect(card).toBeGreaterThan(0)
+    expect(JSON.stringify(msgs[card - 1].blocks)).toContain('Still working.')
+    expect(msgs[card].blocks).toEqual([{ type: 'text', content: 'Check the log.' }])
+    expect(JSON.stringify(msgs.slice(card + 1))).toContain('Checked.')
   })
 
   it('a later round of the task with the same output is a new card', () => {

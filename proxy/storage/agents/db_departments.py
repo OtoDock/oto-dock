@@ -128,12 +128,15 @@ def create_department(
     mode: str = DEFAULT_MODE,
     reach: str = "adjacent",
     level_names: list[str] | None = None,
+    community_set: str = "",
+    community_set_version: str = "",
 ) -> dict:
     """Create a department with its initial levels (rank = list order).
 
     A new department wires delegation downward only unless the caller picks
     another mode (the column default 'both' exists for the migration of
-    pre-existing rows, never for a new one).
+    pre-existing rows, never for a new one). ``community_set`` and its
+    version record the catalog set an install made it from.
     """
     names = [n.strip() for n in (level_names or ["Head", "Team"]) if n.strip()]
     if not names:
@@ -147,9 +150,10 @@ def create_department(
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO departments "
-            "(id, name, created_by_sub, mode, reach, created_at, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (dept_id, name, created_by_sub, mode, reach, now, now),
+            "(id, name, created_by_sub, mode, reach, community_set, community_set_version, "
+            "created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (dept_id, name, created_by_sub, mode, reach, community_set, community_set_version, now, now),
         )
         for rank, level_name in enumerate(names):
             conn.execute(
@@ -159,6 +163,48 @@ def create_department(
             )
         conn.commit()
     return get_department(dept_id)  # type: ignore[return-value]
+
+
+def find_by_set(community_set: str, name: str, created_by_sub: str | None = None) -> dict | None:
+    """The department a set install made under ``name``, if one stands
+    (a retry reuses it); the newest when several do, among the ones
+    ``created_by_sub`` made when given (a creator sees past another
+    creator's namesake to their own)."""
+    with get_conn() as conn:
+        if created_by_sub is None:
+            row = conn.execute(
+                "SELECT id FROM departments WHERE community_set = %s AND name = %s "
+                "ORDER BY created_at DESC LIMIT 1", (community_set, name)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM departments WHERE community_set = %s AND name = %s AND created_by_sub = %s "
+                "ORDER BY created_at DESC LIMIT 1", (community_set, name, created_by_sub)).fetchone()
+    return get_department(row["id"]) if row else None
+
+
+def member_slugs(department_id: str) -> list[str]:
+    """The agents placed in the department, by slug."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT slug FROM agents WHERE department_id = %s ORDER BY slug",
+                            (department_id,)).fetchall()
+    return [r["slug"] for r in rows]
+
+
+def place_members(department_id: str, placements: list[tuple[str, str]]) -> None:
+    """Assign every ``(agent slug, level id)`` to the department in one
+    transaction: all or none, so a set install never leaves half of its
+    members placed. The caller validated each level belongs and recompiles
+    the edges after."""
+    now = _now()
+    with get_conn() as conn:
+        for slug, level_id in placements:
+            conn.execute(
+                "UPDATE agents SET department_id = %s, department_level_id = %s WHERE slug = %s",
+                (department_id, level_id, slug))
+        conn.execute("UPDATE departments SET updated_at = %s WHERE id = %s", (now, department_id))
+        conn.commit()
+    from storage.agents import agent_store
+    agent_store._invalidate_cache()
 
 
 def update_department(department_id: str, **fields) -> dict | None:

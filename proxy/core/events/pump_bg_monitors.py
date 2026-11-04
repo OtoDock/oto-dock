@@ -20,8 +20,11 @@ from core.events.bg_command_state import get_bg_command_registry
 from core.events.common_events import TEXT
 from core.session.session_state import (
     _dashboard_notify_queues,
+    _push_to_chat,
     get_subagent_registry,
+    has_pending_prompt,
     mark_bg_agents_completed,
+    mark_subagent_done,
     push_pump_event,
     queue_pump_prompt,
 )
@@ -155,6 +158,80 @@ async def ride_out_grace(layer, session_id: str) -> bool:
     return True
 
 
+# The agent monitor's wait slice, and how long each slice reads the session's
+# lines (under its lock: a person's send waits about this long plus one 0.4 s
+# read behind it, longer when the read meets a wake turn it then captures).
+AGENT_POLL_S = 2.0
+AGENT_DRAIN_S = 0.5
+
+
+async def _read_between_turns(layer, session_id: str, reg) -> bool:
+    """One read of an idle session's lines while its agents run (the idle
+    drain: their completions, signs of life, the CLI's own wake turn). A wake
+    turn captured here reviewed the agents finished by then, so no later
+    review names them again. True when a background job ended."""
+    from core.events import wake_capture
+    before = wake_capture.captured_at(session_id)
+    try:
+        progressed = bool(await layer.drain_bg_commands(session_id, budget=AGENT_DRAIN_S))
+    except Exception:  # noqa: BLE001  # the drain reads stdout or a satellite: the wait goes on
+        logger.debug("BG agent monitor: drain failed for %s", session_id[:8], exc_info=True)
+        return False
+    after = wake_capture.captured_at(session_id)
+    if after is not None and after != before:
+        reg.mark_reviewed(reg.completed)
+    return progressed
+
+
+async def _read_for_wake(layer, session_id: str, reg) -> bool:
+    """After a sub-agent's own command ended, read on for the CLI's wake
+    turn, up to ``WAKE_GRACE_S`` (the wake follows the re-run agent's last
+    line). False when the session is gone."""
+    from core.events import wake_capture
+    seen = wake_capture.captured_at(session_id)
+    deadline = time.monotonic() + WAKE_GRACE_S
+    while time.monotonic() < deadline:
+        if not await ride_out_grace(layer, session_id):
+            return False
+        await _read_between_turns(layer, session_id, reg)
+        if wake_capture.captured_at(session_id) != seen:
+            return True
+        await asyncio.sleep(0.5)
+    return True
+
+
+def _give_up_silent(reg, session_id: str, chat_id: str, watch_start: float,
+                    ceiling: float) -> None:
+    """Stop waiting for the agents that showed no life for ``ceiling``
+    seconds (their lines, tool calls and hooks stamp them; the clock starts
+    no earlier than this watch): each is counted finished and reviewed, its
+    badge cleared, and the warning names it. The others keep the wait. A
+    session whose prompt waits on a person (a sub-agent's permission card or
+    question) is silent by design: its agents count as alive, the prompt's
+    own wait bounds it (the reapers' rule)."""
+    if has_pending_prompt(session_id):
+        for task_id in reg.spawned - reg.completed:
+            reg.note_alive(task_id)
+        return
+    now = time.monotonic()
+    silent = sorted(t for t in reg.spawned - reg.completed
+                    if now - reg.silent_since(t, watch_start) > ceiling)
+    if not silent:
+        return
+    labels = format_job_list([reg.label_for(t) or t for t in silent], limit=5)
+    for task_id in reg.abandon(silent):
+        tuid = reg.tuid_for(task_id)
+        if chat_id and tuid:
+            mark_subagent_done(chat_id, tuid)
+            _push_to_chat(chat_id, {"type": wire.BG_AGENT_DONE, "tool_use_id": tuid})
+    logger.warning(
+        "BG agent monitor: %d background sub-agent(s) showed no sign of life for "
+        "%.0fs (no line, no tool call, no stop hook): %s. Stopped waiting for "
+        "them and cleared their badges (session=%s)",
+        len(silent), ceiling, labels, session_id[:8],
+    )
+
+
 def bg_monitor_running(session_id: str) -> bool:
     """True if a _bg_agent_monitor is already watching this session's cohort."""
     return session_id in _bg_monitors_running
@@ -192,8 +269,13 @@ async def _bg_agent_monitor_impl(
     (idle-safe — the CLI hook fires over HTTP even while the `-p` process is
     idle, e.g. while a subagent is mid-`sleep`). We do NOT infer completion from
     hook-activity silence: a sleeping/slow subagent produces no hooks and would
-    be falsely read as "done", firing a premature nudge. The MAX_WAIT ceiling is
-    the only backstop for a genuinely lost completion signal. The monitor does
+    be falsely read as "done", firing a premature nudge. Each slice also reads
+    the session's lines between turns (``layer.drain_bg_commands``): a
+    sub-agent's stdout completion heals a stop hook the proxy never received,
+    its own lines and tool calls stamp it alive, and the CLI's own wake turn
+    is captured. The wait has no fixed length: an agent is given up only
+    after it showed no life for the background-work ceiling (the leash the
+    reapers give its session), its badge cleared. The monitor does
     NOT bail when the session lock is held by a concurrent user turn (that
     early-exit was removed — it dropped the nudge); it keeps waiting, and the
     nudge is deferred behind the in-flight turn by the natural turn
@@ -206,21 +288,19 @@ async def _bg_agent_monitor_impl(
     Args:
         layer: ExecutionLayer for session operations.
     """
-    POLL_INTERVAL = 2.0     # event-wait slice; lock/alive re-checked each slice
-    MAX_WAIT = 600.0        # 10 min hard ceiling (lost-SubagentStop backstop)
+    from core.session import background_leash
 
     reg = get_subagent_registry(session_id)
     reg.chat_id = chat_id
     start = time.monotonic()
+    ceiling = background_leash.background_work_ceiling()
     logger.info("BG agent monitor started: session=%s, chat=%s, count=%s", session_id[:8], chat_id[:8], count)
 
-    settled = False
-    while (time.monotonic() - start) < MAX_WAIT:
-        # Primary (and only) signal: every spawned subagent has fired its
-        # SubagentStop hook → registry all-done event.
+    while True:
+        # The registry's all-done event: every spawned subagent has ended (its
+        # SubagentStop hook, or its completion read from stdout).
         try:
-            await asyncio.wait_for(reg.wait_all_done(), timeout=POLL_INTERVAL)
-            settled = True
+            await asyncio.wait_for(reg.wait_all_done(), timeout=AGENT_POLL_S)
             break
         except asyncio.TimeoutError:
             pass
@@ -232,9 +312,23 @@ async def _bg_agent_monitor_impl(
         # concurrent user turn): the cohort's completion still needs its nudge,
         # which the turn-start gate defers behind the user's in-flight turn.
         # The bg work is independent of the user's turn. No hook-silence inference.
+        await _read_between_turns(layer, session_id, reg)
+        _give_up_silent(reg, session_id, chat_id, start, ceiling)
 
-    if not settled:
-        logger.warning("BG agent monitor: no SubagentStop all-done within %ss (lost hook?), session=%s", MAX_WAIT, session_id[:8])
+    # A command a sub-agent started still runs: the CLI starts that sub-agent
+    # again when it ends and then wakes the main agent, so the session's
+    # lines are read on, through that wake (captured as the chat's turn).
+    owned_start = time.monotonic()
+    owned_ran = False
+    while reg.owned_alive and time.monotonic() - owned_start < ceiling:
+        owned_ran = True
+        if not await ride_out_grace(layer, session_id):
+            logger.info("BG agent monitor: session %s gone, exiting", session_id[:8])
+            return None
+        if not await _read_between_turns(layer, session_id, reg):
+            await asyncio.sleep(AGENT_POLL_S)
+    if owned_ran and not await _read_for_wake(layer, session_id, reg):
+        logger.info("BG agent monitor: session %s gone, exiting", session_id[:8])
         return None
 
     # Re-check liveness right before delivering. The nudge itself is deferred by

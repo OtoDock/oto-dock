@@ -2,6 +2,22 @@
 
 from storage import database as task_store
 
+# The apps' store review ask: on unless an admin turns it off, and the days
+# between the first ask and the second (the dashboard's hooks/storeReview).
+STORE_REVIEW_DAYS_DEFAULT = 90
+STORE_REVIEW_DAYS_MIN = 30
+STORE_REVIEW_DAYS_MAX = 730
+
+
+def store_review_days_from(raw: str | None) -> int:
+    """The stored days between the two asks: the default when unset or
+    unreadable, kept inside the range."""
+    try:
+        days = int(str(raw or "").strip())
+    except ValueError:
+        return STORE_REVIEW_DAYS_DEFAULT
+    return min(max(days, STORE_REVIEW_DAYS_MIN), STORE_REVIEW_DAYS_MAX)
+
 
 def build_feature_flags() -> dict:
     """User-facing feature flags, shipped on EVERY user payload.
@@ -29,6 +45,12 @@ def build_feature_flags() -> dict:
         # the client falls back to the shipped defaults when absent.
         "upload_max_bytes": config.MAX_UPLOAD_SIZE_BYTES,
         "recover_bin_max_bytes": config.RECOVER_BIN_MAX_BYTES,
+        # Whether and how often the apps ask for a store review (admin
+        # settings, read by every person's dashboard).
+        "store_review_enabled": task_store.get_platform_setting("store_review_enabled") != "0",
+        "store_review_days": store_review_days_from(
+            task_store.get_platform_setting("store_review_days"),
+        ),
     }
 
 

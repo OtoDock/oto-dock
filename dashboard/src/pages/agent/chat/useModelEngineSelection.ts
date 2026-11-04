@@ -19,26 +19,34 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { AgentSummary, LayerCapabilities } from '../../../api/agents'
 import { useUserExecutionLayers } from '../../../api/executionLayers'
-import { computeModelGroups, pickSeedModel, visibleAgentPaths } from '../../../lib/modelGroups'
+import { computeModelGroups, inPersonOrder, pickSeedModel, visibleAgentPaths } from '../../../lib/modelGroups'
 import { currentMode, seedMode } from '../../../lib/engines/modes'
 import { useAgentPrefsStore } from '../../../store/agentPrefsStore'
 
 type Stream = ReturnType<typeof useChatStream>
 type Selection = ReturnType<typeof useModelEngineSelection>
 
-export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPath }: {
+export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPath, enginesForMe, engineForMe }: {
   agentExecutionPaths: string[]
   agentExecutionPath: string
+  /** The agent row's per-person map (`engines_for_me`): which of its
+   *  engines this person may run there; absent while the agents load. */
+  enginesForMe?: Record<string, boolean>
+  /** The engine the server resolved for this person on the agent
+   *  (`engine_for_me`); '' when nothing of theirs runs here. */
+  engineForMe?: string
 }) {
-  // Per-user engine access (server-computed `can_run` on
-  // /v1/users/me/execution-layers) — drives the engine/model filtering. A
-  // layer absent from the map (older proxy / loading) counts as runnable.
+  // Per-person engine access: the agent row's own map (engines resolve per
+  // person, the allowlist and the local-only rule applied), else the
+  // per-engine `can_run` of /v1/users/me/execution-layers. A layer absent
+  // from the map (older proxy / loading) counts as runnable.
   const { data: userLayers } = useUserExecutionLayers()
   const canRunLayer = useMemo(() => {
+    if (enginesForMe) return { ...enginesForMe }
     const m: Record<string, boolean> = {}
     for (const l of userLayers ?? []) m[l.name] = l.can_run !== false
     return m
-  }, [userLayers])
+  }, [enginesForMe, userLayers])
   // The agent's enabled engines this user can run — unfiltered fallback when
   // that would be empty (an empty selector is a dead-end; the inline notice
   // below explains instead).
@@ -46,15 +54,9 @@ export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPat
     () => visibleAgentPaths(agentExecutionPaths, canRunLayer),
     [agentExecutionPaths, canRunLayer],
   )
-  const zeroAccessible =
-    (userLayers?.length ?? 0) > 0
+  const zeroAccessible = agentExecutionPaths.length > 0
+    && (enginesForMe ? true : (userLayers?.length ?? 0) > 0)
     && agentExecutionPaths.every(p => canRunLayer[p] === false)
-  // Pre-warms target the primary engine unless this user can't run it — then
-  // the first accessible one (a doomed pre-warm burns a spawn and fails
-  // silently server-side).
-  const preWarmPath = (canRunLayer[agentExecutionPath] ?? true)
-    ? agentExecutionPath
-    : (visiblePaths[0] ?? agentExecutionPath)
 
   // The execution layer the chat has COMMITTED to. null until the chat actually
   // starts (warmup_ready) or is restored from DB (chat_history) — only then does
@@ -66,6 +68,14 @@ export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPat
   // highlight + the warmup layer WITHOUT collapsing the dropdown — that's what
   // keeps "all layers visible before the first prompt" working.
   const [selectedLayer, setSelectedLayer] = useState<string | null>(null)
+  // Pre-warms and a warm-up with no committed layer target the SELECTED
+  // engine, else the one the server resolved for this person, else the
+  // primary unless this user can't run it — then the first accessible one
+  // (a doomed pre-warm burns a spawn and fails silently server-side).
+  const preWarmPath = selectedLayer
+    ?? (engineForMe || ((canRunLayer[agentExecutionPath] ?? true)
+      ? agentExecutionPath
+      : (visiblePaths[0] ?? agentExecutionPath)))
   // Best-effort liveness of the chat's session process. Set from the
   // chat_history meta, warmup_ready (alive), engine_switched (dead) and the
   // probe_liveness answer (fired when the model dropdown opens — headless
@@ -106,9 +116,16 @@ export function useModelEngineReconcile({
   layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model,
   setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError, chatId, agentName, sessionId, setProcessAlive,
   urlChatId, agentDefaultModel, setModel, setMode, selectedLayer, setSelectedLayer, currentAgent,
+  engineForMe = '', modelForMe = '', localOnly,
 }: {
   layers: Record<string, LayerCapabilities> | undefined
   agentExecutionPaths: string[]
+  /** The server's resolution for this person on the agent: the engine a
+   *  new chat opens on and its model (`engine_for_me`, `model_for_me`). */
+  engineForMe?: string
+  modelForMe?: string
+  /** The agent's engines restricted to local models. */
+  localOnly?: string[]
   chatActiveLayer: Selection['chatActiveLayer']
   processAlive: Selection['processAlive']
   canRunLayer: Selection['canRunLayer']
@@ -133,16 +150,19 @@ export function useModelEngineReconcile({
   // Model dropdown groups — locked to the chat's engine while its session
   // process is alive/streaming/warming; a DEAD chat's dropdown adds the
   // agent's other engines this user can run (cross-engine switch flow).
+  // The groups in the person's order (the server's, no sort of its own here).
+  const personOrder = currentAgent?.engine_order_for_me
   const modelGroups = useMemo(() => computeModelGroups({
     layers,
-    agentPaths: agentExecutionPaths,
+    agentPaths: inPersonOrder(agentExecutionPaths, personOrder),
     chatActiveLayer,
     processAlive,
     canRun: canRunLayer,
     streaming: viewedStreaming,
     warming,
     activeModel: model,
-  }), [layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model])
+    localOnly,
+  }), [layers, agentExecutionPaths, personOrder, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model, localOnly])
 
   // Centralized pendingEngineSwitch reset — the ONLY chat-exit clear. The
   // sidebar select path (handleSelectChat) pre-stamps lastResumedChatIdRef
@@ -223,12 +243,29 @@ export function useModelEngineReconcile({
     // Find the group whose layer owns the current model. Set the SELECTED layer
     // (NOT the committed chatActiveLayer) so warmup uses the right layer while
     // the dropdown keeps showing every enabled layer until the chat starts.
+    // Engines resolve per person: with no sticky pick of the person's, the
+    // engine the server resolved for them (`engineForMe`) wins over the
+    // agent's default model's engine; a sticky pick on an engine they may
+    // run keeps winning.
+    const sticky = !!(agentName && useAgentPrefsStore.getState().lastModel[agentName])
     const matching = modelGroups.find(g =>
       g.models.some(m => m.value === `${g.layer}::${model}`),
     )
-    if (matching) {
+    const resolved = engineForMe ? modelGroups.find(g => g.layer === engineForMe) : undefined
+    if (matching && (sticky || !resolved || matching.layer === resolved.layer)) {
       setSelectedLayer(matching.layer)
       return
+    }
+    if (resolved) {
+      const offered = !!modelForMe && resolved.models.some(m => m.value === `${resolved.layer}::${modelForMe}`)
+      const seed = offered
+        ? { layer: resolved.layer, model: modelForMe }
+        : pickSeedModel([resolved], layers, [model, agentDefaultModel])
+      if (seed) {
+        setModel(seed.model)
+        setSelectedLayer(seed.layer)
+        return
+      }
     }
 
     // No group owns the current model — the agent has no default_model, its
@@ -244,7 +281,7 @@ export function useModelEngineReconcile({
     if (!seed) return
     setModel(seed.model)
     setSelectedLayer(seed.layer)
-  }, [urlChatId, chatActiveLayer, selectedLayer, modelGroups, model, agentName, agentDefaultModel, currentAgent, layers, setModel, setSelectedLayer])
+  }, [urlChatId, chatActiveLayer, selectedLayer, modelGroups, model, agentName, agentDefaultModel, currentAgent, layers, setModel, setSelectedLayer, engineForMe, modelForMe])
 
   return { modelGroups }
 }

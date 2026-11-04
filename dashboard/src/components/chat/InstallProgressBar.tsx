@@ -6,6 +6,7 @@ import {
   useInstallSliceByAgent,
   type InstallSlice,
 } from '../../store/installStore'
+import { useChatStore } from '../../store/chatStore'
 import { useDelayMount } from '../../hooks/useDelayMount'
 
 // The proxy's row for the session start's workspace sync. A sync alone ends
@@ -13,10 +14,11 @@ import { useDelayMount } from '../../hooks/useDelayMount'
 const WORKSPACE_ROW = 'workspace files'
 
 interface Props {
-  // Lookup precedence: chatId → (machineId+agent) → agent. chatId is
-  // preferred for existing chats; the pair handles known new-chat targets;
-  // agent-only is the new-chat-page fallback where execution_target is
-  // only known once the first install event arrives (carries machine_id).
+  // A chat shows the install of the computer it runs on and nothing else:
+  // its own target from the chat store (the warm-up names it, "" while the
+  // start has not placed it). The page's session target (`machineId`) only
+  // on the new-chat page: a chat's may still be the previous chat's. The
+  // agent's latest install only while the target is unknown.
   chatId: string | null | undefined
   machineId?: string | null
   agent?: string | null
@@ -40,13 +42,11 @@ interface Props {
 // messages typed mid-install queue locally). Delay-mounted 500ms to
 // suppress the flash on cached-MCP install (which completes in <100ms).
 export default function InstallProgressBar({ chatId, machineId, agent, onRetry }: Props) {
+  const chatTarget = useChatStore((s) => (chatId ? s.byChat[chatId]?.executionTarget ?? '' : ''))
   const fromChat = useInstallSliceForChat(chatId)
-  const fromKey = useInstallSliceByKey(machineId, agent)
-  // Agent-only fallback fires only when no chat-keyed and no explicit-key
-  // slice exists (i.e. new-chat page before warmup_ready provides target).
-  const fromAgent = useInstallSliceByAgent(
-    !fromChat && !fromKey ? agent : null,
-  )
+  const fromKey = useInstallSliceByKey(chatId ? null : machineId, agent)
+  const targetKnown = chatId ? chatTarget !== '' : !!machineId
+  const fromAgent = useInstallSliceByAgent(targetKnown ? null : agent)
   const install = fromChat ?? fromKey ?? fromAgent
   // The clock the elapsed hint and the done-grace window read, advanced by
   // the tick below while the bar shows.
@@ -105,6 +105,8 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
     const currentMcp = pickActiveMcp(install)
     const elapsedS = Math.max(0, Math.floor((now - install.startedAt) / 1000))
     const showLongHint = elapsedS >= 30
+    const copying = currentMcp === WORKSPACE_ROW
+    const files = install.progress[WORKSPACE_ROW]?.filesTotal ?? 0
     return (
       <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
         <div className="flex flex-col gap-1">
@@ -116,7 +118,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
           </div>
           <div className="flex items-center justify-between gap-3">
             <span className="truncate min-w-0">
-              {currentMcp ? `Installing ${currentMcp}…` : 'Preparing remote environment…'}
+              {copying ? 'Syncing workspace files…' : currentMcp ? `Installing ${currentMcp}…` : 'Preparing remote environment…'}
             </span>
             <span className="shrink-0 tabular-nums opacity-60">{totalPct}%</span>
           </div>
@@ -132,7 +134,11 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
           )}
           {showLongHint && (
             <div className="opacity-60 mt-1">
-              The first install on a new machine can take about 90 seconds.
+              {!copying
+                ? 'The first install on a new machine can take about 90 seconds.'
+                : files > 0
+                  ? `Copying ${files.toLocaleString()} workspace files to this computer. A large copy can take several minutes.`
+                  : 'Copying the workspace files to this computer. A large copy can take several minutes.'}
             </div>
           )}
         </div>

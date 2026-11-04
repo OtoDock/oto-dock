@@ -162,6 +162,14 @@ _HOOK_AUTH_LADDER = (2.0, 4.0, 8.0)
 _HOOK_SOCK_READ_S = 150
 
 
+def _error_word(text: str) -> str:
+    """The ``error`` word of a synthetic tunnel answer, "" for any other body."""
+    try:
+        return str(json.loads(text or "{}").get("error") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
 def _will_retry(params) -> bool:
     """Whether Codex retries the error an ``error`` notification reports: the
     flag sits at the params' top level (app-server 0.156.1), older builds
@@ -412,6 +420,10 @@ class CodexSession:
         self.config = config
         self.sat_config = sat_config
         self.thread_id: str | None = config.get("thread_id")
+        # The model and effort the thread runs (thread/start or thread/resume
+        # answer): the collaboration mode needs a model (the proxy's twin).
+        self._thread_model = ""
+        self._thread_effort = ""
         # Codex refused the thread the platform asked to resume and a new one
         # started: the session runs without that thread's memory (reported in
         # the start's ack, and on the revive's _resume_handle as resumed False).
@@ -486,6 +498,30 @@ class CodexSession:
     @property
     def _hooks_on(self) -> bool:
         return self._hooks_floor or self._attended_floor
+
+    def _collaboration_mode(self, sandbox_mode: str) -> dict:
+        """turn/start's experimental top-level ``collaborationMode`` (0.5.166):
+        the session's model and effort (the shipped ones, else the thread's)
+        in ``settings``, which takes precedence over the turn's own (a
+        ``collaborationMode/list`` preset would bring its own effort); a null
+        ``developer_instructions`` is the mode's built-in text. Empty when no
+        model is known (``settings.model`` is required)."""
+        model = self.config.get("model", "") or self._thread_model
+        if not model:
+            return {}
+        return {
+            "mode": "plan" if self._plan_mode(sandbox_mode) else "default",
+            "settings": {"model": model,
+                         "reasoning_effort": (self.config.get("effort", "")
+                                              or self._thread_effort or None),
+                         "developer_instructions": None},
+        }
+
+    def _note_thread_settings(self, res) -> None:
+        """The model and effort a thread/start or thread/resume answer names."""
+        res = res if isinstance(res, dict) else {}
+        self._thread_model = str(res.get("model") or "")
+        self._thread_effort = str(res.get("reasoningEffort") or "")
 
     def _plan_mode(self, sandbox_mode: str) -> bool:
         """The plan collaboration mode follows the platform's ``permission_mode``
@@ -655,7 +691,8 @@ class CodexSession:
             # (Codex deprecates hydrating it into the answer).
             resume = {"threadId": self.thread_id, "excludeTurns": True}
             try:
-                await self._client.request("thread/resume", {**resume, **overrides})
+                res = await self._client.request("thread/resume", {**resume, **overrides})
+                self._note_thread_settings(res)
             except AppServerError as e:
                 logger.warning("Codex resume failed (%s); starting new thread", e)
                 self.thread_id = None
@@ -663,6 +700,7 @@ class CodexSession:
         if not self.thread_id:
             res = await self._client.request("thread/start", overrides)
             self.thread_id = (res.get("thread") or {}).get("id") or ""
+            self._note_thread_settings(res)
 
         await self._warm_mcps()
         # The forwarder now becomes the SOLE consumer of notif_queue (warm-up
@@ -883,13 +921,13 @@ class CodexSession:
             "approvalPolicy": self._approval_policy(),
             "approvalsReviewer": self._reviewer(),
             "sandboxPolicy": build_sandbox_policy(sandbox_mode, str(self._cwd or "")),
-            # Plan collaboration mode, re-asserted per turn (mirror of the local
-            # layer): plan iff the platform mode is `plan` (0.5.123 — a check's
-            # judge runs the read-only sandbox WITHOUT planning); minimal
-            # {mode:...} so the user's effort isn't overridden by a preset.
-            "settings": {"collaborationMode": {
-                "mode": "plan" if self._plan_mode(sandbox_mode) else "default"}},
         }
+        # The collaboration mode, re-asserted per turn (mirror of the local
+        # layer): plan iff the platform mode is `plan` (0.5.123: a check's
+        # judge runs the read-only sandbox WITHOUT planning).
+        collaboration_mode = self._collaboration_mode(sandbox_mode)
+        if collaboration_mode:
+            turn_params["collaborationMode"] = collaboration_mode
         if not self._summary_refused:
             # Reasoning summaries (twin of the proxy's helpers.REASONING_SUMMARY):
             # Codex's catalog defaults every hosted model to none.
@@ -1171,6 +1209,10 @@ class CodexSession:
         loop = asyncio.get_running_loop()
         deadline = None
         unreachable = auth = 0
+        # The hold's last failure, named in its final warning: which link
+        # failed (a refused loopback port, the tunnel's own 503) costs hours
+        # to find otherwise.
+        last = ""
         while True:
             status = 0
             try:
@@ -1187,9 +1229,13 @@ class CodexSession:
                             if text:
                                 return json.loads(text)
                             status = 0  # the stream ended before its JSON
+                            last = "the answer was cut off"
+                        elif status in (502, 503, 504):
+                            last = f"HTTP {status} {_error_word(await resp.text())}".strip()
             except Exception as e:  # noqa: BLE001  # fail closed: held, then refused
                 logger.info("Codex bridge: %s unreachable (%s)", path, e)
                 status = 0
+                last = f"{type(e).__name__}: {e}"[:200]
             if status == 401 and auth < len(_HOOK_AUTH_LADDER):
                 await asyncio.sleep(_HOOK_AUTH_LADDER[auth])
                 auth += 1
@@ -1201,7 +1247,8 @@ class CodexSession:
             if deadline is None:
                 deadline = loop.time() + _HOOK_HOLD_S
             if loop.time() + wait > deadline:
-                logger.warning("Codex bridge: %s unreachable for %.0fs", path, _HOOK_HOLD_S)
+                logger.warning("Codex bridge: %s unreachable for %.0fs (last: %s)",
+                               path, _HOOK_HOLD_S, last or "no answer")
                 return None
             await asyncio.sleep(wait)
             unreachable += 1

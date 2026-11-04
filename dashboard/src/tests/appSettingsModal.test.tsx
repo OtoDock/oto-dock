@@ -7,8 +7,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 
-const h = vi.hoisted(() => ({ native: false, opened: [] as string[] }))
-vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => h.native } }))
+const h = vi.hoisted(() => ({ native: false, platform: 'web', opened: [] as string[] }))
+vi.mock('@capacitor/core', () => ({
+  Capacitor: { isNativePlatform: () => h.native, getPlatform: () => h.platform },
+}))
 vi.mock('@capacitor/browser', () => ({
   Browser: { open: async ({ url }: { url: string }) => { h.opened.push(url) } },
 }))
@@ -27,6 +29,7 @@ const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 0)
 afterEach(() => {
   delete (window as unknown as { OtoDockNative?: unknown }).OtoDockNative
   h.native = false
+  h.platform = 'web'
   h.opened = []
 })
 
@@ -90,5 +93,40 @@ describe('the privacy policy link', () => {
     render(<AppSettingsModal open onClose={() => {}} />)
     await settle()
     expect(screen.queryByRole('button', { name: 'Privacy policy' })).toBeNull()
+  })
+})
+
+describe('the battery row', () => {
+  it('shows in the Android app while the battery setting would help, and opens it', async () => {
+    h.platform = 'android'
+    const ch = installFakeNativeChannel({ getInstallations: INSTALLS, getBatteryAdvice: true })
+    render(<AppSettingsModal open onClose={() => {}} />)
+    await settle()
+    expect(screen.getByText('Alarms on this phone')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Open battery settings' }))
+    expect(ch.posted[ch.posted.length - 1]).toMatchObject({ m: 'openBatterySettings', a: [] })
+  })
+
+  it('stays away once the setting is right, and asks again on return to the page', async () => {
+    h.platform = 'android'
+    const answers: Record<string, unknown> = { getInstallations: INSTALLS, getBatteryAdvice: false }
+    const ch = installFakeNativeChannel(answers)
+    render(<AppSettingsModal open onClose={() => {}} />)
+    await settle()
+    expect(screen.queryByTestId('app-battery-row')).toBeNull()
+    answers.getBatteryAdvice = true
+    document.dispatchEvent(new Event('visibilitychange'))
+    await settle()
+    expect(ch.methods().filter((m) => m === 'getBatteryAdvice')).toHaveLength(2)
+    expect(screen.getByTestId('app-battery-row')).toBeTruthy()
+  })
+
+  it('is never asked for outside Android', async () => {
+    h.platform = 'ios'
+    const ch = installFakeNativeChannel({ getInstallations: INSTALLS, getBatteryAdvice: true })
+    render(<AppSettingsModal open onClose={() => {}} />)
+    await settle()
+    expect(ch.methods()).not.toContain('getBatteryAdvice')
+    expect(screen.queryByTestId('app-battery-row')).toBeNull()
   })
 })

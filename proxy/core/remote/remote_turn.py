@@ -23,11 +23,11 @@ from core.events import turn_ending
 from core.events.common_events import DONE, ERROR, CommonEvent
 from core.remote import upload_inflight
 from core.remote.remote_session_info import RemoteSessionInfo
-from core.session import engine_prompts
-from core.session.session_state import (
-    get_session_user_tz,
-    resolve_bg_command_frame,
+from core.session.background_frames import (
+    log_between_turns_census,
+    read_stale_line,
 )
+from core.session.session_state import get_session_user_tz
 
 logger = logging.getLogger("remote-layer")
 
@@ -228,9 +228,6 @@ class RemoteTurnMixin(_Host):
         makes the next bracket the user turn's own."""
         from core.events import wake_capture as _wake
         from core.remote.remote_bg_commands import queue_frame_reader
-        from core.session.session_state import (
-            reconcile_background_snapshot as _reconcile_snapshot,
-        )
         drained: Counter[str] = Counter()
         while True:
             try:
@@ -244,14 +241,7 @@ class RemoteTurnMixin(_Host):
                     source="remote_stale_drain",
                 )
                 continue
-            if isinstance(ev, dict):
-                resolve_bg_command_frame(info.session_id, ev)
-                _reconcile_snapshot(info.session_id, ev)
-                engine_prompts.note_frame(info.session_id, ev)
-            drained[(ev or {}).get("type", "?") if isinstance(ev, dict) else "?"] += 1
-        if drained:
-            logger.warning(
-                "Remote session %s: drained %d stale events (types=%s, results=%d)",
-                info.session_id[:8], sum(drained.values()), dict(drained),
-                drained.get("result", 0),
-            )
+            # A sub-agent's lines and the task frames are background work
+            # the satellite forwarded while the main agent was idle.
+            drained[read_stale_line(info.session_id, ev) if isinstance(ev, dict) else "?"] += 1
+        log_between_turns_census(f"Remote session {info.session_id[:8]}", drained)

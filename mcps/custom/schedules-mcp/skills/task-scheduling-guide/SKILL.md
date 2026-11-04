@@ -33,6 +33,18 @@ agent's system prompt:
 `notify_severity` controls the generic notification's severity in `auto`
 mode (`info` / `success` / `warning`) and is ignored in `manual` and `none`.
 
+**Who is told** (`audience`, an agent-scope task only, offered where the
+agent has the agent scope): the lowest role on this agent that receives the
+task's notifications. That covers its auto and failure notices and
+everything its runs send themselves. The values are `editor` (editors and
+managers, the default for a new task), `contributor`, `viewer` (everyone who
+uses the agent) or `manager`. Platform admins are always told, and people
+below the editor role get it without the chat link. A task created from a
+task run tells that run's people when `audience` is omitted, and a run may
+not name a wider audience than its own (refused). `edit_task(audience=…)`
+changes it. Omit it to leave it. `get_task` prints
+`Who is told: <role> and above`.
+
 ## Scheduled self-continuations (`schedule_continuation`)
 
 `schedule_continuation` wakes THIS session at a future time: the prompt you
@@ -85,9 +97,16 @@ firing until paused or deleted.
 
 ## Choosing a model for a task
 
-Every task runs on **your agent's default model and execution layer** unless
-it says otherwise. That default is the right answer almost always — leave
-`model` and `layer` out.
+A person's new chat, lane or own unpinned task takes the allowed engine they
+use most on that agent (their own dashboard chats there in the last 30 days,
+else on every agent); with no such chats, the agent's default engine when they
+can run it, else an allowed engine on their own account, else one the platform
+lends them; the agent's own work (agent-scope tasks and triggers, a
+Shared-only agent's work, calls) runs on the agent's default engine from the
+platform pool. A task of a person runs on the engine and model their own new
+chat on this agent takes (the line marked `default`); a task the agent owns
+(`scope: "agent"`) runs on the agent's default engine from the platform pool.
+That is the right answer almost always — leave `model` and `layer` out.
 
 The exception is a task whose cost profile genuinely differs from your
 everyday work: a heavy daily briefing that has to reason over a lot of
@@ -99,9 +118,9 @@ lever: a lighter default with one task pinned up, or a frontier default with
 the noisy tasks pinned down.
 
 - **Ask the user before pinning a model, unless they already asked for it.** Which model a schedule burns is their spend, not your call. "Should I run that daily report on <stronger model> and keep everything else on the default?" is the shape of the question.
-- **Valid values come from your own `layers:` line** — it lists your enabled execution layers and the model ids on each, with your current default marked `[default, tN]`. Look for it under **Scheduled-task Execution** in your prompt; if you also have the delegation tools it lives on your own row in **Available Agents** instead, and the Scheduled-task Execution block points you there. A model that isn't on that line is rejected with a 400; do not guess ids.
+- **Valid values come from your own `layers:` line.** The `layers:` line lists the agent's allowed engines someone can run there in the person's order (the engines they use most on that agent first; the allowlist's order in a session with no person), each tagged `person` or `platform`, the person's pick marked `default`, the agent's own engine `agent default` where it differs, and `no paired machine` on an engine that runs on the platform host alone. `person` is the person in this chat, whose own tasks run there, and `platform` the platform pool, which runs agent-scope tasks (the pool's engines alone in a session with no person); their unpinned tasks take the `default` engine and agent-scope tasks the `agent default` one; each layer lists its model ids and its default model `[default, tN]`. A model pinned without `layer` runs on the engine the task would take unpinned when that engine offers it, else on the first engine of the agent's own order that does, which is not always the `layers:` line's order: name `layer` when the id is on two lines and you want the other. Look for it under **Scheduled-task Execution** in your prompt; if you also have the delegation tools it lives on your own row in **Available Agents** instead, and the Scheduled-task Execution block points you there. A model that isn't on that line is rejected with a 400; do not guess ids.
 - **Pick by tier, not by name.** Every id on that line carries a capability tag, `[t1]` (frontier: complex coding, the hardest reasoning, judgement calls, long autonomous work) down to `[t4]` (fast: mechanical, high-volume routine work); `[t?]` is a local or custom model nobody rated. The **Model tiers** list next to it says what each model is good at. Complex, open-ended or judgement-heavy tasks (a code change on a real codebase, a review, a decision, a briefing that weighs evidence) belong on tier 1; only a mechanical, well-defined job (a sync, a reformat) belongs on tier 3 or 4. A newer, bigger-sounding or more expensive-sounding id is not a stronger model: the tag is.
-- **Retuning is cheap.** `edit_task(task_id, model="...")` re-pins a live schedule from its next run on, with no change to when it fires. `edit_task(task_id, model="")` clears the pin and returns the task to your default.
+- **Retuning is cheap.** `edit_task(task_id, model="...")` re-pins a live schedule from its next run on, with no change to when it fires. `edit_task(task_id, model="")` clears the pin, and the task runs unpinned again: a person's own task on their engine, any other on the agent's default.
 
 ## Choosing a machine for a task
 
@@ -139,7 +158,7 @@ fails the run with the findings as its error. Name the agent's offered checks
 by name and your own by `user:<name>`; the agent's mandatory checks run on
 every task whether or not you name them. `edit_task(task_id, checks=[])`
 clears the list.
-- **Read it back, never assume.** `list_tasks` shows every task's effective model, its tier and layer — `runs on: <model> [pinned, tier 2 strong]` for a task-level pin, `[agent default, …]` when it follows the agent's current setting, `[layer default, …]` when only the engine is pinned and that engine's own first choice runs. `get_task` shows the same plus the prompt and any warning about a pin that no longer resolves. When asked "what model does this task run on?", answer from these reads, not from memory or the default. The dashboard's Scheduled Tasks tab shows the same.
+- **Read it back, never assume.** `list_tasks` shows every task's effective model, its tier and layer — `runs on: <model> [pinned, tier 2 strong]` for a task-level pin, `[your engine, …]` when an unpinned task of a person follows the engine their own chats take, `[agent default, …]` when it follows the agent's current setting, `[layer default, …]` when only the engine is pinned and that engine's own first choice runs. `get_task` shows the same plus the prompt and any warning about a pin that no longer resolves. When asked "what model does this task run on?", answer from these reads, not from memory or the default. The dashboard's Scheduled Tasks tab shows the same.
 
 ## Trigger-only tasks (`task_type='trigger'`)
 

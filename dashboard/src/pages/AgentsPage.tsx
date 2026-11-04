@@ -5,9 +5,10 @@
  * new face, the grid stays as the fallback view (low-end devices, WebGL
  * unavailable, personal preference — the choice roams via ui-prefs).
  */
-import { useCallback, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useCallback, useRef, useState } from 'react'
+import { Link, useLocation } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { useNativeBarsFrom } from '../contexts/useNativeBars'
 import { isAdmin as isPlatformAdmin, isCreatorOrAbove } from '../lib/permissions'
 import { toastError } from '../lib/http/apiJson'
 import { useMyUiPrefs, useUpdateMyUiPrefs } from '../api/userUiPrefs'
@@ -24,7 +25,15 @@ export default function AgentsPage() {
   const { user } = useAuth()
   const { data: prefs } = useMyUiPrefs()
   const updatePrefs = useUpdateMyUiPrefs()
-  const [view, setView] = useState<View>('map')
+  const location = useLocation()
+  // The chat page's agent pill names the agent the person came from: the
+  // map opens on its department instead of the favorite's.
+  const fromAgent = (location.state as { fromAgent?: string } | null)?.fromAgent
+  const askedDepartments = new URLSearchParams(location.search).get('view') === 'departments'
+  const [view, setView] = useState<View>(askedDepartments ? 'departments' : 'map')
+  // The apps' bars follow the map's dark bar while it shows.
+  const mapBarRef = useRef<HTMLDivElement>(null)
+  useNativeBarsFrom(mapBarRef, view === 'map')
   // Admin default is "Mine only" — Everything is the deliberate audit/
   // overview mode, not the daily driver.
   const [hideNonMember, setHideNonMember] = useState(true)
@@ -34,6 +43,17 @@ export default function AgentsPage() {
   // hosted here so they overlay whichever view is active.
   const [showCreateAgent, setShowCreateAgent] = useState(false)
   const [showCommunity, setShowCommunity] = useState(false)
+  const [communitySection, setCommunitySection] = useState<'agents' | 'sets'>('agents')
+  // A later navigation to ?view=departments (the set install's "Open the
+  // department") switches the tab and closes the browser.
+  const [seenKey, setSeenKey] = useState(location.key)
+  if (location.key !== seenKey) {
+    setSeenKey(location.key)
+    if (askedDepartments) {
+      setView('departments')
+      setShowCommunity(false)
+    }
+  }
 
   const isAdmin = isPlatformAdmin(user)
   const canEditDepts = isCreatorOrAbove(user)
@@ -41,7 +61,7 @@ export default function AgentsPage() {
   // Roamed stickiness: agents_view ('map' | 'grid') + the admin hide toggle.
   if (prefs && !hydrated) {
     setHydrated(true)
-    if (prefs.agents_view === 'grid') setView('grid')
+    if (prefs.agents_view === 'grid' && !askedDepartments) setView('grid')
     if (isAdmin && prefs.agents_map_hide_non_member === false) {
       setHideNonMember(false)
     }
@@ -63,7 +83,7 @@ export default function AgentsPage() {
 
   const onUnavailable = useCallback(() => {
     setWebglDead(true)
-    setView('grid')
+    setView((v) => (v === 'map' ? 'grid' : v))
   }, [])
 
   const openDepartments = useCallback(() => {
@@ -82,6 +102,7 @@ export default function AgentsPage() {
           the scene; the page root stays in the person's theme because the
           install and community modals render inside it without a portal. */}
       <div
+        ref={mapBarRef}
         data-testid="agents-top-bar"
         className={view === 'map' ? 'dark shrink-0 bg-surface-page' : 'contents'}
       >
@@ -133,19 +154,20 @@ export default function AgentsPage() {
         {view === 'map' && !webglDead && (
           <div className="h-full">
             <AgentsMap3D
+              openAgentSlug={fromAgent}
               onUnavailable={onUnavailable}
               hideNonMember={hideNonMember}
               onToggleHideNonMember={toggleHide}
               onOpenDepartments={openDepartments}
               onCreateAgent={() => setShowCreateAgent(true)}
-              onBrowseCommunity={() => setShowCommunity(true)}
+              onBrowseCommunity={() => { setCommunitySection('agents'); setShowCommunity(true) }}
             />
           </div>
         )}
         {view === 'grid' && <AgentGrid embedded />}
         {view === 'departments' && (
           <main className="p-6 max-w-5xl mx-auto">
-            <DepartmentsEditor />
+            <DepartmentsEditor onInstallFromCommunity={() => { setCommunitySection('sets'); setShowCommunity(true) }} />
           </main>
         )}
       </div>
@@ -157,6 +179,7 @@ export default function AgentsPage() {
       />
       <CommunityAgentsBrowser
         open={showCommunity}
+        section={communitySection}
         onClose={() => setShowCommunity(false)}
       />
     </div>

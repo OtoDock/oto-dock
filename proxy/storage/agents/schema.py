@@ -60,7 +60,13 @@ def init_agents(conn) -> None:
             -- dangling id simply compiles to no edges). No FK by design,
             -- matching agent_delegation_targets.
             department_id TEXT NOT NULL DEFAULT '',
-            department_level_id TEXT NOT NULL DEFAULT ''
+            department_level_id TEXT NOT NULL DEFAULT '',
+            -- The engines of ``execution_paths`` on which this agent runs
+            -- local models only (a JSON list of engine ids; '' = none).
+            -- ``execution_path`` and ``execution_paths`` together are the
+            -- engines the agent MAY run on: each person's sessions take
+            -- their own engine among them (services/engines/engine_resolution.py).
+            local_only_engines TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("""
@@ -143,10 +149,38 @@ def init_departments(conn) -> None:
                 CHECK (mode IN ('off', 'down', 'down_across', 'both')),
             -- Free-form map placement hint (JSON), owned by the map UI.
             position_hint TEXT NOT NULL DEFAULT '',
+            -- The catalog set the department was installed from and its
+            -- version (department_set_installer); '' = made by hand.
+            community_set TEXT NOT NULL DEFAULT '',
+            community_set_version TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
+    # The record of a set's install: one row per job, the members' states
+    # and the lines as JSON (db_set_installs). Whole-table CREATE: a new
+    # table converges existing installs at startup.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS set_installs (
+            id TEXT PRIMARY KEY,
+            set_slug TEXT NOT NULL,
+            set_version TEXT NOT NULL DEFAULT '',
+            department_name TEXT NOT NULL,
+            department_id TEXT NOT NULL DEFAULT '',
+            started_by TEXT NOT NULL,
+            status TEXT NOT NULL
+                CHECK (status IN ('running', 'done', 'failed', 'interrupted')),
+            members JSONB NOT NULL DEFAULT '[]'::jsonb,
+            lines JSONB NOT NULL DEFAULT '[]'::jsonb,
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_set_installs_set ON set_installs (set_slug, status)")
+    # One running job per set: the insert is the claim, so two starts
+    # close together never both run (the second answers 409).
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_set_installs_one_running "
+                 "ON set_installs (set_slug) WHERE status = 'running'")
     # Levels are admin-named tiers (rank 0 = top, e.g. Head/Senior/Junior).
     # Cap of 8 and rank uniqueness are enforced in db_departments (the only
     # writer replaces a department's levels transactionally), not by
@@ -182,18 +216,34 @@ def init_memory(conn) -> None:
     #
     # ``inline_budget_bytes`` — per scope: topic files inject in FULL into
     # the system prompt while their total stays under this; past it the
-    # prompt carries only the generated index (+ the `memory` tool's view).
-    # ``nudge_turns`` — assistant turns without a memory-tool call before a
-    # one-line capture reminder rides the next user message (0 = off).
+    # newest topics that fit load whole and the rest are listed with their
+    # index entries (+ the `memory` tool's view).
+    # ``nudge_turns`` — user turns without a memory write that landed before
+    # a one-line capture reminder rides the next user message (0 = off).
+    # ``topic_grow_cap_bytes`` — a topic over this size no longer grows (a
+    # write that shrinks it always lands); ``entry_cap_bytes`` — the most
+    # one edit may add to a topic.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS memory_settings (
             id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
             user_memory_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             agent_memory_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             inline_budget_bytes INTEGER NOT NULL DEFAULT 8192,
-            nudge_turns INTEGER NOT NULL DEFAULT 10
+            nudge_turns INTEGER NOT NULL DEFAULT 10,
+            topic_grow_cap_bytes INTEGER NOT NULL DEFAULT 32768,
+            entry_cap_bytes INTEGER NOT NULL DEFAULT 2048
         )
     """)
+    # A database that made the table before the two caps existed (1.9.1):
+    # the defaults apply to its row.
+    conn.execute(
+        "ALTER TABLE memory_settings ADD COLUMN IF NOT EXISTS "
+        "topic_grow_cap_bytes INTEGER NOT NULL DEFAULT 32768"
+    )
+    conn.execute(
+        "ALTER TABLE memory_settings ADD COLUMN IF NOT EXISTS "
+        "entry_cap_bytes INTEGER NOT NULL DEFAULT 2048"
+    )
     conn.execute(
         "INSERT INTO memory_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
     )
@@ -206,3 +256,75 @@ def init_memory(conn) -> None:
             agent_memory_enabled BOOLEAN NOT NULL DEFAULT TRUE
         )
     """)
+
+
+#: The one-shot flag of the allowlist widening (``platform_settings``).
+ENGINE_ALLOWLIST_WIDENED_FLAG = "engine_allowlist_widened"
+
+
+def migrate_agents(conn, *, engines=()) -> None:
+    """The agents domain's forward migrations on an existing install
+    (``run_migrations`` calls it once; every step is idempotent; the next
+    migration of the domain goes here). The set a department came from
+    (1.9.1): empty on every pre-existing row.
+
+    1.9.1: the engine switches of an agent became an allowlist ("this agent
+    may run on this engine"; each person's sessions take their own engine
+    among them) where they used to be a selection of what the manager held.
+    So an upgraded install loses no engine anyone used and gains the ones it
+    did not list: every agent row's ``execution_paths`` keeps its stored
+    extras first and appends the registered engines it lacks, in
+    ``engines``' order (the registry's), the primary excluded. One shot (a
+    ``platform_settings`` flag), in a SAVEPOINT so a surprise row never
+    aborts the boot (it retries next start). A boot that passes no engines
+    (the test fixture, the standalone scheduler) widens nothing and leaves
+    the flag unset, so the next proxy boot widens.
+    """
+    for column in ("community_set", "community_set_version"):
+        conn.execute(f"ALTER TABLE departments ADD COLUMN IF NOT EXISTS {column} TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "ALTER TABLE agents "
+        "ADD COLUMN IF NOT EXISTS local_only_engines TEXT NOT NULL DEFAULT ''"
+    )
+    engines = [e for e in engines if e]
+    if not engines:
+        return
+    if conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
+                    (ENGINE_ALLOWLIST_WIDENED_FLAG,)).fetchone():
+        return
+    import json
+    import logging
+    conn.execute("SAVEPOINT engine_allowlist")
+    try:
+        rows = conn.execute(
+            "SELECT slug, execution_path, execution_paths FROM agents"
+        ).fetchall()
+        widened = 0
+        for r in rows:
+            primary = r["execution_path"] or ""
+            try:
+                extras = json.loads(r["execution_paths"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                extras = []
+            if not isinstance(extras, list):
+                extras = []
+            kept = [e for e in extras if isinstance(e, str) and e and e != primary]
+            wanted = kept + [e for e in engines if e != primary and e not in kept]
+            if wanted == kept:
+                continue
+            conn.execute(
+                "UPDATE agents SET execution_paths = %s WHERE slug = %s",
+                (json.dumps(wanted), r["slug"]),
+            )
+            widened += 1
+        conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+                     "ON CONFLICT (key) DO NOTHING", (ENGINE_ALLOWLIST_WIDENED_FLAG,))
+        conn.execute("RELEASE SAVEPOINT engine_allowlist")
+        if widened:
+            logging.getLogger(__name__).info(
+                "engine allowlist widened on %d agent(s): every registered engine is allowed",
+                widened)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT engine_allowlist")
+        logging.getLogger(__name__).exception(
+            "engine allowlist widening failed: will retry next startup")

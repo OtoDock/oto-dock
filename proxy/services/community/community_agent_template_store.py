@@ -65,6 +65,10 @@ class TaskItem:
     override_model: str | None = None
     layer: str | None = None
     notification_mode: str = DEFAULT_NOTIFICATION_MODE
+    # Who is told (an agent-scope task): a per-agent role, "" when the
+    # template names none (seeded as the platform's new-task default), None
+    # on an installed record written before 1.9.1 (no audience key at all).
+    audience: str | None = ""
 
 
 @dataclass
@@ -76,6 +80,7 @@ class TriggerItem:
     default_state: str
     auto_create_for_new_users: bool
     roles: list[str] | None
+    audience: str | None = ""   # as on TaskItem: for the paired task and the trigger
 
 
 @dataclass
@@ -786,7 +791,7 @@ def _task_to_dict(t: TaskItem) -> dict[str, Any]:
         "auto_create_for_new_users": t.auto_create_for_new_users,
         "roles": t.roles,
         "override_model": t.override_model, "layer": t.layer,
-        "notification_mode": t.notification_mode,
+        "notification_mode": t.notification_mode, "audience": t.audience,
     }
 
 
@@ -808,6 +813,9 @@ def _task_from_dict(raw: dict[str, Any]) -> TaskItem:
         override_model=raw.get("override_model") or None,
         layer=raw.get("layer") or None,
         notification_mode=str(raw.get("notification_mode") or DEFAULT_NOTIFICATION_MODE),
+        # A record written before 1.9.1 has no audience key (None): its rows
+        # took the migration's value, not a seed's.
+        audience=None if "audience" not in raw else str(raw.get("audience") or ""),
     )
 
 
@@ -816,7 +824,7 @@ def _trigger_to_dict(t: TriggerItem) -> dict[str, Any]:
         "slug": t.slug, "description": t.description, "scope": t.scope,
         "prompt": t.prompt, "default_state": t.default_state,
         "auto_create_for_new_users": t.auto_create_for_new_users,
-        "roles": t.roles,
+        "roles": t.roles, "audience": t.audience,
     }
 
 
@@ -829,6 +837,7 @@ def _trigger_from_dict(raw: dict[str, Any]) -> TriggerItem:
         default_state=str(raw.get("default_state", "paused")),
         auto_create_for_new_users=bool(raw.get("auto_create_for_new_users", False)),
         roles=raw.get("roles"),
+        audience=None if "audience" not in raw else str(raw.get("audience") or ""),
     )
 
 
@@ -920,6 +929,7 @@ def _parse_tasks_json(data: dict[str, Any]) -> list[TaskItem]:
             override_model=raw.get("override_model") or None,
             layer=raw.get("layer") or None,
             notification_mode=raw.get("notification_mode") or DEFAULT_NOTIFICATION_MODE,
+            audience=raw.get("audience") or "",
         ))
     return out
 
@@ -934,6 +944,7 @@ def _parse_triggers_json(data: dict[str, Any]) -> list[TriggerItem]:
             default_state=raw.get("default_state", "paused"),
             auto_create_for_new_users=bool(raw.get("auto_create_for_new_users", False)),
             roles=raw.get("roles"),
+            audience=raw.get("audience") or "",
         )
         for raw in data.get("triggers") or []
     ]

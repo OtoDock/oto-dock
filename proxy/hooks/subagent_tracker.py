@@ -23,7 +23,17 @@ import http.client
 import json
 import os
 import sys
+import time
+import urllib.error
 import urllib.request
+
+# Within the hook's 10 s: a post refused while a machine's link to the
+# platform reconnects (the tunnel answers 503) or a refused connection is
+# sent again a little later; a longer outage is healed by the CLI's own
+# completion line, which the platform reads from the session's output.
+_ATTEMPTS = 3
+_PAUSES_S = (1.0, 2.0)
+_POST_TIMEOUT_S = 2.0
 
 
 def main():
@@ -73,12 +83,25 @@ def main():
         },
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=10):
-            pass  # Fire and forget
-    except (OSError, http.client.HTTPException, ValueError):
-        pass  # Non-blocking — never interrupt Claude
+    for attempt in range(_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=_POST_TIMEOUT_S):
+                return
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return  # refused for good (a stale token): never interrupt Claude
+        except (OSError, http.client.HTTPException, ValueError):
+            pass
+        if attempt < len(_PAUSES_S):
+            time.sleep(_PAUSES_S[attempt])
 
 
 if __name__ == "__main__":
+    # PROXY_URL is a loopback address (the platform's own listener, or a
+    # satellite's tunnel): no proxy may stand between. urllib's default
+    # opener takes the environment's proxy and, on Windows, Internet
+    # Options' (whose <local> exemption skips only dotless hosts, never
+    # 127.0.0.1). Installed here, never at import: a test that loads the
+    # script keeps its own opener.
+    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
     main()

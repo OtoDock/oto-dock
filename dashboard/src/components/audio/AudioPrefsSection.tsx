@@ -1,8 +1,9 @@
 // User audio preferences (in My Settings). Cross-device mode/language are saved
 // server-side (user_audio_prefs); the per-language native voice pick is
-// device-local (audioPrefsStore). Mode radios only appear when the admin policy
-// is "user choice" (the capability returns "either"); otherwise the policy
-// decides and there's nothing for the user to set.
+// device-local (audioPrefsStore). Mode rows appear where a modality's capability
+// answers "either" (user choice, or Dictation in Apple's WebKit under native
+// preferred with a provider); otherwise the policy decides and there's nothing
+// for the user to set.
 
 import { useEffect, useState } from 'react'
 import { useChatAudioCapability } from '../../hooks/useChatAudioCapability'
@@ -111,7 +112,7 @@ export function AudioPrefsSection() {
               )}
             </div>
           ) : (
-            <p className="text-xs text-tertiary">Voice engine is set by the platform policy.</p>
+            <p className="text-xs text-tertiary">The platform policy sets this.</p>
           )}
 
           {/* Dictation (STT) language — the language the mic recognizes */}
@@ -121,7 +122,7 @@ export function AudioPrefsSection() {
                 label="Dictation language"
                 htmlFor="dictation-language"
                 save={stateOf('stt_language')}
-                info="The language the mic recognizes. Set it to dictate in a language other than English. Automatic starts in your browser language. Within a second or two, it moves to the language you speak. The device recognizer keeps your browser language."
+                info="The language the mic recognizes. Set it to dictate in a language other than English. Automatic starts in your browser language. Within a second or two, it moves to the language you speak. Without a speech service, or with Dictation set to Native, this device listens in its own language."
               >
                 <Select
                   id="dictation-language"

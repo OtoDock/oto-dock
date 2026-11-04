@@ -164,20 +164,30 @@ class TestServiceAccountNeverOnUserMachine:
 
         from core.remote.remote_session_start import placement_refuses
 
-        def cfg(sub, role):
-            return SimpleNamespace(user_sub=sub, security_context=SimpleNamespace(role=role))
+        def cfg(sub, role, agent="test-agent"):
+            return SimpleNamespace(user_sub=sub, placement_sub=None, agent_name=agent,
+                                   security_context=SimpleNamespace(role=role))
         mine = {"pairing_scope": "user", "registered_by": "real-sub"}
-        admin = {"pairing_scope": "admin", "registered_by": "admin-x"}
-        with patch("storage.remote_store.get_remote_machine", return_value=mine):
-            assert not placement_refuses("m-user-1", cfg("real-sub", "editor"))
-            assert placement_refuses("m-user-1", cfg("other-sub", "admin"))
-            assert placement_refuses("m-user-1", cfg("", "manager"))
-        with patch("storage.remote_store.get_remote_machine", return_value=admin):
-            assert placement_refuses("m-admin-1", cfg("editor-sub", "editor"))
-            assert not placement_refuses("m-admin-1", cfg("mgr-sub", "manager"))
-            assert not placement_refuses("m-admin-1", cfg("", "manager"))
-        with patch("storage.remote_store.get_remote_machine", return_value=None):
-            assert not placement_refuses("m-gone", cfg("x", "viewer"))
+        admin = {"id": "m-admin-1", "pairing_scope": "admin", "registered_by": "admin-x"}
+        defaults = {"test-agent": {"execution_target": "m-admin-1"},
+                    "other-agent": {"execution_target": "local"}}
+        with patch("storage.agents.agent_store.get_agent", side_effect=defaults.get):
+            with patch("storage.remote_store.get_remote_machine", return_value=mine):
+                assert not placement_refuses("m-user-1", cfg("real-sub", "editor"))
+                assert placement_refuses("m-user-1", cfg("other-sub", "admin"))
+                assert placement_refuses("m-user-1", cfg("", "manager"))
+            with patch("storage.remote_store.get_remote_machine", return_value=admin):
+                assert placement_refuses("m-admin-1", cfg("editor-sub", "editor"))
+                assert not placement_refuses("m-admin-1", cfg("mgr-sub", "manager"))
+                assert not placement_refuses("m-admin-1", cfg("", "manager"))
+            # Its admin's switch: every role of the agents whose default it
+            # is, never another agent's session.
+            switched = dict(admin, all_roles_run_here=True)
+            with patch("storage.remote_store.get_remote_machine", return_value=switched):
+                assert not placement_refuses("m-admin-1", cfg("viewer-sub", "viewer"))
+                assert placement_refuses("m-admin-1", cfg("viewer-sub", "viewer", "other-agent"))
+            with patch("storage.remote_store.get_remote_machine", return_value=None):
+                assert not placement_refuses("m-gone", cfg("x", "viewer"))
 
     def test_agent_scope_allowed_on_admin_shared(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \

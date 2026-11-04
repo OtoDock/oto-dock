@@ -132,6 +132,116 @@ def test_foreground_bash_not_tracked():
     assert get_bg_command_registry(sid).pending_count == 0
 
 
+def test_a_sub_agents_commands_are_not_the_main_agents():
+    # Claude Code 2.1.296 and 2.1.312 (recorded against a scripted API): a sub-agent's
+    # command names its owner, background or foreground alike. It is the
+    # sub-agent's to read: no badge, no card, nothing the monitor waits for.
+    sid = "s-sub-cmds"
+    t = ClaudeCLIEventTranslator(sid)
+    out = _events(t, [
+        _sys("task_started", task_id="bSub", tool_use_id="tuSub", owned_by_subagent=True,
+             parent_task_id="a1", is_backgrounded=True, task_type="local_bash"),
+        _sys("task_started", task_id="bSub2", tool_use_id="tuSub2", parent_task_id="a1",
+             is_backgrounded=False, task_type="local_bash"),
+    ])
+    assert out == []
+    assert get_bg_command_registry(sid).pending_count == 0
+
+
+def test_a_long_foreground_command_is_no_background_badge():
+    # Any foreground Bash past about three seconds is announced as a task with
+    # is_backgrounded false: its own tool card shows it.
+    sid = "s-fg-task"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, _bash_tool_call(0, "tuF", '{"command":"python3 -c pass","description":"wait"}'))
+    out = _events(t, [_sys("task_started", task_id="bF", tool_use_id="tuF", description="wait",
+                           is_backgrounded=False, task_type="local_bash")])
+    assert not any(ty == "bg_command_start" for ty, _ in out), out
+    assert get_bg_command_registry(sid).pending_count == 0
+    # Its end is no background completion either.
+    done = _events(t, [_sys("task_notification", task_id="bF", tool_use_id="tuF", status="completed")])
+    assert not any(ty == "bg_command_end" for ty, _ in done), done
+
+
+def test_a_foreground_command_moved_to_the_background_gets_its_badge():
+    sid = "s-fg-moved"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, [_sys("task_started", task_id="bMv", tool_use_id="tuMv", description="build",
+                     is_backgrounded=False, task_type="local_bash")])
+    out = _events(t, [_sys("task_updated", task_id="bMv", patch={"is_backgrounded": True})])
+    starts = [d for ty, d in out if ty == "bg_command_start"]
+    assert [s["tool_use_id"] for s in starts] == ["tuMv"]
+    assert get_bg_command_registry(sid).tuid_for("bMv") == "tuMv"
+
+
+def test_a_timed_out_command_moved_to_the_background_on_the_recorded_stream():
+    # probe-bash-moved.jsonl (Claude Code 2.1.312; 2.1.296 sends the same
+    # frames): a foreground Bash past its 7 s timeout is announced in the
+    # foreground at about 4 s, then patched ``is_backgrounded: true`` at the
+    # timeout, and ends after the turn.
+    import json
+
+    from tests._paths import PROXY_DIR
+    fixture = PROXY_DIR / "tests" / "fixtures" / "cli_wake" / "probe-bash-moved.jsonl"
+    frames = [json.loads(line) for line in fixture.read_text().splitlines() if line.strip()]
+    sid = "s-moved-recorded"
+    t = ClaudeCLIEventTranslator(sid)
+    out = _events(t, frames)
+    starts = [d for ty, d in out if ty == "bg_command_start"]
+    ends = [d for ty, d in out if ty == "bg_command_end"]
+    assert len(starts) == 1 and len(ends) == 1, out
+    assert starts[0]["tool_use_id"] == ends[0]["tool_use_id"] != ""
+    assert ends[0]["status"] == "completed"
+    assert get_bg_command_registry(sid).pending_count == 0
+
+
+def test_a_move_and_an_end_in_one_patch_keep_both():
+    sid = "s-moved-ended"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, [_sys("task_started", task_id="bME", tool_use_id="tuME", description="build",
+                     is_backgrounded=False, task_type="local_bash")])
+    out = _events(t, [_sys("task_updated", task_id="bME",
+                           patch={"is_backgrounded": True, "status": "completed"})])
+    assert [ty for ty, _ in out] == ["bg_command_start", "bg_command_end"]
+
+
+def test_each_owner_flag_alone_marks_a_sub_agents_command():
+    # 2.1.243 sends owned_by_subagent with no parent_task_id; a later CLI may
+    # send the parent alone. Either is the sub-agent's, background or not.
+    sid = "s-owner-flags"
+    t = ClaudeCLIEventTranslator(sid)
+    out = _events(t, [
+        _sys("task_started", task_id="bO1", tool_use_id="tuO1", owned_by_subagent=True,
+             is_backgrounded=True, task_type="local_bash"),
+        _sys("task_started", task_id="bO2", tool_use_id="tuO2", parent_task_id="a1",
+             is_backgrounded=True, task_type="local_bash"),
+    ])
+    assert out == []
+    assert get_bg_command_registry(sid).pending_count == 0
+
+
+def test_a_sub_agents_foreground_command_moved_later_stays_the_sub_agents():
+    # The move's patch carries no owner field: the foreground start's owner
+    # decides.
+    sid = "s-owner-moved"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, [_sys("task_started", task_id="bSM", tool_use_id="tuSM", owned_by_subagent=True,
+                     parent_task_id="a1", is_backgrounded=False, task_type="local_bash")])
+    out = _events(t, [_sys("task_updated", task_id="bSM", patch={"is_backgrounded": True})])
+    assert out == []
+    assert get_bg_command_registry(sid).pending_count == 0
+
+
+def test_a_command_with_no_flag_stays_a_background_command():
+    # An older CLI announced background commands only, with no flag.
+    sid = "s-noflag"
+    t = ClaudeCLIEventTranslator(sid)
+    out = _events(t, [_sys("task_started", task_id="bN0", tool_use_id="tuN0",
+                           description="job", task_type="local_bash")])
+    assert any(ty == "bg_command_start" for ty, _ in out), out
+    assert get_bg_command_registry(sid).description_for("bN0") == "job"
+
+
 def test_task_updated_unknown_taskid_ignored():
     sid = "s-unknown"
     t = ClaudeCLIEventTranslator(sid)
@@ -363,6 +473,82 @@ def test_label_helpers():
     assert format_job_list(["a", "b", "c", "d", "e"]) == "a; b; c (+2 more)"
 
 
+# ---------------------------------------------------------------------------
+# A completion read mid-turn reaches the chat: the pump binds the chat at the
+# turn start, then the CLI session's send resets the registries for the turn.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def bound_turn(monkeypatch):
+    """A session whose pump bound ``chat-bound``, then whose turn started
+    (both registries reset, as ``PersistentSession.send_message`` does);
+    the pump's pushes are captured."""
+    from core.events import bg_command_state
+    from core.session import session_state
+    pushed: list[tuple[str, dict]] = []
+    monkeypatch.setattr(session_state, "_push_pump_event_fn",
+                        lambda cid, ev: pushed.append((cid, ev)) or True)
+    sid = "s-bound-turn"
+    get_subagent_registry(sid).chat_id = "chat-bound"
+    get_bg_command_registry(sid).chat_id = "chat-bound"
+    session_state.reset_subagent_registry(sid)
+    bg_command_state.reset_bg_command_registry(sid)
+    yield SimpleNamespace(sid=sid, pushed=pushed, translator=ClaudeCLIEventTranslator(sid))
+    session_state._subagent_registries.pop(sid, None)
+    bg_command_state._bg_command_registries.pop(sid, None)
+
+
+def test_a_command_the_snapshot_ends_mid_turn_clears_its_badge(bound_turn):
+    # The recorded frames put background_tasks_changed before the command's
+    # task_updated; the snapshot resolves it and the later frame finds it done.
+    t = bound_turn.translator
+    _events(t, _bash_tool_call(0, "tuS", '{"command":"sleep 20","run_in_background":true}'))
+    _events(t, [_sys("task_started", task_id="bS", tool_use_id="tuS", task_type="local_bash")])
+    _events(t, [_sys("background_tasks_changed", tasks=[])])
+    assert bound_turn.pushed == [
+        ("chat-bound", {"type": "bg_command_done", "tool_use_id": "tuS", "status": "completed"})]
+    later = _events(t, [_sys("task_updated", task_id="bS", patch={"status": "completed"})])
+    assert not any(ty == "bg_command_end" for ty, _ in later)
+
+
+def test_an_agent_the_snapshot_ends_mid_turn_clears_its_badge(bound_turn):
+    # probe-agent.jsonl: the snapshot (line 38) precedes the agent's
+    # task_updated and task_notification, and its SubagentStop hook then
+    # answers a duplicate, so the snapshot is where its badge clears.
+    t = bound_turn.translator
+    _events(t, [_sys("task_started", task_id="a7b9", tool_use_id="tuA", task_type="local_agent",
+                     description="Run sleep and echo command", is_backgrounded=True)])
+    _events(t, [_sys("background_tasks_changed", tasks=[])])
+    assert ("chat-bound", {"type": "bg_agent_done", "tool_use_id": "tuA"}) in bound_turn.pushed
+    later = _events(t, [_sys("task_notification", task_id="a7b9", tool_use_id="tuA", status="completed")])
+    assert not any(ty == "subagent_end" for ty, _ in later)
+
+
+def test_between_turns_the_frame_goes_to_the_chat_s_viewers(monkeypatch):
+    # No pump runs between turns: a monitor's drain still clears the badge,
+    # through the frame every socket viewing the chat forwards.
+    import asyncio
+
+    from core.events import bg_command_state
+    from core.session import session_state
+    monkeypatch.setattr(session_state, "_push_pump_event_fn", lambda cid, ev: False)
+    queue: asyncio.Queue = asyncio.Queue()
+    session_state._dashboard_notify_queues["s-viewer"] = queue
+    sid = "s-between"
+    try:
+        bgreg = get_bg_command_registry(sid)
+        bgreg.chat_id = "chat-between"
+        bgreg.register_spawn("bB", "tuB")
+        bg_command_state.reset_bg_command_registry(sid)
+        assert session_state.resolve_bg_command(sid, "bB") is True
+        assert queue.get_nowait() == {
+            "type": "chat_ui_frame", "chat_id": "chat-between",
+            "frame": {"type": "bg_command_done", "tool_use_id": "tuB", "status": "completed"}}
+    finally:
+        session_state._dashboard_notify_queues.pop("s-viewer", None)
+        bg_command_state._bg_command_registries.pop(sid, None)
+
+
 def test_registry_reset_keeps_pending_labels():
     sid = "s-label-reset"
     bgreg = get_bg_command_registry(sid)
@@ -438,7 +624,11 @@ async def test_monitor_nudges_for_a_completion_the_model_never_saw(monkeypatch):
             "type": "system", "subtype": "task_updated",
             "task_id": "bM2", "patch": {"status": "completed"}})
 
-    nudge, = await _run_monitor(monkeypatch, sid, idle_drain)
+    done, nudge = await _run_monitor(monkeypatch, sid, idle_drain)
+    # The command's own badge clears first, through its chat's viewers (no
+    # pump runs between turns), then the review is nudged.
+    assert done == {"type": "chat_ui_frame", "chat_id": "c-" + sid, "frame": {
+        "type": "bg_command_done", "tool_use_id": "tuM2", "status": "completed"}}
     assert nudge["type"] == "bg_command_nudge"
     assert nudge["labels"] == ["bM2 — make test"]
 
@@ -805,6 +995,10 @@ class _HeldPump:
                 _active_pumps.pop(chat_id, None)
         self._task = asyncio.ensure_future(_run())
         _active_pumps[chat_id] = self
+
+    def push_ws_event(self, event) -> bool:
+        """A held pump drains nothing: the event waits for the review, as unwired."""
+        return False
 
 
 @pytest.mark.asyncio

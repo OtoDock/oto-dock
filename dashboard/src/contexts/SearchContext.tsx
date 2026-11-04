@@ -78,11 +78,13 @@ export function SearchProvider({ query, children }: { query: string; children: R
     })
   }, [totalMatches])
 
+  // -1 is no match yet (a search result's anchor is still on its way): the
+  // next is the first, the previous the last.
   const prevMatch = useCallback(() => {
     setCurrentMatch((prev) => {
       const total = totalMatches
       if (total === 0) return 0
-      return (prev - 1 + total) % total
+      return prev < 0 ? total - 1 : (prev - 1 + total) % total
     })
   }, [totalMatches])
 

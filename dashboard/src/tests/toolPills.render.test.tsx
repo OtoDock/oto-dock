@@ -6,7 +6,7 @@ import SubagentInfo from '@/components/chat/SubagentInfo'
 import BgCommandInfo from '@/components/chat/BgCommandInfo'
 import DelegateTaskInfo, { DelegateResultFiles } from '@/components/chat/DelegateTaskInfo'
 import { ChatFileProvider } from '@/components/chat/ChatFileContext'
-import { resultFileLabel } from '@/lib/chat/delegateFiles'
+import { resultFileChipLabel, resultFileChipLabelParts, resultFileLabel } from '@/lib/chat/delegateFiles'
 
 // The files list opens through the DELEGATING chat's resolve-path; the
 // preview surface is mocked to what it receives.
@@ -212,6 +212,10 @@ describe('DelegateTaskInfo — expandable delegate pill', () => {
     )
     expect(screen.getAllByText('Triage the inbox.').length).toBeGreaterThan(0)
     expect(screen.queryByText(/Delegated by agent/)).toBeNull()
+    // Expanded, the wrapper stays hidden too.
+    fireEvent.click(screen.getByText('triage'))
+    const pre = document.querySelector('pre')
+    expect(pre?.textContent).toBe('Triage the inbox.')
   })
 
   it('is not expandable on preview-only legacy rows', () => {
@@ -243,6 +247,34 @@ describe('DelegateResultFiles — the files a worker attached', () => {
     expect(resultFileLabel('workspace/inbox/w/data/a.csv')).toBe('inbox/w/data/a.csv')
     expect(resultFileLabel('users/alice/workspace/reports/q3.md')).toBe('reports/q3.md')
     expect(resultFileLabel('knowledge/x.md')).toBe('knowledge/x.md')
+  })
+
+  it('a chip names the file with its last folder, the rest shortened', () => {
+    expect(resultFileChipLabel('users/alice/workspace/projects/site/after/hero-1280.png')).toBe('…/after/hero-1280.png')
+    expect(resultFileChipLabel('workspace/inbox/w/report.md')).toBe('…/report.md')
+    expect(resultFileChipLabel('users/alice/workspace/inbox/w/data/deep/a.csv')).toBe('…/deep/a.csv')
+    expect(resultFileChipLabel('users/alice/workspace/reports/q3.md')).toBe('reports/q3.md')
+    expect(resultFileChipLabel('workspace/q3.md')).toBe('q3.md')
+  })
+
+  it("a chip's label keeps the end of the name whole, from a near separator", () => {
+    const parts = (p: string) => resultFileChipLabelParts(p)
+    expect(parts('users/a/workspace/x/after/hero-strong-spotlight-section-walkthrough-1280.png'))
+      .toEqual({ head: '…/after/hero-strong-spotlight-section-walkthrough', tail: '-1280.png' })
+    expect(parts('workspace/inbox/w/pricing_table_dark_0820.txt'))
+      .toEqual({ head: '…/pricing_table', tail: '_dark_0820.txt' })
+    // A copy the landing renamed keeps what tells it apart, not just its suffix.
+    expect(parts('workspace/inbox/w/hero-strong-spotlight-section-walkthrough-1280_1.txt').tail).toBe('-1280_1.txt')
+    expect(parts('workspace/inbox/w/hero-strong-spotlight-section-walkthrough-0390_1.txt').tail).toBe('-0390_1.txt')
+    // No separator near the end: its last eight characters and the extension.
+    expect(parts('workspace/inbox/w/abcdefghijklmnop.csv')).toEqual({ head: '…/abcdefgh', tail: 'ijklmnop.csv' })
+    // A short name is all tail; no extension keeps the end of the name.
+    expect(parts('workspace/inbox/w/report.md')).toEqual({ head: '…/', tail: 'report.md' })
+    expect(parts('workspace/inbox/w/Makefile')).toEqual({ head: '…/', tail: 'Makefile' })
+    for (const p of ['users/a/workspace/x/after/hero-1280.png', 'workspace/q3.md']) {
+      const { head, tail } = parts(p)
+      expect(head + tail).toBe(resultFileChipLabel(p))
+    }
   })
 
   it('opens a file through the delegating chat, never the bubble agent', async () => {

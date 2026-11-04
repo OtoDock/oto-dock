@@ -9,7 +9,7 @@ import httpx
 import pytest
 import websockets
 from audio.providers.tts import elevenlabs as el_mod
-from audio.providers.tts.base import UnsupportedProviderOperation
+from audio.providers.tts.base import TTSProvider, UnsupportedProviderOperation
 from audio.providers.tts.elevenlabs import (
     ElevenLabsTTS,
     _accepts_language_code,
@@ -115,18 +115,16 @@ def test_streaming_context_rejects_unknown_rate():
 
 
 async def test_default_list_voices_dedupes_configured_map():
-    # ElevenLabs overrides list_voices with a live call; the base fallback is
-    # exercised via Cartesia-style providers — here we only check the library
-    # surface raises cleanly on a provider without one.
-    from audio.providers.tts.cartesia import CartesiaTTS
-
-    cart = CartesiaTTS(api_key="x", voices={"en": "v1", "de": "v1", "el": "v2"})
-    infos = await cart.list_voices()
+    # Both cloud engines override the voice surface with live calls: the
+    # base's own methods answer a provider without one, the configured map
+    # deduped, the library refused cleanly.
+    tts = ElevenLabsTTS(api_key="x", voices={"en": "v1", "de": "v1", "el": "v2"})
+    infos = await TTSProvider.list_voices(tts)
     assert {i.id for i in infos} == {"v1", "v2"}
     with pytest.raises(UnsupportedProviderOperation):
-        await cart.search_voice_library(search="warm")
+        await TTSProvider.search_voice_library(tts, search="warm")
     with pytest.raises(UnsupportedProviderOperation):
-        await cart.add_library_voice("owner", "vid")
+        await TTSProvider.add_library_voice(tts, "owner", "vid")
 
 
 # ── Fake multi-context WS server ───────────────────────────────────

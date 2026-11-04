@@ -249,9 +249,10 @@ _KEEP_AFTER_DELETE = {
     # (like ``route_name``), not a live reference — the admin's call history
     # must survive an agent deletion. Rows age out via 30-day retention.
     "phone_call_log",
-    # A report of an agent's reply: ``agent`` is a display record (who spoke);
-    # the rows go with their chat (FK cascade), and delete_agent deletes the
-    # agent's chats.
+    # A report of an agent's reply: ``agent`` is a display record (who spoke).
+    # It outlives its chat (``chat_id`` set NULL) so the admins keep it after
+    # the agent goes, and the retention sweep deletes it a year after it was
+    # filed.
     "reply_reports",
 }
 

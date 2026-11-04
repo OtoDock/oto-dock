@@ -28,7 +28,6 @@ from typing import cast
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth import roles
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -36,13 +35,16 @@ from auth.providers import (
     require_creator,
     require_user,
 )
-from services.departments import edge_compiler
+from services.departments import assignment, edge_compiler
 from storage.agents import agent_store, db_departments
 
 logger = logging.getLogger("otodock.departments")
 
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
+
+# The refusal a person reads, here and on a department card.
+NAME_TOO_LONG = "A department's name has at most 100 characters."
 
 
 class CreateDepartmentRequest(BaseModel):
@@ -68,13 +70,8 @@ class SetLevelsRequest(BaseModel):
     levels: list[LevelItem]
 
 
-def _can_edit_department(u: UserContext, dept: dict) -> bool:
-    if u.is_admin:
-        return True
-    if u.role != roles.CREATOR or getattr(u, "is_api_key", False):
-        return False
-    owner = dept.get("created_by_sub") or ""
-    return bool(owner) and owner == (u.acting_sub or "")
+# The rule lives with the placement rules (services/departments/assignment).
+_can_edit_department = assignment.can_edit_department
 
 
 def _require_dept_edit(u: UserContext, dept: dict) -> None:
@@ -150,7 +147,7 @@ async def create_department(
     if not name:
         raise HTTPException(400, "Department name is required")
     if len(name) > 100:
-        raise HTTPException(400, "Department name too long (max 100)")
+        raise HTTPException(400, NAME_TOO_LONG)
     try:
         dept = await asyncio.to_thread(
             db_departments.create_department,
@@ -182,7 +179,7 @@ async def update_department(
         raise HTTPException(400, "Department name cannot be empty")
     # Same bounds as create — PATCH must not grow rows/map payloads unbounded.
     if req.name is not None and len(req.name.strip()) > 100:
-        raise HTTPException(400, "Department name too long (max 100 chars)")
+        raise HTTPException(400, NAME_TOO_LONG)
     if req.position_hint is not None and len(str(req.position_hint)) > 200:
         raise HTTPException(400, "position_hint too long (max 200 chars)")
     try:

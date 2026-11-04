@@ -5,6 +5,7 @@ import NotificationBody from './NotificationBody'
 import NotificationAgentHeader from './NotificationAgentHeader'
 import { ToastPortal } from '../../ui/Toast'
 import { TOAST } from '../../ui/classes'
+import { isAlarm } from '../../../lib/status/notificationSeverity'
 
 interface Props {
   toasts: ToastItem[]
@@ -51,7 +52,7 @@ function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toas
 
   const handleDismiss = () => {
     setVisible(false)
-    if (delivery.severity === 'danger' && onStopAlarm) onStopAlarm()
+    if (isAlarm(delivery.severity) && onStopAlarm) onStopAlarm()
     setTimeout(() => onDismiss(toast.id), 200)
   }
 
@@ -69,7 +70,7 @@ function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toas
                   transition-all duration-base ease-enter
                   ${SEVERITY_STYLES[delivery.severity] || SEVERITY_STYLES.info}
                   ${visible ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0'}
-                  ${delivery.severity === 'danger' ? 'animate-pulse' : ''}
+                  ${isAlarm(delivery.severity) ? 'animate-pulse' : ''}
                   ${hasLink ? 'cursor-pointer' : ''}`}
       onClick={handleClick}
     >

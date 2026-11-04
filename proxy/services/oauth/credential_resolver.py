@@ -43,6 +43,9 @@ if TYPE_CHECKING:  # the broker's type only; services import core lazily
 
 logger = logging.getLogger("otodock")
 
+# The credential type of an MCP that signs in with one person's own account.
+PER_USER = "per_user"
+
 # The installation token's life margins (services/oauth/github_apps.py).
 MIN_REMAINING_S = 300
 STEP_MIN_REMAINING_S = 1800
@@ -103,17 +106,43 @@ class AccountRef:
 class AccountNeedsReconnect(Exception):
     """The bound account's token file can no longer serve a session; the
     message is the reason (``expired``, ``revoked``, ``mechanism_changed``,
-    ``registration_unavailable``, ``issuer_changed``, or an installation
-    binding's: ``storage/identity/oauth_app_kinds.INSTALLATION_REASONS``)."""
+    ``registration_unavailable``, ``issuer_changed``, ``refused``, or an
+    installation binding's: ``storage/identity/oauth_app_kinds.INSTALLATION_REASONS``)."""
 
 
-def account_unusable_reason(raw: dict, manifest) -> str:
+# The reason an MCP whose own server refused the file's token reads
+# (``services/oauth/token_refusals.py`` writes the mark).
+REFUSED_REASON = "refused"
+# ``extra.refused_by``: ``{<manifest name>: {"at": <iso>, "methods": [...]}}``,
+# one entry per MCP whose server refused the token, so another MCP of the
+# same file keeps its own verdict.
+REFUSED_BY = "refused_by"
+
+
+def marked_methods(raw: dict, manifest_name: str) -> tuple[str, ...]:
+    """The JSON-RPC methods whose refusal marked the file for
+    ``manifest_name`` (``()`` when it carries no mark for it); an answer
+    to one of them clears the mark."""
+    extra = raw.get("extra") or {}
+    marks = extra.get(REFUSED_BY) if isinstance(extra, dict) else None
+    mark = marks.get(manifest_name) if isinstance(marks, dict) and manifest_name else None
+    if not isinstance(mark, dict):
+        return ()
+    methods = mark.get("methods")
+    named = tuple(m for m in methods if isinstance(m, str) and m) if isinstance(methods, list) else ()
+    return named or ("tools/call",)
+
+
+def account_unusable_reason(raw: dict, manifest, *, refused: bool = True) -> str:
     """Why a token file cannot serve a session on this manifest, or ``""``:
     the file's own verdict (``oauth_account_store.token_dead_reason``), an
     installation token past its hour (the worker re-mints it; a session
-    never carries an expired one), and the token-origin invariant of a
+    never carries an expired one), the token-origin invariant of a
     manifest that names its own authorization server
-    (``mcp_authorization.token_origin_problem``)."""
+    (``mcp_authorization.token_origin_problem``), and the manifest's own
+    MCP server refusing the token (``REFUSED_REASON``). ``refused=False``
+    leaves that last one out: the gateway keeps forwarding for a session
+    that already holds the MCP, so an answered call can clear the mark."""
     from services.oauth import mcp_authorization, oauth_account_store
     dead = oauth_account_store.token_dead_reason(raw)
     if dead:
@@ -123,7 +152,12 @@ def account_unusable_reason(raw: dict, manifest) -> str:
         expiry = oauth_account_store._parse_expiry(str(raw.get("expires_at") or ""))
         if expiry is None or expiry <= datetime.now(timezone.utc):
             return oauth_app_kinds.INSTALLATION_EXPIRED
-    return mcp_authorization.token_origin_problem(raw, manifest)
+    problem = mcp_authorization.token_origin_problem(raw, manifest)
+    if problem:
+        return problem
+    if refused and marked_methods(raw, str(getattr(manifest, "name", "") or "")):
+        return REFUSED_REASON
+    return ""
 
 
 _RECONNECT_WORDING = {
@@ -132,6 +166,7 @@ _RECONNECT_WORDING = {
     "mechanism_changed": "this MCP now signs in through the vendor's own authorization server",
     "registration_unavailable": "the install's client registration at the vendor is gone",
     "issuer_changed": "the vendor's authorization server moved",
+    REFUSED_REASON: "the vendor no longer accepts the account's access",
 }
 # An installation binding's reasons carry their own remedy.
 _INSTALLATION_WORDING = {
@@ -185,7 +220,7 @@ def bind_wording(reason: str) -> str:
 
 
 def pick_account(
-    mcp_name: str, agent_name: str, *, user_sub: str = "",
+    mcp_name: str, agent_name: str, *, user_sub: str = "", only_owner: str | None = None,
 ) -> AccountRef | None:
     """Resolve which labeled account to use for (mcp_name, agent_name, scope).
 
@@ -203,6 +238,11 @@ def pick_account(
       1. Explicit ``service_agent_bindings(mcp, agent)`` row → bound user's
          account.
       2. None — no platform default; the binding must be explicit.
+
+    ``only_owner`` (service scope only): the build of an agent-scope session
+    on a person's own machine reads every binding through it, so a binding
+    answers only when its account is that person's (``""`` matches none,
+    every ``account_owner_sub`` being a real sub). None is no filter.
 
     User scope (unchanged):
       1. ``agent_account_bindings(user, mcp, agent)`` row.
@@ -229,23 +269,62 @@ def pick_account(
     # user's own account (owner_sub is always a real user_sub). No platform
     # default fallback.
     binding = credential_store.get_service_agent_binding(mcp_name, agent_name)
-    if binding is not None:
-        return AccountRef(
-            label=binding.account_label, owner_sub=binding.account_owner_sub,
-            installation_id=binding.installation_id,
-        )
-    return None
+    if binding is None:
+        return None
+    if only_owner is not None and binding.account_owner_sub != only_owner:
+        return None
+    return AccountRef(
+        label=binding.account_label, owner_sub=binding.account_owner_sub,
+        installation_id=binding.installation_id,
+    )
+
+
+def carries_to_personal_machine(manifest) -> bool:
+    """Whether an MCP's credential is one person's account and nothing else,
+    so the binding of a machine's owner may go with an agent-scope session
+    to that owner's computer: a ``per_user`` credential with no admin
+    instance, no sign-in file (the session-file channel gives an agent-scope
+    session on a personal machine none) and no header key (re-read without
+    the owner filter when a session is adopted after a restart)."""
+    from services.mcp import mcp_registry
+    creds = manifest.credentials
+    return (creds.type == PER_USER and not manifest.instances and not creds.api_key_header
+            and not mcp_registry.get_credentials_dirs(manifest.name))
+
+
+def personal_withheld_reason(manifest, agent_name: str, only_owner: str) -> str:
+    """Why a ``per_user`` MCP stays off a personal machine in an agent-scope
+    session whose owner filter is ``only_owner`` (the sentence the session
+    reads), or ``""`` when the MCP may go: its binding then answers through
+    the filter or not at all."""
+    from services.mcp import mcp_registry
+    label = manifest.credentials.label or manifest.label or manifest.name
+    if mcp_registry.get_credentials_dirs(manifest.name):
+        return f"{label} signs in with a file that stays on the platform"
+    if manifest.credentials.api_key_header:
+        return f"{label} uses a key that stays on the platform"
+    if not carries_to_personal_machine(manifest):
+        return f"{label} uses the agent's own account, which stays on the platform"
+    binding = credential_store.get_service_agent_binding(manifest.name, agent_name)
+    if binding is not None and binding.account_owner_sub != only_owner:
+        return (f"{label} uses an account another person connected for this agent, "
+                "which stays on the platform")
+    return ""
 
 
 def binding_reach(
     mcp_name: str, agent_name: str, *, user_sub: str | None, task_scope: str,
+    only_owner: str | None = None,
 ) -> Reach | None:
     """The GitHub reach a session's credential for ``mcp_name`` carries,
     when it narrows (``None`` otherwise), by the scope the session resolves
     in (the same rule as ``_bound_token_source``): in user scope the
     person's own choice of account for the agent (a session on their
     default account, with no choice for the agent, reaches what the account
-    reaches), else the agent's service binding."""
+    reaches), else the agent's service binding. With ``only_owner`` (the
+    owner filter, ``pick_account``) a binding that is gone or another
+    person's raises ``CredentialUnavailable``: the token was read from the
+    owner's binding, and an unnarrowed answer would let it go unjudged."""
     from core.session.visibility import SCOPE_USER
     if user_sub and task_scope == SCOPE_USER:
         own = credential_store.get_account_agent_binding(user_sub, mcp_name, agent_name)
@@ -254,6 +333,8 @@ def binding_reach(
         mine = github_reach.reach_of(own.repositories, own.read_only, personal=True)
         return mine if mine.narrows else None
     binding = credential_store.get_service_agent_binding(mcp_name, agent_name)
+    if only_owner is not None and (binding is None or binding.account_owner_sub != only_owner):
+        raise CredentialUnavailable("the agent's account for it changed while the session started")
     if binding is None:
         return None
     reach = github_reach.reach_of(binding.repositories, binding.read_only)
@@ -265,6 +346,7 @@ def resolve_credentials(
     user_sub: str | None,
     *,
     task_scope: str = "user",
+    only_owner: str | None = None,
 ) -> ResolvedCredentials:
     """Resolve all credentials for a session's MCPs. Synchronous — call via asyncio.to_thread.
 
@@ -275,6 +357,10 @@ def resolve_credentials(
         agent_name: Agent being used (determines which MCPs are in scope).
         user_sub: User sub ID, or None for agent-scoped tasks / phone.
         task_scope: "user" or "agent" — determines credential source for per-user MCPs.
+        only_owner: the owner filter of an agent-scope session on a person's
+            own machine (``pick_account``): a ``per_user`` MCP that may not go
+            there is left out with ``personal_withheld_reason``'s sentence,
+            and every binding is read through the filter.
     """
     from services.mcp import mcp_registry
 
@@ -320,6 +406,15 @@ def resolve_credentials(
             continue
 
         if mcp_type == "per_user":
+            if only_owner is not None:
+                why = personal_withheld_reason(manifest, agent_name, only_owner)
+                if why:
+                    logger.info("credentials: %s for %s stays off the personal machine (%s)",
+                                mcp_name, agent_name, why)
+                    result.excluded_mcps.add(mcp_name)
+                    result.exclusion_reasons[mcp_name] = f"{why}."
+                    _keep_git_refusal(result, manifest)
+                    continue
             # OAuth-based MCPs: check token file instead of DB credentials
             if cred_schema.get("oauth"):
                 label = cred_schema.get("label", mcp_name)
@@ -327,6 +422,7 @@ def resolve_credentials(
                     oauth_env = _resolve_oauth_mcp(
                         mcp_name, cred_schema, user_sub, task_scope,
                         agent_name=agent_name, cli_credentials=result.cli_credentials,
+                        only_owner=only_owner,
                     )
                 except AccountNeedsReconnect as needs:
                     result.excluded_mcps.add(mcp_name)
@@ -385,7 +481,7 @@ def resolve_credentials(
             try:
                 env_vars = _resolve_per_user(
                     mcp_name, cred_schema, user_sub, task_scope,
-                    agent_name=agent_name,
+                    agent_name=agent_name, only_owner=only_owner,
                 )
             except AccountMissingFields as missing:
                 label = cred_schema.get("label", mcp_name)
@@ -426,6 +522,20 @@ def resolve_credentials(
         result.available_mcps.add(mcp_name)
 
     return result
+
+
+def _keep_git_refusal(result: ResolvedCredentials, manifest) -> None:
+    """A command-line host the platform holds an account for but withholds
+    here keeps git pointed at the platform's helper (no secret: the git
+    entries name the helper), so git stops with the platform's reason
+    instead of asking the machine's own credential manager."""
+    helper = (manifest.credentials.oauth or {}).get("git_credential_helper") or {}
+    host = str(helper.get("host") or "").strip().lower() if isinstance(helper, dict) else ""
+    if not host:
+        return
+    entries = git_helper_env(host)
+    result.env_vars.update(entries)
+    result.bash_env_keys.update(entries)
 
 
 def _resolve_infra(
@@ -476,6 +586,7 @@ def _resolve_per_user(
     user_sub: str | None,
     task_scope: str,
     agent_name: str = "",
+    only_owner: str | None = None,
 ) -> dict[str, str] | None:
     """Resolve per-user credentials. Returns merged env vars or None if missing.
 
@@ -505,7 +616,7 @@ def _resolve_per_user(
         # user_credentials directly. No agent → no binding context → no creds.
         if not agent_name:
             return None
-        ref = pick_account(mcp_name, agent_name)
+        ref = pick_account(mcp_name, agent_name, only_owner=only_owner)
         if ref is None:
             return None
         creds = credential_store.get_user_credentials(
@@ -538,6 +649,7 @@ def _resolve_oauth_mcp(
     task_scope: str,
     agent_name: str = "",
     cli_credentials: dict | None = None,
+    only_owner: str | None = None,
 ) -> dict[str, str] | None:
     """Resolve OAuth-based MCP credentials by checking token file existence.
 
@@ -575,6 +687,7 @@ def _resolve_oauth_mcp(
     picked = _bound_token_source(
         mcp_name, provider_id,
         user_sub=user_sub, task_scope=task_scope, agent_name=agent_name,
+        only_owner=only_owner,
     )
     if picked is None:
         logger.debug(
@@ -652,7 +765,8 @@ def _resolve_oauth_mcp(
             for env_name in mcp_env_names:
                 mcp_env_vars[env_name] = access_token
         if git_host and access_token:
-            reach = binding_reach(mcp_name, agent_name, user_sub=user_sub, task_scope=task_scope)
+            reach = binding_reach(mcp_name, agent_name, user_sub=user_sub, task_scope=task_scope,
+                                  only_owner=only_owner)
             env_injection_vars.update(git_helper_env(git_host, reach=reach))
             if cli_credentials is not None:
                 from core.credentials.mcp_gateway import CliCredential, TokenRef
@@ -660,7 +774,7 @@ def _resolve_oauth_mcp(
                 # installation's own token whatever the MCP server gets.
                 cli_dir, cli_label, _ = _bound_token_source(
                     mcp_name, provider_id, user_sub=user_sub, task_scope=task_scope,
-                    agent_name=agent_name, purpose=PURPOSE_CLI,
+                    agent_name=agent_name, purpose=PURPOSE_CLI, only_owner=only_owner,
                 ) or (source_dir, account_label, username)
                 cli_credentials[mcp_name] = CliCredential(
                     host=git_host,
@@ -864,6 +978,7 @@ def _bound_token_source(
     agent_name: str,
     purpose: str = PURPOSE_MCP,
     min_remaining_s: float = MIN_REMAINING_S,
+    only_owner: str | None = None,
 ) -> tuple[Path, str, str] | None:
     """Resolve which central token file backs this ``(mcp, agent, scope)``.
 
@@ -898,7 +1013,7 @@ def _bound_token_source(
     # Agent scope: the binding points at a user's own account (manager
     # designated it as the agent's service identity) — read from their
     # regular user token dir. ref.owner_sub is always a real user_sub.
-    ref = pick_account(mcp_name, agent_name)
+    ref = pick_account(mcp_name, agent_name, only_owner=only_owner)
     if ref is None:
         return None
     username = task_store.get_username_by_sub(ref.owner_sub) or ""
@@ -910,7 +1025,8 @@ def _bound_token_source(
         path = github_apps.ensure_installation_token(
             mcp_name, ref.owner_sub, ref.label, ref.installation_id,
             min_remaining_s=min_remaining_s,
-            reach=binding_reach(mcp_name, agent_name, user_sub=user_sub, task_scope=task_scope),
+            reach=binding_reach(mcp_name, agent_name, user_sub=user_sub, task_scope=task_scope,
+                                only_owner=only_owner),
         )
         return path.parent, path.stem, username
     if ref.installation_id:

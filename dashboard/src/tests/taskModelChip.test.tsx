@@ -50,6 +50,16 @@ describe('TaskModelChip', () => {
     expect(screen.queryByRole('img')).toBeNull()
   })
 
+  it("names the person's own engine for an unpinned task that runs there", () => {
+    render(<TaskModelChip task={task({
+      effective_model: 'gpt-6-sol', effective_execution_path: 'codex-cli',
+      effective_model_source: 'your engine', effective_model_tier: 2, tier_label: 'strong',
+    })} />)
+    const chip = screen.getByTitle('Your engine: gpt-6-sol, tier 2 strong')
+    expect(chip.textContent).toBe('gpt-6-sol')
+    expect(chip.className).toContain('bg-surface-muted')
+  })
+
   it('names the engine default when only the layer is pinned', () => {
     render(<TaskModelChip task={task({
       override_execution_path: 'codex-cli', effective_execution_path: 'codex-cli',

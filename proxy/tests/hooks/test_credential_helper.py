@@ -276,11 +276,28 @@ def test_the_wrapper_tells_the_broker_the_arguments_and_the_remotes(env, tmp_pat
 
 def test_the_wrapper_runs_plainly_when_the_session_holds_no_account(env, tmp_path):
     """The broker's quiet 404 (no account for this session): the command
-    runs as it would without the platform, nothing on stderr."""
+    runs as it would without the platform, after one line with the
+    platform's reason, so gh's own "run gh auth login" is not all it says."""
     cfg = _rig_wrapper(tmp_path, env)
     r = _helper_run(cfg, env, "other.example", "x")
     assert r.returncode == 7 and r.stdout == "GH_TOKEN=unset GITHUB_TOKEN=unset\nargs=x\n"
-    assert r.stderr == ""
+    assert r.stderr == "otodock credential helper: No account\n"
+
+
+@pytest.mark.parametrize("own", ["hosts", "env"])
+def test_the_404_line_stays_out_when_gh_has_its_own_login(env, tmp_path, own):
+    """A machine where gh is signed in itself (its hosts file names the
+    host, or a token in its environment): the command uses that login, as
+    it always did, and the platform's line would only mislead."""
+    cfg = _rig_wrapper(tmp_path, env)
+    if own == "hosts":
+        gh_dir = tmp_path / "home" / ".config" / "gh"
+        gh_dir.mkdir(parents=True)
+        (gh_dir / "hosts.yml").write_text("other.example:\n    user: someone\n")
+    else:
+        env = {**env, "GH_TOKEN": "machine-own"}
+    r = _helper_run(cfg, env, "other.example", "x")
+    assert r.returncode == 7 and r.stderr == ""
 
 
 @pytest.mark.parametrize("answer,reason", [

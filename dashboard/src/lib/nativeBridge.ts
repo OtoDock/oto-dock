@@ -1,11 +1,13 @@
 /**
- * The Android app's native bridge. The app injects `OtoDockNative` (a WebView
- * message listener) only into frames of the installation it is showing, and
- * honours a message only when it is posted on the top-level document's
- * object: the boundary is same-origin script (a same-origin child frame
- * reaches the channel through `top.OtoDockNative`), so a frame that renders
- * third-party content stays off this origin. On the web, and in a sandboxed
- * or other-origin frame, there is no channel and every call here is a no-op.
+ * The apps' native bridge, the Android and the iOS shell alike. The app
+ * injects `OtoDockNative` (a WebView message listener on Android, a WebKit
+ * message handler behind a shim on iOS) only into frames of the installation
+ * it is showing, and honours a message only when it is posted on the
+ * top-level document's object: the boundary is same-origin script (a
+ * same-origin child frame reaches the channel through `top.OtoDockNative`),
+ * so a frame that renders third-party content stays off this origin. On the
+ * web, and in a sandboxed or other-origin frame, there is no channel and
+ * every call here is a no-op.
  *
  * A message is a JSON header `{m, a, id?}`, optionally followed by a newline
  * and a raw body (a saved file's base64, so the app never parses it as JSON).
@@ -15,9 +17,10 @@
  * - setNativeAuthInProgress: block an install switch (swipe / Settings) while an
  *   auth flow that holds in-WebView state is running (Claude code-paste, OpenAI
  *   device-code). Deep-link flows arm this natively in openAuthBrowser.
- * - setNativeSwitchBusy: hint that live work (a meeting/voice call, etc.) would be
- *   lost on a switch, so the switcher confirms first. LLM streaming is already
- *   reported via setStreaming.
+ * - setNativeSwitchBusy: hint that live work (a live meeting or voice
+ *   conversation in the chat) would be lost on a switch, so the switcher
+ *   confirms first. A generating chat is not reported: its turn runs on the
+ *   server.
  */
 
 import { Capacitor } from '@capacitor/core'
@@ -41,14 +44,24 @@ export type NativeMethod =
   | 'renameInstallation'
   | 'disconnectServer'
   | 'openPrivacyPolicy'
+  | 'openBatterySettings'
   | 'foldNote'
 
-export type NativeQuery = 'getInstallations' | 'switchToInstall' | 'openAuthBrowser'
+export type NativeQuery =
+  | 'getInstallations'
+  | 'switchToInstall'
+  | 'openAuthBrowser'
+  | 'getBatteryAdvice'
+  | 'requestStoreReview'
 
 export type NativeArg = string | number | boolean | null
 
 /** A person may spend a while at the app's "open in your browser?" confirm. */
 export const NATIVE_BROWSER_TIMEOUT_MS = 10 * 60 * 1000
+
+/** The app asks the store's service for a review sheet first; a slow phone
+ *  takes seconds. The Android app gives up on its side before this. */
+export const STORE_REVIEW_TIMEOUT_MS = 10 * 1000
 
 interface NativeChannel {
   postMessage(message: string): void
@@ -67,22 +80,22 @@ function channel(): NativeChannel | null {
   return c && typeof c.postMessage === 'function' ? c : null
 }
 
-/** True inside the Android app, on the page the app scoped its channel to. */
+/** True inside an app, on the page the app scoped its channel to. */
 export function hasNativeBridge(): boolean {
   return channel() !== null
 }
 
-/** True inside an app shell: the Android app's channel, or a Capacitor
- *  native platform without it (the iOS app). */
+/** True inside an app shell: the apps' channel, or a Capacitor native
+ *  platform without it (an app older than the channel). */
 export function inAppShell(): boolean {
   return hasNativeBridge() || Capacitor.isNativePlatform()
 }
 
-/** The app's fold log (logcat tag `OtoDockFold`): one line per event from
- *  the page, with the page clock, the visibility state and the device pixel
- *  ratio, so a display switch on a foldable can be read next to the app's
- *  own lines. A no-op off the app. The app caps the text; keep a note to one
- *  short sentence. */
+/** The Android app's fold log (logcat tag `OtoDockFold`): one line per
+ *  event from the page, with the page clock, the visibility state and the
+ *  device pixel ratio, so a display switch on a foldable can be read next to
+ *  the app's own lines. A no-op off the app; the iOS app accepts the call
+ *  and drops it. The app caps the text; keep a note to one short sentence. */
 export function noteFold(text: string): void {
   if (!channel()) return
   const t = typeof performance !== 'undefined' ? Math.round(performance.now()) : 0
@@ -92,12 +105,12 @@ export function noteFold(text: string): void {
 }
 
 /** OtoDock's privacy policy for the apps; the stores require a link to it
- *  inside the app. The Android app opens its own copy of the address. */
+ *  inside the app. Each app opens its own copy of the address. */
 export const APP_PRIVACY_POLICY_URL = 'https://otodock.io/legal/privacy'
 
-/** Open the privacy policy: the Android app hands it to the system browser,
- *  a shell without the channel (a future iOS app) opens it as any outside
- *  link. An app older than the method drops it. */
+/** Open the privacy policy: the app hands it to the system browser, a shell
+ *  without the channel (an app older than it) opens it as any outside link.
+ *  An app older than the method drops it. */
 export function openPrivacyPolicy(): void {
   if (!callNative('openPrivacyPolicy')) void openExternalUrl(APP_PRIVACY_POLICY_URL)
 }
@@ -166,8 +179,9 @@ export function askNative<T>(
   })
 }
 
-/** Save a base64 payload to the phone's Downloads (the app accepts the image
- *  types the lightbox shows and JSON diagnostics). */
+/** Save a base64 payload to the phone's Downloads on Android, to the app's
+ *  folder in Files on iOS (the app accepts the image types the lightbox
+ *  shows and JSON diagnostics). */
 export function saveNativeFile(base64: string, name: string, mime: string): boolean {
   const c = channel()
   return c ? post(c, { m: 'saveImageFromBase64', a: [name, mime] }, base64) : false
@@ -178,6 +192,15 @@ export function saveNativeFile(base64: string, name: string, mime: string): bool
  *  True only when the browser opened. */
 export async function openNativeBrowser(url: string, kind: 'auth' | 'oauth'): Promise<boolean> {
   return (await askNative<boolean>('openAuthBrowser', [url, kind], NATIVE_BROWSER_TIMEOUT_MS)) === true
+}
+
+/** Hand a review request to the store's own sheet (Play's in-app review, the
+ *  App Store's). True only when the app handed it over to a store that can
+ *  show it; the store decides whether the sheet shows and never says. False
+ *  off the apps, in an app older than the method, in a build the store does
+ *  not know, and when no answer comes in time. */
+export async function requestStoreReview(): Promise<boolean> {
+  return (await askNative<boolean>('requestStoreReview', [], STORE_REVIEW_TIMEOUT_MS)) === true
 }
 
 export function setNativeAuthInProgress(active: boolean) {
@@ -191,8 +214,8 @@ export function setNativeSwitchBusy(busy: boolean) {
   callNative('setSwitchBusy', busy)
 }
 
-/** The last switch-busy hint (a live meeting / voice call) — also what the
- * build-reload check defers on, native or not. */
+/** The last switch-busy hint (a live meeting or voice conversation in the
+ * chat) — also what the build-reload check defers on, native or not. */
 export function isNativeSwitchBusy(): boolean {
   return switchBusy
 }

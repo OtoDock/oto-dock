@@ -10,11 +10,14 @@ keep tests fast and deterministic.
 """
 
 import asyncio
+import sys
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from core.remote import install_registry
+from tests._paths import REPO_ROOT
 
 
 @pytest.fixture(autouse=True)
@@ -407,6 +410,7 @@ _UNSAT_ERR = (
     "  Because the current Python version (3.10.12) does not satisfy "
     "Python>=3.11 ..."
 )
+_NO_RUST = "Failed to build `rpds-py==0.30.0` / error: rustc not found"
 
 
 def _memo_env(monkeypatch, *, results, version_hash="hash1"):
@@ -530,6 +534,97 @@ async def test_transient_failure_is_not_memoized(monkeypatch):
         "machine-1", "s2", ["music-gen-mcp"], plan_cb=plan_cb,
     )
     assert fake_cm.send_command.await_count == 2
+
+
+@pytest.mark.parametrize("err, memoized", [
+    ("Failed to build `rpds-py==0.30.0` / error: rustc not found", True),
+    ("RequiredDependencyException: The headers or library files could not be found for libheif", True),
+    ("No solution found when resolving dependencies: / Because pyyaml>=6.0.2 has no usable wheels", True),
+    ("Failed to build `x==1` / Failed to fetch: `https://pypi.org/simple/setuptools/` / dns error", False),
+])
+@pytest.mark.asyncio
+async def test_a_package_the_machine_cannot_build_is_memoized(monkeypatch, err, memoized):
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    _, plan_cb, _ = _memo_env(monkeypatch, results={"music-gen-mcp": {"status": "error", "error": err}})
+    await mcp_sync.sync_mcps_for_session("machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb)
+    assert (("machine-1", "music-gen-mcp") in mcp_sync._unsatisfiable_installs) is memoized
+    mcp_sync._unsatisfiable_installs.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_remembered_failure_is_tried_again_after_an_hour(monkeypatch):
+    """The person may have installed what the build lacked (Rust, a
+    library's headers): within the hour the start skips the install, after
+    it the next start tries again."""
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    fake_cm, plan_cb, _ = _memo_env(
+        monkeypatch, results={"music-gen-mcp": {"status": "error", "error": _NO_RUST}},
+    )
+    await mcp_sync.sync_mcps_for_session("machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb)
+    memo = mcp_sync._unsatisfiable_installs[("machine-1", "music-gen-mcp")]
+    memo["at"] -= mcp_sync._UNSAT_MEMO_TTL_S - 60  # a minute before the hour
+    r = await mcp_sync.sync_mcps_for_session("machine-1", "s2", ["music-gen-mcp"], plan_cb=plan_cb)
+    assert fake_cm.send_command.await_count == 1 and "music-gen-mcp" in r.memoized
+    memo["at"] -= 120  # a minute past it
+    r = await mcp_sync.sync_mcps_for_session("machine-1", "s3", ["music-gen-mcp"], plan_cb=plan_cb)
+    assert fake_cm.send_command.await_count == 2 and not r.memoized
+    mcp_sync._unsatisfiable_installs.clear()
+
+
+def _satellite_cause(log: str) -> str:
+    """The cause the satellite reports for ``log`` (its 600-character cut
+    included): what the platform reads."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from satellite.sessions.mcp_install_support import install_failure_cause
+    return install_failure_cause(log)
+
+
+# A Rust build that could not fetch its crates, after a run of build errors
+# long enough that the joined cause passes the 600-character cut.
+_CRATES_OFFLINE = "\n".join([
+    "  × Failed to build `rpds-py==0.30.0`",
+    "  ├─▶ The build backend returned an error",
+    *(f"      error: failed to run custom build command for `pyo3-build-config v0.25.{i}` in the build tree"
+      for i in range(8)),
+    "      warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name",
+    "      error: failed to get `pyo3` as a dependency of package `rpds-py v0.30.0`",
+    "      Caused by:",
+    "        failed to download from `https://index.crates.io/config.json`",
+])
+
+
+@pytest.mark.parametrize("log, memoized", [
+    (_CRATES_OFFLINE, False),
+    ("  × Failed to build `x==1`\n  ╰─▶ Failed to fetch: `https://pypi.org/simple/setuptools/`", False),
+    ("  × Failed to build `rpds-py==0.30.0`\n      error: rustc not found\n", True),
+    ("  × Failed to build `pyobjc-core==12.2.1`\n      error: [Errno 28] No space left on device\n", False),
+    ("  × Failed to build `x==1`\n  ╰─▶ failed to remove file `site-packages/x.pyd`: The process cannot"
+     " access the file because it is being used by another process. (os error 32)", False),
+])
+@pytest.mark.asyncio
+async def test_a_network_failure_in_a_build_is_never_memoized(monkeypatch, log, memoized):
+    from services.mcp import mcp_sync
+
+    cause = _satellite_cause(log)
+    assert len(cause) <= 600
+    mcp_sync._unsatisfiable_installs.clear()
+    _, plan_cb, _ = _memo_env(monkeypatch, results={"music-gen-mcp": {"status": "error", "error": cause}})
+    await mcp_sync.sync_mcps_for_session("machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb)
+    assert (("machine-1", "music-gen-mcp") in mcp_sync._unsatisfiable_installs) is memoized, cause
+    mcp_sync._unsatisfiable_installs.clear()
+
+
+def test_the_satellite_keeps_the_proxys_network_words_first():
+    from services.mcp import mcp_sync
+    _satellite_cause("")
+    from satellite.sessions import mcp_install_support as mis
+    assert mis._NETWORK_WORDS.pattern == mcp_sync._TRANSIENT_FAIL_RE.pattern
+    assert mis._NETWORK_WORDS.flags == mcp_sync._TRANSIENT_FAIL_RE.flags
 
 
 @pytest.mark.asyncio
@@ -659,6 +754,14 @@ def test_unavailable_reasons_name_each_install_failure():
         "music-gen-mcp": "could not be installed on this machine (npm ERR! code E404)",
         "x-mcp": "could not be installed on this machine",
     }  # a folder the machine holds for no assigned MCP never reaches the prompt
+
+
+def test_unavailable_reasons_keep_the_cause_whole():
+    from services.mcp.mcp_sync import SyncResult, unavailable_reasons
+    cause = "Failed to build `rpds-py==0.30.0` / error: rustc not found / " + "Caused by: cargo not found " * 15
+    r = SyncResult(failed={"memory-mcp": cause}, excluded_names={"memory-mcp"})
+    said = unavailable_reasons(r, {"memory-mcp"})["memory-mcp"]
+    assert "rustc not found" in said and len(said) <= len("could not be installed on this machine ()") + 600
 
 
 def test_an_excluded_mcp_leaves_the_prompt_catalog_for_unavailable(monkeypatch):
@@ -1428,7 +1531,8 @@ async def test_beside_a_plan_the_memo_and_the_deferral_answer_as_on_the_main_pat
                         AsyncMock(return_value={n: "h" for n in _PLAN}))
     err = "No solution found when resolving dependencies"
     monkeypatch.setitem(mcp_sync._unsatisfiable_installs, ("m-1", "mcp-c"),
-                        {"hash": "h", "error": err, "satellite_version": "0.5.157"})
+                        {"hash": "h", "error": err, "satellite_version": "0.5.157",
+                         "at": time.monotonic()})
     mcp_sync._mark_update_deferred("m-1", "mcp-b")
     try:
         second = await mcp_sync.sync_mcps_for_session("m-1", "s-2", ["mcp-a", "mcp-b", "mcp-c"],

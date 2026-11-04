@@ -177,7 +177,9 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             f"Default for this agent: `{_DEFAULT_SCOPE}`. "
                             "'user' = current user only; "
-                            "'agent' = all users of this agent (requires manager/admin). "
+                            "'agent' = the users of this agent (requires an editor or above); "
+                            "from a scheduled or delegated task run it reaches the people the "
+                            "task's Who is told setting names, from a chat every user of the agent. "
                             "Omit to use the agent's default; override only when the user explicitly "
                             "wants the other scope."
                         ),

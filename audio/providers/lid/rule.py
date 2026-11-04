@@ -87,7 +87,7 @@ class LanguageRule:
     def __init__(
         self, default: str, candidates: list[str] | tuple[str, ...] | frozenset[str], switch_at: float, *,
         prior: float = PRIOR, lean_at: float = LEAN, final_after_s: float = FINAL_AFTER_S,
-        lean_at_take: bool = False,
+        lean_at_take: bool = False, max_candidates: int | None = None, reopen_refused: bool = True,
     ) -> None:
         self.default = default
         self.current = default
@@ -97,6 +97,15 @@ class LanguageRule:
         self.lean_at = lean_at
         self.final_after_s = final_after_s
         self.lean_at_take = lean_at_take
+        #: The distinct candidate languages one utterance may open (each
+        #: costs a stream and its replay); a leader past the cap is
+        #: unavailable, never the runner-up in its place. None: no cap.
+        self.max_candidates = max_candidates
+        #: Whether a language the words refused decisively may be proposed
+        #: again in this utterance (a call: yes, the caller may really move
+        #: to it; a dictation: no, the stream would replay and lose again,
+        #: so the refusal finalises the shown language at once).
+        self.reopen_refused = reopen_refused
         self.final: str | None = None
         self.frozen = False
         #: The candidate the consumer was told to open (one at a time).
@@ -144,7 +153,7 @@ class LanguageRule:
         p = posterior[leader]
         self._history.append((voiced_s, leader, p))
         events: list[Event] = []
-        if leader != self.current and leader not in self._unavailable:
+        if leader != self.current and leader not in self._unavailable and self._within_cap(leader):
             if leader != self.default and p >= self.lean_at and self.opened != leader:
                 events.append(self._open(leader, voiced_s))
             if p >= self.switch_at and voiced_s >= SWITCH_MIN_VOICED_S:
@@ -153,6 +162,16 @@ class LanguageRule:
         if final is not None:
             events.append(final)
         return events
+
+    def _within_cap(self, language: str) -> bool:
+        """A leader that would be one more distinct candidate than the cap
+        allows is marked unavailable (a reopen of one already counted is
+        free); the default is never a candidate."""
+        if (self.max_candidates is None or language == self.default or language in self._opened_at
+                or len(self._opened_at) < self.max_candidates):
+            return True
+        self._unavailable.add(language)
+        return False
 
     def _open(self, language: str, voiced_s: float) -> Event:
         self.opened = language
@@ -196,7 +215,7 @@ class LanguageRule:
         if not posterior:
             return []
         leader = max(posterior, key=posterior.get)
-        if leader == self.current or leader in self._unavailable:
+        if leader == self.current or leader in self._unavailable or not self._within_cap(leader):
             return []
         if voiced_s >= MIN_VOICED_S:
             threshold = self.lean_at
@@ -217,8 +236,10 @@ class LanguageRule:
     def unavailable(self, language: str) -> None:
         """The line cannot serve this language (no stream, no voice, the
         candidate failed to open): the rule never moves to it, and never to
-        the runner-up in its place."""
+        the runner-up in its place. A candidate that never streamed gives
+        its slot under the cap back."""
         self._unavailable.add(language)
+        self._opened_at.pop(language, None)
         if self.opened == language:
             self.opened = None
 
@@ -249,6 +270,11 @@ class LanguageRule:
         self.current = self._previous
         if not decisive:
             return []
+        if not self.reopen_refused:
+            # The language can never come back in this utterance: the shown
+            # one stands now (the time guard below protects a reopen).
+            self._unavailable.add(language)
+            return [self._finalise()]
         opened_at = self._opened_at.get(language, self._opened_at.get(self.current, 0.0))
         if self._voiced_s - opened_at < self.final_after_s:
             return []

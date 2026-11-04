@@ -16,7 +16,7 @@ import config
 from core import placement
 from core.background import spawn
 from core.events import chat_writer, input_queue
-from core.events.common_events import TurnInput
+from core.events.common_events import TurnInput, photos_not_attached
 from core.events.stream_pump import (
     _active_pumps,
     shelve_undelivered,
@@ -34,6 +34,7 @@ from ws import wire_events as wire
 # ws/dashboard.py assembles the connection from the mixins at its end, so
 # its helpers are imported inside the functions that call them: this
 # module imports first too (tests/core/test_import_layers.py).
+from ws.dashboard_cancelled import cancelled_context
 from ws.dashboard_chat_text import (
     _REVIVAL_WAIT_S,
     HEAL_ANSWERED,
@@ -354,8 +355,8 @@ class ChatSendMixin(_Host):
             logger.debug("pool cap gate failed for a queued turn", exc_info=True)
         return ""
 
-    async def _prepared_prompt(self, cid: str, cli_text: str, *,
-                               new_text: str) -> tuple[str, dict | None]:
+    async def _prepared_prompt(self, cid: str, cli_text: str, *, new_text: str,
+                               layer, session_id: str) -> tuple[str, dict | None]:
         """The engine prompt of a queued batch whose rows are not written
         yet, prepared as ``_handle_chat``'s send job prepares an idle send's:
         the cancelled turn's context after a hard abort or a lost process
@@ -363,8 +364,12 @@ class ChatSendMixin(_Host):
         that names the sender when the last message was someone else's. One
         lane job. Also returns the abort flags it consumed (None when there
         were none): a turn that then fails to start puts them back
-        (``_restore_abort_flags``)."""
+        (``_restore_abort_flags``). ``layer`` and ``session_id`` name the
+        session that takes the turn: an engine that takes photos inline gets
+        the cut message's photos counted, not named by path."""
         sender = self.user_sub
+        inline_photos = bool(layer and session_id and layer.capabilities_for(
+            session_id).behaviour.attach_images_inline)
 
         def _job() -> dict:
             out: dict[str, Any] = {"prev_author": "", "cancelled": "", "consumed": None}
@@ -378,7 +383,8 @@ class ChatSendMixin(_Host):
                 task_store.update_chat(cid, last_turn_aborted=False, last_abort_graceful=False)
                 out["consumed"] = {"last_turn_aborted": True, "last_abort_graceful": graceful}
                 if not graceful:
-                    out["cancelled"] = self._build_cancelled_context(cid, new_text=new_text)
+                    out["cancelled"] = cancelled_context(cid, new_text=new_text,
+                                                         inline_photos=inline_photos)
             return out
 
         prep = await chat_writer.submit(cid, _job, label="queued_prompt")
@@ -504,7 +510,8 @@ class ChatSendMixin(_Host):
         batch = TurnInput.combine([qi.item for qi in taken])
         await self._push_batch_attachments(chat.get("agent") or "", batch, sid)
         prompt, consumed = await self._prepared_prompt(chat_id, batch.cli_text,
-                                                       new_text=batch.text)
+                                                       new_text=batch.text, layer=layer,
+                                                       session_id=sid)
         rows_first = asyncio.get_running_loop().create_future()
         try:
             pump = await self._start_new_stream(
@@ -784,12 +791,26 @@ class ChatSendMixin(_Host):
         # The turn's input — the same derivation a busy send takes in the
         # dispatcher's steer/queue branch (`_prepare_turn_input`).
         turn_input = await self._prepare_turn_input(text, images, files)
+        if turn_input is not None and not (
+                turn_input.text or turn_input.image_meta or turn_input.files):
+            # No text, and none of its photos and files reached the agent:
+            # nothing is sent and no row is written (a first message wrote
+            # none either).
+            await self._refuse_input(wire.NOTHING_REACHED_THE_AGENT)
+            turn_input = None
         if turn_input is None:
             # The refusal went out as an error frame; the client armed its
             # streaming state on the send, so end the turn it never got.
             await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
             return
         is_agent_scoped = _vis.is_shared_only(self.agent_name)
+        # Photos of this message that did not reach the agent: the notice row
+        # follows the person's row (a kick's too, which the warm-up wrote,
+        # with its own drops told there); the page hears about both.
+        dropped = photos_not_attached(images, turn_input.image_meta)
+        told = dropped + (int(msg.get("_photos_dropped") or 0) if server_kick else 0)
+        inline_photos = bool(self.session_id and self.layer and self.layer.capabilities_for(
+            self.session_id).behaviour.attach_images_inline)
         # The messages this person queued in the chat go first, as one turn
         # with this one (their rows land ahead of its row).
         taken = q.take(self.user_sub or "") if q is not None else []
@@ -856,6 +877,10 @@ class ChatSendMixin(_Host):
             if _persist_row:
                 task_store.add_chat_message(_cid, "user", text, event_data=event_data,
                                             author_sub=_sender)
+            if dropped:
+                task_store.add_chat_message(
+                    _cid, "event", "", event_type=wire.SYSTEM,
+                    event_data=json.dumps(wire.photos_not_attached_block(dropped)))
             if not _cid:
                 return out
             rec = task_store.get_chat(_cid)
@@ -869,13 +894,15 @@ class ChatSendMixin(_Host):
                 out["consumed"] = {"last_turn_aborted": True,
                                    "last_abort_graceful": graceful_abort}
                 if not graceful_abort:
-                    out["cancelled"] = self._build_cancelled_context(
-                        _cid, new_rows=1 + len(_taken_rows or ()))
+                    out["cancelled"] = cancelled_context(
+                        _cid, new_rows=1 + len(_taken_rows or ()), inline_photos=inline_photos)
             return out
 
         sent = await chat_writer.submit(_cid, _send_job, label="chat_send")
         prev_author = sent["prev_author"]
         chat_rec = sent["rec"]
+        if told:
+            await self._send({**wire.photos_not_attached_block(told), "chat_id": _cid})
         if taken:
             queued_batch = TurnInput.combine([qi.item for qi in taken])
             input_queue.fan_out(_cid, {"type": wire.QUEUE_SENT,
@@ -1016,8 +1043,8 @@ class ChatSendMixin(_Host):
         a teammate's this person may not drive, "" when no live terminal is
         there; a truthy answer means the caller must NOT warm. Delivery mirrors the server-side
         first-prompt submit in ``_spawn_tail`` (persist the raw row, stamp the
-        time prelude, note the stamped bytes so the tailer's duplicate-skip
-        matches the journaled user line byte-for-byte)."""
+        time prelude, note the stamped text so the tailer's duplicate-skip
+        matches the journaled user line by its typed key)."""
         if not self.chat_id:
             return ""
         isess = interactive_session.get(self.session_id) if self.session_id else None

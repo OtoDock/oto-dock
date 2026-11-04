@@ -86,3 +86,23 @@ async def test_completed_phase_still_forwards_and_records_the_chip(temp_db):
         assert task_store.get_chat("cg2")["context_used"] == 0
     finally:
         pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_completed_phase_arms_the_memory_nudge(temp_db):
+    from services.memory import memory_nudge
+    temp_db.create_chat("cg3", "user-admin", "a1")
+    pump = _mk_pump("cg3")
+    try:
+        pump.attach()
+        await pump._process_event(CommonEvent(type=CONTEXT_COMPACT, data={
+            "phase": "started", "trigger": "auto",
+        }))
+        assert "sess-cg3" not in memory_nudge._armed
+        await pump._process_event(CommonEvent(type=CONTEXT_COMPACT, data={
+            "phase": "completed", "trigger": "auto",
+        }))
+        assert "sess-cg3" in memory_nudge._armed
+    finally:
+        memory_nudge.forget("sess-cg3")
+        pump.producer.cancel()

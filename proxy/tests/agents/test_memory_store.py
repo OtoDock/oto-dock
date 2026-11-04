@@ -93,3 +93,31 @@ def test_get_agent_toggles_returns_defaults_for_unknown(temp_db):
     assert t["user_memory_enabled"] is True
     assert t["agent_memory_enabled"] is True
     assert "dream_execution_path" not in t
+
+
+# ---------------------------------------------------------------------------
+# The two caps (1.9.1) and their migration onto an older row
+# ---------------------------------------------------------------------------
+
+def test_the_caps_have_defaults_and_round_trip(temp_db):
+    s = memory_store.get_settings()
+    assert (s["topic_grow_cap_bytes"], s["entry_cap_bytes"]) == (32768, 2048)
+    memory_store.update_settings(topic_grow_cap_bytes=40960, entry_cap_bytes=4096)
+    s = memory_store.get_settings()
+    assert (s["topic_grow_cap_bytes"], s["entry_cap_bytes"]) == (40960, 4096)
+
+
+def test_a_database_from_before_the_caps_gains_both_columns_with_their_defaults(temp_db):
+    """A released install's ``memory_settings`` has four columns; the boot
+    adds the two caps to its row without touching what it holds."""
+    from storage.agents.schema import init_memory
+    from storage.pg import get_conn
+    memory_store.update_settings(inline_budget_bytes=12288, nudge_turns=7)
+    with get_conn() as c:
+        c.execute("ALTER TABLE memory_settings DROP COLUMN topic_grow_cap_bytes, DROP COLUMN entry_cap_bytes")
+        c.commit()
+        init_memory(c)
+        c.commit()
+    s = memory_store.get_settings()
+    assert (s["topic_grow_cap_bytes"], s["entry_cap_bytes"]) == (32768, 2048)
+    assert (s["inline_budget_bytes"], s["nudge_turns"]) == (12288, 7)

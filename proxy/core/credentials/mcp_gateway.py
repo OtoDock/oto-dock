@@ -21,6 +21,7 @@ guard's name lookup, behind memos): the callers run it in a thread.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -58,9 +59,9 @@ RENEW_BEFORE_S = 10 * 60
 _ALLOWLIST_MEMO_S = 30.0
 _EGRESS_MEMO_S = 30.0
 
-# The allowlist row a proxy-local sidecar's host is judged under: the seeded
-# rows name ``localhost`` for the github and m365 containers, and in a
-# containerised deployment the sidecar is dialled by its service name.
+# The allowlist row a proxy-local sidecar's host is judged under: a container
+# MCP's manifest names ``localhost`` (m365's), and in a containerised
+# deployment the sidecar is dialled by its service name.
 _SIDECAR_ALLOWLIST_HOST = "localhost"
 # The name RFC 6761 reserves for this machine, with every name under it.
 _LOOPBACK_NAME = "localhost"
@@ -201,6 +202,11 @@ class Resolved:
     path: str
     proxy_local: bool
     expires_in: float | None = None
+    # A token-file credential's: the digest of the token sent
+    # (``token_digest``) and the methods whose refusal marked the MCP
+    # (``credential_resolver.marked_methods``; ``()`` when none).
+    digest: str = ""
+    marked: tuple[str, ...] = ()
 
 
 @dataclass
@@ -444,11 +450,14 @@ def resolve_credential(cred: GatewayCredential) -> Resolved | Refusal:
                 f"The MCP server cannot be reached from the platform: {why}.",
             )
     expires_in: float | None = None
+    digest = ""
+    marked: tuple[str, ...] = ()
     if cred.token_ref is not None:
         got = _token_secret(cred.token_ref, cred.manifest)
         if isinstance(got, Refusal):
             return got
-        secret, expires_in = got
+        secret, expires_in, marked = got
+        digest = _digest(secret)
     else:
         secret = cred.value
     if not secret:
@@ -456,32 +465,54 @@ def resolve_credential(cred: GatewayCredential) -> Resolved | Refusal:
     return Resolved(
         header=cred.header, value=f"{cred.prefix}{secret}", upstream=cred.upstream,
         path=cred.path, proxy_local=cred.proxy_local, expires_in=expires_in,
+        digest=digest, marked=marked,
     )
 
 
-def _token_secret(ref: TokenRef, manifest_name: str) -> tuple[str, float | None] | Refusal:
-    """The token file's current secret and its remaining life, or why it
-    cannot be used: no file, an account that needs a reconnect, no value."""
+def _secret_of(raw: dict, ref: TokenRef) -> str:
+    """The secret a token file gives a reference: the preferred bearer of
+    ``extra`` when the reference or the file names one, else the access
+    token."""
+    from services.oauth import oauth_account_store
+    extra = raw.get("extra") or {}
+    preferred = ref.preferred_bearer or (
+        extra.get("preferred_bearer", "") if isinstance(extra, dict) else "")
+    if preferred and isinstance(extra, dict) and extra.get(preferred):
+        return str(extra.get(preferred) or "")
+    return oauth_account_store.get_canonical_access_token(raw)
+
+
+def _digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
+
+
+def token_digest(raw: dict, ref: TokenRef) -> str:
+    """A short digest of the secret ``raw`` gives ``ref`` now (``""`` for
+    none): what a later rewrite is compared with, never the token."""
+    secret = _secret_of(raw, ref)
+    return _digest(secret) if secret else ""
+
+
+def _token_secret(ref: TokenRef, manifest_name: str) -> tuple[str, float | None, tuple[str, ...]] | Refusal:
+    """The token file's current secret, its remaining life and the methods
+    whose refusal marked the MCP, or why it cannot be used: no file, an
+    account that needs a reconnect, no value. A mark of the MCP's own
+    server does not refuse here: a session that holds the MCP keeps
+    calling, and the call its server answers clears the mark."""
     raw = _read_token(ref)
     if not raw:
         return Refusal("no_value", _REFUSAL_NO_VALUE)
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver, oauth_account_store
     manifest = mcp_registry.get_manifest(manifest_name) if manifest_name else None
-    dead = (credential_resolver.account_unusable_reason(raw, manifest) if manifest
+    dead = (credential_resolver.account_unusable_reason(raw, manifest, refused=False) if manifest
             else oauth_account_store.token_dead_reason(raw))
     if dead:
         return Refusal("needs_reconnect", credential_resolver.reconnect_wording(dead))
-    extra = raw.get("extra") or {}
-    preferred = ref.preferred_bearer or (
-        extra.get("preferred_bearer", "") if isinstance(extra, dict) else "")
-    if preferred and isinstance(extra, dict) and extra.get(preferred):
-        secret = str(extra.get(preferred) or "")
-    else:
-        secret = oauth_account_store.get_canonical_access_token(raw)
+    secret = _secret_of(raw, ref)
     if not secret:
         return Refusal("no_value", _REFUSAL_NO_VALUE)
-    return secret, _expires_in(raw)
+    return secret, _expires_in(raw), credential_resolver.marked_methods(raw, manifest_name)
 
 
 def resolve_cli_credential(cred: CliCredential) -> ResolvedCli | Refusal:
@@ -682,6 +713,20 @@ def forward_response_headers(items) -> list[tuple[str, str]]:
     return [(k, v) for k, v in items if k.lower() not in _RESPONSE_DROP]
 
 
+def request_methods(body: bytes) -> tuple[str, ...]:
+    """The JSON-RPC methods a request body names (a batch's, in order), or
+    ``()`` for a body that is not JSON-RPC or is larger than the parse cap."""
+    if not body or len(body) > _REFUSAL_PARSE_CAP:
+        return ()
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return ()
+    messages = doc if isinstance(doc, list) else [doc]
+    return tuple(m["method"] for m in messages
+                 if isinstance(m, dict) and isinstance(m.get("method"), str) and m["method"])
+
+
 def refusal_shape(method: str, body: bytes, message: str, *, code: int = -32001) -> tuple[int, dict, bytes]:
     """The answer a refused request gets, in the shape an MCP client reads
     without giving up: a JSON-RPC error with the request's id for a POST
@@ -722,6 +767,13 @@ class Prepared:
     # The body to send when a reach rewrote it (a search given the reach's
     # ``repo:`` qualifiers); ``None`` = the request's own.
     content: bytes | None = None
+    # A token-file credential's reference, its manifest, the digest of the
+    # token sent and the methods whose refusal marked the MCP: what the
+    # route needs to note the server's answer (``services/oauth/token_refusals``).
+    token_ref: TokenRef | None = None
+    manifest: str = ""
+    digest: str = ""
+    marked: tuple[str, ...] = ()
 
 
 def _writes(mcp: str, manifest: str):
@@ -890,7 +942,8 @@ async def prepare_forward(
     return Prepared(
         url=upstream_url(res, query, session_id), headers=headers,
         proxy_local=res.proxy_local, client=client(res.proxy_local, res.upstream),
-        content=content,
+        content=content, token_ref=cred.token_ref, manifest=cred.manifest,
+        digest=res.digest, marked=res.marked,
     )
 
 

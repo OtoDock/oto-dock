@@ -583,3 +583,208 @@ describe('AppsOverlay — the soft unpin of an app that runs a server says Stop 
     expect(unpinWords({ ...row, scope: 'personal', kind: 'file', has_server: true }).action).toBe('Unpin')
   })
 })
+
+// ─── An app that follows another agent's app (services/apps/app_follow.py): the card's three states, Not now, the menu rows ───
+
+const followCalls = vi.hoisted(() => ({ take: vi.fn(), send: vi.fn(), stop: vi.fn() }))
+vi.mock('@/api/apps', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api/apps')>()),
+  useApps: () => ({ data: appsData.current, isLoading: false }),
+  useUnpinApp: () => ({ mutateAsync: unpinMutate, isPending: false }),
+  useRollbackApp: () => ({ mutate: rollbackMutate, isPending: false }),
+  useReorderApps: () => ({ mutateAsync: reorderMutate, isPending: false }),
+  useTakeRelease: () => ({ mutate: followCalls.take, isPending: false }),
+  useSendToSource: () => ({ mutate: followCalls.send, isPending: false }),
+  useStopFollowing: () => ({ mutate: followCalls.stop, isPending: false }),
+}))
+
+import { mergePrompt, showsFollowCard } from '@/components/apps/AppFollowCard.helpers'
+
+const follows = (over: Partial<NonNullable<PinnedApp['follows']>> = {}): NonNullable<PinnedApp['follows']> => ({
+  agent: 'head', agent_name: 'Head Office', slug: 'board', release: 1, exists: true, can_take: true,
+  update: { release: 2, mode: 'update' }, ...over,
+})
+
+describe('AppsOverlay — an app that follows its source', () => {
+  it('offers Update and Merge when the copy never released on its own, and reports the press', () => {
+    window.localStorage.clear()
+    followCalls.take.mockClear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, follows: follows() })]
+    renderOverlay()
+    const card = screen.getByTestId('app-follow-card')
+    expect(card.textContent).toContain('Release 2 of Head Office’s app is available for “board”.')
+    expect(card.textContent).toContain('Update replaces this app’s files with release 2. Its data stays.')
+    fireEvent.click(screen.getByTestId('follow-update'))
+    expect(followCalls.take).toHaveBeenCalledTimes(1)
+    const [args, callbacks] = followCalls.take.mock.calls[0]
+    expect(args).toEqual({ appId: 'id-board', mode: 'update' })
+    act(() => { callbacks.onSuccess({ status: 'ok', mode: 'update', release: 2, source_release: 2, text: 'Release 2 of "board" waits for approval here.' }) })
+    expect(screen.getByTestId('app-follow-notice').textContent).toContain('Release 2 of "board" waits for approval here.')
+    expect(screen.queryByRole('button', { name: 'Copy' })).toBeNull()
+    fireEvent.click(screen.getByLabelText('Dismiss'))
+    // A refusal shows its reason the same way.
+    fireEvent.click(screen.getByTestId('follow-update'))
+    act(() => { followCalls.take.mock.calls[1][1].onError(new Error('The files of this app changed since its last release.')) })
+    expect(screen.getByTestId('app-follow-notice').textContent).toContain('The files of this app changed')
+  })
+
+  it('a copy that released on its own gets Merge alone, and the merge hands the person a prompt to copy', () => {
+    window.localStorage.clear()
+    followCalls.take.mockClear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 3, follows: follows({ update: { release: 2, mode: 'merge' } }) })]
+    renderOverlay()
+    const card = screen.getByTestId('app-follow-card')
+    expect(card.textContent).toContain('This app released on its own since it was copied. Ask the agent to merge the two and deploy one release.')
+    expect(screen.queryByTestId('follow-update')).toBeNull()
+    fireEvent.click(screen.getByTestId('follow-merge'))
+    expect(followCalls.take.mock.calls[0][0]).toEqual({ appId: 'id-board', mode: 'merge' })
+    const answer = { status: 'ok', mode: 'merge', release: 2, path: '/workspace/apps/board.source-r2', text: 'Release 2 of Head Office’s app is unpacked at /workspace/apps/board.source-r2.' }
+    act(() => { followCalls.take.mock.calls[0][1].onSuccess(answer) })
+    const notice = screen.getByTestId('app-follow-notice')
+    expect(notice.textContent).toContain('is unpacked at /workspace/apps/board.source-r2')
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeTruthy()
+    expect(mergePrompt(appsData.current[0] as PinnedApp, answer)).toBe(
+      'Merge release 2 of Head Office’s app, unpacked at /workspace/apps/board.source-r2, into the app at /workspace/apps/board.html and deploy one release.')
+    // A personal copy's request names the person's own folder, as their session reads it.
+    const personal = mkApp('board', { scope: 'personal', rel_path: 'users/alice/workspace/apps/board', follows: follows() })
+    expect(mergePrompt(personal, { release: 2, path: '/users/alice/workspace/apps/board.source-r2' })).toBe(
+      'Merge release 2 of Head Office’s app, unpacked at /users/alice/workspace/apps/board.source-r2, into the app at /users/alice/workspace/apps/board and deploy one release.')
+  })
+
+  it('a staged merge says where the release is unpacked, hands the request over again, and Not now hides it', () => {
+    window.localStorage.clear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 3, follows: follows({ update: { release: 2, mode: 'asked', path: '/workspace/apps/board.source-r2' } }) })]
+    const { unmount } = renderOverlay()
+    const card = screen.getByTestId('app-follow-card')
+    expect(card.textContent).toContain('Release 2 of Head Office’s app is unpacked beside “board”.')
+    expect(card.textContent).toContain('Give the agent the request to merge it and deploy one release.')
+    expect(card.textContent).not.toContain('was asked')
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeTruthy()
+    expect(screen.queryByTestId('follow-update')).toBeNull()
+    expect(screen.queryByTestId('follow-merge')).toBeNull()
+    fireEvent.click(screen.getByTestId('follow-not-now'))
+    expect(screen.queryByTestId('app-follow-card')).toBeNull()
+    unmount()
+    // The same release stays hidden; a newer one brings the card back.
+    renderOverlay()
+    expect(screen.queryByTestId('app-follow-card')).toBeNull()
+    cleanup()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 3, follows: follows({ update: { release: 3, mode: 'update' } }) })]
+    renderOverlay()
+    expect(screen.getByTestId('app-follow-card')).toBeTruthy()
+  })
+
+  it('shows no card without an update, for a viewer, or when the person may not take the source\'s releases', () => {
+    window.localStorage.clear()
+    expect(showsFollowCard(mkApp('a', { follows: follows({ update: null }) }))).toBe(false)
+    expect(showsFollowCard(mkApp('a', { can_manage: false, follows: follows() }))).toBe(false)
+    expect(showsFollowCard(mkApp('a', { follows: follows({ can_take: false }) }))).toBe(false)
+    expect(showsFollowCard(mkApp('a', { follows: follows({ exists: false }) }))).toBe(false)
+    expect(showsFollowCard(mkApp('a', { follows: follows() }))).toBe(true)
+    expect(showsFollowCard(mkApp('a', { follows: follows() }), 2)).toBe(false)
+    // A pending release of the copy's own takes the slot instead.
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, deploy_state: 'pending', pending_release: 2, follows: follows() })]
+    renderOverlay()
+    expect(screen.queryByTestId('app-follow-card')).toBeNull()
+  })
+
+  it('the menu offers Send this release to the source and Stop following behind a confirm', () => {
+    window.localStorage.clear()
+    followCalls.send.mockClear()
+    followCalls.stop.mockClear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 2, follows: follows({ update: null }) })]
+    renderOverlay()
+    openMenu('board')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Send this release to the source' }))
+    // Send replaces the source's files: it asks first, like Stop following.
+    const ask = screen.getByTestId('app-send-to-source-confirm')
+    expect(ask.textContent).toContain('Send release 2 of “board” to Head Office’s app? It replaces that app’s files and waits for approval there. Its data stays.')
+    expect(followCalls.send).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Send this release' }))
+    expect(screen.queryByTestId('app-send-to-source-confirm')).toBeNull()
+    expect(followCalls.send).toHaveBeenCalledWith('id-board', expect.anything())
+    act(() => { followCalls.send.mock.calls[0][1].onSuccess({ status: 'ok', release: 4, text: 'Release 4 of Head Office’s app waits for approval there.' }) })
+    expect(screen.getByTestId('app-follow-notice').textContent).toContain('Release 4 of Head Office’s app waits for approval there.')
+    openMenu('board')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Stop following' }))
+    const confirm = screen.getByTestId('app-stop-following-confirm')
+    expect(confirm.textContent).toContain('Stop following Head Office’s app?')
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByTestId('app-stop-following-confirm')).toBeNull()
+    expect(followCalls.stop).not.toHaveBeenCalled()
+    openMenu('board')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Stop following' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stop following' }))
+    expect(followCalls.stop).toHaveBeenCalledWith('id-board', expect.anything())
+    act(() => { followCalls.stop.mock.calls[0][1].onSuccess() })
+    expect(screen.getByTestId('app-follow-notice').textContent).toContain('“board” no longer follows Head Office’s app.')
+    // No rights on the source: no Send; a row that follows nothing: neither row.
+    cleanup()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 2, follows: follows({ update: null, can_take: false }) })]
+    renderOverlay()
+    openMenu('board')
+    expect(screen.queryByRole('menuitem', { name: 'Send this release to the source' })).toBeNull()
+    expect(screen.getByRole('menuitem', { name: 'Stop following' })).toBeTruthy()
+    // A source that is gone: no Send, Stop following still ends it.
+    cleanup()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 2, follows: follows({ update: null, exists: false }) })]
+    renderOverlay()
+    openMenu('board')
+    expect(screen.queryByRole('menuitem', { name: 'Send this release to the source' })).toBeNull()
+    expect(screen.getByRole('menuitem', { name: 'Stop following' })).toBeTruthy()
+    cleanup()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 2 })]
+    renderOverlay()
+    openMenu('board')
+    expect(screen.queryByRole('menuitem', { name: 'Stop following' })).toBeNull()
+  })
+
+  const overlayTree = () => (
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={['/chat/dev']}>
+        <AppsOverlay agent="dev" />
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+
+  it('the update notice stays until the list shows the release waiting, then goes once it is decided', () => {
+    window.localStorage.clear()
+    followCalls.take.mockClear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, follows: follows() })]
+    const { rerender } = renderOverlay()
+    fireEvent.click(screen.getByTestId('follow-update'))
+    act(() => { followCalls.take.mock.calls[0][1].onSuccess({ status: 'ok', mode: 'update', release: 2, source_release: 2, text: 'Release 2 of "board" waits for approval here.' }) })
+    // Before the list catches up the notice stands, and a long path wraps on a phone.
+    const span = screen.getByTestId('app-follow-notice').querySelector('span')
+    expect(span?.className).toContain('min-w-0')
+    expect(span?.className).toContain('break-words')
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, deploy_state: 'pending', pending_release: 2, follows: follows({ held_release: 2 }) })]
+    rerender(overlayTree())
+    expect(screen.getByTestId('app-follow-notice')).toBeTruthy()
+    // Approved: the release went live and the notice goes with the wait.
+    appsData.current = [mkApp('board', { kind: 'folder', release: 2, deploy_state: 'idle', pending_release: 0, follows: follows({ release: 2, update: null }) })]
+    rerender(overlayTree())
+    expect(screen.queryByTestId('app-follow-notice')).toBeNull()
+  })
+
+  it('Not now hides one release: a newer one brings the card back without a reload', () => {
+    window.localStorage.clear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, follows: follows() })]
+    const { rerender } = renderOverlay()
+    fireEvent.click(screen.getByTestId('follow-not-now'))
+    expect(screen.queryByTestId('app-follow-card')).toBeNull()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, follows: follows({ update: { release: 3, mode: 'update' } }) })]
+    rerender(overlayTree())
+    expect(screen.getByTestId('app-follow-card').textContent).toContain('Release 3 of Head Office’s app is available')
+  })
+
+  it('a deploy in progress turns the card\'s buttons off', () => {
+    window.localStorage.clear()
+    appsData.current = [mkApp('board', { kind: 'folder', release: 1, deploying: true, follows: follows() })]
+    renderOverlay()
+    expect((screen.getByTestId('follow-update') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByTestId('follow-merge') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByTestId('follow-not-now') as HTMLButtonElement).disabled).toBe(false)
+  })
+})

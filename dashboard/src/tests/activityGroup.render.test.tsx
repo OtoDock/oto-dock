@@ -229,8 +229,11 @@ const userMsg: DisplayMessage = { id: 'u1', role: 'user', blocks: [{ type: 'text
 const metaBlock: MessageBlock = { type: 'metadata', costUsd: 0, durationMs: 1 }
 
 describe('Progress notes in the steps', () => {
+  // A resting chat's bubble is finished, so each fixture ends with its answer:
+  // a note left last would read as the turn's last words instead.
   it('shows the run latest note as a faint line under the collapsed chip, in place when expanded', () => {
-    renderChat([msg([note('I will read it.'), readTool('/tmp/a.txt'), note('Now the count.'), readTool('/tmp/b.txt')])])
+    renderChat([msg([note('I will read it.'), readTool('/tmp/a.txt'), note('Now the count.'), readTool('/tmp/b.txt'),
+      { type: 'text', content: 'Two files, three lines each.' }])])
     expect(screen.getByTestId('activity-note').textContent).toBe('Now the count.')
     fireEvent.click(screen.getByTestId('activity-chip'))
     expect(screen.queryByTestId('activity-note')).toBeNull()
@@ -238,13 +241,14 @@ describe('Progress notes in the steps', () => {
   })
 
   it('renders a note with no steps around it flat and faint', () => {
-    renderChat([msg([note('Thinking it over.'), { type: 'text', content: 'The answer.' }])])
+    renderChat([msg([note('Thinking it over.'), { type: 'text', content: 'The answer is twenty-two lines.' }])])
     expect(screen.getByTestId('progress-note').textContent).toBe('Thinking it over.')
     expect(screen.queryByTestId('activity-chip')).toBeNull()
   })
 
   it('mounts a collapsed chip notes for search, never the faint line', () => {
-    renderChat([msg([readTool('/tmp/a.txt'), note('the needle here')])], undefined, 'needle')
+    renderChat([msg([readTool('/tmp/a.txt'), note('the needle here'), { type: 'text', content: 'That is the line you asked about.' }])],
+      undefined, 'needle')
     const mount = screen.getByTestId('activity-group-search-mount')
     expect(mount.querySelector('[data-search-match]')?.textContent).toBe('needle')
     expect(screen.getByTestId('activity-note').querySelector('[data-search-match]')).toBeNull()
@@ -353,6 +357,35 @@ describe('A note that is a real message reads as text', () => {
   it('still folds a short preamble before a tool', () => {
     renderChat([msg([note('I will read it.'), readTool('/tmp/a.txt'), { type: 'text', content: 'It holds two lines.' },
       { type: 'metadata', costUsd: 0, durationMs: 1 }])])
+    expect(screen.getByTestId('activity-note').textContent).toBe('I will read it.')
+  })
+
+  // A terminal chat's bubbles carry no metadata block: one outside the open
+  // turn counts as finished, so its last words read as text there too.
+  const remembered = [note('I will remember that you like green.'),
+    readTool('/tmp/memory.md', { name: 'mcp__memory-mcp__memory' }), { type: 'text', content: 'Noted.' }] as MessageBlock[]
+
+  it("shows a terminal bubble's answer before its closing tool as text once the chat rests", () => {
+    renderStreaming([userMsg, msg(remembered, { id: 'term-1' })], false)
+    expect(screen.queryByTestId('activity-note')).toBeNull()
+    expect(screen.getByText('I will remember that you like green.')).toBeInTheDocument()
+  })
+
+  it('folds the same words while the terminal bubble is still the open turn', () => {
+    renderStreaming([userMsg, msg(remembered, { id: 'term-1' })])
+    expect(screen.getByTestId('activity-note').textContent).toBe('I will remember that you like green.')
+  })
+
+  it("draws an earlier bubble's last note as text while a later turn streams", () => {
+    const earlier = msg(remembered, { id: 'term-0' })
+    renderStreaming([userMsg, earlier, { ...userMsg, id: 'u2' }, msg([readTool('/tmp/a.txt', { status: 'running' })], { id: 'term-1' })])
+    expect(screen.getByText('I will remember that you like green.')).toBeInTheDocument()
+    expect(screen.queryByTestId('activity-note')).toBeNull()
+  })
+
+  it('draws a bubble with metadata, while the chat streams, as today', () => {
+    renderStreaming([userMsg, msg([note('I will read it.'), readTool('/tmp/a.txt'), { type: 'text', content: 'It holds two lines.' }, metaBlock], { id: 'db-0' }),
+      { ...userMsg, id: 'u2' }, msg([readTool('/tmp/b.txt', { status: 'running' })], { id: 'stream-1' })])
     expect(screen.getByTestId('activity-note').textContent).toBe('I will read it.')
   })
 

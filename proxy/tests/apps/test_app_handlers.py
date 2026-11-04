@@ -104,6 +104,7 @@ def _clean(monkeypatch):
     catalog._app_subs.clear()
     app_handlers._drains.clear()
     app_handlers._drain_locks.clear()
+    app_handlers._index_lock = None  # bound to the loop that first waits on it
     app_handlers.mark_dirty()
     monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 1000.0)
     yield

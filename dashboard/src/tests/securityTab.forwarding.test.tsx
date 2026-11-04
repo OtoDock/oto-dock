@@ -37,9 +37,11 @@ const h = vi.hoisted(() => ({
 vi.mock('@/api/auth', () => ({ apiFetch: vi.fn(async () => ({ ok: true, json: async () => ({}) })) }))
 vi.mock('@/api/oauth', () => ({
   useBearerAllowlist: () => ({ data: [], isLoading: false }),
+  useBearerPending: () => ({ data: [] }),
+  useAllowMcpHosts: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useAddBearerAllowlist: () => ({ mutateAsync: vi.fn() }),
   useRemoveBearerAllowlist: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()) }),
-  useRestoreBearerAllowlist: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
+  useRemoveAdminBearerRows: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
 }))
 vi.mock('@/pages/admin/PlatformPage.hooks', () => ({
   usePlatformSettings: () => ({ data: h.settings, isLoading: false }),

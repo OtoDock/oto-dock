@@ -52,6 +52,7 @@ from services.apps import app_supervisor, app_tokens, releases
 from services.apps.app_handlers import _inflight_checks
 from services.apps.app_supervisor import forward
 from storage import database as task_store, db_apps
+from storage.automation import notification_severity
 from storage.pg import run_db
 from ws import wire_events as wire
 
@@ -1126,9 +1127,7 @@ async def _notify_from_handler(row: dict, args: dict) -> dict:
     from services.notifications.notification_manager import fire_notification
     title = str((args or {}).get("title") or "").strip()[:200]
     body = str((args or {}).get("body") or "").strip()[:2000]
-    severity = str((args or {}).get("severity") or "info")
-    if severity not in ("info", "success", "warning", "danger"):
-        severity = "info"
+    severity = notification_severity.normalize((args or {}).get("severity"))
     if not title:
         raise _refuse(400, "args.title is required")
     if not _take(f"{row['id']}|notify", NOTIFY_PER_HOUR / 3600.0, float(NOTIFY_PER_HOUR)):

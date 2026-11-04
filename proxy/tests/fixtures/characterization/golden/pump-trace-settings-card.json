@@ -1,0 +1,1001 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "",
+  "engine_cost_total": 0.0,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "text",
+   {
+    "content": "Finding the setting. "
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "mcp__settings-mcp__get_setting",
+    "tool_id": "toolu_settings"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "mcp__settings-mcp__get_setting",
+    "summary": "user.general.wake-word",
+    "tool_input": {
+     "id": "user.general.wake-word"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "mcp__settings-mcp__get_setting",
+    "tool_id": "toolu_settings"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "The card is in the chat."
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "Finding the setting. ",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "mcp__settings-mcp__get_setting",
+    "summary": "user.general.wake-word",
+    "tool_id": "toolu_settings",
+    "tool_input": {
+     "id": "user.general.wake-word"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "catalog_version": 1,
+    "label": "Wake word",
+    "setting": "user.general.wake-word",
+    "type": "settings_card"
+   },
+   "event_type": "settings_card",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "The card is in the chat.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  }
+ ],
+ "seams": {
+  "ephemeral": [],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Finding the setting. "
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Finding the setting. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "mcp__settings-mcp__get_setting",
+      "tool_id": "toolu_settings",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "",
+      "tool_id": "toolu_settings",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "",
+      "tool_id": "toolu_settings",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_settings"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/mcp__settings-mcp__get_setting"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Finding the setting. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_settings"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/mcp__settings-mcp__get_setting"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Finding the setting. ",
+     "type": "text"
+    },
+    {
+     "catalog_version": 1,
+     "label": "Wake word",
+     "setting": "user.general.wake-word",
+     "type": "settings_card"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "catalog_version": 1,
+      "label": "Wake word",
+      "setting": "user.general.wake-word",
+      "type": "settings_card"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     },
+     {
+      "catalog_version": 1,
+      "label": "Wake word",
+      "setting": "user.general.wake-word",
+      "type": "settings_card"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_settings"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:settings_card"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Finding the setting. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "mcp__settings-mcp__get_setting",
+     "summary": "user.general.wake-word",
+     "tool_id": "toolu_settings",
+     "tool_input": {
+      "id": "user.general.wake-word"
+     },
+     "type": "tool"
+    },
+    {
+     "catalog_version": 1,
+     "label": "Wake word",
+     "setting": "user.general.wake-word",
+     "type": "settings_card"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "mcp__settings-mcp__get_setting",
+      "tool_id": "toolu_settings",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     },
+     {
+      "catalog_version": 1,
+      "label": "Wake word",
+      "setting": "user.general.wake-word",
+      "type": "settings_card"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/mcp__settings-mcp__get_setting"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Finding the setting. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "mcp__settings-mcp__get_setting",
+     "summary": "user.general.wake-word",
+     "tool_id": "toolu_settings",
+     "tool_input": {
+      "id": "user.general.wake-word"
+     },
+     "type": "tool"
+    },
+    {
+     "catalog_version": 1,
+     "label": "Wake word",
+     "setting": "user.general.wake-word",
+     "type": "settings_card"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "The card is in the chat.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     },
+     {
+      "catalog_version": 1,
+      "label": "Wake word",
+      "setting": "user.general.wake-word",
+      "type": "settings_card"
+     },
+     {
+      "content": "The card is in the chat.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "The card is in the chat."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Finding the setting. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "mcp__settings-mcp__get_setting",
+      "summary": "user.general.wake-word",
+      "tool_id": "toolu_settings",
+      "tool_input": {
+       "id": "user.general.wake-word"
+      },
+      "type": "tool"
+     },
+     {
+      "catalog_version": 1,
+      "label": "Wake word",
+      "setting": "user.general.wake-word",
+      "type": "settings_card"
+     },
+     {
+      "content": "The card is in the chat.\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-settings",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

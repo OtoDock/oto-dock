@@ -15,7 +15,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
 
@@ -175,21 +175,26 @@ def _wake_mcp_build(
     agent: str, user_sub: str | None, *, username: str, role: str,
     vis: "VisibilityResolution", chat_id: str, where: placement.PlacementCapabilities,
     browser: "BrowserTargetSettings", mcp_format: str | None, session_id: str,
-    targets: list[str], kind: str = "",
+    targets: list[str], kind: str = "", personal_owner: str | None = None,
 ) -> tuple:
     """The MCP build of a respawned session for the delivery's person, as the
     chat builder makes it (the delegation targets included): a task's set,
     or a dashboard chat's when ``kind`` says so (the resume after the
-    agent's own move continues the chat as its person's turn would). Returns
-    the build's five values. Synchronous: it reads agent files and platform
+    agent's own move continues the chat as its person's turn would), with
+    the owner filter of a personal machine when ``personal_owner`` is set
+    (``config_builder.personal_owner_of``). Returns the build's five values. Synchronous: it reads agent files and platform
     settings, so call it off the loop."""
     from services.mcp import mcp_registry
+    owner_kw: dict[str, Any] = {"personal_owner": personal_owner} if personal_owner is not None else {}
+    # Nobody drives a respawned session: a dashboard-kind wake is not the
+    # person's own chat for the MCPs that load only where a person is.
     return mcp_registry.build_session_mcp_config(
         agent, user_sub or None, task_mode=kind != session_kind.DASHBOARD.name,
-        task_scope=vis.mount_scope,
+        task_scope=vis.mount_scope, shared_chat=True,
         username=username or "", user_role=role or "", chat_id=chat_id or "",
         placement=where, target_browser=browser, mcp_config_format=mcp_format,
         session_id=session_id, delegation_targets=targets,
+        **owner_kw,
     )
 
 
@@ -212,6 +217,7 @@ def _wake_prompt(
         client_type=(kind if kind == session_kind.DASHBOARD.name else session_kind.TASK.name),
         placement=where,
         mount_shared=vis.mount_shared, execution_path=exec_path or "",
+        shared_chat=True,
     )
     assigned = [m.name for m in (mcp_registry.get_agent_mcps(agent, placement=where) or [])
                 if m.name not in excluded]
@@ -242,7 +248,7 @@ async def _wake_dynamic_contexts(
             agent, assigned, user_sub=user_sub or "", user_role=role,
             trigger_payload=None, delegation_targets=targets,
             delegation_roster=await asyncio.to_thread(
-                dynamic_context.build_delegation_roster, targets),
+                dynamic_context.build_delegation_roster, targets, user_sub or ""),
             meetings_access=await asyncio.to_thread(
                 dynamic_context.build_meetings_access, user_sub or "", role or ""),
             nouser_reads=not user_sub, placement=where,
@@ -314,7 +320,8 @@ async def _store_undelivered_wakes(chat_id: str, wakes: list[str], *, person: st
     isess = interactive_session.find_live_for_chat(chat_id)
     if isess is not None and isess.alive:
         for rec in await run_db(task_store.claim_pending_wake_records, chat_id):
-            if isess.queue_prompt(rec["prompt"], "delegate_result_replay", chat_id=chat_id) is None:
+            if isess.queue_prompt(rec["prompt"], "delegate_result_replay", chat_id=chat_id,
+                                  note=True) is None:
                 await run_db(functools.partial(
                     task_store.append_pending_delegate_wake, chat_id, rec["prompt"],
                     person=rec["person"], role=rec["role"], by=rec["by"]))
@@ -496,6 +503,7 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
         await _do_deliver(
             on_complete_session_id, on_complete_agent, result_prompt, task,
             chat_id=on_complete_chat_id,
+            worker_chat_id=worker_chat_id or "",
             output_text=output,
             status=status,
             verdict=verdict,
@@ -546,7 +554,8 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
                       ending=None, files: list | None = None,
                       files_skipped: list | None = None,
                       background_pending: int = 0,
-                      report_missing: bool = False) -> None:
+                      report_missing: bool = False,
+                      worker_chat_id: str = "") -> None:
     """Deliver a delegate result via the session-delivery ladder.
 
     The routing itself (WS notify → pump → persistent → one-shot) lives in
@@ -554,7 +563,8 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
     DELEGATE semantics — the ``delegate_result`` event payload, the live-state
     badge, the ``task_result_prompt`` notify shape, and the echo persistence.
     The persistent/one-shot rungs are passed by name so they resolve through
-    this module at call time (tests monkeypatch them here).
+    this module at call time (tests monkeypatch them here). ``worker_chat_id``
+    rides the event for the card's link to the lane and nothing else.
     """
     try:
         from core.session.session_delivery import deliver_prompt
@@ -581,6 +591,7 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
             "agent": task.agent,
             "output_text": output_preview,
             "status": status,
+            **({"worker_chat_id": worker_chat_id} if worker_chat_id else {}),
             **_result_extras(verdict, files, files_skipped,
                              background_pending=background_pending,
                              report_missing=report_missing),
@@ -592,6 +603,7 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
             "agent": task.agent,
             "output_text": output_preview,
             "status": status,
+            **({"worker_chat_id": worker_chat_id} if worker_chat_id else {}),
             **_result_extras(verdict, files, files_skipped,
                              background_pending=background_pending,
                              report_missing=report_missing),
@@ -717,6 +729,7 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
                     "delegate_agent": task.agent,
                     "output_text": output_preview,
                     "status": status,
+                    **({"worker_chat_id": worker_chat_id} if worker_chat_id else {}),
                     **_result_extras(verdict, files, files_skipped,
                                      background_pending=background_pending,
                                      report_missing=report_missing),
@@ -1041,7 +1054,7 @@ async def _deliver_via_oneshot(
     session_id: str, agent: str, result_prompt: str,
     *, user_sub: str | None = None, role: str = "manager", chat_id: str = "",
     permission_mode: str = UNATTENDED_MODE, client_type: str = "",
-    fresh_without_session: bool = False, note_prompt: bool = False,
+    fresh_without_session: bool = False,
 ) -> str | None:
     """Path C: Dead session, use one-shot --resume via execution layer.
 
@@ -1055,10 +1068,10 @@ async def _deliver_via_oneshot(
     Every wake runs in the unattended mode with no client kind; the
     platform's resume after the agent's own move passes the chat's own mode
     and kind (``permission_mode``, ``client_type``: the hook judges the turn
-    as the chat's), opts in to a fresh start for a chat with no session at
-    all (``fresh_without_session``: a summarised move, nothing to probe) and
-    has a terminal note the prompt it types (``note_prompt``: the transcript
-    tailer then writes no person's row for it)."""
+    as the chat's) and opts in to a fresh start for a chat with no session at
+    all (``fresh_without_session``: a summarised move, nothing to probe). A
+    terminal a wake re-warms notes the prompt it types, so the transcript
+    tailer writes no person's row for it (the row is the ladder's)."""
     from core.session import session_state as _state
     from core.session.session_manager import get_execution_layer, resolve_execution_path
     from services.remote import remote_status
@@ -1165,7 +1178,6 @@ async def _deliver_via_oneshot(
                 chat_id=chat_id, chat_row=_chat_row, exec_path=exec_path, target=target,
                 username=username or "", fresh_from=fresh_from, fresh=fresh,
                 permission_mode=permission_mode, client_type=client_type,
-                note_prompt=note_prompt,
             )
     except BaseException:
         if reserved:
@@ -1212,7 +1224,7 @@ async def _spawn_wake_session(
     layer: "ExecutionLayer", session_id: str, agent: str, result_prompt: str, *,
     user_sub: str | None, role: str, chat_id: str, chat_row: dict | None,
     exec_path: str, target: str, username: str, fresh_from: str = "", fresh: bool = False,
-    permission_mode: str = UNATTENDED_MODE, client_type: str = "", note_prompt: bool = False,
+    permission_mode: str = UNATTENDED_MODE, client_type: str = "",
 ) -> tuple[bool, str | None]:
     """Build the resumed session's config and start it (headless, or the
     chat's own terminal). Returns whether a session was started and the rung's
@@ -1220,8 +1232,8 @@ async def _spawn_wake_session(
     ``fresh`` the session starts fresh under ``session_id`` and runs the wake
     through the fresh-spawn rung (``wake_fresh``): ``fresh_from`` the chat's
     session that left no conversation, or empty for a chat that had none.
-    ``permission_mode``, ``client_type`` and ``note_prompt`` as
-    ``_deliver_via_oneshot`` takes them."""
+    ``permission_mode`` and ``client_type`` as ``_deliver_via_oneshot`` takes
+    them."""
     from core.config.task_config_builder import build_delivery_security_context
     from core.events.common_events import TEXT
     from core.execution_layer import AgentConfig
@@ -1252,15 +1264,20 @@ async def _spawn_wake_session(
     from core.session.session_manager import capabilities_for_path
     _mcp_format = capabilities_for_path(exec_path).mcp_config_format
     targets = await run_db(_wake_delegation_targets, agent, user_sub, role)
+    # The resume of a shared chat the agent moved to its person's computer
+    # carries what is that person's there, as the chat's own turn does.
+    from core.config.config_builder import personal_machine_bundles, personal_owner_of
+    _owner = personal_owner_of(_os_placement, vis.mount_username, user_sub, _os_browser)
+    _on_personal = _os_placement.user_paired and not vis.mount_username
     mcp_config, flat_env, excluded, secret_bundles, bash_env_keys = await asyncio.to_thread(
         functools.partial(
             _wake_mcp_build, agent, user_sub, username=username, role=role, vis=vis,
             chat_id=chat_id, where=_os_placement, browser=_os_browser,
             mcp_format=_mcp_format, session_id=session_id, targets=targets, kind=client_type,
+            personal_owner=_owner if _on_personal else None,
         ))
-    from core.config.config_builder import personal_machine_bundles
     secret_bundles = personal_machine_bundles(secret_bundles or {}, _os_placement,
-                                              vis.mount_username, agent, who="wake")
+                                              vis.mount_username, agent, who="wake", owner=_owner)
     contexts = await _wake_dynamic_contexts(
         agent, excluded or {}, user_sub=user_sub, role=role, targets=targets,
         where=_os_placement)
@@ -1335,6 +1352,7 @@ async def _spawn_wake_session(
         mcp_config_path=str(mcp_config) if mcp_config else "",
         credential_env=credential_env,
         mcp_secret_bundles=secret_bundles or {},
+        excluded_mcps=frozenset(excluded or ()),
         multi_value_envs=multi_value_envs,
         permission_mode=permission_mode,
         client_type=client_type,
@@ -1384,7 +1402,6 @@ async def _spawn_wake_session(
             out = await _rewarm_interactive_and_wake(
                 layer, session_id, agent, result_prompt,
                 chat_id=chat_id, base_cfg=oneshot_cfg, chat_row=cast("dict", chat_row),  # interactive needs a row
-                note_prompt=note_prompt,
             )
             return out is not None, out
         await layer.start_session(session_id, oneshot_cfg)
@@ -1437,7 +1454,7 @@ async def _wait_turn_open(isess, timeout: float) -> bool:
 
 async def _rewarm_interactive_and_wake(
     layer, session_id: str, agent: str, result_prompt: str,
-    *, chat_id: str, base_cfg, chat_row: dict, note_prompt: bool = False,
+    *, chat_id: str, base_cfg, chat_row: dict,
 ) -> str | None:
     """Re-warm a DEAD interactive-pinned chat and inject the delegate wake.
 
@@ -1498,13 +1515,17 @@ async def _rewarm_interactive_and_wake(
         done = asyncio.Event()
         isess.on_turn_complete = lambda _msg: done.set()
         # Cold wake prompt: buffered behind the readiness gate, flushed with
-        # the settle Enter (large pastes were losing the fixed-gap Enter). A
-        # prompt the caller recorded as its own row is noted first, so the
-        # transcript tailer writes no person's row for it.
-        if note_prompt:
-            from core.session.transcript_tool_events import note_sent_prompt
-            note_sent_prompt(chat_id, result_prompt)
-        isess.submit_prompt(result_prompt, settle=True)
+        # the settle Enter (large pastes were losing the fixed-gap Enter). Its
+        # row is the ladder's (the result's or the wake's event row), so the
+        # text is noted first and the transcript tailer writes no person's
+        # row for it; a write that did not happen takes the note back.
+        from core.session.transcript_tool_events import (
+            drop_sent_prompt,
+            note_sent_prompt,
+        )
+        note_sent_prompt(chat_id, result_prompt, owner=session_id)
+        if not isess.submit_prompt(result_prompt, settle=True):
+            drop_sent_prompt(chat_id, result_prompt, owner=session_id)
         logger.info(
             "Delegate wake re-warmed interactive: session=%s, "
             "chat=%s, agent=%s", session_id[:8], chat_id[:8], agent

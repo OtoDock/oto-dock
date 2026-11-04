@@ -163,8 +163,8 @@ async def test_same_provider_switch_touches_nothing(switch_env):
     layer, session, calls = switch_env
     before_messages = [dict(m) for m in session.messages]
     before_tools = list(session.tools)
-    await layer.change_model(session.session_id, "gpt-5.6-terra")
-    assert (session.provider, session.model, session.api_key) == ("openai", "gpt-5.6-terra", "old-key")
+    await layer.change_model(session.session_id, "gpt-6.1-terra")
+    assert (session.provider, session.model, session.api_key) == ("openai", "gpt-6.1-terra", "old-key")
     assert session.messages == before_messages and session.tools == before_tools
     assert calls == []
 

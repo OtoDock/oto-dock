@@ -1,0 +1,75 @@
+{
+ "source": "A list started over whose first entry re-sends the shown interim (the same utterance): nothing doubles.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "one."
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "one."
+    },
+    {
+     "isFinal": false,
+     "text": "two three"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "two three four"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "two three four."
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "one.",
+   "two three four."
+  ],
+  "replaces": [],
+  "interims": [
+   "two three",
+   "two three four"
+  ],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

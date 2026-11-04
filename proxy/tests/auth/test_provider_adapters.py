@@ -199,22 +199,32 @@ def test_openai_usage_no_details_is_all_plain_input():
     assert (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens) == (1000, 0, 0)
 
 
-def test_openai_usage_cost_matches_openai_bill_gpt56():
-    # End-to-end with the shared calculate_cost: terra rates (2.00 in, 12 out,
-    # 2.50 write = 1.25x, 0.20 read = 0.1x — the 2026-07-30 cut) — the
-    # decomposed row must price to exactly what OpenAI bills.
+def test_openai_usage_cost_matches_openai_bill_gpt61_terra():
+    # End-to-end with the shared calculate_cost: GPT-6.1 Terra's rates (1.00
+    # in, 5 out, 1.25 write = 1.25x, 0.05 read = 0.05x) — the decomposed row
+    # must price to exactly what OpenAI bills.
     u = OpenAIAdapter._decompose_usage(
         _usage(100_000, 10_000, cached=60_000, written=30_000))
-    cost = OpenAIAdapter().calculate_cost("gpt-5.6-terra", u)
-    #   10k plain * 2.00 + 30k written * 2.50 + 60k read * 0.20 + 10k out * 12
-    assert abs(cost - (0.02 + 0.075 + 0.012 + 0.12)) < 1e-9
+    cost = OpenAIAdapter().calculate_cost("gpt-6.1-terra", u)
+    #   10k plain * 1.00 + 30k written * 1.25 + 60k read * 0.05 + 10k out * 5
+    assert abs(cost - (0.01 + 0.0375 + 0.003 + 0.05)) < 1e-9
     # A 1M-token prompt is past OpenAI's 272K line: the whole request bills at
     # 2x input (cache reads and writes with it) and 1.5x output.
     u = OpenAIAdapter._decompose_usage(
         _usage(1_000_000, 100_000, cached=600_000, written=300_000))
-    cost = OpenAIAdapter().calculate_cost("gpt-5.6-terra", u)
-    #   100k plain * 4.00 + 300k written * 5.00 + 600k read * 0.40 + 100k out * 18
-    assert abs(cost - (0.40 + 1.50 + 0.24 + 1.80)) < 1e-9
+    cost = OpenAIAdapter().calculate_cost("gpt-6.1-terra", u)
+    #   100k plain * 2.00 + 300k written * 2.50 + 600k read * 0.10 + 100k out * 7.5
+    assert abs(cost - (0.20 + 0.75 + 0.06 + 0.75)) < 1e-9
+
+
+def test_groq_usage_cost_on_qwen_3_8():
+    # Qwen 3.8 27B: $0.80 in, $4.00 out; a cached input token (Groq reports
+    # one OpenAI-style) at half the input rate.
+    from core.layers.providers.openai_compat_adapter import GroqAdapter
+    u = GroqAdapter._decompose_usage(_usage(10_000, 1_000, cached=4_000))
+    cost = GroqAdapter().calculate_cost("qwen/qwen3.8-27b", u)
+    #   6k plain * 0.80 + 4k read * 0.40 + 1k out * 4.00
+    assert abs(cost - (0.0048 + 0.0016 + 0.004)) < 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +589,7 @@ def test_groq_effort_sent_with_tools(monkeypatch):
 
 def test_groq_qwen_pinned_to_no_thinking(monkeypatch):
     kw = _effort_kwargs(monkeypatch, GroqAdapter(), effort="high", tools=_TOOL,
-                        model="qwen/qwen3.6-27b")
+                        model="qwen/qwen3.8-27b")
     assert kw["reasoning_effort"] == "none"
 
 

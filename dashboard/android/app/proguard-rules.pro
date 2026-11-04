@@ -1,21 +1,18 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# R8 rules for the release build (build.gradle). AGP's default
+# proguard-android-optimize.txt already keeps every @JavascriptInterface
+# method and the runtime annotations; Capacitor's own rules keep every
+# plugin class and its @PluginMethod methods (NativeChannelPlugin and
+# PushUnconfiguredPlugin among them); the manifest keeps the activities and
+# services; Firebase and Play services ship their own rules. The native
+# channel's method names are JSON strings, never reflection.
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# The bundled setup page calls this raw interface by name
+# (window.Android.addInstallation(...) and the rest): kept explicitly, so a
+# change to the default file cannot rename them.
+-keepclassmembers class com.otodock.MainActivity$SetupBridge {
+    @android.webkit.JavascriptInterface public <methods>;
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
-
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Line numbers in a crash's stack trace, under one file name.
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile

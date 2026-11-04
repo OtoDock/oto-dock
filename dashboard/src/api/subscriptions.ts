@@ -40,6 +40,36 @@ export interface WebhookSubscription {
   /** 'vendor' = the vendor calls this install directly; 'relay' = events
    * arrive via the OtoDock relay (hosted delivery, no console steps). */
   delivery_mode: 'vendor' | 'relay'
+  /** Whether the row's MCP is installed and on: 'removed' is a row left
+   * from before its MCP's uninstall deleted them, 'off' an MCP an admin
+   * switched off (its rows stay and receive nothing). An older proxy
+   * sends none. */
+  mcp_state?: 'on' | 'off' | 'removed'
+}
+
+const MCP_STATE_NOTES: Partial<Record<NonNullable<WebhookSubscription['mcp_state']>, { note: string; why: string }>> = {
+  removed: { note: 'Its MCP was removed', why: 'It receives no events. Delete it, or install the MCP again.' },
+  off: { note: 'Its MCP is turned off', why: 'It receives no events until an admin turns the MCP on again.' },
+}
+
+/** The mark of a subscription that receives nothing because of its MCP,
+ * with the sentence that says why; null when it receives. */
+export function mcpStateMark(state: WebhookSubscription['mcp_state']): { note: string; why: string } | null {
+  return (state && MCP_STATE_NOTES[state]) || null
+}
+
+/** The mark as one line under a list (a phone's closed list cuts the
+ * option short), undefined when the subscription receives. */
+export function mcpStateSentence(state: WebhookSubscription['mcp_state']): string | undefined {
+  const mark = mcpStateMark(state)
+  return mark ? `${mark.note}. ${mark.why}` : undefined
+}
+
+/** A subscription as a choice in a list (a trigger's subscription). */
+export function subscriptionOptionLabel(s: WebhookSubscription): string {
+  const label = `${s.provider_id}/${s.vendor_target} · ${s.selected_events.join(', ') || '—'}`
+  const mark = mcpStateMark(s.mcp_state)
+  return mark ? `${label} (${mark.note})` : label
 }
 
 /** A refused subscription request, with the HTTP status and the parsed

@@ -215,6 +215,7 @@ async def create_direct_session(
     call_ask_back: bool = False,
     user_role: str = "",
     scope: str = "user",
+    excluded_mcps: set[str] | None = None,
 ) -> DirectSession:
     """Create a new direct session with MCP servers started.
 
@@ -228,6 +229,9 @@ async def create_direct_session(
             phone calls.
         call_ask_back: a phone session on an outbound call another agent
             placed: the ask tool joins the call tools.
+        excluded_mcps: the ``mcpServers`` keys the session's builder left
+            out (``AgentConfig.excluded_mcps`` mapped by the layer): the
+            pool starts none of them.
         user_role / scope: the person's role on the agent and the scope the
             MCP build judges the manifests' audience with
             (``layer.audience_gate``), as the session's builder did.
@@ -257,6 +261,7 @@ async def create_direct_session(
         external=external,
         user_role=user_role,
         scope=scope,
+        excluded_mcps=excluded_mcps,
     )
 
     session = DirectSession(

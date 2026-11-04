@@ -12,7 +12,7 @@ Agent Context Deep Pass: six leaner blocks chosen by
 
 The MCP-defaults sentence in each block is now dynamic — only mentions
 scope-aware MCPs (`schedules-mcp`, `delegation-mcp`, `notifications-mcp`,
-`triggers-mcp`, `meetings-mcp`, `memory-mcp`) that are actually in
+`triggers-mcp`, `meetings-mcp`) that are actually in
 ``assigned_mcp_names``.
 When the tuple is empty, the MCP sentence is omitted entirely. Folder
 semantics + knowledge-vs-workspace prose moved to ``# Folders`` and
@@ -20,6 +20,8 @@ semantics + knowledge-vs-workspace prose moved to ``# Folders`` and
 """
 
 from __future__ import annotations
+
+import pytest
 
 from auth.path_policy import SecurityContext, build_permission_context
 from storage.agents import agent_store
@@ -52,11 +54,15 @@ def test_block_a_manager_personal_assistant(temp_db):
     assert "# Execution Scope" in text
     assert "user scope" in text
     assert "default to **user scope**" in text
-    # All six scope-aware nouns listed (Oxford-comma joined; first word
-    # capitalised as a sentence start).
-    assert "Tasks, delegated sessions, notifications, triggers, meetings, and memories" in text
-    # Override-to-agent guidance present.
-    assert 'scope="agent"' in text
+    # All five scope-aware nouns listed (Oxford-comma joined; first word
+    # capitalised as a sentence start). Memory is not one of them: its own
+    # directive carries the scope rule ("content decides").
+    assert "Tasks, delegated sessions, notifications, triggers, and meetings" in text
+    assert "memories" not in text.split("# Execution Scope")[1].split("# Folders")[0]
+    # The one rule and the team clause of the nouns sentence.
+    assert "Content decides where work goes, for files, memory and apps alike." in text
+    assert "One that serves the whole team goes to agent scope." in text
+    assert 'scope="agent"' not in text
 
 
 def test_block_a_no_scope_aware_mcps_omits_mcp_sentence(temp_db):
@@ -101,20 +107,24 @@ def test_block_b_manager_system_admin(temp_db):
         execution_path="claude-code-cli",
     )
     assert "# Execution Scope" in text
-    assert "operational agent" in text
+    assert "This agent works in its shared space by default." in text
+    assert "Content decides where work goes" in text
     assert "default to **agent scope**" in text
-    assert 'scope="user"' in text
+    assert "One that is a person's own goes to user scope." in text
+    assert "operational agent" not in text
 
 
 def test_block_b_no_scope_aware_mcps_still_marks_operational(temp_db):
-    """Even with no scope-aware MCPs, the operational-agent framing stays."""
+    """Even with no scope-aware MCPs, the shared-space framing and the rule stay."""
     agent_store.create_agent("ops", "Ops", default_scope="agent")
     text = build_permission_context(
         _ctx(role="manager", username="alice", agent="ops"),
         assigned_mcp_names=(),
         execution_path="claude-code-cli",
     )
-    assert "operational agent" in text
+    assert "This agent works in its shared space by default." in text
+    assert "Content decides where work goes" in text
+    assert "default to" not in text.split("# Execution Scope")[1].split("# Folders")[0]
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +156,7 @@ def test_block_d_editor_system_admin(temp_db):
     )
     assert "# Execution Scope" in text
     assert "(editor)" in text
-    assert "operational agent" in text
+    assert "This agent works in its shared space by default." in text
     assert "default to **agent scope**" in text
 
 
@@ -327,4 +337,45 @@ def test_collaborative_still_uses_classic_blocks(temp_db):
         assigned_mcp_names=_ALL_SCOPE_MCPS, execution_path="claude-code-cli",
     )
     assert "user scope" in text
-    assert "shared space" not in text   # not a single-space mode
+    # Not a single-space mode: neither the Shared-only nor the Personal-only words.
+    assert "no personal space" not in text.split("# Execution Scope")[1].split("# Folders")[0]
+    assert "**personal space** for" not in text
+
+
+# ---------------------------------------------------------------------------
+# Every block ends clean: no trailing space, one blank line before the rule
+# ---------------------------------------------------------------------------
+
+def _scope_section(text: str) -> str:
+    return text.split("# Execution Scope\n\n")[1].split("---")[0]
+
+
+@pytest.mark.parametrize("role,default_scope,collaborative,session_scope,mcps", [
+    ("manager", "user", True, "user", ()),
+    ("manager", "user", True, "user", _ALL_SCOPE_MCPS),
+    ("editor", "agent", True, "user", ()),
+    ("viewer", "user", True, "user", ()),
+    ("contributor", "agent", True, "user", _ALL_SCOPE_MCPS),
+    ("manager", "user", False, "user", ()),
+    ("manager", "agent", False, "agent", ()),
+    ("editor", "agent", False, "agent", _ALL_SCOPE_MCPS),
+    ("viewer", "agent", False, "agent", ()),
+])
+def test_every_execution_scope_block_ends_with_one_blank_line_and_no_trailing_space(
+        temp_db, role, default_scope, collaborative, session_scope, mcps):
+    agent_store.create_agent("x", "X", collaborative=collaborative, default_scope=default_scope)
+    scopes = ("user", "agent") if collaborative else ((default_scope,))
+    ctx = _ctx_mode(role, "alice", "x", session_scope=session_scope, available_scopes=scopes,
+                    config_visible=role == "manager")
+    text = build_permission_context(ctx, assigned_mcp_names=mcps, execution_path="claude-code-cli")
+    section = _scope_section(text)
+    assert section.endswith(".\n\n"), repr(section[-40:])
+    assert " \n" not in section
+
+
+def test_the_service_block_ends_clean_too(temp_db):
+    agent_store.create_agent("x", "X")
+    text = build_permission_context(SecurityContext(role="agent", username="", agent="x", is_admin_agent=False),
+                                    assigned_mcp_names=(), execution_path="claude-code-cli")
+    section = _scope_section(text)
+    assert section.endswith("trigger.\n\n") and " \n" not in section

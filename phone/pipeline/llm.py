@@ -749,6 +749,7 @@ class LlmStreamingMixin:
                             if tts_chunk:
                                 await _speak(tts_chunk)
                             text_buffer = ""
+                    cut_turn = self.state._control_turn   # before the close's await
                     await race.close()
 
                     if _control_break:
@@ -757,7 +758,7 @@ class LlmStreamingMixin:
                         # the completion point below.
                         discard = getattr(self.llm, "discard_turn", None)
                         if discard is not None:
-                            discard()
+                            discard(cut_turn)
                         logger.info(
                             "[%s] call control: stream left at "
                             "the last spoken words (%s)",
@@ -1428,13 +1429,14 @@ class LlmStreamingMixin:
                         else:
                             pre_tool[:] = [kept]
                         control_cut = True
+            cut_turn = self.state._control_turn   # before the close's await
             await race.close()
             if control_cut:
                 # The last speakable words are collected: the engine's tail
                 # is the proxy's transcript, the drain is the completion point.
                 discard = getattr(self.llm, "discard_turn", None)
                 if discard is not None:
-                    discard()
+                    discard(cut_turn)
                 logger.info(
                     "[%s] call control: parallel stream left at "
                     "the last spoken words (%s)",

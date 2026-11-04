@@ -19,6 +19,7 @@ calls ``record_event_received`` after fan-out.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -38,7 +39,7 @@ from services.oauth.oauth_account_store import (
     account_token_path,
     get_token_dir,
 )
-from services.webhooks import vendor_http
+from services.webhooks import relay_events, vendor_http
 from services.webhooks.webhook_template import (
     _TOKEN_RE,
     _build_substitutions,
@@ -48,7 +49,7 @@ from services.webhooks.webhook_template import (
 )
 from storage import database as task_store
 from storage.automation import webhook_subscription_store
-from storage.identity import credential_store, oauth_app_kinds
+from storage.identity import oauth_app_kinds
 
 logger = logging.getLogger("otodock.subscription-manager")
 
@@ -315,37 +316,19 @@ async def create_subscription(
 
     # Effective registration mode: hosted installs with a relay-capable
     # manifest + a relay-exchanged account deliver events VIA the relay
-    # (zero vendor-console steps). Register with the relay BEFORE the row
-    # insert so an unsupported/failed registration never leaves a half-made
-    # relay row behind.
+    # (zero vendor-console steps).
     reg_block = webhooks_block.get("registration", {})
     effective_mode = _effective_registration_mode(
         webhooks_block=webhooks_block, scope=scope,
         owner=user_sub, agent=agent, mcp_name=mcp_name,
         account_label=account_label, target_kind=target_kind,
     )
-    if effective_mode == "relay":
-        from services.billing import relay_client
-        try:
-            await _relay_register_events(provider_id=provider_id)
-        except relay_client.RelayError as e:
-            if e.code == "events_provider_unsupported":
-                # The relay has no event support for this provider (yet) —
-                # fall back to the manifest's own mode.
-                effective_mode = reg_block.get("mode", "manual")
-            else:
-                # 422, not 502 — edge proxies (Cloudflare) replace origin
-                # 502 bodies with their own HTML page, hiding the message.
-                raise SubscriptionError(
-                    relay_client.relay_error_message(e.code), status=422,
-                ) from e
-        except SubscriptionError:
-            raise
-        except Exception as e:
-            raise SubscriptionError(
-                f"relay events registration failed: {e}", status=502,
-            ) from e
-    delivery_mode = "relay" if effective_mode == "relay" else "vendor"
+    if effective_mode == "relay" and not config.DASHBOARD_PUBLIC_URL:
+        raise SubscriptionError(
+            "DASHBOARD_PUBLIC_URL must be set for hosted event delivery "
+            "(the relay needs a reachable URL to forward events to)",
+            status=400,
+        )
 
     # 3. Generate signing secret + insert row. Per-vendor-secret model
     # routes via manifest.signature.per_subscription_secret. Relay rows
@@ -353,16 +336,15 @@ async def create_subscription(
     sig_block = webhooks_block.get("signature", {})
     per_sub_secret = sig_block.get("per_subscription_secret", False)
     uv_kind = (webhooks_block.get("url_verification") or {}).get("kind", "none")
-    if per_sub_secret and delivery_mode != "relay" and not installation_target \
-            and uv_kind != "verification_token_capture":
-        signing_secret = secrets.token_urlsafe(32)
+    if per_sub_secret and not installation_target and uv_kind != "verification_token_capture":
+        vendor_secret = secrets.token_urlsafe(32)
     else:
         # Platform-wide secret lives in infra_credentials; the row stores
         # "" and the dispatcher resolves at verify time. Token-capture vendors
         # (Notion) DICTATE the secret — the row starts empty and the
         # dispatcher's capture fills it on the vendor's setup POST. An
         # installation target is verified with the app's own secret.
-        signing_secret = ""
+        vendor_secret = ""
 
     # Optional manifest-declared lifetime.
     lifetime_seconds = (webhooks_block.get("registration") or {}).get("lifetime_seconds")
@@ -372,22 +354,32 @@ async def create_subscription(
             datetime.now(timezone.utc) + timedelta(seconds=int(lifetime_seconds))
         ).isoformat().replace("+00:00", "Z")
 
-    row = webhook_subscription_store.create_subscription(
-        scope=scope,
-        owner=user_sub if scope == "user" else "",
-        agent=agent if scope == "service" else None,
-        mcp_name=mcp_name,
-        provider_id=provider_id,
-        account_label=account_label,
-        vendor_target=vendor_target,
-        selected_events=selected_events,
-        selected_subevents=selected_subevents or {},
-        signing_secret=signing_secret,
-        created_by=user_sub,
-        expires_at=expires_at,
-        delivery_mode=delivery_mode,
-        target_kind=target_kind,
-    )
+    row_args: dict[str, Any] = {
+        "scope": scope,
+        "owner": user_sub if scope == "user" else "",
+        "agent": agent if scope == "service" else None,
+        "mcp_name": mcp_name,
+        "provider_id": provider_id,
+        "account_label": account_label,
+        "vendor_target": vendor_target,
+        "selected_events": selected_events,
+        "selected_subevents": selected_subevents or {},
+        "created_by": user_sub,
+        "expires_at": expires_at,
+        "target_kind": target_kind,
+    }
+    row = None
+    if effective_mode == "relay":
+        row = await _create_relay_row(provider_id=provider_id, row_args=row_args)
+        if row is None:
+            # The relay has no event support for this provider (yet) — fall
+            # back to the manifest's own mode.
+            effective_mode = reg_block.get("mode", "manual")
+    signing_secret = vendor_secret
+    if row is None:
+        row = webhook_subscription_store.create_subscription(
+            **row_args, signing_secret=signing_secret, delivery_mode="vendor",
+        )
 
     if effective_mode == "relay" or effective_mode == oauth_app_kinds.REGISTRATION_MODE_APP:
         # Relay delivery, or the app's own webhook: no vendor call, the row
@@ -510,87 +502,36 @@ def _effective_registration_mode(
     return "relay"
 
 
-_register_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
-
-
-def _register_lock_now() -> asyncio.Lock:
-    """The registration lock of the running loop (the test suite runs
-    several loops in one process, and a lock with waiters is bound to one)."""
-    global _register_lock
-    loop = asyncio.get_running_loop()
-    if _register_lock is None or _register_lock[0] is not loop:
-        _register_lock = (loop, asyncio.Lock())
-    return _register_lock[1]
-
-
-async def _relay_register_events(*, provider_id: str) -> None:
-    """Ensure this install's event forwarding is registered with the relay for
-    ``provider_id`` and the forward secret is held locally
-    (``infra_credentials['otodock-relay'].EVENTS_FORWARD_SECRET`` — the relay
-    ingest route verifies forwards against it). Sends ``rotate_secret=True``
-    whenever no local secret exists (first registration or DB restore)."""
+async def _create_relay_row(*, provider_id: str, row_args: dict[str, Any]) -> dict | None:
+    """Insert a relay row as ``creating`` and register the relay endpoint
+    with it, under the one registration lock: the kinds union sees the new
+    row before it can receive, and a delete's switch-off running beside it
+    sees the row. A refusal deletes the row again (None when the relay has
+    no events for the provider: the caller falls back to the manifest's
+    mode)."""
     from services.billing import relay_client
-
-    if not config.DASHBOARD_PUBLIC_URL:
-        raise SubscriptionError(
-            "DASHBOARD_PUBLIC_URL must be set for hosted event delivery "
-            "(the relay needs a reachable URL to forward events to)",
-            status=400,
-        )
-    events_url = (
-        f"{config.DASHBOARD_PUBLIC_URL.rstrip('/')}/v1/webhooks/relay/{provider_id}"
-    )
-    # Two first registrations at once (a hosted connect beside a subscribe)
-    # would each ask for a new secret and could store the older one last.
-    async with _register_lock_now():
-        have_secret = bool(
-            (credential_store.get_infra_credentials(
-                relay_client.EVENTS_FORWARD_SECRET_SLUG) or {})
-            .get(relay_client.EVENTS_FORWARD_SECRET_KEY)
-        )
-        out = await relay_client.events_register(
-            provider_id=provider_id, events_url=events_url, enabled=True,
-            rotate_secret=not have_secret,
-        )
-        fresh = (out or {}).get("forward_secret")
-        if fresh:
-            credential_store.set_infra_credentials(
-                relay_client.EVENTS_FORWARD_SECRET_SLUG,
-                {relay_client.EVENTS_FORWARD_SECRET_KEY: fresh},
-            )
-
-
-async def _maybe_disable_relay_events(provider_id: str) -> None:
-    """Best-effort: after the LAST relay-mode subscription for a provider is
-    deleted, tell the relay to stop forwarding (the secret is kept so a
-    re-subscribe re-enables without rotation)."""
-    if not provider_id:
-        return
-    remaining = webhook_subscription_store.list_subscriptions(
-        provider_id=provider_id, delivery_mode="relay",
-    )
-    if remaining:
-        return
-    from services.billing import relay_client
-    try:
-        # Under the registration's lock: a hosted connect registering now
-        # has written its account before it asked the relay.
-        async with _register_lock_now():
-            # A hosted GitHub-App account needs the forwarding with no
-            # subscription at all: its installations' changes reach its
-            # card through it.
-            names = [m.name for m in (mcp_registry.get_mcps_by_provider(provider_id) or [])]
-            if await asyncio.to_thread(credential_store.any_hosted_app_account, names):
-                return
-            events_url = (
-                f"{(config.DASHBOARD_PUBLIC_URL or '').rstrip('/')}"
-                f"/v1/webhooks/relay/{provider_id}"
-            )
-            await relay_client.events_register(
-                provider_id=provider_id, events_url=events_url, enabled=False,
-            )
-    except Exception as e:  # noqa: BLE001  # the relay's event registration is best effort, the switch stands
-        logger.info("relay events disable skipped (%s): %s", provider_id, e)
+    async with relay_events.registration_lock():
+        row = await asyncio.to_thread(functools.partial(
+            webhook_subscription_store.create_subscription,
+            **row_args, signing_secret="", delivery_mode="relay",
+        ))
+        try:
+            await relay_events.sync_provider_locked(provider_id)
+        except BaseException as e:
+            await asyncio.to_thread(webhook_subscription_store.delete_subscription, row["id"])
+            if isinstance(e, relay_client.RelayError) and e.code == "events_provider_unsupported":
+                return None
+            if isinstance(e, Exception):
+                # The relay may have taken the register: narrow it back.
+                relay_events.sync_provider_soon(provider_id)
+            if isinstance(e, relay_client.RelayError):
+                # 422, not 502 — edge proxies (Cloudflare) replace origin
+                # 502 bodies with their own HTML page, hiding the message.
+                raise SubscriptionError(relay_client.relay_error_message(e.code), status=422) from e
+            if isinstance(e, Exception):
+                raise SubscriptionError(f"relay events registration failed: {e}", status=502) from e
+            raise
+    return row
 
 
 async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
@@ -603,9 +544,10 @@ async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
     logged and does not block the DB delete (orphan-tolerant by design),
     but it is reported — a hook left behind keeps posting to a dead URL
     until a human removes it in the vendor's settings.
-    Relay-delivered rows have no vendor-side registration; deleting the
-    LAST relay row for a provider best-effort disables relay forwarding
-    (the forward secret is kept for cheap re-enable).
+    Relay-delivered rows have no vendor-side registration; deleting one
+    registers the provider's endpoint again in the background, narrowed to
+    the kinds left, or switched off when nothing here uses the provider any
+    more (``relay_events.provider_gone``).
     """
     row = webhook_subscription_store.get_subscription(subscription_id)
     if not row:
@@ -613,7 +555,7 @@ async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
     if row.get("delivery_mode") == "relay":
         deleted = webhook_subscription_store.delete_subscription(subscription_id)
         if deleted:
-            await _maybe_disable_relay_events(row.get("provider_id", ""))
+            relay_events.sync_provider_soon(row.get("provider_id", ""))
         return deleted, True
     try:
         detached = await _vendor_delete(row) is not False
@@ -726,9 +668,20 @@ async def cleanup_account_subscriptions(
     return await _cleanup_rows(rows, token_owner_sub=token_owner_sub)
 
 
+async def cleanup_mcp_subscriptions(mcp_name: str) -> int:
+    """Delete every subscription that names ``mcp_name`` (its uninstall):
+    the vendor's registration first, while the manifest and the bound
+    tokens still exist."""
+    rows = await asyncio.to_thread(webhook_subscription_store.list_subscriptions, mcp_name=mcp_name)
+    return await _cleanup_rows(rows)
+
+
 async def _cleanup_rows(rows: list[dict], *, token_owner_sub: str = "") -> int:
-    """Best-effort vendor DELETE + DB DELETE for each row."""
+    """Best-effort vendor DELETE + DB DELETE for each row, then one relay
+    registration per provider whose relay rows went (narrowed, or switched
+    off when the last went)."""
     count = 0
+    relay_providers: set[str] = set()
     for row in rows:
         try:
             await _vendor_delete(row, token_owner_sub=token_owner_sub)
@@ -739,6 +692,10 @@ async def _cleanup_rows(rows: list[dict], *, token_owner_sub: str = "") -> int:
             )
         if webhook_subscription_store.delete_subscription(row["id"]):
             count += 1
+            if row.get("delivery_mode") == "relay":
+                relay_providers.add(str(row.get("provider_id") or ""))
+    for provider_id in sorted(relay_providers):
+        relay_events.sync_provider_soon(provider_id)
     return count
 
 

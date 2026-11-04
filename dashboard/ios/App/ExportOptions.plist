@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The TestFlight export: the archive is signed with the Apple
+	     Distribution certificate and the App Store profile the project's
+	     Release configuration names (both created through the App Store
+	     Connect API key and installed on the Mac), and uploaded by the same
+	     step. The build number stays the one the version phase wrote
+	     (VERSIONS.md and OTODOCK_IOS_BUILD). -->
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>destination</key>
+	<string>upload</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>signingCertificate</key>
+	<string>Apple Distribution</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.otodock</key>
+		<string>OtoDock App Store</string>
+	</dict>
+	<key>teamID</key>
+	<string>96TJQ346RH</string>
+	<key>uploadSymbols</key>
+	<true/>
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+</dict>
+</plist>

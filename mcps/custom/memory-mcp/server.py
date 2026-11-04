@@ -14,9 +14,9 @@ Paths are virtual and scope-prefixed:
     /memories/user/...   → private to the current user
 
 The agent's memory CONTENT is injected into its system prompt by the proxy
-(full topic files while small, the generated MEMORY.md index past the
-budget) — so the tool exists to WRITE/UPDATE/DELETE, plus ``view`` for
-topics that weren't inlined.
+(the newest topics whole while the inline budget lasts, the rest listed
+with their index entries) — so the tool exists to WRITE/UPDATE/DELETE,
+plus ``view`` for the listed topics and their sections.
 
 Sessions where both memory scopes are disabled get an empty tool list.
 
@@ -132,33 +132,32 @@ def _default_scope() -> str:
 def _memory_tool() -> Tool:
     scopes = _available_scopes()
     default = _default_scope()
+    shared = "agent" in scopes
+    personal = "user" in scopes
     scope_lines = []
-    if "agent" in scopes:
-        scope_lines.append(
-            "/memories/agent/ — shared with every user of this agent "
-            "(operational facts, conventions, workflows, shared project state)"
-        )
-    if "user" in scopes:
-        scope_lines.append(
-            "/memories/user/ — private to the current user "
-            "(their preferences, context, facts about them)"
-        )
+    if shared:
+        scope_lines.append("/memories/agent/ shared with every user of this agent")
+    if personal:
+        scope_lines.append("/memories/user/ private to the current user")
+    # The rules live in the prompt's Memory section, once; the description
+    # carries the scopes, the default and the commands.
     description = (
-        "Manage your persistent memory — markdown topic files that survive "
-        "across sessions. Available scopes:\n"
+        "Your persistent memory: markdown topic files that survive across "
+        "sessions. Scopes:\n"
         + "\n".join(f"  {s}" for s in scope_lines)
         + f"\nDefault scope: /memories/{default}/. "
-        "Your memory content is already shown in your system prompt (full "
-        "topics while small, the index past that) — use this tool to SAVE, "
-        "UPDATE, or DELETE memories the moment you learn something durable, "
-        "and `view` to read topics that weren't inlined. Update existing "
-        "topics instead of creating duplicates; date entries (YYYY-MM-DD); "
-        "start each topic file with a one-line `# heading` (it becomes the "
-        "index entry). Never store secrets/credentials. MEMORY.md is "
-        "auto-generated — edit topic files only.\n"
-        "Commands: view (directory listing / numbered file read), create "
-        "(new topic file — errors if it exists), str_replace (replace a "
-        "unique string), insert (insert text at a line), delete, rename."
+        "The rules are in your prompt's Memory section. Worked examples: "
+        "the skill `memory-guide`.\n"
+        "Commands: view (a directory listing, or a numbered read; "
+        "view_range reads one section), create (a new topic file, errors "
+        "if it exists), str_replace (replace a string that appears once), "
+        "insert (text after a line, 0 = top), delete, rename"
+        + (
+            " (also /memories/user/<x>.md to /memories/agent/<x>.md: share "
+            "a personal topic with the agent, editors and managers)"
+            if shared and personal else ""
+        )
+        + "."
     )
     return Tool(
         name="memory",

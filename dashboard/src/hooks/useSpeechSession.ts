@@ -10,12 +10,15 @@ import { useChatAudioCapability } from './useChatAudioCapability'
 import { useMyAudioPrefs } from '../api/userAudio'
 import { acquireMic, releaseMic } from '../audio/micCoordinator'
 import { setDictationActive, stopActivePlayback } from '../audio/speechActivity'
-import { browserSttLang, isAutoLanguage } from '../audio/lang'
+import { browserSttLang, deviceLanguage, isAutoLanguage } from '../audio/lang'
 import { resolveSttBackend } from '../audio/resolver'
 import { platformStt, STOP_BACKLOG_MAX_MS, STOP_FINAL_WAIT_MS } from '../audio/backends/platformStt'
-import { DICTATION_FINISHING } from '../audio/backends/dictationWords'
-import { type STTBackend, type STTSession } from '../audio/types'
-import { debugWarn } from '../lib/debug/log'
+import { nativeStt } from '../audio/backends/nativeStt'
+import {
+  DICTATION_DEVICE_FALLBACK, DICTATION_FINISHING, DICTATION_IDLE, DICTATION_NO_MIC, DICTATION_NOT_ALLOWED,
+} from '../audio/backends/dictationWords'
+import { type STTBackend, type STTSession, isNativePlatform } from '../audio/types'
+import { debugLog, debugWarn } from '../lib/debug/log'
 
 // 'finishing': the mic is off and the last words are still on the way (the
 // person stopped and the server's last final has not landed yet, or the
@@ -28,6 +31,11 @@ const STOP_WAIT_MAX_MS = STOP_FINAL_WAIT_MS + STOP_BACKLOG_MAX_MS
 
 const MIN_CONNECTING_MS = 500    // floor so the spinner doesn't flicker + gives the user a beat
 const CONNECT_TIMEOUT_MS = 8000  // give up if the recognizer never signals ready
+// The device session may try the on-device recognizer first (its check, a
+// bounded start that may wait on a model download, the cut's wait) before
+// the online one takes the press: about 11 s at worst with the "already
+// running" retry's second wait, plus the plugin's round trips.
+const DEVICE_CONNECT_TIMEOUT_MS = 12_000
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -60,7 +68,7 @@ export interface SpeechSession {
 }
 
 export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
-  const { data: cap } = useChatAudioCapability()
+  const { data: cap, refetch: refetchCapability } = useChatAudioCapability()
   const { data: prefs } = useMyAudioPrefs()
   const [status, setStatus] = useState<SpeechStatus>('idle')
 
@@ -83,7 +91,12 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
   const hRef = useRef(handlers)
   useLayoutEffect(() => { hRef.current = handlers })
 
-  const available = !!cap && cap.stt !== 'unavailable' && !!resolveSttBackend(cap, prefs?.stt_mode ?? 'auto')
+  // Before the server's answer the microphone shows wherever a device
+  // recognizer is present (the browser's own, or the app's plugin), so a
+  // chat opens with it; a tap before the answer waits for it in start().
+  const available = cap
+    ? cap.stt !== 'unavailable' && !!resolveSttBackend(cap, prefs?.stt_mode ?? 'auto', prefs?.stt_language)
+    : nativeStt.isAvailable()
 
   // Mic arbiter: dictation (platform OR native backend) holds the mic — the
   // ambient wake-word listener must release it while we record. Status-driven
@@ -136,8 +149,18 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
 
   const start = useCallback(async () => {
     if (sessionRef.current) return
-    const backend = cap ? resolveSttBackend(cap, prefs?.stt_mode ?? 'auto') : null
-    if (!backend || !cap) { hRef.current.onError?.('Microphone unavailable.'); return }
+    let capability = cap
+    if (!capability) {
+      // A tap before the capability answered: fetch it now (a stop meanwhile
+      // bumps the attempt and abandons the wait).
+      setStatus('connecting')
+      const waiting = ++attemptRef.current
+      capability = await refetchCapability().then((r) => r.data, () => undefined)
+      if (attemptRef.current !== waiting) return
+    }
+    const backend = capability ? resolveSttBackend(capability, prefs?.stt_mode ?? 'auto', prefs?.stt_language) : null
+    if (!backend || !capability) { hRef.current.onError?.('Microphone unavailable.'); setStatus('idle'); return }
+    const resolved = capability
 
     // Dictation captures WITHOUT echo cancellation (see platformStt) — any
     // in-flight one-shot TTS replay would transcribe itself into the
@@ -156,6 +179,13 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     }
     hRef.current.onNotice?.(null)
     hRef.current.onActive?.(true)
+    const mode = prefs?.stt_mode ?? 'auto'
+    // The person's device pick cannot be honoured (no device recognizer on
+    // this device, or its probe failed): the platform listens, said once.
+    // Under Platform only the policy gave the platform, not the device.
+    if (mode === 'native' && backend === platformStt && !nativeStt.isAvailable()) {
+      hRef.current.onNotice?.(DICTATION_DEVICE_FALLBACK)
+    }
 
     // PER-ATTEMPT state, deliberately closure-local: a stopped session's
     // events land LATE (the server's stop flush takes ~1.5s before its socket
@@ -164,6 +194,8 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     let finals = ''       // accumulated finals for onCommit(text)
     let committed = false // onCommit fired once per attempt
     let errored = false   // attempt hit an error → suppress onCommit
+    let heard = false     // a partial or a final landed in this attempt
+    let fellBack = false  // the platform took over once
 
     const fireCommit = () => {
       if (errored || committed) return
@@ -171,14 +203,32 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
       hRef.current.onCommit?.(finals.trim())
     }
 
+    // The device recognizer failed before a word (its start, or an error
+    // right after): under mode auto on an either capability the platform
+    // takes over once, inside the same attempt (the composer's base stays),
+    // with the notice. Not for a failure the platform shares (no microphone,
+    // the microphone refused), nor for a minute of silence.
+    const canFallBack = (message: string) =>
+      !fellBack && mode === 'auto' && resolved.stt === 'either' && platformStt.isAvailable()
+      && message !== DICTATION_NO_MIC && message !== DICTATION_NOT_ALLOWED && message !== DICTATION_IDLE
+    const fallBack = async (why: unknown) => {
+      fellBack = true
+      debugWarn('device dictation failed before a word, the platform takes over:', why)
+      setStatus('connecting')
+      hRef.current.onNotice?.(DICTATION_DEVICE_FALLBACK)
+      await runWith(platformStt)
+    }
+
     const runWith = async (b: STTBackend) => {
-      // No pick: the browser language. Automatic: the platform engine
-      // identifies the language; the device recognizer needs a code and
-      // keeps the browser's.
+      // No pick, or Automatic, on the device recognizer: the device's own
+      // language, the whole tag (WebKit refuses a bare code as a locale).
+      // No pick on the platform: the browser's base code; Automatic there:
+      // the platform engine identifies the language.
       const stored = prefs?.stt_language
-      const language = !stored || (isAutoLanguage(stored) && b.kind === 'native')
-        ? browserSttLang() : stored
-      const session = b.create({ language, providerId: cap.stt_provider_id })
+      const language = b.kind === 'native' && (!stored || isAutoLanguage(stored)) ? deviceLanguage()
+        : !stored ? browserSttLang() : stored
+      debugLog(`[stt] dictation on ${b.kind === 'native' ? 'this device' : 'the platform'} in ${language}`)
+      const session = b.create({ language, providerId: resolved.stt_provider_id })
       // Set when start() fails or times out. withTimeout REJECTS but the
       // underlying start keeps running — without this flag (and the stop()
       // in the catch) a slow platform connect leaves a ZOMBIE session whose
@@ -192,11 +242,12 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
       // kill switch marks the attempt dead and the tail is dropped.
       let dead = false
       killRef.current = () => { dead = true }
-      session.onPartial((t) => { if (!dead && t) hRef.current.onInterim?.(t) })
+      session.onPartial((t) => { if (!dead && t) { heard = true; hRef.current.onInterim?.(t) } })
       session.onFinal((t) => {
         if (dead) return
         const v = t.trim()
         if (!v) return
+        heard = true
         finals = finals ? `${finals} ${v}` : v
         hRef.current.onFinal?.(v)
       })
@@ -216,8 +267,19 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
         // A stopped attempt's late error (its last words never arrived)
         // must not land over the next recording.
         if (sessionRef.current && sessionRef.current !== session) return
+        const message = e?.message || 'Microphone error.'
+        if (b.kind === 'native' && !heard && sessionRef.current === session && canFallBack(message)) {
+          dead = true   // the device session's end must not commit the attempt
+          session.stop().catch(() => {})
+          sessionRef.current = null
+          void fallBack(e).catch((err) => {
+            hRef.current.onError?.(err instanceof Error ? err.message : 'Microphone unavailable.')
+            setStatus('idle'); hRef.current.onActive?.(false); sessionRef.current = null
+          })
+          return
+        }
         errored = true
-        hRef.current.onError?.(e?.message || 'Microphone error.')
+        hRef.current.onError?.(message)
         // Only the CURRENT session may flip the hook's state — a stopped
         // session's late error must not knock out its successor.
         if (sessionRef.current === session) {
@@ -241,7 +303,8 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
       // Hold "connecting" until the recognizer is genuinely ready (session.start()
       // resolves on the real ready event for the platform WS) AND a minimum beat.
       try {
-        await Promise.all([withTimeout(session.start(), CONNECT_TIMEOUT_MS), sleep(MIN_CONNECTING_MS)])
+        const connect = b.kind === 'native' && isNativePlatform() ? DEVICE_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS
+        await Promise.all([withTimeout(session.start(), connect), sleep(MIN_CONNECTING_MS)])
       } catch (e) {
         dead = true
         session.stop().catch(() => {}) // release the mic/socket the failed start may still hold
@@ -268,23 +331,20 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     try {
       await runWith(backend)
     } catch (e) {
-      // Native start failed past the availability probe (recognizer service
-      // flaked mid-click): under mode 'auto' on an 'either' capability, retry
-      // ONCE on the platform engine instead of leaving a dead mic. An
-      // explicit 'native' pick keeps its honest error.
-      const mode = prefs?.stt_mode ?? 'auto'
-      if (backend.kind === 'native' && mode === 'auto' && cap.stt === 'either'
-          && platformStt.isAvailable() && !sessionRef.current) {
+      // The device start failed past the availability probe (the recognizer
+      // refused, the service flaked mid-click): the platform takes over
+      // once instead of leaving a dead mic. An explicit device pick keeps
+      // its honest error.
+      if (backend.kind === 'native' && !sessionRef.current && canFallBack(e instanceof Error ? e.message : '')) {
         try {
-          debugWarn('native STT start failed — falling back to platform:', e)
-          await runWith(platformStt)
+          await fallBack(e)
           return
         } catch { /* fall through to the shared error path */ }
       }
       hRef.current.onError?.(e instanceof Error ? e.message : 'Microphone unavailable.')
       setStatus('idle'); hRef.current.onActive?.(false); sessionRef.current = null
     }
-  }, [cap, prefs])
+  }, [cap, prefs, refetchCapability])
 
   // A tap while a stopped dictation finishes starts the next one (it waits
   // for those last words); a tap on a live or connecting session stops it.

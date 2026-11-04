@@ -169,6 +169,30 @@ def test_allowlist_accepts_platform_mcp_endpoints():
     assert _is_allowed_path("/v1/execution-layers")
 
 
+def test_allowlist_accepts_the_cards_draw_and_read_never_the_click():
+    """The agent-creator tool draws a proposal card and reads its state over
+    the tunnel (0.5.162); the person's click takes a sign-in and is never
+    forwarded, nor anything past a card's id."""
+    assert _is_allowed_path("/v1/cards")
+    assert _is_allowed_path("/v1/cards/0b7a4c6e-9d2f-4e1a-8c3b-5f6a7d8e9f00")
+    assert not _is_allowed_path("/v1/cards/0b7a4c6e-9d2f-4e1a-8c3b-5f6a7d8e9f00/act")
+    assert not _is_allowed_path("/v1/cards/")
+    assert not _is_allowed_path("/v1/cards/x/y")
+
+
+def test_allowlist_accepts_the_agent_creators_reads_exactly():
+    """The agent-creator tool reads the catalog's templates and sets and the
+    departments the person may see (0.5.163): the three exact paths, never
+    a department's own routes or the catalog's install routes."""
+    assert _is_allowed_path("/v1/community/agents")
+    assert _is_allowed_path("/v1/community/departments")
+    assert _is_allowed_path("/v1/departments")
+    assert not _is_allowed_path("/v1/departments/dept-1")
+    assert not _is_allowed_path("/v1/departments/")
+    assert not _is_allowed_path("/v1/community/agents/install")
+    assert not _is_allowed_path("/v1/community/departments/x")
+
+
 def test_allowlist_still_rejects_sensitive():
     """The broadened allowlist must NOT open admin / user / auth surfaces."""
     assert not _is_allowed_path("/v1/admin/remote-machines")

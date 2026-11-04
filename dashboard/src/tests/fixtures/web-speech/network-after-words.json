@@ -1,0 +1,40 @@
+{
+ "source": "The link goes after words: the words stay, the lost sentence, the end.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "γεια"
+    }
+   ]
+  },
+  {
+   "event": "error",
+   "error": "network"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [],
+  "replaces": [],
+  "interims": [
+   "γεια"
+  ],
+  "errors": [
+   "LOST"
+  ],
+  "ended": [
+   "error"
+  ],
+  "recognizers": 1
+ }
+}

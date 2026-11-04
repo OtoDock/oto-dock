@@ -14,6 +14,8 @@ their own modules alongside this one.
 import asyncio
 import uuid
 
+import pytest
+
 from tests.fixtures.ws_dashboard_harness import (
     ANY,
     TEST_MODEL,
@@ -252,6 +254,30 @@ class TestConnectionLifecycle:
                 assert set(snap["chat_ids"]) == {"snap-own", "snap-shared"}
         run_ws_scenario(scenario)
 
+    @pytest.mark.parametrize("shared_only,role,shown", [
+        (False, "viewer", False),     # a collaborative agent's worker: the agent's own work
+        (False, "editor", True),
+        (True, "viewer", True),       # a Shared-only pool chat: every member
+    ])
+    def test_connect_snapshot_floors_an_agent_owned_chat_off_a_shared_only_agent(
+            self, temp_db, monkeypatch, shared_only, role, shown):
+        from core.session import session_state
+        slug = (make_test_agent(collaborative=False, default_scope="agent") if shared_only
+                else make_test_agent())
+        temp_db.set_user_agents("user-viewer", [slug], "user-admin", agent_roles={slug: role})
+        temp_db.create_chat("snap-worker", f"agent::{slug}", slug)
+        monkeypatch.setitem(session_state._chat_streaming_state, "snap-worker", {"streaming": True})
+
+        async def scenario():
+            cookie = session_cookie(sub="user-viewer", email="viewer@test.com",
+                                    name="Viewer User", role="member")
+            async with dashboard_connection(cookie) as ws:
+                await ws.expect({"type": "notification_count", "count": 0})
+                await ws.expect({"type": "satellite_update_sync", "inflight": []})
+                snap = await ws.expect({"type": "chat_status_snapshot", "chat_ids": ANY})
+                assert snap["chat_ids"] == (["snap-worker"] if shown else [])
+        run_ws_scenario(scenario)
+
     def test_connect_snapshot_hides_shared_chats_from_unassigned_member(
             self, temp_db, monkeypatch):
         # An unassigned member gets the EMPTY snapshot even while a shared-only
@@ -363,7 +389,8 @@ class TestNewChatWarmup:
                     "chat_id": ANY,
                     "agent": slug,
                     "execution_path": "claude-code-cli",
-                    "execution_target": "local",
+                    # A new chat on the default place: not placed yet.
+                    "execution_target": "",
                     "new_chat": True,
                 })
                 chat_id = started["chat_id"]
@@ -525,6 +552,48 @@ class TestWarmupStartedNewChatFlag:
             ws.no_more_frames()
         run_ws_scenario(scenario)
 
+    @pytest.mark.parametrize(("text", "queued", "sentence"), [
+        ("hello there", False, "MACHINE_GONE_NOT_SENT"),
+        ("", True, "MACHINE_GONE_NOT_SENT"),
+        ("", False, "MACHINE_GONE"),
+    ], ids=["its-first-message", "a-queued-message", "no-message"])
+    def test_a_machine_that_drops_off_during_the_start_ends_with_a_plain_card(
+            self, temp_db, monkeypatch, text, queued, sentence):
+        """A start whose computer froze: the connection layer raises
+        "Satellite <id> not connected" when it drops the machine, and the
+        card says what happened and what to do, never the machine's id; it
+        names "your message" only when one rides the start (the warm-up's
+        own, or one queued while it warmed)."""
+        from core.events import input_queue
+        from ws import dashboard_chat_text
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+
+        async def _gone(sid, agent_cfg):
+            raise RuntimeError("Satellite 790546a4 not connected")
+        layer.start_session = _gone
+        if queued:
+            monkeypatch.setattr(input_queue, "peek", lambda chat_id: [object()])
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "warmup", "agent": slug, **({"text": text} if text else {})})
+                started = await ws.expect({
+                    "type": "warmup_started", "chat_id": ANY, "agent": slug,
+                    "execution_path": "claude-code-cli", "execution_target": "", "new_chat": True,
+                })
+                await ws.expect({"type": "notification_count", "count": 0})
+                failed = await ws.expect({
+                    "type": "warmup_failed", "chat_id": started["chat_id"],
+                    "error": ANY, "reason": "target_unavailable",
+                })
+                assert failed["error"] == getattr(dashboard_chat_text, sentence)
+                assert "790546a4" not in failed["error"]
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+
     def test_unknown_chat_id_mints_a_new_chat(self, temp_db, monkeypatch):
         layer = FakeExecutionLayer()
         layer.start_gate = asyncio.Event()
@@ -539,7 +608,7 @@ class TestWarmupStartedNewChatFlag:
                 started = await ws.expect({
                     "type": "warmup_started", "chat_id": ANY, "agent": slug,
                     "execution_path": "claude-code-cli",
-                    "execution_target": "local", "new_chat": True,
+                    "execution_target": "", "new_chat": True,
                 })
                 assert started["chat_id"] != "no-such-chat"
                 await ws.expect({"type": "notification_count", "count": 0})
@@ -581,7 +650,7 @@ class TestChatTurn:
                 started = await ws.expect({
                     "type": "warmup_started", "chat_id": ANY, "agent": slug,
                     "execution_path": "claude-code-cli",
-                    "execution_target": "local", "new_chat": True,
+                    "execution_target": "", "new_chat": True,
                 })
                 chat_id = started["chat_id"]
                 await ws.expect({"type": "notification_count", "count": 0})

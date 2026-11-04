@@ -155,7 +155,12 @@ def init_tasks(conn) -> None:
             -- knowledge-write grant follows), transferred_at the last hop.
             -- Empty on a row that never moved. Existing DBs: run_migrations.
             transferred_from TEXT NOT NULL DEFAULT '',
-            transferred_at TEXT NOT NULL DEFAULT ''
+            transferred_at TEXT NOT NULL DEFAULT '',
+            -- Who is told: the lowest
+            -- per-agent role an agent-scope task's notifications reach;
+            -- admins always. Existing DBs: migrate_automation.
+            notify_audience TEXT NOT NULL DEFAULT 'editor'
+                CHECK (notify_audience IN ('manager', 'editor', 'contributor', 'viewer'))
         )
     """)
     # Template-idempotency partial indexes — one row per
@@ -203,7 +208,11 @@ def init_notifications(conn) -> None:
             community_template_item_slug TEXT,
             -- The offboarding transfer record, as on dynamic_tasks.
             transferred_from TEXT NOT NULL DEFAULT '',
-            transferred_at TEXT NOT NULL DEFAULT ''
+            transferred_at TEXT NOT NULL DEFAULT '',
+            -- An agent-scope row's lowest role told: a task run's send
+            -- carries its task's; every other row tells the agent's users.
+            audience TEXT NOT NULL DEFAULT 'viewer'
+                CHECK (audience IN ('manager', 'editor', 'contributor', 'viewer'))
         )
     """)
     conn.execute("""
@@ -366,7 +375,10 @@ def init_triggers(conn) -> None:
             handler TEXT,
             -- The offboarding transfer record, as on dynamic_tasks.
             transferred_from TEXT NOT NULL DEFAULT '',
-            transferred_at TEXT NOT NULL DEFAULT ''
+            transferred_at TEXT NOT NULL DEFAULT '',
+            -- Who the notify block tells, as on dynamic_tasks.
+            notify_audience TEXT NOT NULL DEFAULT 'editor'
+                CHECK (notify_audience IN ('manager', 'editor', 'contributor', 'viewer'))
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_triggers_agent ON triggers(agent)")
@@ -435,3 +447,36 @@ def init_triggers(conn) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_sub)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_api_keys_prefix ON user_api_keys(prefix)")
+
+
+def _column_default(conn, table: str, column: str) -> str | None:
+    row = conn.execute(
+        "SELECT column_default FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+        (table, column),
+    ).fetchone()
+    return row["column_default"] if row else None
+
+
+def migrate_automation(conn) -> None:
+    """The automation domain's forward migrations on an existing install
+    (``run_migrations`` calls it before the role CHECKs; every step is
+    idempotent)."""
+    # The per-task model + engine override, the task's machine (1.9.0) and
+    # its permission mode (1.9.0): empty on every pre-existing row = the
+    # agent's default, Don't Ask, as those tasks ran before.
+    for column in ("override_model", "override_execution_path", "target_machine",
+                   "permission_mode"):
+        conn.execute(f"ALTER TABLE dynamic_tasks ADD COLUMN IF NOT EXISTS {column} TEXT DEFAULT ''")
+    # Who is told (1.9.1): every pre-existing task and trigger keeps telling
+    # every member (viewer); a new one tells the editor tier. The default is
+    # set only when it differs, so a boot after the first rewrites no
+    # catalog entry. The role CHECKs come from run_migrations'
+    # _ROLE_CHECKS.
+    for table in ("dynamic_tasks", "triggers"):
+        conn.execute(f"ALTER TABLE {table} "
+                     "ADD COLUMN IF NOT EXISTS notify_audience TEXT NOT NULL DEFAULT 'viewer'")
+        if not (_column_default(conn, table, "notify_audience") or "").startswith("'editor'"):
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN notify_audience SET DEFAULT 'editor'")
+    conn.execute("ALTER TABLE notifications "
+                 "ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'viewer'")

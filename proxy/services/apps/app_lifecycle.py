@@ -150,7 +150,7 @@ async def purge(row: dict) -> dict:
     present, same = (await asyncio.to_thread(_is_the_registered_folder)) if row.get("rel_path") else (False, False)
     if present:
         if same:
-            removed_files = await _remove_workspace_folder(row["agent"], agent_dir, folder)
+            removed_files = await remove_workspace_folder(row["agent"], agent_dir, folder)
         else:
             logger.warning("App purge: %s resolves elsewhere; the folder was left in place",
                            row["rel_path"])
@@ -173,7 +173,7 @@ async def remove_user_app_dirs(sub: str) -> int:
     return len(rows)
 
 
-async def _remove_workspace_folder(agent: str, agent_dir: Path, folder: Path) -> int:
+async def remove_workspace_folder(agent: str, agent_dir: Path, folder: Path) -> int:
     """The files-API delete sequence per file (recover-bin capture,
     tombstone, delete push), then the empty directories. The files come
     from a walk beneath the agents tree that lists no link and enters none

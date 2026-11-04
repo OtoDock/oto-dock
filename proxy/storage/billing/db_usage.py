@@ -302,7 +302,8 @@ def get_all_users_usage(start: str, end: str) -> list[dict]:
 
 
 def get_agent_activity_counts(start: str, end: str, viewer_sub: str,
-                              shared_agents: list[str]) -> dict[str, dict]:
+                              shared_agents: list[str],
+                              own_work_agents: list[str] | None = None) -> dict[str, dict]:
     """Per-agent activity volume for the agents-map heat, as ``viewer_sub``
     may see it: {agent: {messages, records}}. A row counts when it is the
     agent's own work (``scope='agent'``), the viewer's own, or a chat turn
@@ -313,17 +314,22 @@ def get_agent_activity_counts(start: str, end: str, viewer_sub: str,
     the map. usage_records is the deliberate heat source: it is
     small (rollup rows) and indexed by (agent, scope, created_at);
     chat_messages is the highest-cardinality table in the schema and has
-    no timestamp index, so it must NOT back this."""
+    no timestamp index, so it must NOT back this. ``own_work_agents`` names
+    the agents whose own work (``scope='agent'``) the viewer sees, the editor
+    tier; None = every agent's."""
+    own = "scope = 'agent'" if own_work_agents is None else "(scope = 'agent' AND agent = ANY(%s))"
+    params: list = [start, end] + ([] if own_work_agents is None else [list(own_work_agents)])
+    params += [viewer_sub, list(shared_agents)]
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT agent, COALESCE(SUM(message_count),0) AS messages,"
             " COUNT(*) AS records"
             " FROM usage_records WHERE created_at>=%s AND created_at<%s"
             " AND agent IS NOT NULL AND agent<>''"
-            " AND (scope = 'agent' OR user_sub = %s"
+            f" AND ({own} OR user_sub = %s"
             "      OR (agent = ANY(%s) AND source_type = 'chat'))"
             " GROUP BY agent",
-            (start, end, viewer_sub, list(shared_agents)),
+            params,
         ).fetchall()
         return {r["agent"]: {"messages": r["messages"], "records": r["records"]}
                 for r in rows}

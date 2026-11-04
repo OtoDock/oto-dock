@@ -573,3 +573,23 @@ class TestSharedChatContinuationIdentity:
         self._fire(self._chat("task::so"), "user-viewer2")
         assert [(c["user_sub"], c["role"]) for c in fire_env["calls"]] == [
             (None, "manager"), (None, "editor"), (None, "editor")]
+
+
+class TestWakeFrame:
+    """A fired wake's card reaches a viewer of the chat: the rungs with no
+    socket of their own broadcast the frame where they write the row."""
+
+    def test_a_fired_wake_broadcasts_its_card_with_its_row(self, fire_env, monkeypatch):
+        from core.session import session_state
+        frames: list = []
+        monkeypatch.setattr(session_state, "broadcast_chat_frame",
+                            lambda cid, frame: frames.append((cid, frame)))
+        chat_id = fire_env["chat_id"]
+        task = _cont_task(chat_id, delay_seconds=60)
+        asyncio.run(scheduler.add_dynamic_task(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        assert len(_wake_events(chat_id)) == 1
+        assert frames == [(chat_id, {
+            "type": "schedule_wake", "chat_id": chat_id,
+            "prompt": task.prompt, "task_id": task.id,
+        })]

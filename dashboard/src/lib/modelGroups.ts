@@ -13,7 +13,11 @@
  *    session-file based when possible) plus every OTHER enabled engine the
  *    user can run — picking one of those is the cross-engine switch flow
  *    (banner + confirm; never an immediate model_change).
+ *  - An engine the agent restricts to local models (`localOnly`) offers
+ *    only the models of the engine's local providers (the descriptor's
+ *    `local` kind).
  */
+import { PROVIDER_LOCAL } from './engines'
 
 export interface ModelGroupOption {
   value: string
@@ -34,7 +38,8 @@ export interface ModelGroup {
 
 export interface LayerCatalogEntry {
   display_name: string
-  models?: { value: string; label: string; tier?: number | null; tier_label?: string; good_at?: string }[]
+  models?: { value: string; label: string; provider?: string; tier?: number | null; tier_label?: string; good_at?: string }[]
+  providers?: { id: string; kind?: string }[] | null
   auto_model?: string
   model_successors?: Record<string, string>
 }
@@ -60,6 +65,15 @@ export interface ComputeModelGroupsArgs {
    * the task-chat lock path handled this case; the unlock (1.5) moved the
    * responsibility here. */
   activeModel?: string
+  /** The agent's engines restricted to local models (`local_only_engines`). */
+  localOnly?: string[]
+}
+
+/** The provider ids whose models an engine may offer under the agent's
+ *  local-only rule: null when the rule does not apply to it. */
+function localProviderIds(cap: LayerCatalogEntry, path: string, localOnly?: string[]): Set<string> | null {
+  if (!localOnly?.includes(path)) return null
+  return new Set((cap.providers ?? []).filter((p) => p.kind === PROVIDER_LOCAL).map((p) => p.id))
 }
 
 /** The agent's enabled engines this user can run — unfiltered when that
@@ -71,8 +85,18 @@ export function visibleAgentPaths(
   return accessible.length > 0 ? accessible : agentPaths
 }
 
+/** The agent's engines in the person's order (`engine_order_for_me`, the
+ * engines they use most there first), the server's answer as given: its
+ * entries the agent allows, then any engine it does not name in the agent's
+ * order; the agent's order when no order came (an older proxy, loading). */
+export function inPersonOrder(agentPaths: string[], order?: string[]): string[] {
+  if (!order || order.length === 0) return agentPaths
+  const named = order.filter((p, i) => agentPaths.includes(p) && order.indexOf(p) === i)
+  return [...named, ...agentPaths.filter(p => !named.includes(p))]
+}
+
 export function computeModelGroups(
-  { layers, agentPaths, chatActiveLayer, processAlive, canRun, streaming, warming, activeModel }: ComputeModelGroupsArgs,
+  { layers, agentPaths, chatActiveLayer, processAlive, canRun, streaming, warming, activeModel, localOnly }: ComputeModelGroupsArgs,
 ): ModelGroup[] | undefined {
   if (!layers) return undefined
 
@@ -91,8 +115,9 @@ export function computeModelGroups(
   for (const path of pathsToShow) {
     const cap = layers[path]
     if (cap) {
+      const local = localProviderIds(cap, path, localOnly)
       const models: ModelGroupOption[] = (cap.models || [])
-        .filter((m) => m.value !== '')
+        .filter((m) => m.value !== '' && (!local || local.has(m.provider ?? '')))
         .map((m, i) => ({ m, i }))
         .sort((a, b) => tierRank(a.m.tier) - tierRank(b.m.tier) || a.i - b.i)
         .map(({ m }) => ({

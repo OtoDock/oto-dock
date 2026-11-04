@@ -26,7 +26,7 @@ import {
 } from '../../lib/visibility'
 import StrongConfirmModal from '../../components/StrongConfirmModal'
 import AgentUpdateModal from '../../components/AgentUpdateModal'
-import { engineLabel, isCoding, orderedEngines, runsInteractive, runsRemote, vendorBadge } from '../../lib/engines'
+import { engineLabel, hasLocalProviders, isCoding, orderedEngines, runsInteractive, runsRemote, vendorBadge } from '../../lib/engines'
 import { coerceEffort, effortLabel, effortLadder, offeredEffortLevels, type EffortListing } from '../../lib/engines/effort'
 import Switch from '../../components/ui/Switch'
 import Button from '../../components/ui/Button'
@@ -94,6 +94,7 @@ export default function AgentConfig() {
   // (the server always sends a primary); nothing is assumed before it loads.
   const [executionPath, setExecutionPath] = useState('')
   const [executionPaths, setExecutionPaths] = useState<string[]>([])
+  const [localOnlyEngines, setLocalOnlyEngines] = useState<string[]>([])
   const [defaultModel, setDefaultModel] = useState('')
   // Interactive-CLI per-agent default execution mode: '' (unset
   // → platform default), 'interactive', or '-p'. Only shown when the default
@@ -157,6 +158,7 @@ export default function AgentConfig() {
     setInfoShown(info)
     setExecutionPath(info.execution_path || '')
     setExecutionPaths(info.execution_paths || (info.execution_path ? [info.execution_path] : []))
+    setLocalOnlyEngines(info.local_only_engines || [])
     setDefaultModel(info.default_model || '')
     setDefaultExecutionMode(info.default_execution_mode || '')
     setDefaultEffort(info.default_effort || '')
@@ -812,32 +814,32 @@ export default function AgentConfig() {
               <div>
                 <p className="text-sm font-medium text-primary">
                   AI Engines
-                  <InfoTip label="AI Engines">Which AI engines this agent can use</InfoTip>
+                  <InfoTip label="AI Engines">The engines this agent may run on. Each person's chats and tasks use their own engine among these.</InfoTip>
                   <SaveState state={stateOf('execution_paths')} />
                 </p>
               </div>
             </div>
             {/* Click-to-toggle cards (like the visibility options) — full-width,
-                mobile-friendly, with a provider badge per engine. */}
+                mobile-friendly, with a provider badge per engine. The cards
+                are an allowlist: a person's own account may serve any of
+                them, so none is locked. The platform gate is on the DEFAULT
+                engine alone (the server refuses a move of it onto an engine
+                the platform pool lacks). */}
             <div className="space-y-2">
               {orderedEngines(layers).map((engine) => {
                 const path = engine.name
                 const badge = vendorBadge(engine)
                 const label = engineLabel(engine)
                 const checked = executionPaths.includes(path)
-                // Platform-level gate (server mirror: PATCH /v1/agents refuses
-                // newly-added unconfigured engines). `!== false` so a loading
-                // list or an older proxy (field absent) never flashes a locked
-                // card. Already-enabled engines stay uncheckable-only when
-                // their platform subscription vanished (grandfathering);
-                // admins toggle freely (they're about to connect one).
+                // `!== false` so a loading list or an older proxy (field
+                // absent) never shows the hint by guess.
                 const configured = engine.configured !== false
-                const lockedOff = !checked && !configured && !isAdmin
+                const localOnly = localOnlyEngines.includes(path)
                 return (
+                  <Fragment key={path}>
                   <button
                     type="button"
-                    key={path}
-                    disabled={isReadOnly || lockedOff}
+                    disabled={isReadOnly}
                     onClick={() => {
                       let next: string[]
                       if (checked) {
@@ -861,7 +863,7 @@ export default function AgentConfig() {
                     }}
                     className={`w-full flex items-start gap-2.5 rounded-control border px-3 py-2 text-left transition-colors ${
                       checked ? 'border-subtle bg-action-subtle' : 'border-subtle hover:bg-surface-hover'
-                    } ${isReadOnly || lockedOff ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+                    } ${isReadOnly ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
                   >
                     <span className={`mt-0.5 w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center ${
                       checked ? 'bg-action border-action text-action-fg' : 'border-strong'
@@ -886,14 +888,37 @@ export default function AgentConfig() {
                           Supporting engine: fewer tools, faster replies.
                         </span>
                       )}
-                      {!configured && !checked && (
+                      {!configured && (
                         <span className="block text-xs text-status-warning-fg mt-0.5">
-                          No {label} subscription is connected on this platform
-                          {isAdmin ? '. Connect one in Setup, AI Engines.' : '.'}
+                          No platform subscription. The agent&apos;s own tasks cannot use it. People with their own account can.
+                          {isAdmin ? ' Connect one in Setup, AI Engines.' : ''}
                         </span>
                       )}
                     </span>
                   </button>
+                  {/* The local-only rule, a row of its own below a checked
+                      card (the card is a button): only on an engine that
+                      declares a local provider, never on Claude Code's. */}
+                  {checked && hasLocalProviders(engine) && (
+                    <div className="flex items-center gap-2 pl-9 pr-2 -mt-0.5">
+                      <Switch
+                        checked={localOnly}
+                        disabled={isReadOnly}
+                        aria-labelledby={`local-only-${path}`}
+                        onChange={(on) => {
+                          const next = on
+                            ? [...localOnlyEngines, path]
+                            : localOnlyEngines.filter(p => p !== path)
+                          setLocalOnlyEngines(next)
+                          save('local_only_engines', next, back((i) => setLocalOnlyEngines(i.local_only_engines || [])))
+                        }}
+                      />
+                      <span id={`local-only-${path}`} className="text-xs text-secondary">Only allow local models</span>
+                      <InfoTip label="Only allow local models">On this engine the agent runs only models from a local model server. A subscription or an API key is not used here.</InfoTip>
+                      <SaveState state={stateOf('local_only_engines')} />
+                    </div>
+                  )}
+                  </Fragment>
                 )
               })}
             </div>
@@ -1394,8 +1419,7 @@ export default function AgentConfig() {
               </p>
               <p className="text-xs text-tertiary mt-0.5">
                 Libraries mirror into <span className="font-mono">knowledge/shared/&lt;source&gt;/&lt;folder&gt;/</span> on
-                attached agents. Read-only mirrors are edited on the source agent. A library's{' '}
-                <span className="font-mono">bulletin/&lt;name&gt;.md</span> is injected into every attached agent's context.
+                attached agents. Read-only mirrors are edited on the source agent.
               </p>
             </div>
           </div>
@@ -1437,14 +1461,6 @@ export default function AgentConfig() {
                     <span className="flex-1 min-w-0 truncate">
                       <span className="text-sm text-primary">{lib.name || name}</span>
                       <span className="text-xs font-mono text-tertiary"> · {lib.subdir ? `${lib.subdir}/` : 'whole folder'}</span>
-                      {lib.has_bulletin && (
-                        <span
-                          className={`ml-1.5 text-3xs font-semibold px-1.5 py-0.5 rounded-sm ${BADGE_TONE.info}`}
-                          title={`bulletin/${lib.name}.md is injected into every attached agent's context`}
-                        >
-                          bulletin
-                        </span>
-                      )}
                     </span>
                     {lib.consumers.length > 0 ? (
                       <span className="hidden sm:flex flex-wrap gap-1.5">
@@ -1522,14 +1538,6 @@ export default function AgentConfig() {
                     <span className="flex-1 min-w-0 truncate">
                       <span className="text-sm text-primary">{a.name || a.source_agent}</span>
                       <span className="text-xs font-mono text-tertiary"> · {libMountPath(a.source_agent, a.subdir)}</span>
-                      {a.has_bulletin && (
-                        <span
-                          className={`ml-1.5 text-3xs font-semibold px-1.5 py-0.5 rounded-sm ${BADGE_TONE.info}`}
-                          title="This library publishes a bulletin into this agent's context"
-                        >
-                          bulletin
-                        </span>
-                      )}
                     </span>
                     {canMutateKnowledge ? (
                       <>

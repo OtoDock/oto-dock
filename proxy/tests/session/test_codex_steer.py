@@ -52,27 +52,48 @@ def test_codex_capabilities_expose_plan_mode():
 
 
 class TestCollaborationMode:
-    """Plan collaboration mode is DERIVED from the platform mode
+    """The collaboration mode is DERIVED from the platform mode
     (`permission_mode`), not from the sandbox: plan mode runs a read-only
     sandbox, but so does a judge session (CHECKS.md), which must stay in the
-    default collaboration mode. The per-turn override uses the MINIMAL
-    {mode:...} (not the full preset, whose reasoning_effort would clobber the
-    user's effort)."""
+    default collaboration mode. It rides turn/start's top-level
+    ``collaborationMode`` with the session's own model and effort (a
+    ``collaborationMode/list`` preset would bring its own effort) and a null
+    ``developer_instructions`` (the mode's built-in text)."""
 
-    def test_plan_mode_is_plan(self):
+    def test_plan_mode_is_plan_with_the_sessions_model(self):
         s = _mk(sandbox_mode="read-only")
         s.set_mode("plan", "read-only")
-        assert s._collaboration_mode() == {"mode": "plan"}
+        s.effort = "high"
+        assert s._collaboration_mode() == {"mode": "plan", "settings": {
+            "model": "gpt-5.4", "reasoning_effort": "high", "developer_instructions": None}}
 
     def test_read_only_without_plan_is_default(self):
         # A judge: read-only sandbox, ordinary collaboration.
-        assert _mk(sandbox_mode="read-only")._collaboration_mode() == {"mode": "default"}
+        assert _mk(sandbox_mode="read-only")._collaboration_mode()["mode"] == "default"
 
     def test_workspace_write_is_default(self):
-        assert _mk(sandbox_mode="workspace-write")._collaboration_mode() == {"mode": "default"}
+        assert _mk(sandbox_mode="workspace-write")._collaboration_mode()["mode"] == "default"
 
     def test_danger_full_access_is_default(self):
-        assert _mk(sandbox_mode="danger-full-access")._collaboration_mode() == {"mode": "default"}
+        assert _mk(sandbox_mode="danger-full-access")._collaboration_mode()["mode"] == "default"
+
+    def test_an_unpinned_session_takes_the_threads_model_and_effort(self):
+        s = _mk()
+        s.model = ""
+        s._note_thread_settings({"model": "gpt-6.1-sol", "reasoningEffort": "medium"})
+        assert s._collaboration_mode()["settings"] == {
+            "model": "gpt-6.1-sol", "reasoning_effort": "medium", "developer_instructions": None}
+
+    def test_no_effort_is_null_never_empty(self):
+        # ReasoningEffort has minLength 1 in the protocol.
+        s = _mk()
+        s._note_thread_settings({"model": "gpt-5.4", "reasoningEffort": None})
+        assert s._collaboration_mode()["settings"]["reasoning_effort"] is None
+
+    def test_no_known_model_sends_no_mode(self):
+        s = _mk()
+        s.model = ""
+        assert s._collaboration_mode() == {}
 
 
 class TestCodexSteer:

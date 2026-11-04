@@ -144,6 +144,8 @@ class TestListingOffLoop:
             "skill-c": _manifest("skill-c", category="skill"),
             "cap-d": _manifest("cap-d", cap="audio_tts"),
             "off-e": _manifest("off-e"),
+            # Attached by the platform: a stray enabled row never counts.
+            "plat-f": _manifest("plat-f", assignment_mode="platform"),
         }
         monkeypatch.setattr(mcp_registry, "_manifests", manifests)
         monkeypatch.setattr(audio_service, "tts_capability_available", lambda: tts_available)

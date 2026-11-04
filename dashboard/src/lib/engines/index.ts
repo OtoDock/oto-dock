@@ -96,6 +96,13 @@ export function isLocalProvider(d: EngineDescriptor | undefined, id: string): bo
   return providerEntry(d, id)?.kind === PROVIDER_LOCAL
 }
 
+/** The engine declares a local provider, so an agent may restrict it to
+ *  local models (the "Only allow local models" row; none on an engine with
+ *  a vendor alone, nor on the hosted build's Codex and Direct). */
+export function hasLocalProviders(d: EngineDescriptor | undefined): boolean {
+  return (d?.providers ?? []).some((p) => p.kind === PROVIDER_LOCAL)
+}
+
 /** The providers the hosted relay fronts on this engine — the entries that
  *  declare a `relay_path`. */
 export function relayProviders(d: EngineDescriptor): EngineProvider[] {

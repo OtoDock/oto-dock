@@ -273,8 +273,7 @@ def pings(monkeypatch):
 
     monkeypatch.setattr(stream_pump.notification_manager, "fire_ephemeral", _fake_ephemeral)
     maps = (session_state._permission_events, session_state._permission_decisions,
-            session_state._session_permission_requests, session_state._permission_request_sessions,
-            session_state._question_events)
+            session_state._session_permission_requests, session_state._permission_request_sessions)
     yield fired
     for m in maps:
         m.clear()
@@ -534,13 +533,13 @@ async def test_a_question_card_pings_with_its_question_and_once_across_a_retry(t
     temp_db.create_chat("np9", "user-admin", "a1")
     pump = _mk_pump("np9")
     try:
-        session_state._question_events["req-q1"] = asyncio.Event()
+        session_state.open_permission_wait("req-q1")
         await pump._handle_perm_event(_question_item("req-q1"))
         await _settle()
-        session_state._question_events.pop("req-q1")
+        session_state._permission_events.pop("req-q1")
         await pump._handle_perm_event({"event_type": "prompt_retired", "request_id": "req-q1",
                                        "caller_gone": True})
-        session_state._question_events["req-q2"] = asyncio.Event()
+        session_state.open_permission_wait("req-q2")
         await pump._handle_perm_event(_question_item("req-q2"))
         await _settle()
         assert [p["body"] for p in pings] == ["Delete the keypair file?"]

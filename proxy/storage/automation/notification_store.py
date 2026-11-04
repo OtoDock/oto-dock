@@ -9,6 +9,7 @@ from typing import Any
 
 import psycopg
 
+from auth import roles
 from storage.pg import get_conn
 
 
@@ -38,8 +39,11 @@ def create_notification(
     user_tz: str | None = None,
     community_template: str | None = None,
     community_template_item_slug: str | None = None,
+    audience: str = roles.VIEWER,
 ) -> dict:
     """Create a notification definition. Returns the full row as dict.
+    ``audience`` is an agent-scope row's lowest per-agent role told (every
+    member by default; a task run's send carries its task's).
 
     ``community_template`` + ``community_template_item_slug`` are populated
     when the row is seeded by the community-agents installer. The
@@ -53,8 +57,8 @@ def create_notification(
                (id, title, body, severity, scope, target, source, source_id,
                 notification_type, schedule, run_at, interval_seconds,
                 created_by, created_at, enabled, agent_slug, chat_id, user_tz,
-                community_template, community_template_item_slug)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s)
+                community_template, community_template_item_slug, audience)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (id) DO UPDATE SET
                 title=EXCLUDED.title, body=EXCLUDED.body, severity=EXCLUDED.severity,
                 scope=EXCLUDED.scope, target=EXCLUDED.target, source=EXCLUDED.source,
@@ -65,11 +69,12 @@ def create_notification(
                 agent_slug=EXCLUDED.agent_slug, chat_id=EXCLUDED.chat_id,
                 user_tz=EXCLUDED.user_tz,
                 community_template=EXCLUDED.community_template,
-                community_template_item_slug=EXCLUDED.community_template_item_slug""",
+                community_template_item_slug=EXCLUDED.community_template_item_slug,
+                audience=EXCLUDED.audience""",
             (nid, title, body, severity, scope, target, source, source_id,
              notification_type, schedule, run_at, interval_seconds,
              created_by, now, agent_slug, chat_id, user_tz,
-             community_template, community_template_item_slug),
+             community_template, community_template_item_slug, audience or roles.VIEWER),
         )
         row = conn.execute("SELECT * FROM notifications WHERE id=%s", (nid,)).fetchone()
         return dict(row)
@@ -513,6 +518,24 @@ def get_admin_user_subs() -> list[str]:
     with get_conn() as conn:
         rows = conn.execute("SELECT sub FROM users WHERE role='admin'").fetchall()
         return [r["sub"] for r in rows]
+
+
+def get_agent_members(agent: str) -> list[tuple[str, str]]:
+    """``(sub, role)`` of every user assigned to ``agent`` and every platform
+    admin (``admin`` whatever their row says), one pair per person: the
+    audience the per-agent role floors filter (``roles.meets_floor``)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT sub, agent_role AS role FROM user_agents WHERE agent=%s
+               UNION ALL
+               SELECT sub, %s AS role FROM users WHERE role=%s""",
+            (agent, roles.ADMIN, roles.ADMIN),
+        ).fetchall()
+    members: dict[str, str] = {}
+    for r in rows:
+        if roles.is_admin(r["role"]) or r["sub"] not in members:
+            members[r["sub"]] = r["role"]
+    return list(members.items())
 
 
 def get_agent_user_subs(agent: str) -> list[str]:

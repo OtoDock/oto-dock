@@ -1,0 +1,64 @@
+{
+ "source": "Defensive: a final revised at its index (a capital, punctuation, a longer reading). Neither Chrome nor WebKit revises a final; kept so a revision would rewrite the session's words rather than double them.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "Hello world."
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "Hello world."
+    },
+    {
+     "isFinal": true,
+     "text": "Next one."
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "hello",
+   "Next one."
+  ],
+  "replaces": [
+   "Hello world."
+  ],
+  "interims": [],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

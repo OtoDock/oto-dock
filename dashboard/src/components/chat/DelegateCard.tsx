@@ -13,19 +13,23 @@ interface Props {
   onToggle: () => void
   /** The message's header row: avatar, agent name, badge, time. */
   header: ReactNode
+  /** The card's own controls, outside the toggle (a link to the worker's
+   *  chat): a click on one never toggles the card. */
+  actions?: ReactNode
   /** The whole message as an expanded message renders it. */
   children: ReactNode
 }
 
 /**
- * A delegate's report in the delegating chat, or a worker lane's incoming
- * prompt in its own chat, collapsed by default: the header and a two-line
- * preview in one button (a click, Enter or Space opens it), the attached
- * files as chips that open without expanding. A find-in-chat query that
- * matches inside the card shows it expanded while the query lasts, so its
- * matches register in the list's order.
+ * A message to the agent from another agent or from the platform: a
+ * delegate's report in the delegating chat, a worker lane's incoming prompt
+ * in its own chat, the platform's own wake. Collapsed by default: the header
+ * and a two-line preview in one button (a click, Enter or Space opens it),
+ * the attached files as chips and the actions outside it. A find-in-chat
+ * query that matches inside the card shows it expanded while the query
+ * lasts, so its matches register in the list's order.
  */
-export default function DelegateCard({ card, blocks, open, onToggle, header, children }: Props) {
+export default function DelegateCard({ card, blocks, open, onToggle, header, actions, children }: Props) {
   const bodyId = useId()
   const { query } = useSearch()
   const needle = query.trim().toLowerCase()
@@ -67,9 +71,12 @@ export default function DelegateCard({ card, blocks, open, onToggle, header, chi
           </p>
         )}
       </button>
-      {!expanded && files && files.files.length > 0 && (
-        <div className="px-3 pb-2">
-          <DelegateResultFiles files={files.files} skipped={[]} compact />
+      {(actions || (!expanded && files && files.files.length > 0)) && (
+        <div className="px-3 pb-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+          {!expanded && files && files.files.length > 0 && (
+            <DelegateResultFiles files={files.files} skipped={[]} compact />
+          )}
+          {actions}
         </div>
       )}
       <div id={bodyId} hidden={!expanded} className="px-3 pb-3 pt-1">

@@ -4,7 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  formatCronDescription, formatExpiry, formatIntervalDescription, describeSchedule, scheduleWords, type ScheduleRef,
+  formatCronDescription, formatExpiry, rawCron, formatIntervalDescription, describeSchedule, scheduleWords, type ScheduleRef,
 } from '@/lib/format'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -18,6 +18,20 @@ describe('formatCronDescription', () => {
     expect(formatCronDescription('0 9 * * 7')).toBe('Weekly on Sunday at 09:00')
     expect(formatCronDescription('0 9 * * 1')).toBe('Weekly on Monday at 09:00')
     expect(formatCronDescription('30 17 * * 6')).toBe('Weekly on Saturday at 17:30')
+  })
+
+  it('names a cron the words leave as it is', () => {
+    expect(rawCron({ schedule: '0 9 * * 1,3' })).toBe(true)
+    expect(rawCron({ schedule: '0 */2 * * 1-5' })).toBe(false)
+    expect(rawCron({ schedule: '0 9 * * *' })).toBe(false)
+    expect(rawCron({ interval_seconds: 60 })).toBe(false)
+  })
+
+  it('humanizes the step forms on weekdays', () => {
+    expect(formatCronDescription('0 */2 * * 1-5')).toBe('Every 2 hours on weekdays')
+    expect(formatCronDescription('*/15 * * * 1-5')).toBe('Every 15 minutes on weekdays')
+    expect(formatCronDescription('30 */3 * * 1-5')).toBe('Every 3 hours at :30 on weekdays')
+    expect(formatCronDescription('0 */2 * * 1,3')).toBe('0 */2 * * 1,3')
   })
 
   it('humanizes the */N hours step form', () => {

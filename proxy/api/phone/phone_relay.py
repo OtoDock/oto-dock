@@ -188,8 +188,10 @@ def _check_destination(number: str) -> None:
 
 async def _pinned_route(caller: _Caller, named: str) -> str:
     """The outbound route this call runs on: the one pinned to the agent's
-    phone-mcp instance, an enabled outbound route of this agent, and on a
-    user-mode route the caller must be the tied user."""
+    phone-mcp instance, an enabled outbound route, and on a user-mode route
+    the caller must be the tied user. The route may belong to another agent:
+    that agent speaks on the call, and the admin's assignment of the instance
+    to this agent is the consent, as a delegation edge is."""
     from storage.mcp import mcp_store
     from storage.phone import phone_route_store
     inst = await run_db(
@@ -205,11 +207,10 @@ async def _pinned_route(caller: _Caller, named: str) -> str:
         raise HTTPException(
             status_code=403, detail="Calls run on the route pinned to this agent's instance")
     route = await run_db(phone_route_store.get_route, pinned)
-    if (route is None or route.get("agent") != caller.agent
-            or not is_outbound(route.get("direction")) or not route.get("enabled")):
+    if route is None or not is_outbound(route.get("direction")) or not route.get("enabled"):
         raise HTTPException(
             status_code=403,
-            detail="The pinned route is not an enabled outbound route of this agent")
+            detail="The pinned route is not an enabled outbound route")
     from services.phone import phone_identity
     if phone_identity.route_identity_mode(route) == phone_identity.IDENTITY_MODE_USER:
         tied = route.get("identity_user_sub") or ""

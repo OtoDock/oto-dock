@@ -43,7 +43,7 @@ describe('useActiveChats title fallback', () => {
 
   it('uses the cached chat list title when the seed has no row', async () => {
     const { qc, wrapper } = harness()
-    qc.setQueryData(['chats', 'alpha'], [{ id: 'c1', agent: 'alpha', title: 'Release Workflow Improvements' }])
+    qc.setQueryData(['chats', 'alpha'], { chats: [{ id: 'c1', agent: 'alpha', title: 'Release Workflow Improvements' }], has_more: false })
     streamingSlice('c1', 'alpha')
     const { result } = renderHook(() => useActiveChats(), { wrapper })
     await waitFor(() => expect(result.current.length).toBe(1))

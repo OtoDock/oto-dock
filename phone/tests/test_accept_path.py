@@ -345,3 +345,52 @@ async def test_a_malformed_pbx_host_is_skipped_and_the_refresh_task_is_held_unti
     assert phone_main._pbx_refresh_tasks == set()
     assert phone_main._pbx_peers.addresses == {"192.0.2.20"}
     assert len([r for r in caplog.records if "did not resolve" in r.getMessage()]) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_outbound_call_on_a_covered_server_gets_a_transfer_handle(monkeypatch):
+    """The outbound media leg gets the handle that reads the channel the
+    PBX reports, whenever it lands; a server no listener covers, or no
+    listener manager at all, gets none."""
+    from types import SimpleNamespace
+
+    from telephony.transfer import AmiOutboundTransfer
+
+    class Listener:
+        def __init__(self, key):
+            self.key = key
+            self.bound = []
+            self.unbound = []
+
+        def resolve_server_key(self, server_id):
+            return self.key
+
+        def bind_outbound(self, key, audio_uuid, conn):
+            self.bound.append((key, audio_uuid))
+            return False
+
+        def outbound_bound(self, key, audio_uuid):
+            return False
+
+        def unbind_outbound(self, key, audio_uuid):
+            self.unbound.append((key, audio_uuid))
+
+    route = SimpleNamespace(agent="caller", llm_mode="proxy", phone_server_id=7, pin="")
+    handles = []
+
+    async def fake_run_call(conn, call_uuid, route, is_outbound, caller_info, cfg, logger,
+                            transfer=None):
+        handles.append(transfer)
+
+    monkeypatch.setattr(phone_main, "_resolve_route", lambda u, cfg: (route, True))
+    monkeypatch.setattr(phone_main, "_run_call", fake_run_call)
+    covered = Listener("7")
+    for listener in (covered, Listener(None), None):
+        reader = asyncio.StreamReader()
+        reader.feed_data(struct.pack(">BH", 0x01, 16) + uuid.uuid4().bytes)
+        await phone_main._handle_connection(
+            reader, _StubWriter("127.0.0.1"), _Cfg(), logging.getLogger("accept-test"), listener)
+    assert isinstance(handles[0], AmiOutboundTransfer)
+    assert handles[1:] == [None, None]
+    audio_uuid = covered.bound[0][1]
+    assert handles[0]._audio_uuid == audio_uuid and covered.unbound == [("7", audio_uuid)]

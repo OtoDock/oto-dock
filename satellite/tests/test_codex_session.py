@@ -330,6 +330,42 @@ class TestTurnParams:
         assert params["summary"] == "auto"
         assert params["effort"] == "high"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode,sandbox,word", [
+        ("plan", "read-only", "plan"), ("autoReview", "workspace-write", "default")])
+    async def test_every_turn_sends_its_collaboration_mode_where_codex_reads_it(
+            self, tmp_agent_dir, codex_config, sat_config, mode, sandbox, word):
+        """Twin of the proxy's: turn/start's experimental top-level
+        ``collaborationMode`` with the model it requires (no ``settings`` key
+        in the protocol), the shipped effort, the mode's built-in text."""
+        session = CodexSession("sess-cm", tmp_agent_dir, {
+            **codex_config, "permission_mode": mode, "sandbox_mode": sandbox}, sat_config)
+        session.thread_id = "t1"
+        sent: list = []
+
+        async def fake_request(method, params=None):
+            sent.append((method, params))
+            session._main_turn_done.set()
+            return {"turn": {"id": "u1"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await asyncio.wait_for(session._run_turn_locked("hello"), 5)
+        (_method, params), = sent
+        assert "settings" not in params
+        assert params["collaborationMode"] == {"mode": word, "settings": {
+            "model": "gpt-5.4", "reasoning_effort": "high", "developer_instructions": None}}
+
+    def test_an_unpinned_session_plans_with_the_threads_model(
+            self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-cm2", tmp_agent_dir, {
+            **codex_config, "model": "", "effort": "", "permission_mode": "plan",
+            "sandbox_mode": "read-only"}, sat_config)
+        assert session._collaboration_mode("read-only") == {}
+        session._note_thread_settings({"model": "gpt-6.1-sol", "reasoningEffort": None})
+        assert session._collaboration_mode("read-only") == {"mode": "plan", "settings": {
+            "model": "gpt-6.1-sol", "reasoning_effort": None, "developer_instructions": None}}
+
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_first", [True, False])
@@ -804,7 +840,7 @@ class TestCodexSessionLocalProvider:
         (codex_dir / "models.json").write_text(_CATALOG)
         await self._start(
             tmp_agent_dir, sat_config, self._config(
-                mcp_config_toml="", model="gpt-5.6-terra", env={"CODEX_API_KEY": "sk-test"},
+                mcp_config_toml="", model="gpt-6.1-terra", env={"CODEX_API_KEY": "sk-test"},
             ),
         )
         assert not (codex_dir / "models.json").exists()
@@ -889,7 +925,7 @@ class TestCodexSessionLocalProvider:
         from satellite.tests._toml import toml_loads
         path = await self._start(
             tmp_agent_dir, sat_config, self._config(
-                mcp_config_toml="", model="gpt-5.6-terra",
+                mcp_config_toml="", model="gpt-6.1-terra",
                 env={"CODEX_API_KEY": "sk-test"},
             ),
         )
@@ -1272,6 +1308,35 @@ class TestBridgeHold:
             assert calls["n"] >= 2
         finally:
             await server.close()
+
+    @pytest.mark.asyncio
+    async def test_the_hold_names_its_last_failure(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch, caplog):
+        """Which link failed is in the final warning: the tunnel's own 503,
+        or a loopback port nobody answers on."""
+        import logging
+        import socket
+
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_HOOK_BACKOFF", (0.01,))
+        monkeypatch.setattr(cs, "_HOOK_HOLD_S", 0.05)
+        server, _ = await self._serve([(503, b'{"error": "tunnel-not-connected"}')])
+        try:
+            session = self._session(tmp_agent_dir, codex_config, sat_config, server)
+            with caplog.at_level(logging.WARNING):
+                assert await session._decide_permission_remote("Bash", {}) == {"decision": "deny"}
+        finally:
+            await server.close()
+        assert "(last: HTTP 503 tunnel-not-connected)" in caplog.text
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            dead = s.getsockname()[1]
+        session._proxy_url = f"http://127.0.0.1:{dead}"
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert await session._decide_permission_remote("Bash", {}) == {"decision": "deny"}
+        assert f"127.0.0.1:{dead}" in caplog.text and "(last: ClientConnectorError" in caplog.text
 
     @pytest.mark.asyncio
     async def test_the_hold_counts_from_the_first_failure(

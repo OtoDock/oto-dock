@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Integration } from '../api/credentials'
 import { AccountsManager } from '../components/accounts/AccountsManager'
 import type { AccountsOps } from '../components/accounts/types'
-import { BUTTON_VARIANT } from '../components/ui/classes'
+import { BADGE_TONE, BUTTON_VARIANT } from '../components/ui/classes'
 
 vi.mock('../components/accounts/AccountCard', () => ({
   AccountCard: ({ account }: { account: { account_label: string } }) => <div data-testid="account">{account.account_label}</div>,
@@ -49,5 +49,16 @@ describe('AccountsManager', () => {
   it('offers no second account on an integration that takes one', () => {
     open(['work'], false)
     expect(screen.queryByRole('button', { name: /^Add/ })).toBeNull()
+  })
+
+  it('says in its header when any account needs a reconnect, else counts them', () => {
+    const two = integration(['work', 'home'])
+    const { rerender } = render(<AccountsManager integration={two} ops={{} as AccountsOps} />)
+    expect(screen.getByText('2 accounts').className).toContain(BADGE_TONE.success)
+    expect(screen.queryByText('Reconnect needed')).toBeNull()
+    two.accounts[1].needs_reconnect = true
+    rerender(<AccountsManager integration={{ ...two }} ops={{} as AccountsOps} />)
+    expect(screen.getByText('Reconnect needed').className).toContain(BADGE_TONE.warning)
+    expect(screen.queryByText('2 accounts')).toBeNull()
   })
 })

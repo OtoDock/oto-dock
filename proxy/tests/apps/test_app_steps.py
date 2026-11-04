@@ -43,6 +43,7 @@ from services.apps import (
     releases,
 )
 from services.scheduler import shared
+from services.scripts import runner as script_runner
 from storage import database as task_store, db_app_deliveries as deliveries
 from storage.pg import get_conn
 
@@ -584,6 +585,47 @@ def test_the_argv_rule_and_the_scrub():
     assert app_steps.argv_for(b"echo no shebang\n", "/app/x.sh") == ["/bin/sh", "/app/x.sh"]
     assert app_steps.argv_for(b"#!\n", "/app/x.sh") == ["/bin/sh", "/app/x.sh"]
     assert app_steps.scrub("token=abcdefghij tail short", ["abcdefghij", "short"]) == "token=[redacted] tail short"
+
+
+# The Windows table, the same on the satellite's twin (satellite/tests/test_step_runner.py).
+_WIN = {"bash": r"C:\Git\bin\bash.exe", "sh": r"C:\Git\bin\sh.exe",
+        "env": r"C:\Git\usr\bin\env.exe", "python": r"C:\Py\python.exe"}
+_WIN_PATH = r"C:\OtoDock\steps\d\check.sh"
+_WIN_CASES = [
+    (b"echo no shebang\n", [_WIN["sh"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/bin/sh -e\n", [_WIN["sh"], "-e", "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env bash\n", [_WIN["bash"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env -S bash -eu\n", [_WIN["bash"], "-eu", "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/python3 -u\n", [_WIN["python"], "-u", _WIN_PATH]),
+    (b"#!/usr/bin/env python\n", [_WIN["python"], _WIN_PATH]),
+    (b"#!/usr/bin/env LANG=C bash\n", [_WIN["env"], "LANG=C", _WIN["bash"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env -u FOO bash\n", [_WIN["env"], "-u", "FOO", _WIN["bash"], "C:/OtoDock/steps/d/check.sh"]),
+    (b"#!/usr/bin/env node\n", [r"C:\Node\node.exe", _WIN_PATH]),
+]
+
+
+def _which(name):
+    return {"node": r"C:\Node\node.exe", "npx": r"C:\Node\npx.cmd"}.get(name)
+
+
+@pytest.mark.parametrize("script,argv", _WIN_CASES)
+def test_the_argv_rule_on_windows(script, argv):
+    """A Windows machine has no /bin/sh: a shell line and the default run
+    under Git Bash, a Python line under the machine's Python."""
+    assert script_runner.argv_for(script, _WIN_PATH, windows=_WIN, which=_which) == argv
+
+
+@pytest.mark.parametrize("script,word", [
+    (b"echo\n", "bash"), (b"#!/bin/bash\n", "bash"), (b"#!/usr/bin/env python3\n", "Python"),
+    (b"#!/usr/bin/env npx tsx\n", "npx"), (b"#!/usr/bin/env ruby\n", "ruby"), (b"#!/usr/bin/env\n", "env"),
+])
+def test_an_interpreter_the_machine_lacks_is_named(script, word):
+    """Without the baseline tools (no Git Bash, no Python) or with a word
+    that resolves to nothing or to a .cmd: the interpreter is named, never
+    the OS's error code."""
+    with pytest.raises(script_runner.MissingInterpreter) as e:
+        script_runner.argv_for(script, _WIN_PATH, windows=dict.fromkeys(_WIN, ""), which=_which)
+    assert str(e.value) == word
 
 
 def test_a_local_step_mounts_only_its_signed_script(agent_tree, monkeypatch):

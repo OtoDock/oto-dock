@@ -43,7 +43,10 @@ vi.mock('@/api/remoteMachines', async (importOriginal) => ({
   useRemoteMachines: () => ({ data: h.machines, isLoading: false }),
   useDeleteMachine: () => ({ mutateAsync: h.del, isPending: false }),
 }))
-vi.mock('@/components/RemoteBadge', () => ({ default: () => null }))
+vi.mock('@/components/RemoteBadge', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/components/RemoteBadge')>()),
+  default: () => null,
+}))
 
 import RemoteMachinesPage from '@/pages/admin/RemoteMachinesPage'
 
@@ -107,6 +110,32 @@ describe('Admin removes a user-paired machine', () => {
     personClick(within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Remove machine' }))
     expect(await screen.findByText('Failed to delete machine')).toBeInTheDocument()
     expect(screen.getByRole('alertdialog')).toBeInTheDocument()
+  })
+})
+
+// A machine whose local link is down (its sessions cannot reach OtoDock):
+// the row says so, and the expanded card names the satellite's reason.
+describe('Admin machine whose local link is down', () => {
+  it('says the satellite is restoring it, then to restart it, with the reason inside', () => {
+    h.machines = [
+      { ...USER_MACHINE, id: 'm-adm-0001', name: 'Office PC', pairing_scope: 'admin',
+        registered_by: 'admin-sub', link_ok: false, link_down_s: 12,
+        link_error: 'connection refused at 127.0.0.1:57353' },
+      { ...USER_MACHINE, id: 'm-adm-0002', name: 'Plotter PC', pairing_scope: 'admin',
+        registered_by: 'admin-sub', link_ok: false, link_down_s: 300, link_error: '' },
+      { ...USER_MACHINE, link_ok: false, link_down_s: 5 },
+    ]
+    mount()
+    expect(screen.getByText(
+      'Its sessions cannot reach OtoDock. The satellite is restoring the link.')).toBeInTheDocument()
+    expect(screen.getByText(
+      'Its sessions cannot reach OtoDock. Restart the satellite on that machine.')).toBeInTheDocument()
+    expect(screen.queryByText(/Last problem/)).toBeNull()
+    fireEvent.click(screen.getByText('Office PC'))
+    expect(screen.getByText('Last problem: connection refused at 127.0.0.1:57353')).toBeInTheDocument()
+    // The user-paired row says it too.
+    fireEvent.click(screen.getByRole('button', { name: /User-Paired Remote Machines/ }))
+    expect(screen.getAllByTestId('machine-link-notice')).toHaveLength(3)
   })
 })
 
@@ -177,5 +206,75 @@ describe('Admin machine device grant confirm', () => {
     personClick(within(dialog).getByRole('button', { name: 'Cancel' }))
     await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
     expect(h.apiFetch.mock.calls.some(([path]) => String(path).includes('device-grants'))).toBe(false)
+  })
+})
+
+// "Every role of its agents runs here": off by default, turned on behind a
+// confirm that says what the other roles' chats reach, turned off at once.
+describe('Admin machine: every role of its agents runs here', () => {
+  const studio = (on: boolean) => ({
+    ...USER_MACHINE, id: 'm-studio', name: 'Studio PC', pairing_scope: 'admin', allow_full_fs: false,
+    device_grants: [], all_roles_run_here: on, registered_by: 'admin-sub',
+    owner_display_name: null, owner_email: null,
+  })
+  // The file's fetch stub is typed with the path alone: read the init too.
+  const puts = () => (h.apiFetch.mock.calls as unknown as [string, RequestInit | undefined][])
+    .filter(([path]) => path.endsWith('/all-roles'))
+    .map(([path, init]) => [path, init?.body])
+
+  function mountWithDialogs() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    renderWithDialogs(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <RemoteMachinesPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+  }
+
+  beforeEach(() => { h.apiFetch.mockClear() })
+
+  it('asks before it lets every role run there, and Cancel changes nothing', async () => {
+    h.machines = [studio(false)]
+    mountWithDialogs()
+    fireEvent.click(screen.getByText('Studio PC'))
+    expect(screen.getByText('Who runs here')).toBeInTheDocument()
+    expect(screen.getByText(
+      "On, the chats of editors, contributors and viewers run on this computer, with the machine's own access.",
+    )).toBeInTheDocument()
+    expect(infoTexts('Every role of its agents runs here')).toEqual([
+      'Off, their chats run on the OtoDock platform. Managers and admins run here either way. '
+      + 'An outside caller always runs on the platform.'])
+    const box = screen.getByRole('checkbox', { name: 'Every role of its agents runs here' })
+    expect(box).not.toBeChecked()
+
+    fireEvent.click(box)
+    let dialog = await findAlertDialog('Let every role run on Studio PC?')
+    expect(within(dialog).getByText(
+      "Chats of editors, contributors and viewers will run on this computer. They can reach every file this "
+      + "computer's user can. They also get its browser and computer control, and the accounts their chats use.",
+    )).toBeInTheDocument()
+    personClick(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+    expect(puts()).toEqual([])
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Every role of its agents runs here' }))
+    dialog = await findAlertDialog('Let every role run on Studio PC?')
+    personClick(within(dialog).getByRole('button', { name: 'Allow' }))
+    await waitFor(() => expect(puts()).toEqual([
+      ['/v1/admin/remote-machines/m-studio/all-roles', JSON.stringify({ enabled: true })]]))
+  })
+
+  it('turns it off with no question', async () => {
+    h.machines = [studio(true)]
+    mountWithDialogs()
+    fireEvent.click(screen.getByText('Studio PC'))
+    const box = screen.getByRole('checkbox', { name: 'Every role of its agents runs here' })
+    expect(box).toBeChecked()
+    fireEvent.click(box)
+    await waitFor(() => expect(puts()).toEqual([
+      ['/v1/admin/remote-machines/m-studio/all-roles', JSON.stringify({ enabled: false })]]))
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
   })
 })

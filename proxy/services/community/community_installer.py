@@ -661,6 +661,8 @@ async def install_from_extracted_folder(
         source, resolved_version, target_dir, backup_dir, mcp_name, version)
     container_started = await _register_and_start(
         mcp_name, is_update, prior_enabled, progress_cb, container_started)
+    from services.community import manifest_hosts
+    to_confirm = await asyncio.to_thread(manifest_hosts.after_install, mcp_name, from_catalog=from_catalog)
     await _emit(progress_cb, "finalize", 95, "Finalizing")
     return {
         "status": "updated" if is_update else "installed",
@@ -670,6 +672,8 @@ async def install_from_extracted_folder(
         "runtime": runtime,
         "install_log": install_log,
         "container_started": container_started,
+        # The hosts the MCP sends a sign-in to that wait for an admin's Allow.
+        **({"hosts_to_confirm": to_confirm} if to_confirm else {}),
     }
 
 
@@ -985,18 +989,13 @@ async def _register_and_start(mcp_name: str, is_update: bool, prior_enabled: boo
             ) from exc
         except OSError as exc:
             logger.warning("Compose pre-rewrite skipped for %s: %s", mcp_name, exc)
-        # T2 only: the boot-time startup_docker_mcps skips community Docker MCPs,
-        # so a runtime install has no other trigger to actually start the pulled
-        # container — start it here when the MCP is enabled. Best-effort: a slow
-        # first pull or a transient failure doesn't fail the install (the admin
-        # can retry via restart). T1 is unchanged — startup_docker_mcps / the
-        # admin start it there.
         from core.config import deployment
         enabled_now = True if not is_update else bool(prior_enabled)
         # Auto-start the container after install on every self-host topology —
-        # T1 bare-metal AND T2 socket-proxy; only cloud (external-pool) has no
-        # local container. start_container pulls (or builds, T1 fallback) + brings
-        # it up, so the slow opaque fetch shows as the "image" phase on both.
+        # T1 bare-metal AND T2 socket-proxy (an update's only start); only cloud
+        # (external-pool) has no local container. start_container pulls (or
+        # builds, T1 fallback) + brings it up, so the slow opaque fetch shows as
+        # the "image" phase on both.
         if enabled_now and deployment.current_mode() != deployment.EXTERNAL_POOL:
             await _emit(
                 progress_cb, "image", 40,
@@ -1265,7 +1264,12 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
     notes: list[str] = []
     prior = await _existing_enabled_state(mcp_name)
     if prior is not True:
-        await asyncio.to_thread(mcp_store.set_mcp_enabled, mcp_name, True)
+        from core.credentials import catalog_install_registry
+        from services.community import manifest_hosts
+        # As the enable route does: an Allow at the same moment is not lost.
+        async with catalog_install_registry.lock_for(mcp_name):
+            await asyncio.to_thread(mcp_store.set_mcp_enabled, mcp_name, True)
+            await asyncio.to_thread(manifest_hosts.after_enable, mcp_name)
         if prior is False:
             notes.append("Re-enabled platform-wide (was disabled).")
 
@@ -1368,6 +1372,9 @@ async def approve_request(
         raise HTTPException(404, _REQUEST_GONE)
     if req["status"] not in mcp_request_store.APPROVABLE:
         raise HTTPException(409, _request_state_sentence(req["status"]))
+    # Nobody requests a platform-attached MCP: the request stays pending for the admin to deny.
+    if getattr(mcp_registry.get_manifest(req["mcp_name"]), "assignment_mode", "") == _mt.ASSIGNMENT_PLATFORM:
+        raise HTTPException(409, _mt.PLATFORM_NOT_REQUESTABLE)
 
     if instance_id is not None:
         manifest = mcp_registry.get_manifest(req["mcp_name"])

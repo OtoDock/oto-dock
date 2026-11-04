@@ -65,7 +65,7 @@ class BackgroundCommandRegistry:
     """
 
     __slots__ = ("spawned", "completed", "unsurfaced", "task_to_tuid",
-                 "labels", "chat_id", "_all_done_event")
+                 "labels", "descriptions", "chat_id", "_all_done_event")
 
     def __init__(self) -> None:
         self.spawned: set[str] = set()           # shell ids seen at task_started
@@ -78,6 +78,9 @@ class BackgroundCommandRegistry:
         # unsurfaced work — not for completions the model already read inline.
         self.unsurfaced: set[str] = set()
         self.task_to_tuid: dict[str, str] = {}    # shell id → spawning Bash tool_use_id
+        # shell id → the text a person reads (the badge's when the page has
+        # no block for it); the label when the layer gives none.
+        self.descriptions: dict[str, str] = {}
         # task_id → model-facing label ("b5gxm4wuh — sleep 30 && make test"
         # for claude, whose shell id the model knows from its Bash result;
         # bare command text for codex, whose itemId the model never sees).
@@ -85,11 +88,14 @@ class BackgroundCommandRegistry:
         # there. Consumed by the completion nudges so the model can tell WHICH
         # job finished. Empty label → the nudge degrades to count-only.
         self.labels: dict[str, str] = {}
-        self.chat_id: str = ""                    # set by the pump/monitor (badge + nudge routing)
+        # The chat the session serves (badge + nudge routing), bound by the
+        # pump at each turn start and by a monitor: it names the chat, not
+        # the turn, so the per-turn reset keeps it.
+        self.chat_id: str = ""
         self._all_done_event = asyncio.Event()
 
     def register_spawn(self, task_id: str, tool_use_id: str,
-                       label: str = "") -> None:
+                       label: str = "", description: str = "") -> None:
         """Record a backgrounded command (CLI ``task_started``, local_bash)."""
         if not task_id:
             return
@@ -98,6 +104,8 @@ class BackgroundCommandRegistry:
             self.task_to_tuid[task_id] = tool_use_id
         if label:
             self.labels[task_id] = label
+        if description or label:
+            self.descriptions[task_id] = description or label
         self._refresh()
 
     def mark_done(self, task_id: str, *, surfaced: bool = True) -> bool:
@@ -138,6 +146,9 @@ class BackgroundCommandRegistry:
         """Model-facing label for a tracked command ("" when never captured)."""
         return self.labels.get(task_id, "")
 
+    def description_for(self, task_id: str) -> str:
+        return self.descriptions.get(task_id) or self.labels.get(task_id, "")
+
     @property
     def has_pending(self) -> bool:
         """True if any tracked command hasn't finished yet."""
@@ -174,7 +185,7 @@ class BackgroundCommandRegistry:
         self.unsurfaced = set()
         self.task_to_tuid = {t: u for t, u in self.task_to_tuid.items() if t in pending}
         self.labels = {t: l for t, l in self.labels.items() if t in pending}
-        self.chat_id = ""
+        self.descriptions = {t: d for t, d in self.descriptions.items() if t in pending}
         self._refresh()
 
 

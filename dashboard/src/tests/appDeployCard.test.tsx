@@ -107,6 +107,27 @@ describe('AppDeployCard', () => {
     expect(container.querySelector('[data-testid="deploy-lowers-approval"]')).toBeNull()
   })
 
+  it('says a held release came from the source, and never claims the app always waits', async () => {
+    statusStub.current = {
+      deploy_state: 'pending', release: 1, pending_release: 2, manifest_approved: true,
+      deploy_requires_approval: false, deploying: false, server: 'up', error: '', retry_after: 0,
+      changes: { added: [], changed: ['client/index.html'], removed: [] },
+    }
+    const follows = {
+      agent: 'head', agent_name: 'Head Office', slug: 'board', release: 1, exists: true,
+      held_release: 2, can_take: true, update: null,
+    }
+    const { container } = renderIn(<AppDeployCard app={mkApp({ actions_approved: true, follows })} agent="dev" />)
+    await waitFor(() => expect(container.textContent)
+      .toContain('This release came from Head Office’s app, so it waits for a person here.'))
+    expect(container.textContent).not.toContain('always wait for a person')
+    // A release held for another reason the card cannot name reads plainly.
+    const other = renderIn(<AppDeployCard app={mkApp({ actions_approved: true })} agent="dev" />)
+    await waitFor(() => expect(other.container.textContent)
+      .toContain('This release waits for a person before it goes live.'))
+    expect(other.container.textContent).not.toContain('always wait for a person')
+  })
+
   it('takes the approval card\'s slot while a release is pending', () => {
     expect(appNeedsApproval(mkApp())).toBe(false)
     expect(appNeedsApproval(mkApp({ deploy_state: 'idle' }))).toBe(true)

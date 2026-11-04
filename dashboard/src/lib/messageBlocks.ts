@@ -3,6 +3,7 @@ import type { PendingFile, PendingImage } from '../store/types'
 import { cleanUserMessageText } from './transcriptCleanup'
 import { PERSISTED, RESEND_REASONS, SYSTEM_SUBTYPE, WIRE, type DbMessageRow, type LiveBlock, type PersistedEvent } from '../api/wireEvents'
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from './status/run'
+import { BG_COMMAND_BLOCK } from './kinds/block'
 
 // Pure mappers from wire/DB event shapes to renderable MessageBlocks.
 // Single source of truth shared by AgentChat (live chat + task chats)
@@ -110,9 +111,15 @@ export function delegateResultBadge(status: string | undefined, reportMissing = 
 /** The badge the platform stamps on a worker lane's incoming prompt (the
  * stored spelling: the scheduler's prompt row and a lane steer's meta). */
 export const DELEGATED_BY_BADGE = 'delegated by'
+/** The badge of a task run's prompt with no delegating agent (the stored
+ * spelling: the scheduler's prompt row). */
+export const TASK_PROMPT_BADGE = 'task prompt'
 
 /** The badge of a meeting participant's bubble. */
 export const MEETING_BADGE = 'meeting'
+
+/** The kinds of a delegate card (`DelegateCardMark.kind`), named once. */
+export const CARD_KIND = { RESULT: 'result', PROMPT: 'prompt', WAKE: 'wake' } as const
 
 function textHash(text: string): string {
   let h = 5381
@@ -121,14 +128,41 @@ function textHash(text: string): string {
 }
 
 /** A delegate result's card: keyed by its task and its blocks, the same for
- * the live frame and the stored row. */
-export function delegateResultCard(taskKey: string | undefined, blocks: MessageBlock[]): DelegateCardMark {
-  return { kind: 'result', key: `r:${taskKey || ''}:${textHash(delegateResultSignature(blocks))}` }
+ * the live frame and the stored row; the task's name and the worker's chat
+ * ride it for the card's title and its link to the lane. */
+export function delegateResultCard(
+  taskKey: string | undefined, blocks: MessageBlock[],
+  title: { taskName?: string; workerChatId?: string } = {},
+): DelegateCardMark {
+  return {
+    kind: CARD_KIND.RESULT, key: `r:${taskKey || ''}:${textHash(delegateResultSignature(blocks))}`,
+    ...(title.taskName ? { taskName: title.taskName } : {}),
+    ...(title.workerChatId ? { workerChatId: title.workerChatId } : {}),
+  }
 }
 
-/** A worker's incoming prompt is a card when the platform stamped it so. */
+/** A worker's incoming prompt is a card when the platform stamped it so: a
+ * delegated task or steer, or a task run's own prompt. */
 export function delegatePromptCard(badge: string | undefined, key: string): DelegateCardMark | undefined {
-  return badge === DELEGATED_BY_BADGE ? { kind: 'prompt', key } : undefined
+  return badge === DELEGATED_BY_BADGE || badge === TASK_PROMPT_BADGE ? { kind: CARD_KIND.PROMPT, key } : undefined
+}
+
+/** The platform's own prompt into the chat (a scheduled wake, the resume
+ * after the agent's move): one card message from the live frame and from the
+ * stored row, keyed by the task and the prompt, so the two are one card. The
+ * answer the prompt starts opens its own bubble under it. */
+export function wakeMessage(
+  evt: { prompt?: string; task_id?: string; source?: string }, id: string, createdAt: string,
+): DisplayMessage {
+  const prompt = evt.prompt || ''
+  return {
+    id, role: 'assistant', createdAt,
+    blocks: [{ type: 'text', content: cleanUserMessageText(prompt) ?? prompt }],
+    delegateCard: {
+      kind: CARD_KIND.WAKE, key: `w:${evt.task_id || ''}:${textHash(prompt)}`,
+      ...(evt.source ? { source: evt.source } : {}),
+    },
+  }
 }
 
 // The shapes the builders give a delegate card. Any other block (a permission,
@@ -144,10 +178,6 @@ export function delegateCardOf(msg: DisplayMessage): DelegateCardMark | null {
   return msg.blocks.every((b) => CARD_BLOCK_TYPES.has(b.type)) ? card : null
 }
 
-// The delegation MCP's two wrappers around a worker's prompt, outer first;
-// only a LEADING, CLOSED one is the platform's.
-const DELEGATED_WORK_RE = /^\s*\[DELEGATED_WORK\][\s\S]*?\[\/DELEGATED_WORK\]\s*/
-const TASK_OUTPUT_DIR_RE = /^\s*\[TASK_OUTPUT_DIR\][\s\S]*?\[\/TASK_OUTPUT_DIR\]\s*/
 // The bounded result's own head line (lanes._delegate_output_preview).
 const OUTPUT_TRUNCATED_RE = /^\s*… \[output truncated[^\]\n]*\]\s*/
 const MD_LINE_LEAD_RE = /^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+)/
@@ -162,17 +192,18 @@ function resultTail(text: string): string {
 
 // What a card's preview shows of its text, by its kind.
 const PREVIEW_BODY: Record<DelegateCardMark['kind'], (text: string) => string> = {
-  prompt: (text) => text.replace(DELEGATED_WORK_RE, '').replace(TASK_OUTPUT_DIR_RE, ''),
+  prompt: (text) => text,
+  wake: (text) => text,
   result: resultTail,
 }
 
 /**
- * The two-line preview of a delegate card: a prompt's task (its head, the
- * platform's wrappers stripped) or a result's outcome (its tail: a lane's
- * report ends its narration). Plain text: the leading markdown marks of
- * each line, emphasis stars and backticks dropped. The stored text and the
- * expanded card are untouched; a preview the stripping would empty shows
- * the text as it is.
+ * The two-line preview of a delegate card: a prompt's task (its head; the
+ * builders already dropped the platform's wrappers from the block) or a
+ * result's outcome (its tail: a lane's report ends its narration). Plain
+ * text: the leading markdown marks of each line, emphasis stars and
+ * backticks dropped. The expanded card is untouched; a preview the stripping
+ * would empty shows the text as it is.
  */
 export function delegatePreviewText(kind: DelegateCardMark['kind'], blocks: MessageBlock[]): string {
   const text = blocks
@@ -267,6 +298,12 @@ export function liveBlockToMessageBlock(ib: LiveBlock): MessageBlock | null {
       return { type: 'app_action', appId: ib.app_id || '', slug: ib.slug || undefined, title: ib.title || undefined, actionId: ib.action_id || '', label: ib.label || undefined, prompt: ib.prompt || undefined }
     case WIRE.QUESTION:
       return { type: 'question', toolName: ib.tool_name || '', toolInput: ib.tool_input || {}, answered: false }
+    case WIRE.SETTINGS_CARD:
+      return { type: 'setting', settingId: ib.setting || '', label: ib.label || '', catalogVersion: ib.catalog_version || 0 }
+    case WIRE.ACTION_CARD:
+      return { type: 'card', cardId: String(ib.card_id || ''), title: String(ib.title || ''), text: String(ib.text || ''), note: String(ib.note || ''), buttons: Array.isArray(ib.buttons) ? ib.buttons : [], options: Array.isArray(ib.options) ? ib.options : [] }
+    case WIRE.LIST_CARD:
+      return { type: 'list', kind: String(ib.kind || ''), filters: ib.filters && typeof ib.filters === 'object' ? ib.filters : {}, title: String(ib.title || ''), person: String(ib.person || '') }
     case WIRE.THINKING:
       return { type: 'thinking', content: ib.content || '', collapsed: true, done: true }
     case WIRE.METADATA:
@@ -346,7 +383,7 @@ export function eventToBlock(evt: PersistedEvent, dbMessageId?: number): Message
       }
     case WIRE.BG_COMMAND_SPAWN:
       return {
-        type: 'bgcommand',
+        type: BG_COMMAND_BLOCK,
         command: evt.command || '',
         description: evt.description || '',
         isActive: false,  // Historical = finished (spawn-only persist, mirrors subagents)
@@ -365,10 +402,6 @@ export function eventToBlock(evt: PersistedEvent, dbMessageId?: number): Message
       }
     case WIRE.DELEGATE_RESULT:
       return null  // Handled by post-processing (marks matching delegate_spawn as completed)
-    case PERSISTED.SCHEDULE_WAKE:
-      // A scheduled self-continuation drove this turn, or the platform
-      // resumed the chat after the agent moved it (`source` move): the row.
-      return { type: 'schedulewake', prompt: evt.prompt || '', ...(evt.source ? { source: evt.source } : {}) }
     case WIRE.CHECK_VERDICT:
       // A check judged this turn (CHECKS.md): the compact verdict card.
       return {
@@ -393,6 +426,12 @@ export function eventToBlock(evt: PersistedEvent, dbMessageId?: number): Message
       }
     case WIRE.QUESTION:
       return { type: 'question', toolName: evt.tool_name || '', toolInput: evt.tool_input || {}, answered: false }
+    case WIRE.SETTINGS_CARD:
+      return { type: 'setting', settingId: evt.setting || '', label: evt.label || '', catalogVersion: evt.catalog_version || 0 }
+    case WIRE.ACTION_CARD:
+      return { type: 'card', cardId: String(evt.card_id || ''), title: String(evt.title || ''), text: String(evt.text || ''), note: String(evt.note || ''), buttons: Array.isArray(evt.buttons) ? evt.buttons : [], options: Array.isArray(evt.options) ? evt.options : [] }
+    case WIRE.LIST_CARD:
+      return { type: 'list', kind: String(evt.kind || ''), filters: evt.filters && typeof evt.filters === 'object' ? evt.filters : {}, title: String(evt.title || ''), person: String(evt.person || '') }
     case WIRE.PLAN_MODE:
       return { type: 'plan', action: evt.action || 'enter', toolInput: evt.tool_input }
     case WIRE.PLAN_REVIEW:
@@ -516,21 +555,25 @@ export function dbMessagesToDisplay(
     if (m.role === 'user') {
       const blocks: MessageBlock[] = []
       let agentMeta: { agent_slug?: string; agent_display_name?: string; agent_color?: string; badge?: string } = {}
-      // Check for image attachments and agent identity in event_data
+      let fromCard = false
+      // Check for image attachments, agent identity and a card's mark in event_data
       if (m.event_data) {
         try {
           const ed = JSON.parse(m.event_data)
           blocks.push(...attachmentBlocks(ed.images, ed.files))
           if (ed.agent_slug) agentMeta = ed
+          fromCard = Boolean(ed.card && typeof ed.card === 'object')
         } catch { /* ignore */ }
       }
-      // Render-side cleanup (data untouched): injected time preludes strip off
-      // the bubble; pure slash-command records hide the whole row — unless it
-      // carries attachments, which keep the row alive without the noise text.
-      const cleanedText = cleanUserMessageText(m.content)
-      if (cleanedText === null && blocks.length === 0) continue
-      if (cleanedText !== null) blocks.push({ type: 'text', content: cleanedText })
+      // Render-side cleanup (data untouched): injected time preludes and the
+      // platform's wrappers strip off the bubble; pure slash-command records
+      // hide the whole row — unless it carries attachments, which keep the
+      // row alive without the noise text, or it is a card (a prompt that was
+      // only the wrapper still shows its header).
       const promptCard = agentMeta.agent_slug ? delegatePromptCard(agentMeta.badge, `db-${m.id}`) : undefined
+      const cleanedText = cleanUserMessageText(m.content)
+      if (cleanedText === null && blocks.length === 0 && !promptCard) continue
+      if (cleanedText !== null) blocks.push({ type: 'text', content: cleanedText })
       displayMsgs.push({
         id: `db-${m.id}`,
         role: 'user',
@@ -543,6 +586,7 @@ export function dbMessagesToDisplay(
           badge: agentMeta.badge,
         } : {}),
         ...(promptCard ? { delegateCard: promptCard } : {}),
+        ...(fromCard ? { fromCard: true } : {}),
       })
       newTurnNext = false
       continueNext = false
@@ -592,11 +636,21 @@ export function dbMessagesToDisplay(
       newTurnNext = false
       continueNext = false
     } else if (m.role === 'event' && m.event_data) {
-      // delegate_result / bg_nudge / artifact_interaction / app_action /
-      // schedule_wake signal a new LLM turn (a wake's marker opens the bubble
-      // its answer lands in, a nudge's line the review's)
+      if (m.event_type === PERSISTED.SCHEDULE_WAKE) {
+        // The platform's prompt (a scheduled wake, the resume after a move):
+        // its own card, and the answer's bubble starts fresh under it.
+        try {
+          const evt = JSON.parse(m.event_data)
+          if (!evt.dismissed) displayMsgs.push(wakeMessage(evt, `db-evt-${m.id}`, m.created_at))
+        } catch { /* skip */ }
+        newTurnNext = true
+        continueNext = false
+        continue
+      }
+      // delegate_result / bg_nudge / artifact_interaction / app_action
+      // signal a new LLM turn (a nudge's line opens the review's bubble)
       const nudge = m.event_type === PERSISTED.BG_NUDGE || m.event_type === PERSISTED.BG_COMMAND_NUDGE
-      if (m.event_type === WIRE.DELEGATE_RESULT || nudge || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION || m.event_type === PERSISTED.SCHEDULE_WAKE) {
+      if (m.event_type === WIRE.DELEGATE_RESULT || nudge || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION) {
         newTurnNext = true
         continueNext = nudge
       }
@@ -620,8 +674,8 @@ export function dbMessagesToDisplay(
         const evt = JSON.parse(m.event_data)
         // Skip dismissed events
         if (evt.dismissed) continue
-        // A wake's or a nudge's row data carries no type (its column names it).
-        if (!evt.type && (m.event_type === PERSISTED.SCHEDULE_WAKE || nudge)) evt.type = m.event_type
+        // A nudge's row data carries no type (its column names it).
+        if (!evt.type && nudge) evt.type = m.event_type
         const block = eventToBlock(evt, m.id)
         // Find or create the host assistant message — only when the event
         // actually renders an inline block (or opens a meeting identity
@@ -694,7 +748,8 @@ export function dbMessagesToDisplay(
               agentDisplayName: delegateAgent?.display_name,
               agentColor: delegateAgent?.color || '',
               badge: delegateResultBadge(evt.status, evt.report_missing === true),
-              delegateCard: delegateResultCard(evt.task_id || evt.task_name, blocks),
+              delegateCard: delegateResultCard(evt.task_id || evt.task_name, blocks,
+                { taskName: evt.task_name, workerChatId: evt.worker_chat_id }),
             })
             // The response bubble belongs to the DELEGATE agent — whatever
             // follows (the delegating agent's synthesis echo) starts fresh.
@@ -885,7 +940,7 @@ export function pairBgCommandBlocks(blocks: MessageBlock[]): {
   let toolIdxById: Map<string, number> | null = null
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i]
-    if (b.type !== 'bgcommand' || !b._toolId) continue
+    if (b.type !== BG_COMMAND_BLOCK || !b._toolId) continue
     if (toolIdxById === null) {
       toolIdxById = new Map()
       for (let j = 0; j < blocks.length; j++) {
@@ -961,10 +1016,6 @@ export const RESUME_TEXT = 'Continue from where you stopped.'
 
 /** The endings whose card offers Resume once the turn had started. */
 const RESUME_REASONS: ReadonlySet<string> = new Set(['error', 'exited', 'silent', 'lost', 'restarted'])
-/** The endings that lose the engine's copy of the turn (`TurnEnding.abort_stamps`):
- *  Resume carries the turn's saved attachments again, since the proxy's note
- *  holds text alone (a duplicate is harmless when the session kept them). */
-const RESUME_WITH_ATTACHMENTS: ReadonlySet<string> = new Set(['exited', 'silent', 'lost'])
 /** Blocks that are not the agent's work: a notice, the closing metadata, a
  *  person's attachments. */
 const WORKLESS_BLOCKS: ReadonlySet<string> = new Set([WIRE.SYSTEM, WIRE.METADATA, 'image_attachments', 'file_attachments'])
@@ -1003,23 +1054,23 @@ export interface SendAgainAction {
 }
 
 /** What the turn-ended card in message `messageId` sends. Resume (one short
- *  message, plus the turn's saved attachments after an ending that lost the
- *  session's copy) when the turn had started and its ending allows it; Send
- *  again (that turn's messages verbatim, an earlier card's included) for a
- *  message that met a stopped engine or a turn that never started; nothing
- *  for a decline, a limit, or a restart that cut nothing. */
+ *  message and nothing else: the cut message's own row keeps its photos and
+ *  files, and after an ending that lost the session's copy the proxy names
+ *  them to the agent) when the turn had started and its ending allows it;
+ *  Send again (that turn's messages verbatim with their attachments, an
+ *  earlier card's included) for a message that met a stopped engine or a
+ *  turn that never started; nothing for a decline, a limit, or a restart that
+ *  cut nothing. */
 export function sendAgainAction(messages: DisplayMessage[], messageId: string): SendAgainAction | null {
   const at = messages.findIndex((m) => m.id === messageId)
   if (at < 0) return null
   const reason = turnEndedCard(messages[at])?.reason
   if (!reason) return null
-  const turn = messages.slice(0, at + 1)
   if (RESUME_REASONS.has(reason) && turnHadWork(messages, messageId)) {
-    const kept = RESUME_WITH_ATTACHMENTS.has(reason) ? lastTurnPrompt(turn) : null
-    return { kind: 'resume', text: RESUME_TEXT, images: kept?.images ?? [], files: kept?.files ?? [] }
+    return { kind: 'resume', text: RESUME_TEXT, images: [], files: [] }
   }
   if (!RESEND_REASONS.has(reason)) return null
-  const again = lastTurnPrompt(turn)
+  const again = lastTurnPrompt(messages.slice(0, at + 1))
   return again && { kind: 'again', ...again }
 }
 
@@ -1044,6 +1095,9 @@ export function lastTurnPrompt(messages: DisplayMessage[]):
   const turn: DisplayMessage[] = []
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
+    // A card is another agent's or the platform's message, never the
+    // person's turn: the scan ends there.
+    if (m.delegateCard) break
     if (m.role === 'user') turn.unshift(m)
     else if (turn.length && (textOf(m) || endedShort(m))) break
   }
@@ -1077,7 +1131,9 @@ export function lastTurnPrompt(messages: DisplayMessage[]):
 /** An agent's reply, the thing a person may report: never a person's
  *  message, nor another agent's prompt shown as an agent's bubble. */
 export function isAgentReply(m: DisplayMessage): boolean {
-  return m.role === 'assistant'
+  // The platform's own prompt (a wake card) is drawn as an assistant message
+  // and is nobody's reply.
+  return m.role === 'assistant' && m.delegateCard?.kind !== CARD_KIND.WAKE
 }
 
 /** A bubble built from stored rows is named by its first row

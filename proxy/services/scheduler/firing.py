@@ -253,6 +253,7 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     _continuation_skip_counts.pop(task.id, None)
 
     from core.events import chat_writer
+    from core.session.session_state import broadcast_chat_frame
     from storage.pg import run_db
     # A Shared-only chat is woken as the person who scheduled the wake; a
     # personal chat's wake is its owner's (``scope == "user"``).
@@ -279,7 +280,9 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     persisted: list[str] = []
 
     def _persist_wake(target_chat_id: str) -> None:
-        # On the chat's lane, off the loop, ahead of the wake turn's rows.
+        # On the chat's lane, off the loop, ahead of the wake turn's rows; the
+        # card's frame to a viewer of the chat (the rungs that reach here
+        # carry no socket of their own; the socket's rung sends it itself).
         persisted.append(target_chat_id)
         if target_chat_id:
             chat_writer.submit(
@@ -289,6 +292,10 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
                                   event_data=wake_event_data),
                 label="schedule_wake",
             )
+            broadcast_chat_frame(target_chat_id, {
+                "type": wire.SCHEDULE_WAKE, "chat_id": target_chat_id,
+                "prompt": wake_prompt, "task_id": task.id,
+            })
 
     # Same identity resolution as delegate delivery: the chat owner's remote
     # pins / role must be honored on the persistent/one-shot rungs.

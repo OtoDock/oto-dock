@@ -489,8 +489,8 @@ class TestControlFrames:
         layer, info = self._layer_with("codex-cli")
         await layer.send_control_request("s-1", "set_permission_mode", mode="plan")
         assert info.mode == "plan"
-        await layer.send_control_request("s-1", "set_model", model="gpt-5.6-terra")
-        assert info.model == "gpt-5.6-terra"
+        await layer.send_control_request("s-1", "set_model", model="gpt-6.1-terra")
+        assert info.model == "gpt-6.1-terra"
         # An unknown subtype is the engine's to forward or ignore (Codex ignores).
         n = layer._cm.send_fire_and_forget.call_count
         await layer.send_control_request("s-1", "set_thinking_tokens", tokens=1)

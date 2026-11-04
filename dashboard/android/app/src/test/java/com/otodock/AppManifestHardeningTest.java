@@ -167,18 +167,24 @@ public class AppManifestHardeningTest {
         assertTrue(ask.contains("if (sStartupQuestionsAsked"));
         assertTrue("never over the setup page", ask.contains("installStore.active() == null"));
         assertTrue("one question per start", ask.contains("if (offerFullScreenIntentOnce()) return;"));
+        // Recorded when offered, so it is asked once (the order is
+        // OneTimeOffers.take's, OneTimeOffersTest).
         String once = SourceText.body(main, "private boolean offerOnce(");
-        int read = once.indexOf("prefs.getBoolean(key, false)");
-        int write = once.indexOf("putBoolean(key, true)");
-        assertTrue("recorded when offered, so it is asked once", read >= 0 && write > read);
+        assertTrue(once.contains("OneTimeOffers.take("));
+        assertTrue(once.contains("prefs.getBoolean(k, false)"));
+        assertTrue(once.contains("putBoolean(k, true)"));
         String fsi = SourceText.body(main, "private boolean offerFullScreenIntentOnce(");
         assertTrue(fsi.contains("canUseFullScreenIntent()"));
         assertTrue(fsi.contains("offerOnce(FULL_SCREEN_OFFERED)"));
         String battery = SourceText.body(main, "private boolean offerBatterySettingsOnce(");
         assertTrue(battery.contains("isIgnoringBatteryOptimizations("));
-        assertTrue(battery.contains("isBackgroundRestricted()"));
+        assertTrue(battery.contains("backgroundRestricted()"));
         assertTrue(battery.contains("offerOnce(BATTERY_SETTINGS_OFFERED)"));
-        assertTrue(battery.contains("ACTION_APPLICATION_DETAILS_SETTINGS"));
+        assertTrue(battery.contains("appDetailsSettings()"));
+        assertTrue(SourceText.body(main, "private boolean backgroundRestricted(")
+                .contains("isBackgroundRestricted()"));
+        assertTrue(SourceText.body(main, "private Intent appDetailsSettings(")
+                .contains("ACTION_APPLICATION_DETAILS_SETTINGS"));
     }
 
     /** A danger message Android downgraded (or a refused start) still raises
@@ -235,6 +241,41 @@ public class AppManifestHardeningTest {
             assertTrue(task + " is guarded", guarded.contains("'" + task + "'"));
         }
         assertFalse("no keystore in the repo", new File("release.keystore").exists());
+    }
+
+    /** Android 16 ignores an app's orientation and resizability requests on
+     *  a large screen, and Play counts them against large-screen support: the
+     *  app requests none, in code or in its manifest. */
+    @Test
+    public void theAppRequestsNoOrientationAndNoAspectRatio() throws Exception {
+        for (File f : new File("src/main/java/com/otodock").listFiles((d, n) -> n.endsWith(".java"))) {
+            String src = SourceText.withoutComments(SourceText.read(f.getPath()));
+            assertFalse(f.getName(), src.contains("setRequestedOrientation("));
+            assertFalse(f.getName(), src.contains("getRequestedOrientation("));
+        }
+        String manifest = SourceText.read("src/main/AndroidManifest.xml");
+        for (String attr : new String[]{"screenOrientation", "resizeableActivity", "minAspectRatio",
+                "maxAspectRatio", "supports_size_changes"}) {
+            assertFalse(attr, manifest.contains(attr));
+        }
+    }
+
+    /** Play asks for an optimized release: R8 shrinks and renames it, and
+     *  the setup page's raw interface, which the page calls by name, keeps
+     *  its names; the notification sounds, read by name, stay in the APK. */
+    @Test
+    public void theReleaseBuildIsShrunkAndKeepsWhatThePageCallsByName() throws Exception {
+        String release = SourceText.body(SourceText.body(
+                SourceText.withoutComments(SourceText.read("build.gradle")), "buildTypes"), "release {");
+        assertTrue(release.contains("minifyEnabled true"));
+        assertTrue(release.contains("shrinkResources true"));
+        assertTrue(release.contains("getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'"));
+        String rules = SourceText.read("proguard-rules.pro");
+        assertTrue(rules.contains("-keepclassmembers class com.otodock.MainActivity$SetupBridge {\n"
+                + "    @android.webkit.JavascriptInterface public <methods>;\n}"));
+        assertFalse("no blanket warning switch", rules.contains("-dontwarn"));
+        assertTrue(SourceText.read("src/main/res/raw/keep.xml").contains("tools:keep=\"@raw/notif_*\""));
+        assertTrue(SourceText.javaSource("MainActivity").contains("\"android.resource://\" + getPackageName() + \"/raw/notif_"));
     }
 
     /** A bundle built without the Firebase file would ship an app with no
@@ -402,15 +443,33 @@ public class AppManifestHardeningTest {
         assertTrue("a notification tap or a relaunch shows the icon too",
                 launch.contains("android:windowSplashScreenBehavior=icon_preferred"));
         assertTrue(SourceText.read("../../index.html").contains("--boot-mark: 127px"));
-        assertTrue("the activity theme carries the boot bars too", activityBars.containsAll(java.util.Arrays.asList(
-                "android:statusBarColor=@color/bootField", "android:navigationBarColor=@color/bootFieldDeep",
+        assertTrue("both themes start the bars with light icons", activityBars.containsAll(java.util.Arrays.asList(
+                "android:windowLightStatusBar=false", "android:windowLightNavigationBar=false"))
+                && launch.containsAll(java.util.Arrays.asList(
                 "android:windowLightStatusBar=false", "android:windowLightNavigationBar=false")));
+        for (String item : new String[]{"android:statusBarColor", "android:navigationBarColor"}) {
+            assertFalse("no bar colour in a theme (deprecated from Android 15): " + item,
+                    styles.contains("\"" + item + "\""));
+        }
         String main = SourceText.javaSource("MainActivity");
         String onCreate = SourceText.body(main, "protected void onCreate(");
         assertTrue(onCreate.contains("getColor(R.color.bootField)") && onCreate.contains("getColor(R.color.bootFieldDeep)"));
-        assertTrue(onCreate.contains("paintBars(getColor(R.color.bootField), getColor(R.color.bootFieldDeep), false)"));
+        assertTrue(onCreate.contains("paintBarIcons(false)"));
+        int created = onCreate.indexOf("super.onCreate(savedInstanceState);");
+        int e2e = onCreate.indexOf("edgeToEdge();");
+        assertTrue("edge-to-edge after the plugins load, before the no-WebView return",
+                created >= 0 && e2e > created && e2e < onCreate.indexOf("if (getBridge() == null)"));
+        assertTrue(SourceText.body(main, "private void edgeToEdge(").contains("EdgeToEdge.enable(this, clear, clear)"));
+        assertTrue(SourceText.body(main, "private void reapplyBars(").contains("edgeToEdge();"));
         String set = SourceText.body(main, "private void setContainerColor(int to)");
-        assertTrue(set.contains("paintBars(to, to, ColorUtils.calculateLuminance(to) > 0.5)"));
+        assertTrue(set.contains("paintBarIcons(ColorUtils.calculateLuminance(to) > 0.5)"));
+        String alarm = SourceText.javaSource("AlarmActivity");
+        assertTrue(alarm.contains("public class AlarmActivity extends ComponentActivity"));
+        assertTrue(alarm.contains("EdgeToEdge.enable(this, clear, clear)"));
+        for (String src : new String[]{main, alarm}) {
+            assertFalse("no deprecated bar colouring", SourceText.withoutComments(src).contains("setStatusBarColor("));
+            assertFalse("no deprecated bar colouring", SourceText.withoutComments(src).contains("setNavigationBarColor("));
+        }
         assertTrue("the field from an older page's boot is already painted",
                 set.trim().startsWith("if (to == getColor(R.color.bootField)) return;"));
         String changed = SourceText.body(main, "public void onConfigurationChanged(");
@@ -447,6 +506,10 @@ public class AppManifestHardeningTest {
         String main = SourceText.javaSource("MainActivity");
         assertEquals("one insets listener", 1, SourceText.count(main, "setOnApplyWindowInsetsListener("));
         assertEquals("one keyboard term", 1, SourceText.count(main, "Math.max(ime.bottom, bars.bottom)"));
+        assertTrue("every side is padded (a side bar or cutout, a window on a large screen)",
+                main.contains("view.setPadding(bars.left, bars.top, bars.right, bottomPadding)"));
+        assertTrue("a fullscreen video keeps clear of a cutout only",
+                main.contains("view.setPadding(cut.left, cut.top, cut.right, cut.bottom)"));
         assertTrue(SourceText.body(main, "protected void load()").contains(".setPluginsConfiguration(pluginsConfiguration())"));
         assertTrue(SourceText.body(main, "private JSONObject pluginsConfiguration(").contains("getAssets().open(\"capacitor.config.json\")"));
         String plugin = SourceText.withoutComments(SourceText.read(

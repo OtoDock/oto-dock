@@ -194,7 +194,7 @@ class TestTaskSurface:
             return _Layer()
         monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
         pushed: list = []
-        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+        monkeypatch.setattr(lane_steer, "running_delegate_run",
                             lambda cid: task_store.get_run("run-live1"))
         from services.notifications import notification_manager
         monkeypatch.setattr(notification_manager, "push_live",
@@ -488,6 +488,34 @@ class TestSpawnOverrides:
         assert task.override_execution_path is None
         assert task.override_execution_mode is None
 
+    def test_a_model_only_pin_lands_where_the_model_is_offered(self, client, monkeypatch):
+        """``delegate(model=...)`` without a layer asks the delegating
+        person's engine first (the validator and the worker's row both do)
+        and lands on the allowed engine that offers the model: here the
+        agent's own, since the person's engine is not allowed. An unpinned
+        lane follows the person."""
+        from services.engines import engine_resolution as er
+        from storage.billing import subscription_store
+        monkeypatch.setattr(subscription_store, "list_models",
+                            lambda layer=None: [{"model_id": "claude-opus-5-5", "enabled": True}])
+        asked: list[str] = []
+
+        def _resolve(agent, sub):
+            asked.append(sub)
+            return er.Resolution("direct-llm", "hosted-mini", er.REASON_USE,
+                                 ("claude-code-cli", "direct-llm"), ("claude-code-cli", "direct-llm"), {})
+        monkeypatch.setattr(er, "resolve_session_engine", _resolve)
+        r = _spawn(client, surface="chat", model="claude-opus-5-5")
+        assert r.status_code == 200, r.text
+        chat = task_store.get_chat(r.json()["chat_id"])
+        assert (chat["execution_path"], chat["model"]) == ("claude-code-cli", "claude-opus-5-5")
+        assert asked and set(asked) == {"user-alice"}
+        asked.clear()
+        r = _spawn(client, surface="chat")
+        chat = task_store.get_chat(r.json()["chat_id"])
+        assert (chat["execution_path"], chat["model"]) == ("direct-llm", "hosted-mini")
+        assert asked == ["user-alice"]
+
     def test_layer_outside_agent_envelope_400(self, client):
         r = _spawn(client, layer="codex-cli")
         assert r.status_code == 400
@@ -688,7 +716,7 @@ class TestContinueModelChange:
         async def _chat_layer(chat):
             return _Layer()
         monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
-        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+        monkeypatch.setattr(lane_steer, "running_delegate_run",
                             lambda cid: task_store.get_run("run-mid1"))
 
         class _Pump:
@@ -856,7 +884,7 @@ class TestContinueOntoALiveTerminal:
         term = self._lane(client, "task-run-term1", "run-term1",
                           callback_chat=client.parent_chat_id)
         monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
-        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+        monkeypatch.setattr(lane_steer, "running_delegate_run",
                             lambda cid: task_store.get_run("run-term1"))
         r = _spawn(client, continue_id="task-run-term1", prompt="also T")
         assert r.status_code == 200
@@ -866,15 +894,30 @@ class TestContinueOntoALiveTerminal:
         assert [(q["text"], q["source"], q["steer"]) for q in term.queued] == [
             ("also T", "delegate_continue", True)]
         assert term.queued[0]["chat_id"] == "task-run-term1"
-        # The transcript tailer owns the terminal's rows: nothing persisted here.
+        # Nothing persisted before the paste: the row is written from the
+        # injection, with the delegating agent's meta, and the item is noted
+        # so the transcript tailer skips the journaled copy.
         assert task_store.get_chat_messages("task-run-term1") == []
+        [item] = term.queued
+        assert item["note"] is True
+        import asyncio
+        import json as _json
+
+        async def _inject():
+            item["on_injected"]()
+            await asyncio.sleep(0.3)
+        asyncio.run(_inject())
+        [row] = task_store.get_chat_messages("task-run-term1")
+        assert row["role"] == "user" and row["content"] == "also T"
+        assert _json.loads(row["event_data"])["badge"] == "delegated by"
+        assert _json.loads(row["event_data"])["agent_slug"] == AGENT
 
     def test_a_round_for_another_caller_queues_a_run(self, client, monkeypatch):
         from core.session import interactive_session
         from services.scheduler import lane_steer
         term = self._lane(client, "task-run-term2", "run-term2", callback_chat="other-chat")
         monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
-        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+        monkeypatch.setattr(lane_steer, "running_delegate_run",
                             lambda cid: task_store.get_run("run-term2"))
         r = _spawn(client, continue_id="task-run-term2", prompt="also U")
         assert r.status_code == 200
@@ -888,7 +931,7 @@ class TestContinueOntoALiveTerminal:
                           callback_chat=client.parent_chat_id)
         term.alive = False
         monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
-        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+        monkeypatch.setattr(lane_steer, "running_delegate_run",
                             lambda cid: task_store.get_run("run-term3"))
         r = _spawn(client, continue_id="task-run-term3", prompt="also V")
         assert r.status_code == 200
@@ -948,6 +991,142 @@ class TestSpawnMachine:
         assert r.json()["detail"].startswith("Only a person can pick a machine")
         assert _spawn(client, scope="agent", machine="default").status_code == 200
 
+    def _shared_only(self, client, sub="user-alice"):
+        if not agent_store.agent_exists("shared-only"):
+            agent_store.create_agent("shared-only", "SO", collaborative=False, default_scope="agent")
+        agent_store.set_delegation_targets(AGENT, ["shared-only"])
+        task_store.upsert_user(sub, f"{sub}@test.com", sub.split("-")[-1].title(), "member")
+        caller = _session_user(sub=sub)
+        caller.agents.append("shared-only")
+        caller.agent_roles["shared-only"] = "editor"
+        client.app_ref.state.user = caller
+
+    def test_a_chat_worker_runs_on_its_delegators_own_computer_as_the_agent(self, client, machines):
+        """A chat worker of a Shared-only agent runs as the agent, and may
+        still name the delegating person's own computer (never another's);
+        a background worker keeps the rule above."""
+        self._shared_only(client)
+        r = _spawn(client, agent="shared-only", surface="chat", machine="alice-laptop")
+        assert r.status_code == 200, r.text
+        assert r.json()["scope"] == "agent"
+        assert client.fired[0]["task"].target_machine == "m-alice"
+        # The chat sits on that computer from the spawn: a first round that
+        # finds it offline leaves the chat there.
+        chat = task_store.get_chat(r.json()["chat_id"])
+        assert chat["execution_target"] == "m-alice"
+        r = _spawn(client, agent="shared-only", surface="chat", machine="bob-laptop")
+        assert r.status_code == 400
+        r = _spawn(client, agent="shared-only", surface="task", machine="alice-laptop")
+        assert r.status_code == 400
+
+    def test_a_lane_on_the_delegators_own_computer_takes_their_engine(self, client, machines, monkeypatch):
+        """An agent-scope lane on its delegator's own computer spends the
+        delegator's accounts (the task builder's rule), so its row carries
+        the delegator's engine; the same lane on the platform keeps the
+        agent's default and asks nobody."""
+        from services.engines import engine_resolution as er
+        from storage.billing import subscription_store
+        monkeypatch.setattr(subscription_store, "list_models",
+                            lambda layer=None: [{"model_id": "claude-opus-5-5", "enabled": True}])
+        asked: list[str] = []
+
+        def _resolve(agent, sub):
+            asked.append(sub)
+            return er.Resolution("direct-llm", "hosted-mini", er.REASON_OWN,
+                                 ("claude-code-cli", "direct-llm"), ("direct-llm",), {})
+        monkeypatch.setattr(er, "resolve_session_engine", _resolve)
+        self._shared_only(client)
+        r = _spawn(client, agent="shared-only", surface="chat", machine="alice-laptop")
+        assert r.status_code == 200, r.text
+        chat = task_store.get_chat(r.json()["chat_id"])
+        assert (chat["execution_path"], chat["model"]) == ("direct-llm", "hosted-mini")
+        assert asked == ["user-alice"]
+        r = _spawn(client, agent="shared-only", surface="chat")
+        chat = task_store.get_chat(r.json()["chat_id"])
+        assert (chat["execution_path"], chat["model"]) == ("claude-code-cli", "claude-opus-5-5")
+        assert asked == ["user-alice"]
+
+    def test_an_agent_scope_chat_worker_on_a_shared_agent_too(self, client, machines):
+        task_store.upsert_user("user-alice", "alice@test.com", "Alice", "member")
+        r = _spawn(client, scope="agent", surface="chat", machine="alice-laptop")
+        assert r.status_code == 200, r.text
+        assert client.fired[0]["task"].target_machine == "m-alice"
+        assert _spawn(client, scope="agent", surface="task", machine="alice-laptop").status_code == 400
+
+    def _worker_on(self, client, machine: str, *, owner: str) -> str:
+        wid = str(uuid.uuid4())
+        task_store.create_chat(wid, owner, "shared-only", "auto", origin="delegated",
+                               parent_chat_id=client.parent_chat_id, delegate_role="worker")
+        task_store.update_chat(wid, session_id=str(uuid.uuid4()), execution_target=machine)
+        return wid
+
+    def test_a_continue_keeps_the_computer_for_its_owner_only(self, client, machines):
+        self._shared_only(client)
+        wid = self._worker_on(client, "m-alice", owner="agent::shared-only")
+        r = _spawn(client, agent="shared-only", continue_id=wid, prompt="more")
+        assert r.status_code == 200, r.text
+        assert client.fired[-1]["task"].target_machine == "m-alice"
+        # A teammate continuing the same pooled worker runs on the default.
+        self._shared_only_teammate(client)
+        r = _spawn(client, agent="shared-only", continue_id=wid, prompt="more")
+        assert r.status_code == 200, r.text
+        assert client.fired[-1]["task"].target_machine == ""
+
+    def _shared_only_teammate(self, client):
+        task_store.upsert_user("user-bob", "bob@test.com", "Bob", "member")
+        bob = _session_user(sub="user-bob")
+        bob.agents.append("shared-only")
+        bob.agent_roles["shared-only"] = "editor"
+        client.app_ref.state.user = bob
+
+    def test_a_teammate_neither_continues_nor_steers_a_worker_live_on_a_persons_computer(
+            self, client, machines, monkeypatch):
+        from services.remote import chat_move
+        from services.scheduler import lane_steer
+        self._shared_only(client)
+        wid = self._worker_on(client, "m-alice", owner="agent::shared-only")
+        monkeypatch.setattr(chat_move, "_session_live", lambda chat: True)
+        steered: list = []
+
+        async def _steer(*a, **kw):
+            steered.append(a)
+            return None
+        monkeypatch.setattr(lane_steer, "try_steer_continue", _steer)
+        self._shared_only_teammate(client)
+        r = _spawn(client, agent="shared-only", continue_id=wid, prompt="take over")
+        from services.remote import chat_targets
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            f"This chat is running on {chat_targets.owner_name('user-alice')}'s computer.")
+        assert steered == [] and client.fired == []
+        # Its owner continues it there.
+        self._shared_only(client)
+        r = _spawn(client, agent="shared-only", continue_id=wid, prompt="go on")
+        assert r.status_code == 200, r.text
+        assert client.fired[-1]["task"].target_machine == "m-alice"
+
+    def test_the_dashboard_refuses_a_teammates_frames_on_that_worker(self, client, machines, monkeypatch):
+        """Every frame that drives a chat (a send, Stop, a prompt answer, the
+        terminal's keys) asks ``drive_refusal`` first: on the worker live on
+        Alice's computer it refuses Bob and lets Alice through."""
+        import asyncio as _asyncio
+        from types import SimpleNamespace
+
+        from services.remote import chat_move
+        from ws import dashboard_chat_move
+        self._shared_only(client)
+        task_store.upsert_user("user-bob", "bob@test.com", "Bob", "member")
+        wid = self._worker_on(client, "m-alice", owner="agent::shared-only")
+        monkeypatch.setattr(chat_move, "_session_live", lambda chat: True)
+        dashboard_chat_move._lock_cache.clear()
+        bob = SimpleNamespace(user_sub="user-bob")
+        alice = SimpleNamespace(user_sub="user-alice")
+        from services.remote import chat_targets
+        assert _asyncio.run(dashboard_chat_move.drive_refusal(bob, wid)) == (
+            f"This chat is running on {chat_targets.owner_name('user-alice')}'s computer.")
+        assert _asyncio.run(dashboard_chat_move.drive_refusal(alice, wid)) == ""
+        dashboard_chat_move._lock_cache.clear()
+
     def test_a_continue_ignores_the_machine(self, client, machines):
         prior_sid = str(uuid.uuid4())
         task_store.create_chat("task-run-old9", "user-alice", AGENT, "auto",
@@ -956,3 +1135,183 @@ class TestSpawnMachine:
         r = _spawn(client, continue_id="task-run-old9", machine="bob-laptop")
         assert r.status_code == 200, r.text
         assert client.fired[0]["task"].target_machine == ""
+
+
+class TestFollowUpsAtTheCap:
+    """The parallel cap counts a continue that starts work; a follow-up to a
+    worker in the middle of a turn counts only when it neither steers that
+    turn nor waits behind it (one waiting run per chat)."""
+
+    @pytest.fixture(autouse=True)
+    def _at_the_cap(self, client):
+        mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "1"})
+
+    @staticmethod
+    def _lane(client, chat_id, *, report_to=None, running=True):
+        """A task-run worker chat of Alice's; with ``running`` its delegate
+        run is RUNNING on it (and fills Alice's one slot)."""
+        sid = str(uuid.uuid4())
+        task_store.create_chat(chat_id, "user-alice", AGENT, "auto",
+                               origin="delegated", title="lane", model="claude-opus-5-5")
+        task_store.update_chat(chat_id, session_id=sid)
+        if running:
+            task_store.create_dynamic_task(
+                f"dyn-{chat_id}", AGENT, "lane", "do the work", "cli", "delegate",
+                None, None, None, 3600, "user-alice",
+                on_complete_agent=AGENT, on_complete_prompt="report",
+                on_complete_session_id=PARENT_SESSION,
+                on_complete_chat_id=report_to or client.parent_chat_id,
+            )
+            task_store.create_run(f"run-{chat_id}", f"dyn-{chat_id}", AGENT, "manual", None,
+                                  "do the work", task_type="delegate", scope="user",
+                                  created_by="user-alice")
+            task_store.update_run(f"run-{chat_id}", status="running", session_id=sid,
+                                  chat_id=chat_id)
+        return sid
+
+    @staticmethod
+    def _other_lane_running():
+        task_store.create_run(f"run-{uuid.uuid4().hex[:8]}", "dyn-elsewhere", AGENT, "manual",
+                              None, "work", task_type="delegate", scope="user",
+                              created_by="user-alice")
+
+    @staticmethod
+    def _pump(monkeypatch, chat_id, sid, *, kind="task", steers=True):
+        from core.events import stream_pump
+        from core.session import session_delivery
+
+        steered: list = []
+
+        class _Pump:
+            session_id = sid
+            is_done = False
+            source_type = kind
+
+            def record_steer(self, qi, **kw):
+                return True
+
+        class _Caps:
+            class behaviour:
+                supports_steer = steers
+
+        class _Layer:
+            def capabilities_for(self, s):
+                return _Caps()
+
+            async def steer(self, s, text):
+                steered.append(text)
+                return True
+
+        async def _chat_layer(chat):
+            return _Layer()
+        monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
+        monkeypatch.setitem(stream_pump._active_pumps, chat_id, _Pump())
+        return steered
+
+    @staticmethod
+    def _untouched(client, n_tasks=0):
+        assert client.fired == []
+        assert len(task_store.list_dynamic_tasks(AGENT)) == n_tasks
+        assert (task_store.get_chat(client.parent_chat_id) or {}).get("delegate_role") in (None, "")
+
+    def test_a_follow_up_to_a_working_lane_steers_through_the_cap(self, client, monkeypatch):
+        sid = self._lane(client, "task-run-busy1")
+        steered = self._pump(monkeypatch, "task-run-busy1", sid)
+        assert task_store.count_active_delegate_runs("user-alice") == 1
+        r = _spawn(client, continue_id="task-run-busy1", prompt="also X")
+        assert r.status_code == 200, r.text
+        assert r.json()["steered"] is True and r.json()["run_id"] == "run-task-run-busy1"
+        assert steered == ["also X"] and client.fired == []
+
+    def test_a_continue_on_an_idle_worker_is_refused_before_any_write(self, client):
+        self._lane(client, "task-run-idle1", running=False)
+        self._other_lane_running()
+        r = _spawn(client, continue_id="task-run-idle1", prompt="next round")
+        assert r.status_code == 403 and "Delegation limit reached" in r.json()["detail"]
+        self._untouched(client)
+
+    def test_a_refused_steer_waits_behind_the_turn_once(self, client, monkeypatch):
+        # A person's own turn on the worker chat: the steer is not for it, so
+        # the follow-up's run waits behind that turn, uncounted. A second one
+        # while the first still waits counts.
+        sid = self._lane(client, "task-run-person1", running=False)
+        steered = self._pump(monkeypatch, "task-run-person1", sid, kind="chat")
+        self._other_lane_running()
+        r = _spawn(client, continue_id="task-run-person1", prompt="when you are done, X")
+        assert r.status_code == 200, r.text
+        assert "steered" not in r.json() and steered == [] and len(client.fired) == 1
+        queued = client.fired[0]["task"]
+        assert queued.target_chat_id == "task-run-person1"
+        # The fire is stubbed: the run row the runner would have made.
+        task_store.create_run("run-queued1", queued.id, AGENT, "manual", None, "X",
+                              task_type="delegate", scope="user", created_by="user-alice")
+        assert task_store.live_delegate_run_ids_for_chat("task-run-person1") == ["run-queued1"]
+        r = _spawn(client, continue_id="task-run-person1", prompt="and Y")
+        assert r.status_code == 403 and "Delegation limit reached" in r.json()["detail"]
+        assert "another follow-up already waits for it" in r.json()["detail"]
+        assert len(client.fired) == 1
+
+    def test_a_refused_steer_behind_the_lanes_own_run_waits_uncounted(self, client, monkeypatch):
+        # The lane's own run fills the one slot and its engine takes no
+        # steer (a parked card, an older machine): the follow-up waits
+        # behind that run, uncounted.
+        sid = self._lane(client, "task-run-busy4")
+        steered = self._pump(monkeypatch, "task-run-busy4", sid, steers=False)
+        assert task_store.count_active_delegate_runs("user-alice") == 1
+        r = _spawn(client, continue_id="task-run-busy4", prompt="also X")
+        assert r.status_code == 200, r.text
+        assert "steered" not in r.json() and steered == [] and len(client.fired) == 1
+
+    def test_the_spawn_window_counts(self, client):
+        # A RUNNING run and no pump yet: the queued run would start at once
+        # beside it (the lane gate waits on a pump only).
+        self._lane(client, "task-run-start1")
+        r = _spawn(client, continue_id="task-run-start1", prompt="also X")
+        assert r.status_code == 403 and "Delegation limit reached" in r.json()["detail"]
+        assert r.json()["detail"].endswith(
+            "This follow-up counts: the worker is starting or ending a turn, or another "
+            "follow-up already waits for it. Send it again in a moment.")
+        self._untouched(client, n_tasks=1)
+
+    def test_a_model_change_on_a_working_lane_counts(self, client, monkeypatch):
+        sid = self._lane(client, "task-run-busy2")
+        steered = self._pump(monkeypatch, "task-run-busy2", sid)
+        r = _spawn(client, continue_id="task-run-busy2", prompt="also X", model="claude-sonnet-5-5")
+        assert r.status_code == 403 and "Delegation limit reached" in r.json()["detail"]
+        assert steered == [] and client.fired == []
+        assert task_store.get_chat("task-run-busy2")["model"] == "claude-opus-5-5"
+
+    def test_a_zero_limit_refuses_a_follow_up(self, client, monkeypatch):
+        mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "0"})
+        sid = self._lane(client, "task-run-busy3")
+        steered = self._pump(monkeypatch, "task-run-busy3", sid)
+        r = _spawn(client, continue_id="task-run-busy3", prompt="also X")
+        assert r.status_code == 403 and "limited to 0" in r.json()["detail"]
+        assert steered == []
+
+    def test_a_foreign_chat_at_the_cap_gets_the_authority_refusal(self, client):
+        task_store.create_chat("task-run-bobs1", "user-bob", AGENT, "auto", origin="delegated")
+        self._other_lane_running()
+        r = _spawn(client, continue_id="task-run-bobs1", prompt="X")
+        assert r.status_code == 403
+        assert "does not refer to a worker of this chat" in r.json()["detail"]
+
+    def test_a_fresh_spawn_at_the_cap_is_refused(self, client):
+        self._other_lane_running()
+        r = _spawn(client)
+        assert r.status_code == 403 and "Delegation limit reached" in r.json()["detail"]
+        self._untouched(client)
+
+    def test_the_runs_tied_to_a_chat(self, client):
+        self._lane(client, "task-run-tied1")
+        task_store.create_dynamic_task(
+            "dyn-next1", AGENT, "lane", "next", "cli", "delegate",
+            None, None, None, 3600, "user-alice", target_chat_id="task-run-tied1")
+        task_store.create_run("run-next1", "dyn-next1", AGENT, "manual", None, "next",
+                              task_type="delegate", scope="user", created_by="user-alice")
+        task_store.create_run("run-done1", "dyn-next1", AGENT, "manual", None, "old",
+                              task_type="delegate", scope="user", created_by="user-alice")
+        task_store.update_run("run-done1", status="completed")
+        assert task_store.live_delegate_run_ids_for_chat("task-run-tied1") == [
+            "run-next1", "run-task-run-tied1"]
+        assert task_store.live_delegate_run_ids_for_chat("task-run-nothing") == []

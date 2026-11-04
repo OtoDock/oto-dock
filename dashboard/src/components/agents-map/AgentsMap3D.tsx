@@ -30,8 +30,9 @@
  * colored card shadows anywhere (dept-color spill pools were cut —
  * they read as stains).
  *
- * The map OPENS directly on the favorite agent's department stage (operator
- * round 7) — overview is one zoom-out away.
+ * The map OPENS directly on the department stage of the agent the person
+ * came from (the chat page's agent pill), else the favorite agent's
+ * (operator round 7) — overview is one zoom-out away.
  *
  * OVERVIEW: agents are compact GLASS PILLS ([chip][name][⋯] — the same
  * glass language as the stage, smaller); spaced-caps dept name + member
@@ -133,11 +134,14 @@ export interface AgentsMap3DProps {
   onCreateAgent: () => void
   /** Open the same community browser the grid view uses (page-hosted). */
   onBrowseCommunity: () => void
+  /** The agent the person came from (the chat page's agent pill): the map
+   * opens on ITS department and parks its pose. Without one, the favorite. */
+  openAgentSlug?: string
 }
 
 export default function AgentsMap3D({
   onUnavailable, hideNonMember, onToggleHideNonMember, onOpenDepartments,
-  onCreateAgent, onBrowseCommunity,
+  onCreateAgent, onBrowseCommunity, openAgentSlug,
 }: AgentsMap3DProps) {
   const navigate = useNavigate()
   const qc = useQueryClient()
@@ -210,6 +214,9 @@ export default function AgentsMap3D({
   // rebuild every chip and the terrain for nothing.
   const memberKey = (user?.agents ?? []).join('\0')
   const defaultAgent = user?.default_agent
+  // The opening anchor: the agent the person came from, else the favorite.
+  // The ★ stays the favorite's (buildScene reads defaultAgent).
+  const anchorAgent = openAgentSlug || defaultAgent
   const memberOf = useMemo(
     () => (isAdmin ? new Set(memberKey ? memberKey.split('\0') : []) : undefined),
     [isAdmin, memberKey],
@@ -258,8 +265,9 @@ export default function AgentsMap3D({
     return { cluster, arc: computeStageLayout(cluster, members, { rowCap }) }
   }, [stage, layout, rowCap])
 
-  // The map OPENS directly ON the favorite agent's department stage
-  // (operator round 7) — decided in RENDER on purpose (2026-08-15): the old
+  // The map OPENS directly ON the anchor agent's department stage (the
+  // agent the person came from, else the favorite; operator round 7) —
+  // decided in RENDER on purpose (2026-08-15): the old
   // post-paint effect let the chips build once at whole-map scatter, paint,
   // and only then rebuild into the amphitheater — the ~1s load jump. A
   // render-phase setState is the legal derived-state pattern (React
@@ -272,25 +280,25 @@ export default function AgentsMap3D({
   if (!opened && agentsReady && deptsReady
       && layout.nodes.length > 0 && !userMoved) {
     setOpened(true)
-    const fav = defaultAgent ? nodeBySlug.get(defaultAgent) : undefined
-    if (fav) {
-      setStage({ deptId: fav.departmentId })
+    const anchor = anchorAgent ? nodeBySlug.get(anchorAgent) : undefined
+    if (anchor) {
+      setStage({ deptId: anchor.departmentId })
     } else if (layout.clusters[0]) {
-      // No favorite: open on the paged whole-map view behind the first
+      // No anchor: open on the paged whole-map view behind the first
       // department (round 16 — free-roam is only the last resort).
       setMapDept(layout.clusters[0].departmentId)
     }
   }
-  // The favorite's department (null until resolvable) — the pose-park
+  // The anchor's department (null until resolvable) — the pose-park
   // writer gates on it so the parked pose is BY CONSTRUCTION the
-  // favorite's own stage, never the last visited department (live-hit
+  // anchor's own stage, never the last visited department (live-hit
   // 2026-08-15: "map opens rotated to Engineering").
-  const favDeptRef = useRef<string | null>(null)
+  const anchorDeptRef = useRef<string | null>(null)
   useEffect(() => {
-    favDeptRef.current = defaultAgent
-      ? nodeBySlug.get(defaultAgent)?.departmentId ?? null
+    anchorDeptRef.current = anchorAgent
+      ? nodeBySlug.get(anchorAgent)?.departmentId ?? null
       : null
-  }, [nodeBySlug, defaultAgent])
+  }, [nodeBySlug, anchorAgent])
 
   // Stable refs for handlers built inside the scene effect / rAF loop.
   const openAgent = useCallback((node: MapNode, x: number, y: number) => {
@@ -314,7 +322,8 @@ export default function AgentsMap3D({
   useMapRenderer({
     containerRef, bagRef,
     stageRefs: () => ({ enterStageRef, findClusterRef, exitStageRef }),
-    onUnavailable, setAssetsTick, setRowCap, setUserMoved, user,
+    onUnavailable, setAssetsTick, setRowCap, setUserMoved,
+    anchorSlug: anchorAgent ?? '',
   })
 
   // --- the living environment (terrain + lake) ---------------------------
@@ -341,7 +350,7 @@ export default function AgentsMap3D({
     pagerRef,
   } = useStageMachine({
     bagRef, layout, stage, setStage, mapDept, setMapDept, stageData,
-    setPopup, setMenu, user, favDeptRef,
+    setPopup, setMenu, anchorSlug: anchorAgent ?? '', anchorDeptRef,
   })
 
   // A department created from the map stays on the map: page to its dais

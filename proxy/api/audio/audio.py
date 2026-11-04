@@ -88,7 +88,10 @@ _POLICY_KEYS = {
     "chat_user_policy": "audio_chat_user_policy",
     "show_experimental": "audio_show_experimental",
 }
-_VALID_POLICIES = {"native_only", "native_preferred", "user_choice"}
+_VALID_POLICIES = set(audio_service.POLICIES)
+# Platform only needs a provider to point at; the released values resolve to
+# the device without one, so they are accepted as before.
+_PLATFORM_ONLY_NEEDS_PROVIDER = "Add a speech provider under Setup, Audio before choosing Platform only."
 
 
 # ---------------------------------------------------------------------------
@@ -376,14 +379,23 @@ async def update_audio_policy(
     req: PolicyUpdate, user: UserContext | None = Depends(get_current_user),
 ):
     u = require_admin(user)
+    # Every value is checked before anything is written: a refused policy
+    # must not save the switch sent beside it.
+    if req.chat_user_policy is not None:
+        if req.chat_user_policy not in _VALID_POLICIES:
+            raise HTTPException(status_code=400, detail=f"Invalid policy. Allowed: {sorted(_VALID_POLICIES)}")
+        if req.chat_user_policy == "platform_only":
+            usable = await asyncio.to_thread(
+                lambda: audio_service.platform_provider_usable("stt") or audio_service.platform_provider_usable("tts"),
+            )
+            if not usable:
+                raise HTTPException(status_code=400, detail=_PLATFORM_ONLY_NEEDS_PROVIDER)
     if req.chat_enabled is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting,
             _POLICY_KEYS["chat_enabled"], "true" if req.chat_enabled else "false",
         )
     if req.chat_user_policy is not None:
-        if req.chat_user_policy not in _VALID_POLICIES:
-            raise HTTPException(status_code=400, detail=f"Invalid policy. Allowed: {sorted(_VALID_POLICIES)}")
         await asyncio.to_thread(
             task_store.set_platform_setting, _POLICY_KEYS["chat_user_policy"], req.chat_user_policy,
         )
@@ -550,16 +562,18 @@ class TTSSessionRequest(BaseModel):
 
 @router.get("/v1/audio/capability")
 async def get_audio_capability(
-    has_native_tts: bool = False, has_native_stt: bool = False,
+    has_native_tts: bool = False, has_native_stt: bool = False, apple_webkit: bool = False,
     user: UserContext | None = Depends(get_current_user),
 ):
     """What the chat sound/mic icons can do for this device. Read on-demand —
-    never cached — so a mid-session policy/flag change is reflected next call."""
+    never cached — so a mid-session policy/flag change is reflected next call.
+    ``apple_webkit``: the device recognizer is Apple's WebKit (Safari, every
+    browser on iOS), offered beside the platform rather than instead of it."""
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     cap = await asyncio.to_thread(
         audio_service.resolve_chat_audio_capability,
-        has_native_tts=has_native_tts, has_native_stt=has_native_stt,
+        has_native_tts=has_native_tts, has_native_stt=has_native_stt, apple_webkit=apple_webkit,
     )
     resp = asdict(cap)
     resp["duplex"] = await asyncio.to_thread(audio_service.duplex_capability)

@@ -9,6 +9,7 @@ The guard degrades to a COLD start; the visible notice rides
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections import deque
 
@@ -22,20 +23,23 @@ from satellite.terminal.codex_pty_session import CodexPtySession
 from satellite.terminal.pty_relay import PtyProcess
 
 
-def _bare_session(tmp_path, *, resume: bool, thread_id: str) -> CodexPtySession:
+def _bare_session(tmp_path, *, resume: bool, thread_id: str, local: bool = False) -> CodexPtySession:
     s = CodexPtySession.__new__(CodexPtySession)
     s._codex_dir = tmp_path / ".codex"
     s._codex_dir.mkdir(parents=True, exist_ok=True)
     s._resume = resume
     s._thread_id = thread_id
     s._transcript_skip_existing = resume
+    s.config = {"local_model_provider": {"base_url": "http://127.0.0.1:11434/v1"}} if local else {}
     return s
 
 
-def _write_rollout(codex_dir, thread_id: str) -> None:
+def _write_rollout(codex_dir, thread_id: str, provider: str = "") -> None:
     day = codex_dir / "sessions" / "2026" / "07" / "19"
     day.mkdir(parents=True)
-    (day / f"rollout-2026-07-19T03-00-00-{thread_id}.jsonl").write_text("{}\n")
+    meta = (json.dumps({"type": "session_meta", "payload": {"model_provider": provider}})
+            if provider else "{}")
+    (day / f"rollout-2026-07-19T03-00-00-{thread_id}.jsonl").write_text(meta + "\n")
 
 
 class TestRolloutOnDisk:
@@ -59,7 +63,7 @@ class TestResumeGuard:
         s = _bare_session(tmp_path, resume=True, thread_id="tid-gone")
         s._apply_resume_guard()
         assert s._resume is False
-        assert s._resume_degraded is True
+        assert s._resume_degraded == "missing"
         assert s._transcript_skip_existing is False
 
     def test_keeps_resume_when_rollout_present(self, tmp_path):
@@ -67,14 +71,28 @@ class TestResumeGuard:
         _write_rollout(s._codex_dir, "tid-here")
         s._apply_resume_guard()
         assert s._resume is True
-        assert s._resume_degraded is False
+        assert not s._resume_degraded
         assert s._transcript_skip_existing is True
+
+    @pytest.mark.parametrize("recorded,local,resumes", [
+        ("openai", False, True), ("oto_local", True, True),
+        ("openai", True, False), ("oto_local", False, False), ("", True, True),
+    ])
+    def test_a_thread_of_another_provider_starts_fresh(self, tmp_path, recorded, local, resumes):
+        """Codex 0.166 refuses a thread recorded with another model provider
+        (the chat moved between a local model and OpenAI while idle): a cold
+        start with its own notice instead of a terminal that exits."""
+        s = _bare_session(tmp_path, resume=True, thread_id="tid-p", local=local)
+        _write_rollout(s._codex_dir, "tid-p", recorded)
+        s._apply_resume_guard()
+        assert s._resume is resumes
+        assert s._resume_degraded == ("" if resumes else "provider")
 
     def test_cold_start_untouched(self, tmp_path):
         s = _bare_session(tmp_path, resume=False, thread_id="")
         s._apply_resume_guard()
         assert s._resume is False
-        assert s._resume_degraded is False
+        assert not s._resume_degraded
 
 
 class TestInjectOutput:

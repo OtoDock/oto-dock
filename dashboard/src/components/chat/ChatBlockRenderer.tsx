@@ -1,4 +1,4 @@
-import { type JSX, useState } from 'react'
+import { type JSX, useLayoutEffect, useRef, useState } from 'react'
 import MarkdownContent from './MarkdownContent'
 import ImageLightbox, { type LightboxImage } from './media/ImageLightbox'
 import ToolActivity from './ToolActivity'
@@ -8,7 +8,6 @@ import SubagentInfo from './SubagentInfo'
 import BgCommandInfo from './BgCommandInfo'
 import DelegateTaskInfo, { DelegateResultFiles } from './DelegateTaskInfo'
 import CheckVerdictCard from './checks/CheckVerdictCard'
-import { WAKE_SOURCE } from '../../api/wireEvents'
 import SystemEvent from './SystemEvent'
 import ImageGallery from './media/ImageGallery'
 import VideoPlayer from './media/VideoPlayer'
@@ -19,6 +18,9 @@ import DocumentCard from './media/DocumentCard'
 import UiArtifact from './media/UiArtifact'
 import PlanView from './plan/PlanView'
 import QuestionDialog from './QuestionDialog'
+import SettingCard from './SettingCard'
+import ActionCard from './ActionCard'
+import ListCard from './ListCard'
 import SearchHighlight from './SearchHighlight'
 
 import type { MessageBlock } from './types'
@@ -26,6 +28,7 @@ import type { BgCommandPair } from '../../lib/messageBlocks'
 import PlanReviewCard from './PlanReviewCard'
 import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
 import { useSearch } from '../../contexts/useSearch'
+import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
 import { CARD } from '../ui/classes'
 
 // URL regex for linkifying plain text (user messages)
@@ -72,31 +75,127 @@ function linkifyText(text: string, matchIdPrefix?: string, matchOrder?: number):
   return parts
 }
 
-// Live chat-attached photos (base64 data URLs). Opens the shared lightbox on
-// click — Chromium blocks window.open on data: URLs, so a new-tab navigation
-// would silently do nothing.
-function AttachedImageStrip({ images }: { images: string[] }) {
-  const [lightboxIdx, setLightboxIdx] = useState<number | null>(null)
+// A person's message folds past FOLD_LINES rendered lines (wrapped lines
+// count) to its first FOLDED_LINES.
+const FOLD_LINES = 10
+const FOLDED_LINES = 8
+
+/** A person's text, folded when long: measured against its own line height
+ *  on every change of text or width, under a fade in the bubble's fill, with
+ *  Show more at the bottom. Open while a find-in-chat query matches it, so
+ *  the match registers and scrolls into view. An unknown line height (a
+ *  layout-free test) never folds; an empty text (a photo-only message)
+ *  draws nothing. */
+function UserMessageText({ text, blockId, blockOrder }: { text: string; blockId: string; blockOrder: number }) {
+  const { query } = useSearch()
+  const textRef = useRef<HTMLParagraphElement>(null)
+  const [open, setOpen] = useState(false)
+  // The folded height in px when the text is long enough to fold, else null.
+  const [foldPx, setFoldPx] = useState<number | null>(null)
+  const needle = query.trim().toLowerCase()
+  const expanded = open || (!!needle && text.toLowerCase().includes(needle))
+
+  useLayoutEffect(() => {
+    const el = textRef.current
+    if (!el) return
+    const measure = () => {
+      const line = parseFloat(getComputedStyle(el).lineHeight)
+      if (!Number.isFinite(line) || line <= 0) {
+        setFoldPx(null)
+        return
+      }
+      setFoldPx(el.scrollHeight > FOLD_LINES * line + 1 ? Math.round(FOLDED_LINES * line) : null)
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [text])
+
+  if (!text) return null
+  const folded = foldPx !== null && !expanded
+  const toggle = () => {
+    // Closing: the bubble's top back in view, not the place the long text
+    // left the reader at.
+    if (open) textRef.current?.closest('[data-msg-id]')?.scrollIntoView?.({ block: 'nearest' })
+    setOpen(!open)
+  }
+  return (
+    <div>
+      <div className="relative">
+        <p
+          ref={textRef}
+          className="text-sm whitespace-pre-wrap"
+          style={folded ? { maxHeight: foldPx, overflow: 'hidden' } : undefined}
+          data-testid="user-message-text"
+        >
+          {linkifyText(text, query ? blockId : undefined, query ? blockOrder : undefined)}
+        </p>
+        {folded && (
+          <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-linear-to-t from-action to-transparent" />
+        )}
+      </div>
+      {foldPx !== null && (
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={expanded}
+          className="mt-1.5 rounded-sm text-xs font-medium underline-offset-2 hover:underline
+                     focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-action-fg/60"
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      )}
+    </div>
+  )
+}
+
+const PHOTO_ICON_PATH = 'M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z'
+
+// A person's photos, each on its own: a fresh one from its data URL, a saved
+// one through the agent files API (the route's own role check), and one with
+// neither, or whose file does not load (deleted since, or a folder this
+// viewer may not read), as a quiet tile instead of a broken image. Opens the
+// shared lightbox over the photos that loaded; Chromium blocks window.open
+// on data: URLs, so a new-tab navigation would silently do nothing.
+function AttachedImageStrip({ srcs }: { srcs: Array<string | null> }) {
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
+  const [gone, setGone] = useState<ReadonlySet<number>>(() => new Set())
+  const shown = srcs.flatMap((src, i) => (src && !gone.has(i) ? [src] : []))
   return (
     <div className="flex gap-2 flex-wrap mb-1">
-      {images.map((src, i) => (
+      {srcs.map((src, i) => (src && !gone.has(i) ? (
         <img
           key={i}
           src={src}
           alt={`Attached image ${i + 1}`}
           className="w-20 h-20 rounded-card object-cover border border-action-fg/30 cursor-pointer
                      hover:opacity-90 transition-opacity"
-          onClick={() => setLightboxIdx(i)}
+          onClick={() => setLightboxSrc(src)}
+          onError={() => setGone((prev) => new Set(prev).add(i))}
         />
-      ))}
-      {lightboxIdx !== null && (
+      ) : (
+        <div
+          key={i}
+          data-testid="photo-not-available"
+          className="w-20 h-20 rounded-card border border-dashed border-action-fg/40 flex flex-col items-center
+                     justify-center gap-1 px-1 text-center text-2xs leading-tight text-action-fg/80"
+        >
+          <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={PHOTO_ICON_PATH} />
+          </svg>
+          Photo not available
+        </div>
+      )))}
+      {lightboxSrc !== null && shown.includes(lightboxSrc) && (
         <ImageLightbox
-          images={images.map((src): LightboxImage => {
+          images={shown.map((src): LightboxImage => {
             const m = src.match(/^data:([^;,]+);base64,(.*)$/)
             return m ? { imageData: m[2], mimeType: m[1] } : { url: src }
           })}
-          initialIndex={lightboxIdx}
-          onClose={() => setLightboxIdx(null)}
+          initialIndex={shown.indexOf(lightboxSrc)}
+          onClose={() => setLightboxSrc(null)}
         />
       )}
     </div>
@@ -173,11 +272,7 @@ export default function BlockRenderer({
         return <NoteBlock content={block.content} blockId={blockId} blockOrder={blockOrder} />
       }
       if (isUserMessage) {
-        return (
-          <p className="text-sm whitespace-pre-wrap">
-            {linkifyText(block.content, searchQuery ? blockId : undefined, searchQuery ? blockOrder : undefined)}
-          </p>
-        )
+        return <UserMessageText text={block.content} blockId={blockId} blockOrder={blockOrder} />
       }
       return (
         <MarkdownContent className="text-sm" searchMatchIdPrefix={searchQuery ? blockId : undefined} searchOrder={searchQuery ? blockOrder : undefined}>
@@ -232,7 +327,7 @@ export default function BlockRenderer({
     case 'subagent':
       return <SubagentInfo description={block.description} subagentType={block.subagentType} isActive={block.isActive} failed={block.failed} background={block._background} toolInput={block.toolInput} toolResult={block.toolResult} />
 
-    case 'bgcommand':
+    case BG_COMMAND_BLOCK:
       return <BgCommandInfo command={block.command} description={block.description} isActive={block.isActive} failed={block.failed} toolInput={bgPair?.toolInput} toolResult={bgPair?.toolResult} />
 
     case 'delegate':
@@ -259,27 +354,6 @@ export default function BlockRenderer({
         />
       )
 
-    case 'schedulewake':
-      // A schedule_continuation wake drove this turn (no user present), or
-      // the platform resumed the chat on its new place after the agent moved it.
-      return block.source === WAKE_SOURCE.MOVE ? (
-        <div className="my-1.5 flex items-center gap-2 py-1.5 px-2 rounded-card bg-surface-muted text-xs text-secondary"
-             data-testid="move-resume-row">
-          <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-          </svg>
-          <span className="shrink-0 font-medium">Continued after the move</span>
-          {block.prompt && <span className="truncate text-tertiary">{block.prompt}</span>}
-        </div>
-      ) : (
-        <div className="my-1.5 flex items-center gap-2 py-1.5 px-2 rounded-card bg-surface-muted text-xs text-secondary">
-          <span className="shrink-0" aria-hidden>⏰</span>
-          <span className="shrink-0 font-medium">Scheduled wake</span>
-          {block.prompt && <span className="truncate text-tertiary">{block.prompt}</span>}
-        </div>
-      )
-
     case 'permission':
       return (
         <PermissionDialog
@@ -303,6 +377,37 @@ export default function BlockRenderer({
           requestId={block.requestId}
           onAnswerStructured={onQuestionAnswerStructured}
           readOnly={dialogsInTerminal}
+        />
+      )
+
+    case 'setting':
+      return (
+        <SettingCard
+          settingId={block.settingId}
+          label={block.label}
+          catalogVersion={block.catalogVersion}
+        />
+      )
+
+    case 'card':
+      return (
+        <ActionCard
+          cardId={block.cardId}
+          title={block.title}
+          text={block.text}
+          note={block.note}
+          buttons={block.buttons}
+          options={block.options}
+        />
+      )
+
+    case 'list':
+      return (
+        <ListCard
+          kind={block.kind}
+          filters={block.filters}
+          title={block.title}
+          agentName={agentName}
         />
       )
 
@@ -399,27 +504,20 @@ export default function BlockRenderer({
       )
 
     case 'image_attachments': {
-      // Images are base64 data URLs during live session, filenames on history reload
-      const isLive = block.images.length > 0 && block.images[0].startsWith('data:')
-      if (isLive) {
-        return <AttachedImageStrip images={block.images} />
-      }
-      // History reload: the saved upload paths render through the agent files
-      // API (same-origin session cookie). Only when EVERY image has a path —
-      // pre-path rows (and task views without an agent) keep the count badge.
-      const fileUrls = agentName
-        ? (block.paths ?? []).flatMap((p) =>
-            p ? [`/v1/agents/${agentName}/files/${encodeURI(p)}`] : [])
-        : []
-      if (fileUrls.length > 0 && fileUrls.length === block.images.length) {
-        return <AttachedImageStrip images={fileUrls} />
-      }
-      // Legacy rows without saved paths: badge with count
+      // Per photo: a data URL on the live send, else a saved path drawn
+      // through the agent files API; a bubble may mix the two (a photo handed
+      // back from a cancelled queued message, then a new one).
+      const srcs = block.images.map((src, i) => {
+        if (src.startsWith('data:')) return src
+        const path = block.paths?.[i]
+        return path && agentName ? `/v1/agents/${agentName}/files/${encodeURI(path)}` : null
+      })
+      if (srcs.some(Boolean)) return <AttachedImageStrip srcs={srcs} />
+      // Rows from before paths were stored, and views without an agent: the count.
       return (
         <div className="flex items-center gap-1.5 mb-1 text-xs text-action-fg">
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={PHOTO_ICON_PATH} />
           </svg>
           {block.images.length} image{block.images.length > 1 ? 's' : ''} attached
         </div>

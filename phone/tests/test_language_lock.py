@@ -979,6 +979,29 @@ def test_the_cleanup_reports_the_second_listen_once_with_the_routes_provider(mak
     assert sent == [{"agent": p.route.agent, "provider": "deepgram", "seconds": 7.5, "session_id": "sess-9"}]
 
 
+def test_the_cleanup_reports_the_speech_through_the_seam(make_pipeline, monkeypatch):
+    """The spoken conversation overrides the seam: what the teardown gathers
+    is whatever the subclass answers, with the call's seconds."""
+    from pipeline import core as plcore
+    seen = []
+
+    async def noted():
+        seen.append("gathered")
+    p = make_pipeline(route=make_route(language="el"), llm=FakeLLM(session_id="sess-10"))
+    p.stt.relisten_seconds = 2.0
+    p.stt.audio_offered_s = 30.5
+    monkeypatch.setattr(plcore, "report_relisten_usage", lambda **kw: noted())
+    asked = []
+
+    def seam(**kw):
+        asked.append(kw)
+        return [noted()]
+    monkeypatch.setattr(p, "_speech_usage_reports", seam)
+    asyncio.run(p._cleanup())
+    assert asked == [{"streamed": 30.5, "relistened": 2.0, "session_id": "sess-10"}]
+    assert seen == ["gathered"]
+
+
 def test_a_call_with_no_second_listen_reports_none(make_pipeline, monkeypatch):
     from pipeline import core as plcore
     sent = []

@@ -161,11 +161,21 @@ class TestValidation:
         assert r.status_code == 400
         assert "not enabled" in r.json()["detail"]
 
-    def test_model_foreign_to_layer_400(self, client):
-        # hosted-mini is enabled on direct-llm, not on the agent's primary.
+    def test_model_alone_is_accepted_where_an_allowed_engine_offers_it(self, client):
+        # hosted-mini is enabled on direct-llm, not on the agent's primary:
+        # the pin passes with no layer and the listing names direct-llm,
+        # the engine the run takes (`engine_for_model`).
         r = _create_scheduled(client, model="hosted-mini")
+        assert r.status_code == 200
+        row = task_store.get_dynamic_task(r.json()["task_id"])
+        assert (row["override_model"], row["override_execution_path"]) == ("hosted-mini", "")
+        listed = {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}[r.json()["task_id"]]
+        assert (listed["effective_execution_path"], listed["effective_model_source"]) == ("direct-llm", "pinned")
+
+    def test_model_no_allowed_engine_offers_400(self, client):
+        r = _create_scheduled(client, model="m-nowhere")
         assert r.status_code == 400
-        assert "not available" in r.json()["detail"]
+        assert "not available on any execution layer" in r.json()["detail"]
 
     def test_model_valid_on_explicitly_chosen_layer(self, client):
         r = _create_scheduled(client, model="hosted-mini", layer="direct-llm")
@@ -279,7 +289,43 @@ class TestConsumption:
         assert chat["model"] == MODEL_STRONG
         assert chat["execution_path"] == "claude-code-cli"
 
-    def test_chat_row_falls_back_to_agent_default(self, client):
+    def test_a_model_pin_without_an_engine_pin_runs_where_the_model_is_offered(self, client, monkeypatch):
+        """A model pin without a layer runs on the engine that offers the
+        model: the creator's own engine first (the roster's `default`
+        line), else another allowed engine. The unpinned sibling follows
+        the person as before."""
+        from services.engines import engine_resolution as er
+        theirs = er.Resolution("direct-llm", "hosted-mini", er.REASON_USE,
+                               ("claude-code-cli", "direct-llm"), ("claude-code-cli", "direct-llm"),
+                               {"claude-code-cli": MODEL_DEFAULT, "direct-llm": "hosted-mini"})
+        monkeypatch.setattr(er, "resolve_session_engine", lambda agent, sub: theirs)
+        monkeypatch.setattr(er, "resolve_for_person", lambda row, holdings, catalog: theirs)
+        strong = _create_scheduled(client, model=MODEL_STRONG).json()["task_id"]   # offered on claude-code-cli alone
+        mini = _create_scheduled(client, model="hosted-mini").json()["task_id"]   # offered on the person's direct-llm
+        unpinned = _create_scheduled(client).json()["task_id"]
+        rows = {}
+        for run, tid in (("run-mp1", strong), ("run-mp3", mini), ("run-mp2", unpinned)):
+            task = scheduler._row_to_task(task_store.get_dynamic_task(tid))
+            task_store.create_run(run, tid, AGENT, "scheduled", None, "x")
+            chat_id = f"task-{run}-{uuid.uuid4().hex[:6]}"
+            scheduler._create_task_chat_row(chat_id, run, task)
+            rows[tid] = task_store.get_chat(chat_id)
+        assert (rows[strong]["execution_path"], rows[strong]["model"]) == ("claude-code-cli", MODEL_STRONG)
+        assert (rows[mini]["execution_path"], rows[mini]["model"]) == ("direct-llm", "hosted-mini")
+        assert (rows[unpinned]["execution_path"], rows[unpinned]["model"]) == ("direct-llm", "hosted-mini")
+        # The listing says the same for all three.
+        listed = {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}
+        assert (listed[strong]["effective_execution_path"], listed[strong]["effective_model"],
+                listed[strong]["effective_model_source"]) == ("claude-code-cli", MODEL_STRONG, "pinned")
+        assert (listed[mini]["effective_execution_path"], listed[mini]["effective_model"],
+                listed[mini]["effective_model_source"]) == ("direct-llm", "hosted-mini", "pinned")
+        assert (listed[unpinned]["effective_execution_path"], listed[unpinned]["effective_model"],
+                listed[unpinned]["effective_model_source"]) == ("direct-llm", "hosted-mini", "your engine")
+
+    def test_chat_row_is_stamped_with_the_agent_default(self, client):
+        # An unpinned run whose creator holds nothing of their own: the
+        # agent's default engine and its model, written on the row (the
+        # builder reads them back; a re-warm follows them).
         tid = _create_scheduled(client).json()["task_id"]
         task = scheduler._row_to_task(task_store.get_dynamic_task(tid))
         task_store.create_run("run-ov2", tid, AGENT, "scheduled", None, "x")
@@ -287,7 +333,7 @@ class TestConsumption:
         scheduler._create_task_chat_row(chat_id, "run-ov2", task)
         chat = task_store.get_chat(chat_id)
         assert chat["model"] == MODEL_DEFAULT
-        assert chat["execution_path"] == ""
+        assert chat["execution_path"] == "claude-code-cli"
 
 
     def test_a_pin_written_after_the_boot_walk_runs_on_its_successor(self, client):
@@ -577,7 +623,7 @@ class TestContinuedLaneModelChange:
             async def close_session(self, sid):
                 events.append(("failure-close", sid))
 
-        cfg = SimpleNamespace(execution_target="local", execution_path="claude-code-cli",
+        cfg = SimpleNamespace(placement_sub=None, execution_target="local", execution_path="claude-code-cli",
                               interactive=False, resume=False, extra_env={}, chat_id="",
                               subscription_id="", model=MODEL_STRONG)
 
@@ -698,7 +744,8 @@ class TestAFreshContinueRound:
                 raise RuntimeError("the second build failed")
             seen["builds"].append(sid)
             return SimpleNamespace(
-                execution_target="local", execution_path="claude-code-cli", interactive=False,
+                placement_sub=None, execution_target="local", execution_path="claude-code-cli",
+                interactive=False,
                 resume=False, extra_env={}, chat_id="", subscription_id="sub-1", model=MODEL_STRONG,
                 credential_env={"OTO_SESSION_ID": sid}, mcp_config_path=f"/configs/{sid}.json")
 
@@ -1044,6 +1091,127 @@ class TestTaskMachineAtRunTime:
         task_store.set_platform_setting("allow_user_paired_machines", "0")
         assert tcb.task_target(task, _viewer_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
 
+    def test_an_editors_task_runs_on_the_agents_machine_by_its_switch(self, client, machines, resolver):
+        """A person below the owner tier runs a task on an admin machine
+        only when it is the agent's own default and its admin let every role
+        of its agents run there."""
+        from core.config import task_config_builder as tcb
+        from storage import remote_store
+        task = self._task(target_machine="m-rack")
+        assert tcb.task_target(task, _viewer_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
+        remote_store.set_all_roles_run_here("m-rack", True)
+        # Not the agent's default yet: another agent's machine stays refused.
+        assert tcb.task_target(task, _viewer_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
+        remote_store.set_agent_remote_target(AGENT, "m-rack", "user-admin")
+        assert tcb.task_target(task, _viewer_identity()) == ("m-rack", None, "")
+        machines.discard("m-rack")
+        assert tcb.task_machine_note(task, _viewer_identity(), "local") == (
+            "rack-1 was offline, so this run used the OtoDock platform.")
+
+    def test_a_chat_worker_runs_as_the_agent_on_its_delegators_computer_and_waits_for_it(
+            self, client, machines, resolver):
+        """A chat-surface worker a person delegated may run as the agent on
+        that person's own computer; offline, it waits for it (the round ends
+        with the sentence, no move). A task-surface worker, a scheduled task
+        and another person's worker keep no personal machine."""
+        from core import placement
+        from core.config import task_config_builder as tcb
+        from services.scheduler import task_kinds
+        worker = self._task(target_machine="m-own", task_type=task_kinds.DELEGATE, scope="agent",
+                            target_chat_id=str(uuid.uuid4()), created_by="user-viewer")
+        assert tcb.worker_machine_owner(worker) == "user-viewer"
+        assert tcb.task_target(worker, _agent_identity()) == ("m-own", None, "")
+        machines.discard("m-own")
+        waiting = tcb.task_target(worker, _agent_identity())
+        assert placement.is_offline_sentinel(waiting.target) and waiting.fallback_reason is None
+        machines.add("m-own")
+        for other in (
+                self._task(task_type=task_kinds.DELEGATE, target_chat_id="task-run-x", created_by="user-viewer"),
+                self._task(task_type=task_kinds.SCHEDULED, created_by="user-viewer"),
+                self._task(task_type=task_kinds.DELEGATE, target_chat_id="c-1", created_by="pa")):
+            assert tcb.worker_machine_owner(other) is None
+        theirs = worker.model_copy(update={"created_by": "user-viewer2"})
+        assert tcb.task_target(theirs, _agent_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
+
+    def test_a_queued_round_leaves_the_computer_of_a_delegator_below_the_tier(
+            self, client, machines, resolver):
+        """A delegator moved below the editor tier, or removed, names no
+        computer any more: the next round gives way to the agent's default,
+        never waiting for or landing on their computer."""
+        from core import placement
+        from core.config import task_config_builder as tcb
+        from services.scheduler import task_kinds
+        from storage.identity import db_users
+        worker = self._task(target_machine="m-own", task_type=task_kinds.DELEGATE, scope="agent",
+                            target_chat_id=str(uuid.uuid4()), created_by="user-viewer")
+        db_users.set_user_agent_role("user-viewer", AGENT, "contributor")
+        assert tcb.worker_machine_owner(worker) is None
+        chosen = tcb.task_target(worker, _agent_identity())
+        assert chosen == ("local", tcb.FALLBACK_TASK_MACHINE, "viewer-laptop")
+        machines.discard("m-own")
+        assert not placement.is_offline_sentinel(tcb.task_target(worker, _agent_identity()).target)
+
+    def test_a_worker_on_its_delegators_computer_meets_their_own_limit(
+            self, client, machines, monkeypatch):
+        """Its spend is the delegator's own account: the delegator's own
+        limit stops the round as the agent's does. On the platform only the
+        agent's limit applies."""
+        import asyncio as _asyncio
+
+        from core.config import task_config_builder as tcb
+        from services.billing import usage_service
+        from services.scheduler import runner, task_kinds
+        monkeypatch.setattr(usage_service, "check_agent_limit", lambda a: {"allowed": True})
+        monkeypatch.setattr(usage_service, "check_user_limit",
+                            lambda sub, role: {"allowed": sub != "user-viewer"})
+        worker = self._task(target_machine="m-own", task_type=task_kinds.DELEGATE, scope="agent",
+                            target_chat_id=str(uuid.uuid4()), created_by="user-viewer")
+        assert tcb.owners_computer_person(worker) == "user-viewer"
+        assert tcb.owners_computer_person(worker.model_copy(update={"target_machine": "m-rack"})) is None
+        run_id = _asyncio.run(runner._execute_task(worker, trigger_type="delegate"))
+        row = task_store.get_run(run_id)
+        assert (row["status"], row["error_message"]) == ("limit_exceeded", "User usage limit exceeded")
+
+    def test_the_start_guard_judges_the_runs_own_person(self, client, machines):
+        """An agent-scope task names nobody to the start guard, whoever made
+        it: its creator's own computer refuses it. A chat worker names its
+        delegator; every other session keeps its ``user_sub``."""
+        from core.execution_layer import AgentConfig
+        from core.remote.remote_session_start import placement_refuses
+
+        def cfg(user_sub, placement_sub=None):
+            return AgentConfig(agent_name=AGENT, user_sub=user_sub, placement_sub=placement_sub,
+                               security_context=type("C", (), {"role": "manager"})())
+        assert placement_refuses("m-own", cfg("user-viewer", ""))
+        assert not placement_refuses("m-own", cfg("user-viewer", "user-viewer"))
+        assert not placement_refuses("m-own", cfg("user-viewer"))
+        assert placement_refuses("m-own", cfg("user-viewer2"))
+
+    def test_the_runs_layer_takes_the_workers_delegator_as_its_person(self, client, monkeypatch):
+        """The engine layer refuses a session of no person on a user-paired
+        machine: a chat worker's run asks for its layer as its delegator
+        (``placement_sub``), a scheduled agent-scope task as nobody."""
+        import asyncio as _asyncio
+
+        from core.execution_layer import AgentConfig
+        from core.session import session_manager
+        from services.scheduler import task_run as task_run_mod
+        seen: list = []
+        monkeypatch.setattr(session_manager, "get_execution_layer",
+                            lambda agent, **kw: seen.append(kw["user_sub"]) or object())
+
+        async def _noop(self):
+            return None
+        monkeypatch.setattr(task_run_mod.TaskRun, "_record_target", _noop)
+        monkeypatch.setattr(task_store, "update_chat", lambda *a, **k: None)
+        for placement_sub, expected in (("user-viewer", "user-viewer"), ("", None)):
+            run = task_run_mod.TaskRun("run-x", "sess-x", self._task(), "p", "manual", None, 1, None,
+                                       _agent_identity(), "")
+            run.agent_cfg = AgentConfig(agent_name=AGENT, execution_target="m-own",
+                                        execution_path="claude-code-cli", placement_sub=placement_sub)
+            _asyncio.run(run._bind_layer())
+            assert seen[-1] == expected
+
     def test_a_judges_machine_the_guard_refuses_falls_back_to_the_resolver(
             self, client, machines, resolver):
         from core.config import task_config_builder as tcb
@@ -1127,7 +1295,7 @@ class TestTaskMachineAtRunTime:
         run = task_run.TaskRun(run_id, sid, task, task.prompt, "manual", None, 1, None,
                                _viewer_identity(), "local")
         run.chat_id = chat_id
-        run.agent_cfg = SimpleNamespace(execution_target="m-rack",
+        run.agent_cfg = SimpleNamespace(placement_sub=None, execution_target="m-rack",
                                         fallback_reason=tcb.FALLBACK_TASK_MACHINE)
 
         async def _twice():

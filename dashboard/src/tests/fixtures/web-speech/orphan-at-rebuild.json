@@ -1,0 +1,76 @@
+{
+ "source": "A list started over while an interim was still shown: the interim is kept before the new words.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "one."
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "one."
+    },
+    {
+     "isFinal": false,
+     "text": "two three"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "four"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "four five."
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "one.",
+   "two three",
+   "four five."
+  ],
+  "replaces": [],
+  "interims": [
+   "two three",
+   "four"
+  ],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

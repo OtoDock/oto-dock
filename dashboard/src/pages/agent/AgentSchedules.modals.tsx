@@ -1,14 +1,19 @@
 import { useState, type ReactNode } from 'react'
 
 import {
-  TASK_MACHINE_DEFAULT, useEditTaskMachine, useEditTaskMode, type Task, type TaskPermissionMode,
+  TASK_MACHINE_DEFAULT, useEditTaskDetails, useEditTaskMachine, useEditTaskMode, type Task,
+  type TaskPermissionMode,
 } from '../../api/tasks'
 import { useAgentRunTargets } from '../../api/remoteMachines'
 import { AUTO_REVIEW_MODE, DONT_ASK_MODE } from '../../lib/engines/modes'
 import { errorText } from '../../lib/http/apiJson'
 import Button from '../../components/ui/Button'
-import { Select } from '../../components/ui/Field'
+import { Input, Select } from '../../components/ui/Field'
 import InfoTip from '../../components/ui/InfoTip'
+import { audienceOf } from '../../components/common/audience'
+import { WhoIsToldField } from '../../components/common/WhoIsTold'
+import type { AgentRole } from '../../lib/permissions'
+import { SCOPE } from '../../lib/visibility'
 import { FormError, Modal } from './AgentTriggers.modals'
 
 
@@ -20,16 +25,21 @@ import { FormError, Modal } from './AgentTriggers.modals'
  * A task's settings, opened from its row: where it runs ("Runs on": the
  * agent's default, or one of the places the server offers for the task's
  * run person, an offline machine listed but not pickable). `extraFields` is
- * a slot under "Runs on" for a further field of the task (its mode): the
- * caller owns its value, says it changed with `extraDirty` and saves it in
+ * a slot under "Runs on" for further fields of the task (its mode, who is
+ * told) and `leadFields` one above it (its name): the caller owns their
+ * values, says they changed with `extraDirty` and saves them in
  * `onSaveExtra`. Save sends only what changed, the machine first, then the
- * slot's field, and closes. A refusal of either shows inline and keeps the
+ * slots' fields, and closes. A refusal of either shows inline and keeps the
  * dialog open.
  */
-export function TaskSettingsModal({ agent, task, onClose, extraFields, extraDirty = false, onSaveExtra }: {
+export function TaskSettingsModal({
+  agent, task, onClose, leadFields, extraFields, extraDirty = false, onSaveExtra,
+}: {
   agent: string
   task: Task
   onClose: () => void
+  /** Rendered above "Runs on". */
+  leadFields?: ReactNode
   /** Rendered under "Runs on". */
   extraFields?: ReactNode
   /** The slot's field differs from the task's. */
@@ -84,6 +94,7 @@ export function TaskSettingsModal({ agent, task, onClose, extraFields, extraDirt
   return (
     <Modal onClose={onClose} title={`Task settings: ${task.name}`} busy={busy}>
       <form onSubmit={onSubmit} className="space-y-3">
+        {leadFields}
         <div>
           <div className="mb-1">
             <label htmlFor="task-runs-on" className="text-xs font-medium text-primary">Runs on</label>
@@ -132,11 +143,14 @@ export function TaskSettingsModal({ agent, task, onClose, extraFields, extraDirt
 }
 
 
+/** A task's notification mode that sends nothing. */
+const SILENT_MODE = 'none'
+
 /**
- * The Task settings dialog the schedules page opens: "Runs on", and the
- * task's mode in the dialog's extra field (Don't Ask or Auto, saved with
- * `permission_mode`; a refusal, such as Auto on an engine with no reviewer,
- * shows inline).
+ * The Task settings dialog the schedules page opens: the task's name, "Runs
+ * on", its mode (Don't Ask or Auto, saved with `permission_mode`; a refusal,
+ * such as Auto on an engine with no reviewer, shows inline) and, for a
+ * shared task that notifies, who is told (`notify_audience`).
  */
 export function TaskSettingsDialog({ agent, task, onClose }: {
   agent: string
@@ -145,36 +159,73 @@ export function TaskSettingsDialog({ agent, task, onClose }: {
 }) {
   const current: TaskPermissionMode = task.permission_mode === AUTO_REVIEW_MODE ? AUTO_REVIEW_MODE : DONT_ASK_MODE
   const [mode, setMode] = useState<TaskPermissionMode>(current)
+  const [name, setName] = useState(task.name)
+  const savedAudience = audienceOf(task.notify_audience)
+  const [audience, setAudience] = useState<AgentRole>(savedAudience)
+  // A silent task tells nobody: the field is left out.
+  const showsAudience = task.scope === SCOPE.AGENT && task.notification_mode !== SILENT_MODE
   const editMode = useEditTaskMode()
+  const editDetails = useEditTaskDetails()
+  const nameDirty = name.trim() !== task.name
+  const audienceDirty = showsAudience && audience !== savedAudience
+  const onSaveExtra = async () => {
+    if (nameDirty && !name.trim()) throw new Error('A task needs a name.')
+    if (nameDirty || audienceDirty) {
+      await editDetails.mutateAsync({
+        taskId: task.id,
+        ...(nameDirty ? { name: name.trim() } : {}),
+        ...(audienceDirty ? { notify_audience: audience } : {}),
+      })
+    }
+    if (mode !== current) await editMode.mutateAsync({ taskId: task.id, mode })
+  }
   return (
     <TaskSettingsModal
       agent={agent}
       task={task}
       onClose={onClose}
-      extraDirty={mode !== current}
-      onSaveExtra={() => editMode.mutateAsync({ taskId: task.id, mode })}
-      extraFields={(
+      extraDirty={mode !== current || nameDirty || audienceDirty}
+      onSaveExtra={onSaveExtra}
+      leadFields={(
         <div>
-          <div className="mb-1">
-            <label htmlFor="task-mode" className="text-xs font-medium text-primary">Mode</label>
-            <InfoTip label="Mode">
-              Auto has the engine&apos;s own reviewer check a tool that needs approval first.
-            </InfoTip>
-          </div>
-          <Select
-            id="task-mode"
-            data-testid="task-mode"
-            value={mode}
-            onChange={(e) => setMode(e.target.value as TaskPermissionMode)}
-            disabled={editMode.isPending}
-          >
-            <option value={DONT_ASK_MODE}>Don&apos;t Ask</option>
-            <option value={AUTO_REVIEW_MODE}>Auto</option>
-          </Select>
-          <p className="text-xs text-secondary mt-1">
-            Don&apos;t Ask runs every tool.
-          </p>
+          <label htmlFor="task-name" className="block text-xs font-medium text-primary mb-1">Name</label>
+          <Input
+            id="task-name"
+            data-testid="task-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={editDetails.isPending}
+          />
         </div>
+      )}
+      extraFields={(
+        <>
+          <div>
+            <div className="mb-1">
+              <label htmlFor="task-mode" className="text-xs font-medium text-primary">Mode</label>
+              <InfoTip label="Mode">
+                Auto has the engine&apos;s own reviewer check a tool that needs approval first.
+              </InfoTip>
+            </div>
+            <Select
+              id="task-mode"
+              data-testid="task-mode"
+              value={mode}
+              onChange={(e) => setMode(e.target.value as TaskPermissionMode)}
+              disabled={editMode.isPending}
+            >
+              <option value={DONT_ASK_MODE}>Don&apos;t Ask</option>
+              <option value={AUTO_REVIEW_MODE}>Auto</option>
+            </Select>
+            <p className="text-xs text-secondary mt-1">
+              Don&apos;t Ask runs every tool.
+            </p>
+          </div>
+          {showsAudience && (
+            <WhoIsToldField id="task-who-is-told" value={audience} onChange={setAudience}
+                            disabled={editDetails.isPending} />
+          )}
+        </>
       )}
     />
   )

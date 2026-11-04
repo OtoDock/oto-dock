@@ -207,7 +207,8 @@ export const useDisconnectOAuth = () => {
       accountLabel: string
       isService?: boolean
     }) => {
-      return apiJson(`/v1/oauth/${provider}/disconnect`, {
+      // ``kept_for``: the other MCPs that share this sign-in and keep it.
+      return apiJson<{ status: string; kept_for?: string[] }>(`/v1/oauth/${provider}/disconnect`, {
         method: 'POST',
         body: JSON.stringify({
           mcp_name: mcpName,
@@ -319,17 +320,48 @@ export interface BearerAllowlistEntry {
   host_pattern: string
   added_by: string
   added_at: string
+  /** `admin`, or the MCP whose manifest put the row there. */
+  source: string
+}
+
+/** Hosts an installed MCP sends a sign-in to that wait for an admin's Allow. */
+export interface BearerPending {
+  mcp_name: string
+  mcp_label: string
+  provider: string
+  hosts: string[]
+  shared_with: string[]
+  digest: string
+}
+
+// Under the MCP list's key: an MCP's install, update, switch, enable,
+// disable or removal changes its rows and what waits, and every one of them
+// refreshes the MCP list.
+const BEARER_ALLOWLIST_KEY = ['admin-mcps', 'bearer-allowlist']
+
+const fetchAllowlist = async (): Promise<{ entries: BearerAllowlistEntry[]; pending: BearerPending[] }> => {
+  const data = await apiJson<{ entries?: BearerAllowlistEntry[]; pending?: BearerPending[] }>(
+    '/v1/admin/oauth-bearer-allowlist').catch(withMessage('Failed to load allowlist'))
+  return { entries: data.entries || [], pending: data.pending || [] }
 }
 
 export const useBearerAllowlist = () =>
-  useQuery({
-    queryKey: ['oauth-bearer-allowlist'],
-    queryFn: async (): Promise<BearerAllowlistEntry[]> => {
-      const data = await apiJson<{ entries?: BearerAllowlistEntry[] }>('/v1/admin/oauth-bearer-allowlist')
-        .catch(withMessage('Failed to load allowlist'))
-      return data.entries || []
-    },
+  useQuery({ queryKey: BEARER_ALLOWLIST_KEY, queryFn: fetchAllowlist, select: (d) => d.entries })
+
+export const useBearerPending = () =>
+  useQuery({ queryKey: BEARER_ALLOWLIST_KEY, queryFn: fetchAllowlist, select: (d) => d.pending })
+
+export const useAllowMcpHosts = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (p: BearerPending) =>
+      apiJson('/v1/admin/oauth-bearer-allowlist/allow', {
+        method: 'POST',
+        body: JSON.stringify({ mcp_name: p.mcp_name, provider: p.provider, hosts: p.hosts, digest: p.digest }),
+      }, 'The addresses were not allowed'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: BEARER_ALLOWLIST_KEY }),
   })
+}
 
 export const useAddBearerAllowlist = () => {
   const qc = useQueryClient()
@@ -350,7 +382,7 @@ export const useAddBearerAllowlist = () => {
       }, 'Failed to add')
     },
     onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
+      qc.invalidateQueries({ queryKey: BEARER_ALLOWLIST_KEY }),
   })
 }
 
@@ -364,21 +396,22 @@ export const useRemoveBearerAllowlist = () => {
       ).catch(withMessage('Failed to remove'))
     },
     onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
+      qc.invalidateQueries({ queryKey: BEARER_ALLOWLIST_KEY }),
   })
 }
 
-export const useRestoreBearerAllowlist = () => {
+// Removes every admin row and keeps the MCPs' rows.
+export const useRemoveAdminBearerRows = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async () => {
       return apiJson(
-        '/v1/admin/oauth-bearer-allowlist/restore-defaults',
+        '/v1/admin/oauth-bearer-allowlist/admin-rows/remove',
         { method: 'POST' },
-      ).catch(withMessage('Failed to restore defaults'))
+      ).catch(withMessage('The addresses were not removed'))
     },
     onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
+      qc.invalidateQueries({ queryKey: BEARER_ALLOWLIST_KEY }),
   })
 }
 

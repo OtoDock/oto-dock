@@ -839,7 +839,9 @@ class DashboardConnection(
         self._warmup_abort_chat: str | None = None
         self.layer: ExecutionLayer | None = None   # resolved on warmup, used by producer + handlers
         self.session_execution_target: str = placement.LOCAL    # surfaced in warmup_ready for badge rendering
-        self.session_fallback_reason: str | None = None  # non-None iff target differs from intent
+        # non-None when the target differs from intent, or explains a placement
+        # below the owner tier (all-roles-on-admin-remote)
+        self.session_fallback_reason: str | None = None
         self._attached_warmups: set[str] = set()  # chat_ids this WS is attached to in warmup_registry
         # Tracks whether _handle_warmup is currently mid-flight. When True, a
         # mode_change / model_change that arrives still goes through the existing
@@ -1132,6 +1134,7 @@ class DashboardConnection(
         if not isinstance(msg, dict):
             await self._send_error("Invalid message")
             return None
+        msg = wire.client_frame(msg)
         # Periodically re-validate the session + refresh role
         # (demotion / logout / password change / expiry) before
         # acting on a client message on this long-lived socket.
@@ -1504,18 +1507,25 @@ class DashboardConnection(
         from storage.pg import run_db
         cids = list(dict.fromkeys(
             c for c in [*_pump_streaming(), *_isess.streaming_chat_ids()] if c))
-        rows = await run_db(task_store.get_chats_by_ids, cids) if cids else {}
+
+        def _rows_and_modes() -> tuple[dict, set[str]]:
+            found = task_store.get_chats_by_ids(cids)
+            agents = {r.get("agent") or "" for r in found.values()}
+            return found, {a for a in agents if a and _vis.is_shared_only(a)}
+        rows, shared = await run_db(_rows_and_modes) if cids else ({}, set())
         live_ids: list[str] = []
         for cid in cids:
             row = rows.get(cid) or {}
             owner = row.get("user_sub") or ""
-            # task:: owners mirror chat_status_targets: scheduled
-            # agent-scope runs are visible to every user of the agent
-            # (the Task history view is the reader).
+            agent = row.get("agent") or ""
+            # Mirrors chat_status_targets: the agent's own work (a task::
+            # owner, an agent:: one off a Shared-only agent) reaches its
+            # editor tier, a Shared-only pool every member.
+            own_work = _vis.is_task_chat_owner(owner) or agent not in shared
             if owner == self.user_sub or (
-                (_is_shared_owner(owner) or _vis.is_task_chat_owner(owner))
-                and self._can_access_agent(row.get("agent") or "")
-            ):
+                    (_is_shared_owner(owner) or _vis.is_task_chat_owner(owner))
+                    and self._can_access_agent(agent) and (not own_work or roles.is_admin(
+                        self.user_role) or roles.can_edit(self.agent_roles.get(agent)))):
                 live_ids.append(cid)
         return {"type": wire.CHAT_STATUS_SNAPSHOT, "chat_ids": live_ids}
 

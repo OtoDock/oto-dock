@@ -314,12 +314,12 @@ class TestCrossAgentVisibility:
     sessions' cross-agent reach is their delegation roster instead
     (``TestNoUserEdgeReads``); without an edge, the 403 stands."""
 
-    def _alice_multi(self):
+    def _alice_multi(self, other: str = "viewer"):
         return UserContext(
             sub="user-alice", email="alice@test.com", name="Alice",
             role="member", is_api_key=True, session_id=PARENT_SESSION,
             agent=AGENT, agents=[AGENT, "other"],
-            agent_roles={AGENT: "editor", "other": "viewer"},
+            agent_roles={AGENT: "editor", "other": other},
         )
 
     def _seed_other(self, client):
@@ -327,7 +327,7 @@ class TestCrossAgentVisibility:
         task_store.create_chat(mine, "user-alice", "other", title="Mine")
         task_store.create_chat(bobs, "user-bob", "other", title="Bobs")
         # Agent-scope task-run chat on "other" (+ its run row) — the dashboard
-        # shows it to ANY accessor via Task History; entitlement lives on the
+        # shows it to the editor tier via Task History; entitlement lives on the
         # run, not the chat's synthetic ``task::`` owner.
         task_store.create_chat("task-run-x", "task::other", "other",
                                title="Nightly")
@@ -354,9 +354,12 @@ class TestCrossAgentVisibility:
         assert r.status_code == 200
         ids = {s["chat_id"] for s in r.json()["sessions"]}
         assert mine in ids
-        assert "task-run-x" in ids          # agent-scope run: any accessor
+        assert "task-run-x" not in ids      # agent-scope run: the editor tier only
         assert bobs not in ids              # another user's chat
         assert "task-run-y" not in ids      # another user's user-scope run
+        client.app_ref.state.user = self._alice_multi(other="editor")
+        r = client.get("/v1/delegation/sessions", params={"agent": "other"})
+        assert "task-run-x" in {s["chat_id"] for s in r.json()["sessions"]}
 
     def test_agent_all_spans_accessible_agents(self, client):
         client.app_ref.state.user = self._alice_multi()
@@ -408,6 +411,9 @@ class TestCrossAgentVisibility:
         client.app_ref.state.user = self._alice_multi()
         self._seed_other(client)
         task_store.add_chat_message("task-run-x", "assistant", "nightly done")
+        # A viewer of "other" reads none of the agent's own runs.
+        assert client.get("/v1/delegation/sessions/task-run-x/peek").status_code == 403
+        client.app_ref.state.user = self._alice_multi(other="editor")
         r = client.get("/v1/delegation/sessions/task-run-x/peek")
         assert r.status_code == 200
         assert r.json()["messages"][0]["content"] == "nightly done"

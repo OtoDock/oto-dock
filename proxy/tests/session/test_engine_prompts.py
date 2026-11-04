@@ -430,3 +430,316 @@ async def test_a_remote_re_entry_reads_the_mode_and_writes_none(monkeypatch):
     finally:
         lay._sessions.pop(sid, None)
         session_state._session_modes.pop(sid, None)
+
+
+def _plan_ask(rid: str, tool: str = "mcp__display__display_ui", tool_input: dict | None = None,
+              tool_use_id: str = "toolu_plan", **extra) -> dict:
+    request = {"subtype": "can_use_tool", "tool_name": tool,
+               "input": {"html": "<p>x</p>"} if tool_input is None else tool_input,
+               "tool_use_id": tool_use_id, "decision_reason_type": "mode", **extra}
+    return {"type": "control_request", "request_id": rid, "request": request}
+
+
+async def _answers(layer, n: int) -> None:
+    for _ in range(200):
+        if len(layer.answers) >= n:
+            return
+        await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+def plan_record():
+    yield
+    engine_prompts._gate_allowed.clear()
+    engine_prompts._set_modes.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_turn", [True, False])
+async def test_the_cli_ask_for_a_call_the_gate_allowed_in_plan_is_answered_at_once(
+        layer, plan_record, in_turn):
+    """Claude Code 2.1.299+ asks again for a call the hook allowed in plan
+    mode: the gate's record answers it with the request's own input, no card
+    (in the turn's stream or read between turns), and the record is used up."""
+    inp = {"html": "<p>x</p>"}
+    engine_prompts.note_gate_allow("s-plan", "toolu_plan", "mcp__display__display_ui",
+                                   engine_prompts.input_digest(inp))
+    engine_prompts.note_frame("s-plan", _plan_ask("r-plan", tool_input=inp), in_turn=in_turn)
+    assert engine_prompts.withdrawn_before_registered("r-plan")
+    await _answers(layer, 1)
+    assert layer.answers == [("s-plan", "r-plan", True, inp)]
+    assert not engine_prompts.owns("r-plan")
+    assert engine_prompts._gate_allowed == {}
+
+
+@pytest.mark.asyncio
+async def test_exit_plan_modes_own_question_after_the_approval_is_answered(layer, plan_record):
+    """ExitPlanMode's ask carries no reason and an empty input (the plan is in
+    its file) and asks for the person: the plan review already answered it."""
+    engine_prompts.note_gate_allow("s-exit", "toolu_exit", "ExitPlanMode",
+                                   engine_prompts.input_digest({"plan": "# p"}))
+    frame = {"type": "control_request", "request_id": "r-exit", "request": {
+        "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "input": {},
+        "tool_use_id": "toolu_exit", "requires_user_interaction": True}}
+    engine_prompts.note_frame("s-exit", frame, in_turn=True)
+    await _answers(layer, 1)
+    assert layer.answers == [("s-exit", "r-exit", True, {})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    {"tool_use_id": "toolu_other"},
+    {"tool": "mcp__memory-mcp__memory"},
+    {"tool_input": {"html": "<p>changed</p>"}},
+    {"decision_reason_type": "safetyCheck"},
+    {"decision_reason_type": "sandboxOverride"},
+    {"decision_reason_type": "asyncAgent"},
+    {"decision_reason_type": "permissionPromptTool"},
+    {"decision_reason_type": "someFutureReason"},
+    {"decision_reason_type": "rule"},
+    {"decision_reason_type": "hook"},
+    {"decision_reason_type": "subcommandResults"},
+    {"classifier_approvable": False},
+    {"decision_reason_code": "org_ask_ceiling"},
+])
+async def test_an_ask_the_record_does_not_cover_stays_a_card(layer, plan_record, change):
+    """Another call, another tool, a changed input, a safety check, a rule,
+    another hook, a compound command or a managed ceiling: the request is a
+    card as before, and an unused record stays for its own call."""
+    engine_prompts.note_gate_allow("s-card", "toolu_plan", "mcp__display__display_ui",
+                                   engine_prompts.input_digest({"html": "<p>x</p>"}))
+    kwargs = dict(change)
+    tool = kwargs.pop("tool", "mcp__display__display_ui")
+    tool_input = kwargs.pop("tool_input", None)
+    tool_use_id = kwargs.pop("tool_use_id", "toolu_plan")
+    frame = _plan_ask("r-card", tool=tool, tool_input=tool_input, tool_use_id=tool_use_id)
+    frame["request"].update(kwargs)
+    engine_prompts.note_frame("s-card", frame, in_turn=True)
+    await asyncio.sleep(0.05)
+    assert layer.answers == []
+    assert not engine_prompts.withdrawn_before_registered("r-card")
+
+
+@pytest.mark.asyncio
+async def test_a_record_is_used_once_and_expires(layer, plan_record):
+    digest = engine_prompts.input_digest({"html": "<p>x</p>"})
+    engine_prompts.note_gate_allow("s-once", "toolu_plan", "mcp__display__display_ui", digest)
+    engine_prompts.note_frame("s-once", _plan_ask("r-1"), in_turn=True)
+    await _answers(layer, 1)
+    engine_prompts.note_frame("s-once", _plan_ask("r-2"), in_turn=True)
+    await asyncio.sleep(0.05)
+    assert [rid for _s, rid, _ok, _i in layer.answers] == ["r-1"]
+    # A record past its life answers nothing, and the next write prunes it.
+    engine_prompts.note_gate_allow("s-old", "toolu_old", "mcp__display__display_ui", digest)
+    name, kept, _expiry, kind = engine_prompts._gate_allowed["s-old"]["toolu_old"]
+    engine_prompts._gate_allowed["s-old"]["toolu_old"] = (name, kept, 0.0, kind)
+    engine_prompts.note_frame("s-old", _plan_ask("r-3", tool_use_id="toolu_old"), in_turn=True)
+    await asyncio.sleep(0.05)
+    assert [rid for _s, rid, _ok, _i in layer.answers] == ["r-1"]
+    engine_prompts.note_gate_allow("s-new", "toolu_new", "mcp__display__display_ui", digest)
+    assert "s-old" not in engine_prompts._gate_allowed
+
+
+@pytest.mark.asyncio
+async def test_a_remote_record_waits_on_a_satellite_that_answers(layer, plan_record, monkeypatch):
+    """A satellite older than the answer's shape keeps today's path: the ask
+    is a card (refused at once there), never answered from the record."""
+    from core.remote import remote_file_flow, satellite_connection
+    monkeypatch.setattr(remote_file_flow, "remote_machine_id", lambda sid: "m-1")
+
+    class _CM:
+        def satellite_version(self, machine):
+            return "0.5.139"
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _CM)
+    engine_prompts.note_gate_allow("s-rem", "toolu_plan", "mcp__display__display_ui",
+                                   engine_prompts.input_digest({"html": "<p>x</p>"}))
+    engine_prompts.note_frame("s-rem", _plan_ask("r-rem"), in_turn=True)
+    await asyncio.sleep(0.05)
+    assert layer.answers == []
+    assert not engine_prompts.withdrawn_before_registered("r-rem")
+
+
+def _bypass_ask(rid: str, command: str = "cd out && rm -f *", tool_use_id: str = "toolu_rm",
+                **extra) -> dict:
+    """Claude Code's ask under bypass for an ``rm`` its safety check cannot
+    clear (the shape probed on 2.1.296 and 2.1.312)."""
+    request = {"subtype": "can_use_tool", "tool_name": "Bash",
+               "input": {"command": command, "description": "clear"},
+               "tool_use_id": tool_use_id, "decision_reason_type": "safetyCheck",
+               "classifier_approvable": False, "suppress_always_allow_rule": True, **extra}
+    return {"type": "control_request", "request_id": rid, "request": request}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["safetyCheck", "subcommandResults"])
+async def test_the_clis_safety_ask_for_a_call_the_hook_alone_allowed_is_answered(
+        layer, plan_record, reason):
+    """Don't Ask, the unattended word, or the person's Allow in Ask: the hook
+    is the authority, so the CLI's own ask for that call is answered from the
+    record at once, never a card."""
+    inp = {"command": "cd out && rm -f *", "description": "clear"}
+    engine_prompts.note_gate_allow("s-hook", "toolu_rm", "Bash", engine_prompts.input_digest(inp),
+                                   kind=engine_prompts.HOOK_RECORD)
+    engine_prompts.note_frame("s-hook", _bypass_ask("r-rm", decision_reason_type=reason),
+                              in_turn=True)
+    assert engine_prompts.withdrawn_before_registered("r-rm")
+    await _answers(layer, 1)
+    assert layer.answers == [("s-hook", "r-rm", True, inp)]
+    assert engine_prompts._gate_allowed == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    {"command": "rm -rf /"},
+    {"tool_use_id": "toolu_other"},
+    {"classifier_approvable": True},
+    {"classifier_approvable": None},
+    {"decision_reason_type": "mode"},
+    {"decision_reason_type": "rule"},
+    {"decision_reason_type": "hook"},
+    {"decision_reason_code": "org_ask_ceiling"},
+])
+async def test_a_hook_record_does_not_cover_another_ask(layer, plan_record, change):
+    """A changed command, another call, an ask the CLI's reviewer could take
+    (Auto keeps its cards), a plan floor's reason, a rule, another hook or a
+    managed ceiling: the request is a card as before."""
+    inp = {"command": "cd out && rm -f *", "description": "clear"}
+    engine_prompts.note_gate_allow("s-hk", "toolu_rm", "Bash", engine_prompts.input_digest(inp),
+                                   kind=engine_prompts.HOOK_RECORD)
+    kwargs = dict(change)
+    frame = _bypass_ask("r-hk", command=kwargs.pop("command", inp["command"]),
+                        tool_use_id=kwargs.pop("tool_use_id", "toolu_rm"))
+    frame["request"].update(kwargs)
+    if frame["request"].get("classifier_approvable") is None:
+        frame["request"].pop("classifier_approvable")
+    engine_prompts.note_frame("s-hk", frame, in_turn=True)
+    await asyncio.sleep(0.05)
+    assert layer.answers == []
+    assert not engine_prompts.withdrawn_before_registered("r-hk")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,word", [("autoReview", "auto"), ("ask", "default"),
+                                       ("plan", ""), ("dontAsk", "")])
+async def test_exit_plan_modes_answer_moves_the_cli_to_the_chosen_mode(
+        layer, plan_record, mode, word):
+    """After Implement in Auto or in Ask the answer to ExitPlanMode's own
+    question carries setMode, so a chat that started in Plan implements under
+    Claude's own reviewer in Auto; any other mode keeps the plain allow."""
+    sid = f"s-set-{mode}"
+    session_state.set_session_mode(sid, mode)
+    try:
+        engine_prompts.note_gate_allow(sid, "toolu_exit", "ExitPlanMode",
+                                       engine_prompts.input_digest({"plan": "# p"}))
+        frame = {"type": "control_request", "request_id": f"r-set-{mode}", "request": {
+            "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "input": {},
+            "tool_use_id": "toolu_exit", "requires_user_interaction": True}}
+        engine_prompts.note_frame(sid, frame, in_turn=True)
+        await _answers(layer, 1)
+        decision = engine_prompts.answer_frame(f"r-set-{mode}", True, {})["response"]["response"]
+        if word:
+            assert decision["updatedPermissions"] == [
+                {"type": "setMode", "mode": word, "destination": "session"}]
+        else:
+            assert "updatedPermissions" not in decision
+        # Used once: a second answer for the same id carries nothing.
+        assert "updatedPermissions" not in engine_prompts.answer_frame(
+            f"r-set-{mode}", True, {})["response"]["response"]
+    finally:
+        session_state._session_modes.pop(sid, None)
+
+
+# --- the hook's own cards between turns (offer_hook_card, end_hook_card) -----
+
+@pytest.fixture
+def hook_cards(layer, monkeypatch):
+    from core.events import chat_writer
+    rows: list[tuple[str, dict]] = []
+
+    def _submit(chat_id, fn, *, label=""):
+        rows.append((label, dict(fn.keywords)))
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result(None)
+        return fut
+    monkeypatch.setattr(chat_writer, "submit", _submit)
+    monkeypatch.setattr(engine_prompts, "_ping_hook_card", lambda *a, **k: None)
+    layer.rows = rows
+    yield layer
+    engine_prompts._hook_cards.clear()
+
+
+def _ask_item(rid: str) -> dict:
+    return {"event_type": "permission_prompt", "request_id": rid, "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf out"}}
+
+
+@pytest.mark.asyncio
+async def test_a_hook_card_with_no_pump_joins_the_resumes_read(hook_cards):
+    queue = asyncio.Queue()
+    assert engine_prompts.offer_hook_card(queue, _ask_item("r-h1"), session_id="s-h",
+                                          chat_id="c-h") is True
+    assert queue.empty()
+    [p] = engine_prompts.pending_for_chat("c-h")
+    assert engine_prompts.card_frame(p) == {
+        "type": "permission_prompt", "chat_id": "c-h", "request_id": "r-h1",
+        "tool_name": "Bash", "tool_input": {"command": "rm -rf out"}}
+    assert hook_cards.broadcasts == [("c-h", engine_prompts.card_frame(p))]
+    # Never answered through the layer: the hook answers its own call.
+    assert not engine_prompts.owns("r-h1")
+    engine_prompts.end_hook_card(queue, "r-h1", answered=True, approved=True,
+                                 caller_gone=False, chat_id="c-h")
+    assert engine_prompts.pending_for_chat("c-h") == []
+    assert hook_cards.answers == []
+    [(label, kw)] = hook_cards.rows
+    assert label == "hook_card" and kw["event_type"] == "permission_prompt"
+    assert json.loads(kw["event_data"])["resolved"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_hook_plan_review_frame_and_its_row(hook_cards):
+    queue = asyncio.Queue()
+    engine_prompts.offer_hook_card(queue, {
+        "event_type": "plan_review", "request_id": "r-hp", "plan": "# p",
+        "tool_input": {"planFilePath": "/x/plan-z.md"}}, session_id="s-h", chat_id="c-h")
+    [p] = engine_prompts.pending_for_chat("c-h")
+    assert engine_prompts.card_frame(p)["type"] == "plan_review"
+    assert engine_prompts.card_frame(p)["filename"] == "plan-z.md"
+    engine_prompts.note_card_action("r-hp", "edit")
+    engine_prompts.end_hook_card(queue, "r-hp", answered=True, approved=False,
+                                 caller_gone=False, chat_id="c-h")
+    row = json.loads([kw for lab, kw in hook_cards.rows if lab == "hook_card"][0]["event_data"])
+    assert row["type"] == "plan_review" and row["action"] == "edit"
+
+
+@pytest.mark.asyncio
+async def test_a_hook_card_with_no_chat_goes_onto_its_queue(hook_cards):
+    queue = asyncio.Queue()
+    assert engine_prompts.offer_hook_card(queue, _ask_item("r-nc"), session_id="s-h",
+                                          chat_id="") is False
+    assert queue.get_nowait()["request_id"] == "r-nc"
+    assert hook_cards.broadcasts == []
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_hook_card_is_retired_where_it_shows(hook_cards):
+    queue = asyncio.Queue()
+    engine_prompts.offer_hook_card(queue, _ask_item("r-rt"), session_id="s-h", chat_id="c-h")
+    engine_prompts.end_hook_card(queue, "r-rt", answered=False, approved=False,
+                                 caller_gone=False, chat_id="c-h")
+    assert hook_cards.broadcasts[-1] == ("c-h", {"type": "prompt_retired", "chat_id": "c-h",
+                                                 "request_id": "r-rt"})
+    assert queue.empty()
+    # A card a live pump showed: its retire goes through that pump's queue.
+    from core.events import stream_pump
+
+    class _Pump:
+        perm_queue = queue
+        is_done = False
+    stream_pump._active_pumps["c-live"] = _Pump()
+    try:
+        engine_prompts.end_hook_card(queue, "r-pumped", answered=False, approved=False,
+                                     caller_gone=True, chat_id="c-live")
+        assert queue.get_nowait() == {"event_type": "prompt_retired", "request_id": "r-pumped",
+                                      "caller_gone": True}
+    finally:
+        stream_pump._active_pumps.pop("c-live", None)

@@ -226,6 +226,60 @@ class TestPtyViewer:
             ws.no_more_frames()
         run_ws_scenario(scenario)
 
+    def test_a_settings_card_reaches_the_viewer_as_a_window(self, temp_db, monkeypatch):
+        """The drainer's card item, its row id stamped, goes out as a
+        ``pty_artifact`` carrying the card's event (api/settings) and the
+        row id the window's dismissal is remembered by."""
+        slug, cid, sid, isess = self._setup(monkeypatch)
+        item = {"event_type": "settings_card", "setting": "user.general.wake-word",
+                "label": "Wake word", "catalog_version": 3, "db_message_id": 41}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                await self._resume_interactive(ws, cid, sid)
+                ws.client_send({"type": "pty_attach", "chat_id": cid})
+                await ws.expect({
+                    "type": "pty_status", "chat_id": cid, "session_id": sid,
+                    "state": "attached", "tui_theme": "light",
+                })
+                await isess.on_perm_event(item)
+                await ws.expect({"type": "pty_artifact", "chat_id": cid, "session_id": sid,
+                                 "event": {"type": "settings_card", "setting": "user.general.wake-word",
+                                           "label": "Wake word", "catalog_version": 3,
+                                           "db_message_id": 41}})
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+    def test_an_action_card_reaches_the_viewer_as_a_window(self, temp_db, monkeypatch):
+        """The drainer's action card goes out as a ``pty_artifact`` like the
+        settings card, with the row id stamped."""
+        slug, cid, sid, isess = self._setup(monkeypatch)
+        item = {"event_type": "action_card", "card_id": "card-9", "title": "Move Alpha to Eng",
+                "text": "Places Alpha at the Team level of Eng.", "note": "",
+                "buttons": [{"id": "go", "label": "Move", "kind": "do"}], "options": [], "db_message_id": 42}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                await self._resume_interactive(ws, cid, sid)
+                ws.client_send({"type": "pty_attach", "chat_id": cid})
+                await ws.expect({
+                    "type": "pty_status", "chat_id": cid, "session_id": sid,
+                    "state": "attached", "tui_theme": "light",
+                })
+                await isess.on_perm_event(item)
+                await ws.expect({"type": "pty_artifact", "chat_id": cid, "session_id": sid,
+                                 "event": {"type": "action_card", "card_id": "card-9",
+                                           "title": "Move Alpha to Eng",
+                                           "text": "Places Alpha at the Team level of Eng.", "note": "",
+                                           "buttons": [{"id": "go", "label": "Move", "kind": "do"}],
+                                           "options": [], "db_message_id": 42}})
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
     def test_a_pushed_documents_token_reaches_only_its_own_person(self, temp_db, monkeypatch):
         """A push queued for Bob before a takeover that the next controller's
         drainer hands on: the frame reaches the controller without Bob's
@@ -534,3 +588,270 @@ class TestInteractiveColdFirstPromptArgv:
         assert second == focus
         assert rest == "cold argv prompt"
         assert out["rows"] == [("user", "cold argv prompt")]
+
+
+def _photo_data_url() -> str:
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (200, 30, 30)).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+async def _frames_until(ws, kind: str, limit: int = 60) -> list[dict]:
+    frames = []
+    for _ in range(limit):
+        frame = await ws.next_frame()
+        frames.append(frame)
+        if frame["type"] == kind:
+            return frames
+    raise AssertionError(f"no {kind} frame in {[f['type'] for f in frames]}")
+
+
+def test_an_entry_that_names_nothing_is_no_message():
+    from core.events.common_events import carries_prompt
+    assert carries_prompt({"text": "hi"})
+    assert carries_prompt({"images": [{"data": "data:image/png;base64,AA==", "name": "p.png"}]})
+    assert carries_prompt({"images": [{"path": "users/u/workspace/uploads/photos/a.jpg"}]})
+    assert carries_prompt({"files": [{"path": "users/u/workspace/uploads/files/a.pdf", "name": "a.pdf"}]})
+    assert not carries_prompt({"images": [{}], "files": [{"name": "x"}]})
+    assert not carries_prompt({"images": ["data:image/png;base64,AA=="], "files": None})
+    assert not carries_prompt({"text": "", "images": [], "files": []})
+
+
+class TestFirstMessageAttachments:
+    """The first message of a chat (a new chat, or a chat whose session is
+    gone) rides the warm-up: its photos are saved and its files checked when
+    its row is written, so the row carries them like any other send's, the
+    kick reads the same files back (no second copy), a message of photos
+    alone starts its turn, and a photo that cannot be read back is told."""
+
+    def _layer(self, monkeypatch):
+        from core.events.common_events import DONE, TEXT, CommonEvent
+        layer = FakeExecutionLayer()
+        layer.turn_events = [
+            CommonEvent(type=TEXT, data={"content": "answer"}),
+            CommonEvent(type=DONE, data={}),
+        ]
+        stub_dashboard_seams(monkeypatch, layer)
+        return layer
+
+    def _run(self, layer, frame: dict) -> dict:
+        out: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send(frame)
+                started = await ws.next_frame()
+                assert started["type"] == "warmup_started"
+                out["chat_id"] = started["chat_id"]
+                out["frames"] = await _frames_until(ws, "done")
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+        return out
+
+    def test_photos_and_files_are_saved_once_and_the_row_keeps_them(self, temp_db, monkeypatch):
+        import json as jsonlib
+
+        import config as cfg
+        layer = self._layer(monkeypatch)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        doc = cfg.AGENTS_DIR / slug / "users/admin/workspace/uploads/files/plan.txt"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text("the plan")
+        out = self._run(layer, {
+            "type": "warmup", "agent": slug, "text": "look at these",
+            "images": [{"data": _photo_data_url(), "name": "pic.png"}],
+            "files": [{"path": "users/admin/workspace/uploads/files/plan.txt", "name": "plan.txt"}],
+        })
+        _sid, prompt, _kw = layer.messages[0]
+        assert prompt.startswith("look at these\n\nThe user has attached 1 image(s).")
+        assert "- /users/admin/workspace/uploads/photos/img_" in prompt
+        assert "- /users/admin/workspace/uploads/files/plan.txt (" in prompt
+        user_row = temp_db.get_chat_messages(out["chat_id"])[0]
+        assert user_row["content"] == "look at these"
+        meta = jsonlib.loads(user_row["event_data"])
+        assert meta["images"][0]["name"] == "pic.png"
+        assert meta["images"][0]["path"].startswith("users/admin/workspace/uploads/photos/img_")
+        assert meta["files"] == [{"path": "users/admin/workspace/uploads/files/plan.txt", "name": "plan.txt"}]
+        # Saved at the warm-up, read back by the kick: one file.
+        photos = list((cfg.AGENTS_DIR / slug / "users/admin/workspace/uploads/photos").iterdir())
+        assert [p.relative_to(cfg.AGENTS_DIR / slug).as_posix() for p in photos] == [meta["images"][0]["path"]]
+        assert not [f for f in out["frames"] if f.get("subtype") == "photos_not_attached"]
+
+    def test_a_message_of_photos_alone_starts_its_turn(self, temp_db, monkeypatch):
+        import json as jsonlib
+        layer = self._layer(monkeypatch)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        out = self._run(layer, {"type": "warmup", "agent": slug,
+                                "images": [{"data": _photo_data_url(), "name": "pic.png"}]})
+        _sid, prompt, _kw = layer.messages[0]
+        assert prompt.startswith("\n\nThe user has attached 1 image(s).")
+        rows = temp_db.get_chat_messages(out["chat_id"])
+        assert [(r["role"], r["content"]) for r in rows] == [("user", ""), ("assistant", "answer")]
+        assert jsonlib.loads(rows[0]["event_data"])["images"][0]["name"] == "pic.png"
+
+    def test_files_alone_that_all_failed_send_nothing_and_say_why(self, temp_db, monkeypatch):
+        from ws import wire_events as wire
+        layer = self._layer(monkeypatch)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        out = self._run(layer, {"type": "warmup", "agent": slug,
+                                "files": [{"path": "users/admin/workspace/uploads/files/gone.pdf",
+                                           "name": "gone.pdf"}]})
+        errors = [f for f in out["frames"] if f["type"] == "error"]
+        assert [e["message"] for e in errors] == [wire.NOTHING_REACHED_THE_AGENT]
+        assert out["frames"][-1] == {"type": "done", "chat_id": out["chat_id"]}
+        assert layer.messages == []
+        assert temp_db.get_chat_messages(out["chat_id"]) == []
+
+    def test_an_idle_photo_send_that_reached_nothing_is_refused(self, temp_db, monkeypatch):
+        from ws import wire_events as wire
+        layer = self._layer(monkeypatch)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        out: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, _sid = await warm_new_chat(ws, layer, slug)
+                ws.client_send({"type": "chat", "chat_id": chat_id, "text": "",
+                                "images": [{"path": "users/admin/workspace/uploads/photos/gone.png",
+                                            "name": "gone.png"}]})
+                out["chat_id"] = chat_id
+                out["frames"] = await _frames_until(ws, "done")
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+        assert [f["message"] for f in out["frames"] if f["type"] == "error"] == [wire.NOTHING_REACHED_THE_AGENT]
+        assert layer.messages == []
+        assert temp_db.get_chat_messages(out["chat_id"]) == []
+
+    def test_a_photo_that_cannot_be_read_back_is_told(self, temp_db, monkeypatch):
+        import json as jsonlib
+        layer = self._layer(monkeypatch)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        out = self._run(layer, {"type": "warmup", "agent": slug, "text": "look again",
+                                "images": [{"path": "users/admin/workspace/uploads/photos/gone.png",
+                                            "name": "gone.png"}]})
+        kinds = [(f["type"], f.get("subtype")) for f in out["frames"]]
+        notice = kinds.index(("system", "photos_not_attached"))
+        assert notice < kinds.index(("text", None))
+        frame = out["frames"][notice]
+        assert frame["chat_id"] == out["chat_id"]
+        assert frame["message"] == "The photo did not reach the agent. Attach it again to send it."
+        _sid, prompt, _kw = layer.messages[0]
+        assert prompt == "look again"
+        rows = temp_db.get_chat_messages(out["chat_id"])
+        assert [(r["role"], r["event_type"] or "") for r in rows] == [
+            ("user", ""), ("event", "system"), ("assistant", "")]
+        assert rows[0]["event_data"] == ""
+        assert jsonlib.loads(rows[1]["event_data"])["subtype"] == "photos_not_attached"
+
+
+class TestInteractiveFirstMessageAttachments:
+    """A terminal's first message with photos: the server types the Read
+    paths with it, as a typed send's are, and notes what it typed so the
+    tailer adds no second row; an engine that takes its first prompt as a
+    launch argument gets it through the terminal instead (the paths are
+    lines)."""
+
+    def _run(self, temp_db, monkeypatch, *, via_argv: bool, extra_images=()) -> dict:
+        import dataclasses
+
+        from core.session import interactive_session, transcript_tool_events as tte
+        from storage.db_settings import set_platform_setting
+
+        registered: list[FakeInteractiveSession] = []
+
+        class _InteractiveSpawnLayer(FakeExecutionLayer):
+            async def start_session(self, sid, agent_cfg):
+                await super().start_session(sid, agent_cfg)
+                if getattr(agent_cfg, "interactive", False):
+                    isess = FakeInteractiveSession(sid, "")
+                    registered.append(isess)
+                    monkeypatch.setitem(interactive_session._sessions, sid, isess)
+
+        layer = _InteractiveSpawnLayer()
+        if via_argv:
+            layer.capabilities = dataclasses.replace(
+                layer.capabilities,
+                runtime=dataclasses.replace(
+                    layer.capabilities.runtime, interactive_first_prompt_via_argv=True,
+                ),
+            )
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        set_platform_setting("interactive_cli_enabled", "true")
+        monkeypatch.setattr(tte, "_sent_prompts", {})
+        out: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({
+                    "type": "warmup", "agent": slug, "text": "what is this",
+                    "images": [{"data": _photo_data_url(), "name": "pic.png"}, *extra_images],
+                    "execution_mode": "interactive",
+                })
+                started = await ws.next_frame()
+                assert started["type"] == "warmup_started"
+                chat_id = started["chat_id"]
+                frames = await _frames_until(ws, "warmup_ready", limit=10)
+                assert frames[-1]["interactive"] is True
+                for _ in range(100):
+                    if registered and registered[0].submitted:
+                        break
+                    await asyncio.sleep(0.02)
+                assert registered and registered[0].submitted, "nothing typed into the terminal"
+                frames = list(frames)
+                while not ws._outbound.empty():
+                    frames.append(ws._outbound.get_nowait())
+                out["frames"] = frames
+                out["chat_id"] = chat_id
+                _sid, agent_cfg = layer.started[0]
+                out["argv"] = agent_cfg.interactive_first_prompt
+                out["submitted"] = registered[0].submitted
+                out["rows"] = temp_db.get_chat_messages(chat_id)
+                out["consumed"] = tte.consume_sent_prompt(chat_id, registered[0].submitted[0])
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+        return out
+
+    def test_the_photos_ride_the_terminal_first_prompt(self, temp_db, monkeypatch):
+        import json as jsonlib
+        out = self._run(temp_db, monkeypatch, via_argv=False)
+        submitted, = out["submitted"]
+        assert submitted.startswith("[Current time: ")
+        assert "\n\nwhat is this\n\nThe user has attached 1 image(s)." in submitted
+        assert "- /users/admin/workspace/uploads/photos/img_" in submitted
+        row, = out["rows"]
+        assert row["content"] == "what is this"
+        assert jsonlib.loads(row["event_data"])["images"][0]["name"] == "pic.png"
+        assert out["consumed"] is True
+
+    def test_a_photo_gone_by_the_warm_up_is_told_live_and_kept_out_of_the_prompt(
+            self, temp_db, monkeypatch):
+        import json as jsonlib
+        gone = {"path": "users/admin/workspace/uploads/photos/gone.png", "name": "gone.png"}
+        out = self._run(temp_db, monkeypatch, via_argv=False, extra_images=[gone])
+        submitted, = out["submitted"]
+        assert submitted.count("- /users/admin/workspace/uploads/photos/img_") == 1
+        assert "gone.png" not in submitted
+        notices = [f for f in out["frames"] if f.get("subtype") == "photos_not_attached"]
+        assert [(n["chat_id"], n["count"]) for n in notices] == [(out["chat_id"], 1)]
+        rows = out["rows"]
+        assert [r["role"] for r in rows] == ["user", "event"]
+        assert jsonlib.loads(rows[1]["event_data"])["subtype"] == "photos_not_attached"
+
+    def test_a_launch_argument_engine_takes_them_through_the_terminal(self, temp_db, monkeypatch):
+        out = self._run(temp_db, monkeypatch, via_argv=True)
+        assert not out["argv"]
+        submitted, = out["submitted"]
+        assert "- /users/admin/workspace/uploads/photos/img_" in submitted

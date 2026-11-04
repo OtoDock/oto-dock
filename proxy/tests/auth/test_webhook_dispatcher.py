@@ -258,6 +258,11 @@ def _setup_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
         webhook_dispatcher.mcp_registry, "get_all_manifests",
         lambda: {"slack-mcp": manifest})
     monkeypatch.setattr(
+        webhook_dispatcher.mcp_registry, "get_manifest",
+        lambda name: manifest if name == "slack-mcp" else None)
+    monkeypatch.setattr(webhook_dispatcher.mcp_store, "get_all_mcp_states", lambda: {})
+    monkeypatch.setattr(credential_store, "hosted_app_account_mcps", set)
+    monkeypatch.setattr(
         credential_store, "get_infra_credentials",
         lambda slug: (
             {relay_client.EVENTS_FORWARD_SECRET_KEY: _FORWARD_SECRET}
@@ -267,9 +272,8 @@ def _setup_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
     def fake_list(**kw):
         return [
             r for r in rows
-            if r.get("vendor_target") == kw.get("vendor_target")
-            and r.get("delivery_mode") == kw.get("delivery_mode")
-            and r.get("provider_id") == kw.get("provider_id")
+            if all(kw.get(k) is None or r.get(k) == kw[k]
+                   for k in ("vendor_target", "delivery_mode", "provider_id"))
         ]
 
     monkeypatch.setattr(
@@ -333,19 +337,101 @@ def test_relay_ingest_stale_timestamp_401(monkeypatch):
 def test_relay_ingest_unknown_team_no_subscriptions(monkeypatch):
     processed = _setup_relay_env(monkeypatch, _relay_rows())
     body = json.dumps({"team_id": "T_UNKNOWN", "event": {"type": "x"}}).encode()
-    status, resp, _ = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+    status, resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
         provider_id="slack", raw_body=body, headers=_forward_headers(body)))
     assert status == 200 and resp["status"] == "no_subscriptions"
+    assert headers["x-otodock-event-outcome"] == "no_subscription"
     assert processed == []
 
 
 def test_relay_ingest_no_workspace_id_ignored(monkeypatch):
     processed = _setup_relay_env(monkeypatch, _relay_rows())
     body = json.dumps({"event": {"type": "x"}}).encode()
-    status, resp, _ = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+    status, resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
         provider_id="slack", raw_body=body, headers=_forward_headers(body)))
     assert status == 200 and resp["status"] == "ignored"
+    assert headers["x-otodock-event-outcome"] == "no_subscription"
     assert processed == []
+
+
+def _gone_mark(provider: str, ts: str) -> str:
+    return "v0=" + hmac_mod.new(
+        _FORWARD_SECRET.encode(), f"v0:gone:{provider}:{ts}".encode(), hashlib.sha256,
+    ).hexdigest()
+
+
+def test_relay_ingest_answers_gone_with_its_mark_when_nothing_takes_the_provider(monkeypatch):
+    processed = _setup_relay_env(monkeypatch, [])
+    body = json.dumps({"team_id": "T1", "event": {"type": "reaction_added"}}).encode()
+    sent = _forward_headers(body)
+    status, resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+        provider_id="slack", raw_body=body, headers=sent))
+    assert status == 410 and resp == {"status": "gone"} and processed == []
+    assert headers["x-otodock-event-outcome"] == "gone"
+    assert headers["x-otodock-event-gone-signature"] == _gone_mark(
+        "slack", sent["x-otodock-event-timestamp"])
+
+
+def test_relay_ingest_checks_the_signature_before_anything_else(monkeypatch):
+    """A provider no manifest declares: a bad signature is a 401 (never a
+    hint of what is installed), a good one the signed 410."""
+    _setup_relay_env(monkeypatch, [])
+    body = json.dumps({"x": 1}).encode()
+    status, resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+        provider_id="linear", raw_body=body + b" ",
+        headers=_forward_headers(body, provider="linear")))
+    assert status == 401 and "x-otodock-event-outcome" not in headers
+    sent = _forward_headers(body, provider="linear")
+    status, resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+        provider_id="linear", raw_body=body, headers=sent))
+    assert status == 410 and headers["x-otodock-event-gone-signature"] == _gone_mark(
+        "linear", sent["x-otodock-event-timestamp"])
+
+
+def test_relay_ingest_outcome_fired_and_not_selected(monkeypatch):
+    processed = _setup_relay_env(monkeypatch, _relay_rows())
+    body = json.dumps({"team_id": "T1", "event": {"type": "reaction_added"}}).encode()
+    status, _resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+        provider_id="slack", raw_body=body, headers=_forward_headers(body)))
+    assert status == 200 and headers["x-otodock-event-outcome"] == "fired"
+
+    async def ignored(*, row, **kw):
+        processed.append(row["id"])
+        return {"status": "ignored", "fired": 0, "event_type": "x"}
+    monkeypatch.setattr(webhook_dispatcher, "_process_subscription_events", ignored)
+    status, _resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+        provider_id="slack", raw_body=body, headers=_forward_headers(body)))
+    assert status == 200 and headers["x-otodock-event-outcome"] == "not_selected"
+
+
+def test_relay_ingest_skips_a_switched_off_mcps_rows(monkeypatch):
+    """Its rows stay (the switch is undone), so the provider is not gone:
+    a 200 that no subscription took it."""
+    processed = _setup_relay_env(monkeypatch, _relay_rows())
+    monkeypatch.setattr(webhook_dispatcher.mcp_store, "get_all_mcp_states",
+                        lambda: {"slack-mcp": False})
+    body = json.dumps({"team_id": "T1", "event": {"type": "reaction_added"}}).encode()
+    status, _resp, headers = asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+        provider_id="slack", raw_body=body, headers=_forward_headers(body)))
+    assert status == 200 and processed == []
+    assert headers["x-otodock-event-outcome"] == "no_subscription"
+
+
+def test_relay_ingest_gone_waits_for_a_create_holding_the_lock(monkeypatch):
+    from services.webhooks import relay_events
+    rows: list[dict] = []
+    _setup_relay_env(monkeypatch, rows)
+    body = json.dumps({"team_id": "T9", "event": {"type": "reaction_added"}}).encode()
+
+    async def scenario():
+        async with relay_events.registration_lock():
+            forward = asyncio.create_task(webhook_dispatcher.dispatch_relay_webhook(
+                provider_id="slack", raw_body=body, headers=_forward_headers(body)))
+            await asyncio.sleep(0.05)
+            rows.append({**_relay_rows()[0], "status": "creating"})
+        return await forward
+    status, _resp, headers = asyncio.run(scenario())
+    assert status == 200 and headers["x-otodock-event-outcome"] == "no_subscription"
 
 
 def test_relay_ingest_provider_header_mismatch_400(monkeypatch):
@@ -521,6 +607,11 @@ def _setup_notion_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
     monkeypatch.setattr(
         webhook_dispatcher.mcp_registry, "get_all_manifests",
         lambda: {"notion-mcp": manifest})
+    monkeypatch.setattr(
+        webhook_dispatcher.mcp_registry, "get_manifest",
+        lambda name: manifest if name == "notion-mcp" else None)
+    monkeypatch.setattr(webhook_dispatcher.mcp_store, "get_all_mcp_states", lambda: {})
+    monkeypatch.setattr(credential_store, "hosted_app_account_mcps", set)
     monkeypatch.setitem(
         webhook_providers._MANIFEST_CACHE, "notion",
         GenericWebhookProvider(provider_id="notion"))
@@ -534,9 +625,8 @@ def _setup_notion_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
     def fake_list(**kw):
         return [
             r for r in rows
-            if r.get("vendor_target") == kw.get("vendor_target")
-            and r.get("delivery_mode") == kw.get("delivery_mode")
-            and r.get("provider_id") == kw.get("provider_id")
+            if all(kw.get(k) is None or r.get(k) == kw[k]
+                   for k in ("vendor_target", "delivery_mode", "provider_id"))
         ]
 
     monkeypatch.setattr(
@@ -596,6 +686,11 @@ def _setup_zoom_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
     monkeypatch.setattr(
         webhook_dispatcher.mcp_registry, "get_all_manifests",
         lambda: {"zoom-mcp": manifest})
+    monkeypatch.setattr(
+        webhook_dispatcher.mcp_registry, "get_manifest",
+        lambda name: manifest if name == "zoom-mcp" else None)
+    monkeypatch.setattr(webhook_dispatcher.mcp_store, "get_all_mcp_states", lambda: {})
+    monkeypatch.setattr(credential_store, "hosted_app_account_mcps", set)
     monkeypatch.setitem(
         webhook_providers._MANIFEST_CACHE, "zoom",
         GenericWebhookProvider(provider_id="zoom"))
@@ -609,9 +704,8 @@ def _setup_zoom_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
     def fake_list(**kw):
         return [
             r for r in rows
-            if r.get("vendor_target") == kw.get("vendor_target")
-            and r.get("delivery_mode") == kw.get("delivery_mode")
-            and r.get("provider_id") == kw.get("provider_id")
+            if all(kw.get(k) is None or r.get(k) == kw[k]
+                   for k in ("vendor_target", "delivery_mode", "provider_id"))
         ]
 
     monkeypatch.setattr(
@@ -820,6 +914,30 @@ def _l5_dispatch(sid: str, body: bytes, headers: dict):
     return asyncio.run(webhook_dispatcher.dispatch_webhook(
         provider_id=_L5_PROVIDER, subscription_id=sid, raw_body=body,
         headers=headers, query_params={}))
+
+
+def test_a_switched_off_mcps_vendor_subscription_fires_nothing(monkeypatch):
+    """The vendor's own route skips the MCP an admin switched off, as the
+    relay's does, with a 200 so the vendor neither retries nor disables the
+    hook; switched on again, it fires."""
+    sid = _l5_stub_row(monkeypatch)
+    fired: list[str] = []
+
+    async def fan_out(*, triggers, body, event, trigger_source, event_id=""):
+        fired.append(len(triggers))
+        return (len(triggers), [])
+    monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fan_out)
+    monkeypatch.setattr(trigger_store, "list_triggers",
+                        lambda **kw: [{"id": "t-1", "subscription_id": sid, "event_filter": "{}"}])
+    state = {"name": "l5-mcp", "enabled": False}
+    monkeypatch.setattr(webhook_dispatcher.mcp_store, "get_mcp_state", lambda name: dict(state))
+    body = json.dumps({"items": [{"type": "thing.changed", "id": "e1"}]}).encode()
+    status, resp, _ = _l5_dispatch(sid, body, _l5_sign(body))
+    assert status == 200 and resp == {"status": "ignored", "reason": "mcp_off", "fired": 0}
+    assert fired == []
+    state["enabled"] = True
+    status, resp, _ = _l5_dispatch(sid, body, _l5_sign(body))
+    assert status == 200 and resp["fired"] == 1 and fired == [1]
 
 
 def test_batch_scans_the_subscription_triggers_once(monkeypatch):

@@ -239,8 +239,10 @@ def test_search_task_mode_matches_and_gates(temp_db, _as):
 def test_chat_status_targets_task_owner_reaches_agent_users(temp_db, monkeypatch):
     from services.notifications import notification_manager as nm
     from storage.automation import notification_store
-    monkeypatch.setattr(notification_store, "get_agent_user_subs",
-                        lambda agent: ["user-alice", "user-bob"])
+    monkeypatch.setattr(notification_store, "get_agent_members",
+                        lambda agent: [("user-alice", "editor"), ("user-bob", "manager"),
+                                       ("user-carol", "contributor")])
+    # The agent's own runs reach its editor tier only.
     assert nm.chat_status_targets(f"task::{AGENT}", AGENT) == [
         "user-alice", "user-bob"]
     # Owner-less / agent-less stays empty (no fan-out target).

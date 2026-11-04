@@ -363,18 +363,39 @@ class TestInstallationBinding:
         assert credential_store.set_account_meta(user_sub, mcp_name, "ghost", meta) is False
         assert credential_store.update_account_meta(user_sub, mcp_name, "ghost", lambda m: m) is None
 
-    def test_any_hosted_app_account(self, mcp_name, user_sub):
+    def test_hosted_app_account_mcps(self, mcp_name, user_sub, user_sub2):
+        hosted = credential_store.hosted_app_account_mcps
         credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")
-        assert credential_store.any_hosted_app_account([mcp_name]) is False
+        assert mcp_name not in hosted()
         credential_store.set_account_meta(user_sub, mcp_name, "gh", _github_app_meta(_installation(77)))
-        assert credential_store.any_hosted_app_account([mcp_name]) is False     # self-managed
+        assert mcp_name not in hosted()                                    # self-managed
         credential_store.set_account_meta(user_sub, mcp_name, "gh", {**_github_app_meta(), "hosted": True})
-        assert credential_store.any_hosted_app_account([mcp_name]) is True     # no installation needed
-        assert credential_store.any_hosted_app_account(["another-mcp"]) is False
-        assert credential_store.any_hosted_app_account([]) is False
-        credential_store.set_account_meta(user_sub, mcp_name, "gh", {"kind": oauth_app_kinds.KIND_OAUTH_APP,
+        assert mcp_name in hosted()                                        # no installation needed
+        assert mcp_name not in hosted(user_sub)                            # the person being deleted
+        credential_store.set_user_credentials(user_sub2, mcp_name, {"k": "v"}, account_label="gh2")
+        credential_store.set_account_meta(user_sub2, mcp_name, "gh2", {**_github_app_meta(), "hosted": True})
+        assert mcp_name in hosted(user_sub)                                # someone else still holds one
+        for sub, label in ((user_sub, "gh"), (user_sub2, "gh2")):
+            credential_store.set_account_meta(sub, mcp_name, label, {"kind": oauth_app_kinds.KIND_OAUTH_APP,
                                                                      "hosted": True})
-        assert credential_store.any_hosted_app_account([mcp_name]) is False     # not a GitHub-App one
+        assert mcp_name not in hosted()                                    # not a GitHub-App one
+
+    def test_list_all_user_accounts(self, mcp_name, user_sub, user_sub2):
+        other = f"{mcp_name}-b"
+        try:
+            credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="work")
+            credential_store.set_user_credentials(user_sub, other, {"k": "v"}, account_label="home")
+            credential_store.set_user_credentials(user_sub2, mcp_name, {"k": "v"}, account_label="theirs")
+            credential_store.set_account_meta(user_sub, mcp_name, "work", {"kind": "x"})
+            mine = credential_store.list_all_user_accounts(user_sub)
+            assert [(a["mcp_name"], a["account_label"]) for a in mine] == [(mcp_name, "work"), (other, "home")]
+            assert mine[0]["meta"] == {"kind": "x"} and mine[1]["meta"] == {}
+            assert credential_store.list_all_user_accounts("local:nobody") == []
+        finally:
+            with get_conn() as conn:
+                conn.execute("DELETE FROM user_credentials WHERE mcp_name=%s", (other,))
+                conn.execute("DELETE FROM user_credential_accounts WHERE mcp_name=%s", (other,))
+                conn.commit()
 
     def test_an_installation_binds_only_while_it_stands(self, mcp_name, user_sub):
         credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")

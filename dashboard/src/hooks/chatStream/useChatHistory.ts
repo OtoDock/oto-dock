@@ -6,6 +6,7 @@
 import { useCallback, useRef } from 'react'
 import { useChatStore } from '@/store/chatStore'
 import { continuesAbove, dbMessagesToDisplay, finishedBubble, latestCostBilled, toolFeesOf, withPlanRows } from '../../lib/messageBlocks'
+import { markRunningBackground, runningBackgroundOf } from '../../lib/chat/runningBackground'
 import { HOOK_ITEM, SYSTEM_SUBTYPE, type DbMessageRow, type LiveStateFrame, type MeetingRestore } from '../../api/wireEvents'
 import type { WsCallbacks } from '../useDashboardWs.types'
 import type { DisplayMessage } from '../../components/chat/types'
@@ -62,7 +63,7 @@ export function useChatHistory(core: StreamCore, deps: {
     ensureAssistantMsg, appendBlock,
     setTurnStartTime, setThinkingActive, setCompressingActive, setPermissionPending, setAborting, setWorkflows,
     setTotalCost, setBilledCost, setToolCost, setCostBilled, setContextUsed, setContextMax, setCacheStats, setSessionPlans, setCurrentTodos,
-    setCurrentGoal,
+    setCurrentGoal, setRunningBackground,
   } = core
   const { resetSteers, applyMeetingRestore, noteLiveSpeaker, applyLiveStateMeeting } = deps
 
@@ -177,7 +178,10 @@ export function useChatHistory(core: StreamCore, deps: {
       setLoadingOlder(false)
       setHasMoreOlder(!!data.has_more)
       planRowsRef.current = dbPlans
-      const displayMsgs = withPlanRows(dbMessagesToDisplay(dbMessages, agents), dbPlans)
+      // The rows read every spawn finished: the frame names what still runs.
+      const running = runningBackgroundOf(data.running)
+      setRunningBackground(running, data.chat_id || chatIdRef.current)
+      const displayMsgs = markRunningBackground(withPlanRows(dbMessagesToDisplay(dbMessages, agents), dbPlans), running)
       // History is authoritative for everything PERSISTED — but a send can
       // race a slow history load (long chat): the optimistic user bubble that
       // handleSend appended would be erased by a wholesale replace, because
@@ -250,7 +254,9 @@ export function useChatHistory(core: StreamCore, deps: {
       for (const r of incoming) byId.set(r.id, r)
       const rows = [...byId.values()].sort((a, b) => a.id - b.id)
       rawRowsRef.current = rows
-      const displayMsgs = dbMessagesToDisplay(rows, agents)
+      const running = runningBackgroundOf(data.running)
+      setRunningBackground(running, data.chat_id)
+      const displayMsgs = markRunningBackground(dbMessagesToDisplay(rows, agents), running)
       currentMsgRef.current = null
       reviewNudgeRef.current = null
       // The same carry rule as onChatHistory: trailing optimistic user

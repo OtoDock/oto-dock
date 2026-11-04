@@ -418,7 +418,13 @@ async def _update_and_record(run_id, name, info, manifest, trigger) -> tuple[str
         "mcp autoupdate: updating %s (reason=%s)", name, info.get("reason", "package"),
     )
     try:
-        result = await mcp_updater.update_one(name, settled_only=True)
+        result = await mcp_updater.run_update(name, settled_only=True)
+    except mcp_updater.UpdateAlreadyRunning:
+        # An admin's update of the same MCP is running: it is busy, not failed.
+        logger.info("mcp autoupdate: %s is being updated by an admin, skipped", name)
+        _record(run_id, name, runtime, old_version, info.get("latest", ""),
+                log_store.STATUS_SKIPPED_IN_USE, "", trigger)
+        return log_store.STATUS_SKIPPED_IN_USE, ""
     except Exception as e:  # noqa: BLE001  # the weekly sweep's per-mcp update: one failure must not stop the rest
         err = str(e)
         logger.warning("mcp autoupdate: %s failed: %s", name, err)

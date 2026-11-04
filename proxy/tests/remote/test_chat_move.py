@@ -181,6 +181,18 @@ def test_the_chip_marks_the_current_place_and_says_who_may_move(temp_db, online)
     assert view["can_move"] and view["lock"] is None
     other = chat_move.targets_view(db.get_chat(cid), _asker("u-bob", "manager"))
     assert not other["can_move"] and other["refusal"] == chat_move.NOT_MOVER
+    assert view["shared"] is False
+
+
+def test_the_chip_says_a_shared_chat_runs_with_the_agents_accounts(temp_db, online):
+    """The move dialog's sentence about the agent's accounts reads it."""
+    from core.session.visibility import shared_chat_owner
+    from storage import database as db
+    _user("u-ann")
+    slug = _agent()
+    view = chat_move.targets_view(db.get_chat(_chat(slug, shared_chat_owner(slug))),
+                                  _asker("u-ann", "manager"))
+    assert view["shared"] is True
 
 
 def test_a_direct_llm_chat_stays_on_the_server(temp_db, online):
@@ -654,6 +666,35 @@ def test_a_chat_on_a_place_the_person_may_not_use_needs_a_hand_over(temp_db, onl
     assert not chat_move.placement_blocked(on_srv, "u-bob", "manager")
 
 
+def test_an_admin_machines_switch_lets_every_role_of_its_agents_run_there(temp_db, online):
+    """With "Every role of its agents runs here" on the machine an agent
+    runs on by default, an editor is offered it as the default and a chat
+    pinned there needs no hand-over; another agent's chat there still does."""
+    from core.session.visibility import shared_chat_owner
+    from storage import database as db, remote_store
+    _user("u-bob")
+    _machine("m-srv", "Server", scope="admin", owner="u-admin")
+    online.add("m-srv")
+    slug = _agent(default_scope="agent", collaborative=False)
+    other = _agent(default_scope="agent", collaborative=False)
+    remote_store.set_agent_remote_target(slug, "m-srv", "u-admin")
+    on_srv = db.get_chat(_chat(slug, shared_chat_owner(slug), pin="m-srv"))
+    elsewhere = db.get_chat(_chat(other, shared_chat_owner(other), pin="m-srv"))
+    bob = chat_targets.RunPerson("u-bob", "editor")
+    default, targets = chat_targets.offered(slug, bob, engine_path="claude-code-cli",
+                                            admin_asker=False)
+    assert default == placement.LOCAL and "m-srv" not in {t.target for t in targets}
+    assert chat_move.placement_blocked(on_srv, "u-bob", "editor")
+
+    remote_store.set_all_roles_run_here("m-srv", True)
+    default, targets = chat_targets.offered(slug, bob, engine_path="claude-code-cli",
+                                            admin_asker=False)
+    by = {t.target: t for t in targets}
+    assert default == "m-srv" and by["m-srv"].is_default and by["m-srv"].pickable
+    assert not chat_move.placement_blocked(on_srv, "u-bob", "editor")
+    assert chat_move.placement_blocked(elsewhere, "u-bob", "editor")
+
+
 # -- the config builder's two reads ------------------------------------------------
 
 def test_a_summarised_move_keeps_its_chosen_place_on_the_fresh_spawn(temp_db, online):
@@ -858,12 +899,20 @@ def test_the_builder_names_where_a_refused_chat_is(temp_db):
     _user("u-ann", name="Ann")
     _machine("m-ann", "Ann laptop", owner="u-ann")
     _machine("m-srv", "Server", scope="admin", owner="u-admin")
-    assert cb._placement_refusal("m-ann", "u-ann", "editor") == ""
-    assert cb._placement_refusal("m-ann", "u-bob", "admin") == (
+    assert cb._placement_refusal("m-ann", "u-ann", "editor", "local") == ""
+    assert cb._placement_refusal("m-ann", "u-bob", "admin", "local") == (
         "This chat is on Ann's computer (Ann laptop). Move it to one of your places from "
         "the Runs on menu.")
-    assert cb._placement_refusal("m-srv", "u-bob", "editor").startswith("This chat is on Server")
-    assert cb._placement_refusal("m-srv", "u-bob", "manager") == ""
+    assert cb._placement_refusal("m-srv", "u-bob", "editor", "m-srv").startswith(
+        "This chat is on Server")
+    assert cb._placement_refusal("m-srv", "u-bob", "manager", "local") == ""
+    # Its admin's switch admits every role of the agents whose default it is.
+    from storage import remote_store
+    remote_store.set_all_roles_run_here("m-srv", True)
+    assert cb._placement_refusal("m-srv", "u-bob", "editor", "m-srv") == ""
+    assert cb._placement_refusal("m-srv", "u-bob", "viewer", "m-srv") == ""
+    assert cb._placement_refusal("m-srv", "u-bob", "editor", "local").startswith(
+        "This chat is on Server")
 
 
 # -- the routes ----------------------------------------------------------------------
@@ -1103,7 +1152,7 @@ def test_the_agents_own_move_continues_on_the_new_place_by_itself(temp_db, onlin
     assert call["user_sub"] == "u-ann" and call["allow_ws"] is False and call["allow_pty"] is False
     one = call["oneshot_fn"].keywords
     assert one == {"permission_mode": "autoReview", "client_type": "dashboard",
-                   "fresh_without_session": True, "note_prompt": True}
+                   "fresh_without_session": True}
     # The wake row the transcript shows, at the head of the resumed turn (the
     # ladder writes it on the chat's lane, on the loop).
     async def persist():

@@ -42,6 +42,14 @@ from .vad_serial import SerializedVad
 
 logger = logging.getLogger("pipeline")
 
+#: How long an outbound call's end waits for the utterance task (and an end
+#: raised between turns) to reach its completion point before the outcome
+#: summary opens a turn on the same socket: the 0.5 s pause and a transfer's
+#: settle (``TRANSFER_SETTLE_S``), with room.
+UTTERANCE_SETTLE_S = 8.0
+#: How long a cancelled one may take to unwind before the finalize goes on.
+UTTERANCE_CANCEL_S = 1.0
+
 
 class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin, TurnMixin,
                    OutboundMixin, LlmStreamingMixin):
@@ -325,11 +333,9 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 await self._listen_loop()
                 # The listen loop exits once the call is hung up (_running=False,
                 # set after the farewell TTS plays — see the [CALL_COMPLETE] block
-                # in llm.py). Await the utterance task in case it's still finishing
-                # the farewell + hangup sequence.
-                if self.state._utterance_task and not self.state._utterance_task.done():
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await self.state._utterance_task
+                # in llm.py), or on the person's hangup frame mid-reply: the
+                # utterance task finishes the farewell + hangup sequence first.
+                await self._settle_call_tasks()
                 await self._finalize_outbound_call()
             else:
                 # Inbound: warmup during greeting → greeting + listen
@@ -343,6 +349,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             # Finalize outbound call on remote hangup (callee hung up)
             if self._is_outbound:
                 try:
+                    await self._settle_call_tasks()
                     await self._adopt_before_finalize()
                     await self._finalize_outbound_call()
                 except Exception as fin_err:  # noqa: BLE001  # the outbound call's summary is best effort, the call already ended
@@ -354,6 +361,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             logger.exception("[%s] Pipeline error: %s", self.conn.peer_addr, e)
             if self._is_outbound:
                 try:
+                    await self._settle_call_tasks()
                     await self._adopt_before_finalize()
                     await self._finalize_outbound_call()
                 except Exception as fin_err:  # noqa: BLE001  # the outbound call's summary is best effort, the call already ended
@@ -366,9 +374,34 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         the outcome the call log and the record read. An end the agent asked
         for (the marker, ``end_call``), a transfer, the gate's verdict and an
         error keep their own word, whoever hung up first."""
+        self.state._line_closed = True
         if (self.state.call_outcome == "completed" and not self.state._call_complete
                 and not self._control_pending_end()):
             self.state.call_outcome = "hangup"
+
+    async def _settle_call_tasks(self) -> None:
+        """An outbound call's end: the utterance task and an end raised
+        between turns reach their completion point before the finalize reads
+        the call's state and the outcome summary opens its turn on the same
+        socket. With an end, a transfer or the marker pending they get
+        ``UTTERANCE_SETTLE_S``; with nothing pending the person is gone and
+        the reply is cancelled at once. A cancel the task swallows (it guards
+        its TTS waits) is not waited out past ``UTTERANCE_CANCEL_S``."""
+        current = asyncio.current_task()
+        tasks = {t for t in (self.state._utterance_task, self.state._control_between_turns)
+                 if t is not None and not t.done() and t is not current}
+        if not tasks:
+            return
+        if self._control_pending_end() or self.state._call_complete:
+            await asyncio.wait(tasks, timeout=UTTERANCE_SETTLE_S)
+        left = {t for t in tasks if not t.done()}
+        for task in left:
+            task.cancel()
+        if left:
+            await asyncio.wait(left, timeout=UTTERANCE_CANCEL_S)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                task.exception()       # retrieved: the cleanup skips a finished task
 
     async def _adopt_before_finalize(self) -> None:
         """A call that ends before it adopted its pre-warmed client (a hangup
@@ -957,8 +990,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             except Exception as e:  # noqa: BLE001  # the debug audio tap is best effort at the call's end
                 logger.warning("[%s] Outgoing audio save failed: %s", self.conn.peer_addr, e)
 
-        # Report the call's turn-classifier spend and its second listen's seconds
-        # (one row each per call), together. Awaited with a tight timeout and all
+        # Report the session's turn-classifier spend and its speech seconds
+        # (``_speech_usage_reports``), together. Awaited with a tight timeout and all
         # errors swallowed inside the helpers — never blocks or fails teardown
         # beyond the timeout. Runs after the gather so it can't delay freeing the
         # audiosocket/STT/LLM. ``relisten_seconds`` is not zeroed by the report:
@@ -970,9 +1003,18 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 agent=self.route.agent, model=clf_model,
                 input_tokens=clf_in, output_tokens=clf_out, session_id=session_id,
             ))
-        if relistened > 0:
-            provider = (self._route_settings.stt_provider or {}).get("provider_name", "deepgram")
-            reports.append(report_relisten_usage(agent=self.route.agent, provider=provider,
-                                                 seconds=relistened, session_id=session_id))
+        reports.extend(self._speech_usage_reports(
+            streamed=float(streamed or 0.0), relistened=relistened, session_id=session_id))
         if reports:
             await asyncio.gather(*reports)
+
+    def _speech_usage_reports(self, *, streamed: float, relistened: float, session_id: str) -> list:
+        """The speech usage reports of this call, coroutines for the teardown
+        to gather: a call's second listen as its own row (its stream is the
+        route's and billed by the proxy's own turns); the spoken conversation
+        on a chat overrides this with the speaker's rows."""
+        if relistened <= 0:
+            return []
+        provider = (self._route_settings.stt_provider or {}).get("provider_name", "deepgram")
+        return [report_relisten_usage(agent=self.route.agent, provider=provider,
+                                      seconds=relistened, session_id=session_id)]

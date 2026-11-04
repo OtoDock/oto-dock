@@ -808,6 +808,15 @@ async def hook_app_open(req: HookAppOpenRequest, authorization: str | None = Hea
     return {"status": "opened", "app_id": row["id"], "screens": screens}
 
 
+def _origin_fields(row: dict) -> dict:
+    # Where the code came from, for a row that came from a template or a
+    # bundle (app_blueprints.origin_of: a copy seeded before the origin
+    # columns reads its seed reference).
+    from services.apps import app_blueprints
+    from_template, from_version = app_blueprints.origin_of(row)
+    return {"from_template": from_template, "from_version": from_version} if from_template else {}
+
+
 @router.post("/v1/hooks/apps/list")
 async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Header(None)):
     """The caller-scope app list (shared + the session user's personal rows)
@@ -862,6 +871,8 @@ async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Hea
         return out
 
     placed = await asyncio.to_thread(_placed)
+    # The follow state reads and settles rows and hashes trees: off the loop.
+    follows = await asyncio.to_thread(lambda: {r["id"]: _follow_fields(r) for r in rows if r.get("follows")})
     return {"placed": placed, "apps": [{
         "id": r["id"],
         "kind": r.get("kind") or "file",
@@ -879,11 +890,25 @@ async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Hea
                     for a in _mf.parse_actions(r)],
         "actions_approved": task_store.app_actions_approved(r),
         "updated_at": r["updated_at"],
+        **_origin_fields(r),
+        **follows.get(r["id"], {}),
         **({"unpinned": "user removed it from the dashboard — "
                         "pin_app(slug) restores it (approval intact)"}
            if r.get("hidden") else {}),
         **({"waiting": waiting[r["id"]]} if waiting.get(r["id"]) else {}),
     } for r in rows]}
+
+
+def _follow_fields(row: dict) -> dict:
+    """The source a copy follows and the update its card offers
+    (services/apps/app_follow.py), for the agent's list."""
+    if not row.get("follows"):
+        return {}
+    from services.apps import app_follow
+    state = app_follow.state(row)
+    if not state:
+        return {}
+    return {"follows": {**state["source"], "update": state["update"]}}
 
 
 def _waiting_reason(row: dict) -> str:

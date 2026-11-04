@@ -25,8 +25,10 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .. import config
@@ -40,6 +42,7 @@ from ..config import (
 )
 from ..host.auth_paths import is_safe_slug
 from ..host.env_hygiene import curate_satellite_env
+from ..host.interpreters import windows_interpreters
 
 logger = logging.getLogger("satellite")
 
@@ -80,15 +83,75 @@ def wipe_steps_root() -> None:
             logger.warning("steps: could not wipe %s", root, exc_info=True)
 
 
-def argv_for(script: bytes, path: str) -> list[str]:
-    """The proxy's rule, verbatim: a ``#!`` line names the interpreter,
-    otherwise ``/bin/sh``."""
+class MissingInterpreter(Exception):
+    """A script's first line names an interpreter this computer lacks;
+    ``args[0]`` names it as a person reads it (``bash``, ``Python``, the
+    word itself)."""
+
+
+_ENV_WORD = "env"
+_SHELL_WORDS = ("sh", "bash", "dash")
+_PYTHON_WORDS = ("python3", "python")
+
+
+def argv_for(script: bytes, path: str, *, windows: dict[str, str] | None = None,
+             which: Callable[[str], str | None] = shutil.which) -> list[str]:
+    """The proxy's rule, verbatim (``services/scripts/runner.argv_for``): a
+    ``#!`` line names the interpreter, otherwise ``/bin/sh``.
+
+    ``windows``: the interpreters this Windows machine has, by kind
+    (``host/interpreters.windows_interpreters``). There a shell line and the default run under Git
+    Bash (the path given with forward slashes), a Python line under the
+    machine's Python, an ``env`` line's assignments and ``-u NAME``
+    removals through Git's ``env.exe`` (its other options were already
+    applied by the split or change nothing there), and any other word as
+    the program PATH names; one the
+    machine lacks, or a ``.cmd``/``.bat`` it cannot start without a shell,
+    raises ``MissingInterpreter``."""
     first = script.split(b"\n", 1)[0].strip()
-    if first.startswith(b"#!"):
-        words = shlex.split(first[2:].decode("utf-8", "replace"))
-        if words:
-            return [*words, path]
-    return ["/bin/sh", path]
+    words = shlex.split(first[2:].decode("utf-8", "replace")) if first.startswith(b"#!") else []
+    if windows is None:
+        return [*words, path] if words else ["/bin/sh", path]
+    word, flags = (words[0], words[1:]) if words else ("sh", [])
+    env_args: list[str] = []
+    if re.split(r"[\\/]", word)[-1] == _ENV_WORD:
+        while flags and (flags[0].startswith("-") or "=" in flags[0]):
+            opt = flags.pop(0)
+            if not opt.startswith("-"):
+                env_args.append(opt)
+            elif opt in ("-u", "--unset") and flags:
+                env_args += [opt, flags.pop(0)]
+            elif opt.startswith(("-u", "--unset=")):
+                env_args.append(opt)
+        if not flags:
+            raise MissingInterpreter(_ENV_WORD)
+        word, flags = flags[0], flags[1:]
+    name = re.split(r"[\\/]", word)[-1]
+    if name in _SHELL_WORDS:
+        exe, path = windows.get("bash" if name == "bash" else "sh", ""), path.replace("\\", "/")
+        if not exe:
+            raise MissingInterpreter("bash")
+    elif name in _PYTHON_WORDS:
+        exe = windows.get("python", "")
+        if not exe:
+            raise MissingInterpreter("Python")
+    else:
+        exe = which(word) or which(name) or ""
+        if not exe or exe.lower().endswith((".cmd", ".bat")):
+            raise MissingInterpreter(name)
+    if env_args:
+        if not windows.get("env"):
+            raise MissingInterpreter("bash")
+        return [windows["env"], *env_args, exe, *flags, path]
+    return [exe, *flags, path]
+
+
+def missing_sentence(word: str) -> str:
+    """The ack's sentence for an interpreter the machine lacks: the
+    baseline tools bring bash and Python."""
+    if word in ("bash", "Python"):
+        return f"Scripts need {word} on this computer: install the baseline tools."
+    return f"Scripts need {word} on this computer."
 
 
 def _resolve_inside(agent_dir: Path, rel: str) -> Path:
@@ -230,7 +293,12 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
         env["OTODOCK_STEP_SCRIPT"] = str(script_path)
         env["OTODOCK_WORKSPACE_DIR"] = str(plan["cwd"])
         env["OTODOCK_KNOWLEDGE_DIR"] = str(plan["knowledge"]) if plan["knowledge"] else ""
-        argv = argv_for(plan["data"], str(script_path))
+        try:
+            argv = argv_for(plan["data"], str(script_path),
+                            windows=None if config.HOST.posix else windows_interpreters())
+        except MissingInterpreter as e:
+            await _ack(status="error", error=missing_sentence(str(e)))
+            return
         spawn_kwargs: dict = {"start_new_session": True} if config.HOST.posix else {}
         started = time.monotonic()
         try:

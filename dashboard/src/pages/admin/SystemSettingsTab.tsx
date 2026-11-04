@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useFlag } from '../../hooks/useFlag'
 import { useTitleGeneration, useSaveTitleGeneration, useCheckTitleGeneration } from '../../api/titleGeneration'
 import { useMcpAutoUpdateLog, type McpAutoUpdateRow } from '../../api/mcps'
-import { useMemorySettings, useUpdateMemorySettings } from '../../api/memory'
+import { useMemorySettings, useUpdateMemorySettings, type MemorySettings } from '../../api/memory'
 import {
   usePlatformSettings,
   useSavePlatformSettings,
@@ -13,9 +13,11 @@ import {
 import { ConcurrencyRow, QuotaRow } from './PlatformPage.shared'
 import type { PlatformSettings } from './PlatformPage.types'
 import { SaveState, SettingRow } from '../../components/ui/SettingsControls'
-import { useSaveState, type SaveStatus } from '../../hooks/useSaveState'
+import { useSaveState, type SaveStateApi, type SaveStatus } from '../../hooks/useSaveState'
 import InfoTip from '../../components/ui/InfoTip'
 import OffboardedArchivesCard from './OffboardedArchivesCard'
+import NotebookSettingsCard from './NotebookSettingsCard'
+import MobileAppsCard from './MobileAppsCard'
 import { formatBytes, relativeTime, TIMEZONE_OPTIONS, MCP_STATUS_LABEL } from './PlatformPage.format'
 import { apiJson, withMessage } from '../../lib/http/apiJson'
 import { useDialogs } from '../../components/ui/dialogs'
@@ -298,6 +300,94 @@ interface RetentionRun {
     reached: boolean
   }>
   errors?: number
+}
+
+// ---------------------------------------------------------------------------
+// The two memory size caps (Setup → System Settings, the Memory card). Each
+// keeps a draft and saves when the field is left, so a half-typed number
+// never reaches the server's range check; a value out of range goes back to
+// the saved one. The ranges mirror the route's (proxy memory_file
+// GROW_CAP_RANGE and ENTRY_CAP_RANGE); they live here, not in the API
+// module, so a test that mocks the API module's hooks never meets them.
+// ---------------------------------------------------------------------------
+
+const GROW_CAP_RANGE = { min: 16384, max: 65536 } as const
+const ENTRY_CAP_RANGE = { min: 256, max: 65536 } as const
+
+const CAP_FIELDS = [
+  {
+    key: 'topic_grow_cap_bytes', id: 'memory-grow-cap', label: 'Growth cap in bytes',
+    tip: 'A topic over this size no longer grows. The agent is asked to shrink it first. Edits that make it smaller always work.',
+    range: GROW_CAP_RANGE, step: 1024, hint: 'From 16,384 to 65,536.',
+  },
+  {
+    key: 'entry_cap_bytes', id: 'memory-entry-cap', label: 'Entry cap in bytes',
+    tip: 'The most one edit may add to a topic. A memory entry is a fact, a rule or a pointer, not a log.',
+    range: ENTRY_CAP_RANGE, step: 256, hint: 'From 256 to 65,536.',
+  },
+] as const
+type CapKey = typeof CAP_FIELDS[number]['key']
+const NO_NOTES: Record<CapKey, string> = { topic_grow_cap_bytes: '', entry_cap_bytes: '' }
+
+export function MemoryCapsFields({ memory, run, stateOf, saveMemory }: {
+  memory: Pick<MemorySettings, CapKey>
+  run: SaveStateApi['run']
+  stateOf: (key: string) => SaveStatus
+  saveMemory: { mutateAsync: (patch: Partial<MemorySettings>) => Promise<unknown> }
+}) {
+  const [drafts, setDrafts] = useState<Record<CapKey, string>>({
+    topic_grow_cap_bytes: String(memory.topic_grow_cap_bytes),
+    entry_cap_bytes: String(memory.entry_cap_bytes),
+  })
+  // The saved values fill the drafts when they arrive or change (in render).
+  const [filledFrom, setFilledFrom] = useState(memory)
+  if (filledFrom !== memory) {
+    setFilledFrom(memory)
+    setDrafts({
+      topic_grow_cap_bytes: String(memory.topic_grow_cap_bytes),
+      entry_cap_bytes: String(memory.entry_cap_bytes),
+    })
+  }
+  // A value outside the range goes back to the saved one, and the field
+  // says so until the next change.
+  const [notes, setNotes] = useState<Record<CapKey, string>>(NO_NOTES)
+  const leave = (key: CapKey, range: { min: number; max: number }) => {
+    const n = parseInt(drafts[key], 10)
+    const back = () => setDrafts((d) => ({ ...d, [key]: String(memory[key]) }))
+    if (n === memory[key]) {
+      back()
+      return
+    }
+    if (!Number.isFinite(n) || n < range.min || n > range.max) {
+      back()
+      setNotes((m) => ({ ...m, [key]: `Outside the range, set back to ${memory[key].toLocaleString('en-US')}.` }))
+      return
+    }
+    void run(key, () => saveMemory.mutateAsync({ [key]: n }), { failTitle: 'The memory setting was not saved', revert: back })
+  }
+  return (
+    <>
+      {CAP_FIELDS.map((f) => (
+        <div key={f.key}>
+          <div className="mb-1">
+            <label htmlFor={f.id} className="text-xs text-secondary">{f.label}</label>
+            <InfoTip label={f.label}>{f.tip}</InfoTip>
+            <SaveState state={stateOf(f.key)} />
+          </div>
+          <Input id={f.id} type="number" min={f.range.min} max={f.range.max} step={f.step}
+            value={drafts[f.key]}
+            onChange={(e) => {
+              const value = e.target.value
+              setDrafts((d) => ({ ...d, [f.key]: value }))
+              setNotes((m) => (m[f.key] ? { ...m, [f.key]: '' } : m))
+            }}
+            onBlur={() => leave(f.key, f.range)}
+          />
+          <span className="block text-3xs text-tertiary mt-1" role="status">{notes[f.key] || f.hint}</span>
+        </div>
+      ))}
+    </>
+  )
 }
 
 export function ChatTitleGenerationCard() {
@@ -830,8 +920,8 @@ export default function SystemSettingsTab() {
               <div className="mb-1">
                 <label htmlFor="memory-inline-budget" className="text-xs text-secondary">Inline budget in bytes</label>
                 <InfoTip label="Inline budget in bytes">
-                  For each scope: below this size, topic files go into the prompt in full. Above
-                  it, only their index goes in.
+                  For each scope, the newest topics go into the prompt in full until this size is
+                  used. The rest are listed with their sections.
                 </InfoTip>
                 <SaveState state={stateOf('inline_budget_bytes')} />
               </div>
@@ -861,9 +951,14 @@ export default function SystemSettingsTab() {
               />
               <span className="block text-3xs text-tertiary mt-1">0 turns it off.</span>
             </div>
+            <MemoryCapsFields memory={memory} run={run} stateOf={stateOf} saveMemory={saveMemory} />
           </div>
         </div>
       )}
+
+      <NotebookSettingsCard />
+
+      <MobileAppsCard />
 
       {/* Storage & Retention — hidden on the OtoDock cloud (operator owns disk
           policy: retention is forced ON at the default window server-side). */}

@@ -889,12 +889,12 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.158"
+SATELLITE_VERSION = "0.5.168"
 SHARED_LOOP_WATCHDOG_HASH = "3627e437d8e1d3c373c2a4f96a9f0cfe3978be4050850e56e71764f3358d2dc4"
 SHARED_LAYOUT_HASH = "2addd8b41902ccd73df4135667a276d215d83e635cc5d94587f764ba58d38ad9"
 SHARED_TERMINAL_QUERIES_HASH = "3cbc0e533e4aef2d4a532f7e97117bb30a1cdc4bfcf73bad82aee1385e95e0ac"
-SHARED_STDIO_INTERCEPTOR_HASH = "da22d95ff38fefe4c69c488e9355c71c01acc9614b0be8aa1df796ce6d0480d4"
-SHARED_CODEX_APPROVALS_HASH = "e95b161d721361ea9cfbd5aaa60848b86af83bde400bf900cbb09dc3cdfff80a"
+SHARED_STDIO_INTERCEPTOR_HASH = "eaaa3facf03a7c2e5c9242e5234f3953fddafdaa680e582b6e2c795f38d50f0b"
+SHARED_CODEX_APPROVALS_HASH = "44ec5c5b74db9887db72831c7f6b1c6f61c39c6f1f4bec44e852a1bf9ff8f661"
 SHARED_APP_SERVER_CLIENT_HASH = "d141cda0ed263bd6ab815d0346295dd87aefc21bfc4f6dff1409be91fd91d831"
 SHARED_MCP_INSTALLER_HASH = "f060f8d1e0742c0ef3cad1e167150f7f9b95370ffdd863d11a688149b2f95721"
 

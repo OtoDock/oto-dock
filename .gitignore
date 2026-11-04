@@ -10,6 +10,11 @@ phone/.env
 mcps/**/.env
 # Firebase config — project-specific; ships as google-services.json.example (the docs site's Android app page)
 dashboard/android/app/google-services.json
+# The iOS twin: the Firebase client config, copied into the bundle by a build phase
+dashboard/ios/App/App/GoogleService-Info.plist
+# The shell package's build products
+dashboard/ios/OtoDockShell/.build/
+dashboard/ios/OtoDockShell/.swiftpm/
 
 # ── Agent data (user-specific, not shipped) ──
 agents/

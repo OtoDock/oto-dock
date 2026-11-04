@@ -5,6 +5,7 @@
 import { isArtifactBlock } from '../../lib/kinds/artifact'
 import { continuesAbove, nudgeBlock, reviewSpeaker } from '../../lib/messageBlocks'
 import { SERVER_TURN_CAUSE, SYSTEM_SUBTYPE } from '../../api/wireEvents'
+import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
 import type { DisplayMessage } from '../../components/chat/types'
 import type { WsCallbacks } from '../useDashboardWs.types'
 import type { StreamCore } from './core'
@@ -16,7 +17,7 @@ import type { StreamCore } from './core'
 // try-again message.
 const SUBSCRIPTION_REASONS = new Set([
   'no_subscription', 'auth_off', 'admin_oauth_only', 'no_pool', 'none',
-  'own_sub_expired',
+  'own_sub_expired', 'local_only',
 ])
 
 export function warmupFailSubtype(
@@ -70,15 +71,13 @@ export function useTurnEnd(core: StreamCore, deps: {
       // Turn-done tail (chat: ping when not in a meeting and no bg subagent is
       // running, then refetchChats). The ping gate inputs are computed here so
       // the page doesn't need stale-closure-free reads of meeting/bg state.
-      // A bg subagent block still active (in any assistant message) gates the
-      // turn-complete ping. Derived from the blocks (the badge's source).
+      // A bg subagent block or a background command still active (in any
+      // assistant message) gates the turn-complete ping: the work is not
+      // finished. Derived from the blocks (the badge's source).
       const bgStillRunning = messagesRef.current.some((m) =>
         m.role === 'assistant' && m.blocks.some(
           (b) => (b.type === 'subagent' && b.isActive && b._background)
-            // A live Commands badge gates the refetch too: history
-            // rehydrates bg_command_spawn rows isActive:false, so a
-            // refetch would clobber a still-running command's badge.
-            || (b.type === 'bgcommand' && b.isActive),
+            || (b.type === BG_COMMAND_BLOCK && b.isActive),
         ),
       )
       options.onTurnDone?.({ meetingActive, bgStillRunning })
@@ -129,16 +128,12 @@ export function useTurnEnd(core: StreamCore, deps: {
       // events dropped between WS frames and React render), auto-refetch this
       // chat's history from DB. The backend pump persists every event before
       // signaling done, so a clean refetch gives the canonical end-of-turn
-      // state. No-op when the bubble has content.
-      // Skip the refetch while a background sub-agent is still running: the
-      // refetch rebuilds from DB history, where a task_spawn is always isActive:
-      // false ("Historical = completed"), so it would clobber the still-running
-      // bg badge (Codex: the main turn ends while the sub keeps going). Once the
-      // sub finishes, the next turn's onDone (bgStillRunning false) runs the
-      // refetch and history then correctly shows it done.
+      // state. No-op when the bubble has content. The refetch is a delta
+      // resume, whose frame names the background work still running
+      // (`running`), so the rebuild keeps those badges.
       const errored = erroredRef.current
       erroredRef.current = false
-      if (options.enableDefensiveRefetch && !bgStillRunning && !errored) {
+      if (options.enableDefensiveRefetch && !errored) {
         // The bubble's id NOW (synchronously): the queueMicrotask above nulls
         // currentMsgRef BEFORE the 400ms timeout fires, so reading the ref
         // inside the timeout always saw null → "no content" → refetch EVERY

@@ -1,0 +1,71 @@
+{
+ "source": "Defensive: a recognizer that starts its list over at 0 for a new utterance. Neither Chrome nor WebKit does (the list grows within one recognizer); kept against an engine the recorder has not shown yet.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "γεια"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "γεια σου."
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "τι"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "τι κάνεις;"
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "γεια σου.",
+   "τι κάνεις;"
+  ],
+  "replaces": [],
+  "interims": [
+   "γεια",
+   "τι"
+  ],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

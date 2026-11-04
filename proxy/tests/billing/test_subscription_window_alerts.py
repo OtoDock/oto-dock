@@ -101,6 +101,14 @@ class TestThresholds:
         assert kw["title"] == "Claude Max (me@example.com): weekly limit reached"
         assert "refuses new work on this account until Tue 12:00" in kw["body"]
         assert {k[2] for k in store.alerts} == {90, 100}
+        # A pool-only account: nothing of the person's to switch from.
+        assert kw["href"] == "" and "Open it" not in kw["body"]
+
+    def test_hundred_on_a_persons_own_account_links_the_notice(self):
+        _, fire, _ = _sweep([{**_row(), "use_personal": True}], {"s1": _reading(100.0)})
+        kw = fire.await_args.kwargs
+        assert kw["href"] == "/user-settings?tab=ai-engines&limit=claude-code-cli"
+        assert kw["body"].endswith("until Tue 12:00. Open it to see where to pick another engine until then.")
 
     def test_other_accounts_are_mentioned(self):
         rows = [_row("s1"), _row("s2", email="two@example.com")]

@@ -1,0 +1,44 @@
+{
+ "source": "No result for a minute of held pauses: the dictation stops with the idle sentence.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "a."
+    }
+   ]
+  },
+  {
+   "event": "wait",
+   "ms": 61000
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 300
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "a."
+  ],
+  "replaces": [],
+  "interims": [],
+  "errors": [
+   "IDLE"
+  ],
+  "ended": [
+   "idle"
+  ],
+  "recognizers": 1
+ }
+}

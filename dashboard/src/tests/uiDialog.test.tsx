@@ -119,6 +119,49 @@ describe('Dialog', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 
+  it('shakes on a refused Escape or Back, never on the backdrop, and once at a time', () => {
+    vi.useFakeTimers()
+    try {
+      const onClose = vi.fn()
+      render(<Dialog onClose={onClose} dismissible="none" aria-label="Editor"><p>unsaved work</p></Dialog>)
+      const dialog = screen.getByRole('dialog')
+      const shaking = () => dialog.querySelector('.oto-refuse') !== null
+      fireEvent.pointerDown(dialog)
+      fireEvent.click(dialog, { detail: 1 })
+      expect(shaking()).toBe(false)
+      pressEscape(dialog)
+      expect(shaking()).toBe(true)
+      // A held key during the shake does not start it again.
+      act(() => { vi.advanceTimersByTime(200) })
+      pressEscape(dialog)
+      act(() => { vi.advanceTimersByTime(100) })
+      expect(shaking()).toBe(false)
+      // The app's Back on an open dialog.
+      act(() => { (window as unknown as { __otodockDialogClose: () => void }).__otodockDialogClose() })
+      expect(shaking()).toBe(true)
+      act(() => { vi.advanceTimersByTime(300) })
+      // The browser's own close request.
+      act(() => { dialog.dispatchEvent(new Event('cancel', { cancelable: true })) })
+      expect(shaking()).toBe(true)
+      expect(onClose).not.toHaveBeenCalled()
+      expect(screen.getByText('unsaved work')).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not shake a dialog that closes, nor on a backdrop it refuses by design', () => {
+    const onClose = vi.fn()
+    render(<Dialog onClose={onClose} dismissible="escape" aria-label="Key"><p>secret</p></Dialog>)
+    const dialog = screen.getByRole('dialog')
+    fireEvent.pointerDown(dialog)
+    fireEvent.click(dialog, { detail: 1 })
+    expect(dialog.querySelector('.oto-refuse')).toBeNull()
+    pressEscape(dialog)
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(dialog.querySelector('.oto-refuse')).toBeNull()
+  })
+
   it("turns the browser's own close request into onClose and keeps the dialog open while the parent does", () => {
     const onClose = vi.fn()
     render(<Dialog onClose={onClose} aria-label="Kept"><p>body</p></Dialog>)
@@ -155,6 +198,25 @@ describe('Dialog', () => {
     expect(onClose).not.toHaveBeenCalled()
     pressEscape(dialog)
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it("answers only its own dialog's cancel: a nested one's close request stays the nested one's", () => {
+    const outerClose = vi.fn()
+    const innerClose = vi.fn()
+    render(
+      <Dialog aria-label="Outer" dismissible="none" onClose={outerClose}>
+        <p>unsaved work</p>
+        <Dialog aria-label="Inner" onClose={innerClose}><p>inner</p></Dialog>
+      </Dialog>,
+    )
+    const outer = screen.getByRole('dialog', { name: 'Outer' })
+    const inner = screen.getByRole('dialog', { name: 'Inner' })
+    // The Android back gesture's cancel on the inner dialog: React carries it
+    // up the tree to the outer Dialog's handler too.
+    act(() => { inner.dispatchEvent(new Event('cancel', { cancelable: true, bubbles: true })) })
+    expect(innerClose).toHaveBeenCalledTimes(1)
+    expect(outerClose).not.toHaveBeenCalled()
+    expect(outer.querySelector('.oto-refuse')).toBeNull()
   })
 
   it('stacks: Escape closes the top dialog only, and the focus returns into the one below', () => {

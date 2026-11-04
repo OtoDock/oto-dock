@@ -104,6 +104,9 @@
   {
    "author_sub": "",
    "content": "I’ll list the workspace, write and read back the note, then display the Example link.\n",
+   "event_data": {
+    "note": true
+   },
    "role": "assistant",
    "sync_search": false
   },

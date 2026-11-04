@@ -28,10 +28,10 @@
 # fresh isolated /proc. NO cap_add (SYS_ADMIN dropped), NOT --privileged. Net a
 # privilege REDUCTION vs a root-run proxy.
 
-ARG PYTHON_IMAGE=python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530
-ARG NODE_IMAGE=node:26.12.1-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe
+ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:ae14d4ce8771606477a81446e7ef429edd6762305fc50c84507c1041fa8285d1
+ARG NODE_IMAGE=node:26.13.0-trixie-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39
 
-# --- Node stage: source the pinned Node (same bookworm/glibc base) ---
+# --- Node stage: source the pinned Node (same Debian release and glibc as the base) ---
 FROM ${NODE_IMAGE} AS node
 
 # --- Dashboard build stage: compile the SPA (only dist/ is copied forward) ---
@@ -65,7 +65,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Docker CLI + compose plugin — the proxy drives sibling MCP containers via
 # `docker compose` over the socket-proxy (DOCKER_HOST=tcp://...). CLI only; no
-# daemon. Pinned to Debian bookworm's Docker apt channel.
+# daemon. Docker's apt channel for the base's own Debian release (its codename
+# read from /etc/os-release, so a base move needs no edit here).
 # (wget is a prerequisite of install-baseline-tools.sh's gh-repo step — present
 # on bare-metal/satellite hosts, absent from the slim base, so add it here;
 # libgomp1 is the OpenMP runtime onnxruntime loads for the language identifier;
@@ -74,7 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && install -m 0755 -d /etc/apt/keyrings \
  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
  && chmod a+r /etc/apt/keyrings/docker.asc \
- && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
       > /etc/apt/sources.list.d/docker.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
@@ -91,8 +92,9 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # Baseline agent tooling — the single shared installer (git, gh, uv, pnpm, Bun,
 # sympy, bubblewrap, poppler-utils, sqlite3, the pinned claude/codex CLIs, the
 # git credential helper, passt/iproute2 (required), xfsprogs (best-effort)).
-# bookworm's own passt is older than PASST_MIN_VERSION, so the installer builds
-# the pinned release from its tag; OTODOCK_PASST_BUILD=required fails the build
+# Debian 13's own passt meets PASST_MIN_VERSION, but the image carries the
+# pinned release, built from its tag: the pasta that image-boot-check.sh proves
+# and the releases were tested on. OTODOCK_PASST_BUILD=required fails the build
 # rather than ship any other pasta.
 # Same script the satellite + bare-metal installs run, so the sandbox sees
 # identical tools everywhere. Copied first (small, changes rarely) for layer

@@ -72,14 +72,28 @@ def test_ultra_effort_clamps_to_max_for_claude_cli():
     assert cmd[cmd.index("--effort") + 1] == "max"
 
 
-def test_headless_plan_mode_has_no_prompt_tool():
-    """-p plan keeps hooks-only prompting: a stdio prompt tool there could
-    route a real permission prompt to a channel the translator never answers."""
+def test_headless_plan_mode_passes_the_prompt_tool():
+    """-p plan carries the stdio prompt tool: Claude Code 2.1.299+ asks for a
+    call the hook allowed in plan mode, and engine_prompts answers that ask
+    from the gate's record; bypass is never passed beside it."""
     s = _mk(False)
     s.permission_mode = "plan"
     cmd, _env, _cwd = s.build_spawn_command()
-    assert "--permission-mode" in cmd and "plan" in cmd
+    assert cmd[cmd.index("--permission-mode") + 1] == "plan"
+    assert cmd[cmd.index("--permission-prompt-tool") + 1] == "stdio"
+    assert "--dangerously-skip-permissions" not in cmd
+    assert "--allow-dangerously-skip-permissions" not in cmd
+
+
+def test_interactive_plan_mode_has_no_prompt_tool():
+    """A terminal in Plan keeps its own dialog: no stdio channel, no bypass
+    (bypass beside plan mode opens the acceptance screen at launch)."""
+    s = _mk(True)
+    s.permission_mode = "plan"
+    cmd, _env, _cwd = s.build_spawn_command()
+    assert cmd[cmd.index("--permission-mode") + 1] == "plan"
     assert "--permission-prompt-tool" not in cmd
+    assert "--allow-dangerously-skip-permissions" not in cmd
 
 
 def test_interactive_argv_drops_headless_flags_keeps_shared():

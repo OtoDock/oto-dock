@@ -68,10 +68,12 @@ def _mark_update_deferred(machine_id: str, mcp_name: str) -> None:
 # resolve on EVERY session start re-ran a doomed ~0.5s install per warmup —
 # wasted latency plus an install-bar flash the user reads as "it's installing
 # something again". The memo keys on the SHIPPED version_hash: a platform-side
-# MCP change (new requirements) invalidates it, a successful install clears
-# it, and ``force`` (the dashboard retry button) bypasses + clears it.
-# In-memory: a proxy restart grants every memoized MCP one fresh attempt.
-# Transient failures (network, file locks, disk) are NEVER memoized.
+# MCP change (new requirements) invalidates it, a successful install or a new
+# satellite version clears it, ``force`` bypasses + clears it, and an entry
+# expires after ``_UNSAT_MEMO_TTL_S``: a package the machine could not build
+# may build once the person installs what it lacked (Rust, a library's
+# headers). In-memory: a proxy restart grants every memoized MCP one fresh
+# attempt. Transient failures (network, file locks, disk) are NEVER memoized.
 # The version hash per MCP dir, keyed by the manifest version plus the mtime
 # and size of each hash input file present, served for a minute: an
 # install, update or switch rewrites the manifest (a new key at once), a
@@ -133,7 +135,24 @@ async def version_hashes_for(names, *, force: bool = False) -> dict[str, str]:
 _UNSAT_FAIL_RE = re.compile(
     r"No solution found when resolving dependencies"
     r"|does not satisfy Python"
+    # A package this machine has no build for and cannot build (no Rust, a
+    # missing library's headers): lasting until the MCP or the machine changes.
+    r"|has no usable wheels|Failed to build|Failed building wheel"
+    r"|RequiredDependencyException|(?:rustc|cargo)\b[^\n]*not (?:found|installed)"
 )
+# Words of a network, service, disk or file-lock failure (uv's, pip's,
+# cargo's, the OS's): never memoized, whatever else the error names, since
+# the next start may well succeed. The satellite keeps such lines first in a failure's cause, by the
+# same words (``mcp_install_support._NETWORK_WORDS``, held equal by a test).
+_TRANSIENT_FAIL_RE = re.compile(
+    r"Failed to fetch|Failed to download|resolve host|spurious network error|error sending request"
+    r"|dns error|timed out|Connection (?:reset|refused|closed)|Network is unreachable|tls handshake"
+    r"|No space left on device|Disk quota exceeded|Text file busy|resource busy"
+    r"|being used by another process|Resource temporarily unavailable",
+    re.IGNORECASE,
+)
+# How long a memoized failure is skipped before the next start tries again.
+_UNSAT_MEMO_TTL_S = 3600.0
 _unsatisfiable_installs: dict[tuple[str, str], dict] = {}
 
 # Callback signature: proxy-side mcp_sync calls this with each progress
@@ -188,9 +207,10 @@ def unavailable_reasons(result: SyncResult, assigned) -> dict[str, str]:
         if name in result.not_installed:
             out[name] = "not installed yet on this machine, a new chat here installs it"
             continue
+        # Whole enough to carry the cause the machine reported first.
         err = " ".join(str(result.failed.get(name) or "").split())
-        if len(err) > 200:
-            err = err[:197] + "..."
+        if len(err) > 600:
+            err = err[:597] + "..."
         out[name] = (f"could not be installed on this machine ({err})" if err
                      else "could not be installed on this machine")
     return out
@@ -452,7 +472,7 @@ def _skip_known(machine_id: str, to_install: set[str], to_update: set[str],
         memo = _unsatisfiable_installs.get((machine_id, name))
         if memo is None:
             continue
-        if force:
+        if force or time.monotonic() - memo.get("at", 0.0) >= _UNSAT_MEMO_TTL_S:
             _unsatisfiable_installs.pop((machine_id, name), None)
             continue
         if memo.get("satellite_version") != sat_ver:
@@ -904,13 +924,14 @@ def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
             result.failed[name] = err
             result.excluded_names.add(name)
             # A resolver-unsatisfiable failure is DETERMINISTIC for these
-            # platform bytes on this machine — memo it so every later
-            # session skips the doomed re-attempt (and its bar flash)
-            # until the MCP changes, an install succeeds, or force retry.
-            if _UNSAT_FAIL_RE.search(err) and shipped_hashes.get(name):
+            # platform bytes on this machine — memo it so the sessions of the
+            # next hour skip the doomed re-attempt (and its bar flash), unless
+            # the MCP or the satellite changes or an install succeeds first.
+            if (_UNSAT_FAIL_RE.search(err) and not _TRANSIENT_FAIL_RE.search(err)
+                    and shipped_hashes.get(name)):
                 _unsatisfiable_installs[(machine_id, name)] = {
                     "hash": shipped_hashes[name], "error": err,
-                    "satellite_version": sat_ver,
+                    "satellite_version": sat_ver, "at": time.monotonic(),
                 }
         # Pre-warm boot check. "warn:<reason>" = installed but
         # didn't answer initialize in time. Advisory — not excluded.

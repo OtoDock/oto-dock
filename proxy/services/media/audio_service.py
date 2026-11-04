@@ -232,6 +232,10 @@ class ChatAudioCapability:
     # dictation pick reads the language from the audio (else it falls back
     # to the provider's automatic stream).
     language_identify: bool = False
+    # Where the Automatic dictation language runs: "platform" when a usable
+    # chat STT provider exists and the policy is not native-only (the device
+    # recognizer cannot identify a language), else "device".
+    stt_automatic: str = "device"
 
 
 def language_identify_enabled() -> bool:
@@ -268,29 +272,85 @@ def language_candidates() -> list[str]:
     return parse(task_store.get_platform_setting("audio_language_candidates") or "")
 
 
-def _resolve_modality(provider_type: str, policy: str, has_native: bool) -> tuple[str, int | None, str]:
+# The capability's reason, shown under "Sound and mic icons in chat" on the
+# Audio settings page: plain sentences, one per modality.
+_REASONS = {
+    "tts": {
+        "device": "Your device is used for voice.",
+        "unavailable": "Voice on your device is unavailable.",
+        "either": "You pick the voice: your device or the platform.",
+        "platform": "Your device cannot speak, so the platform's speech provider does.",
+        "platform_only": "The platform's speech provider is used for voice.",
+        "nothing": "Voice on your device is unavailable, and the platform has no voice provider.",
+    },
+    "stt": {
+        "device": "Your device is used for dictation.",
+        "unavailable": "Dictation on your device is unavailable.",
+        "either": "You pick who listens: your device or the platform.",
+        "platform": "Your device cannot dictate, so the platform's speech provider listens.",
+        "platform_only": "The platform's speech provider is used for dictation.",
+        "nothing": "Dictation on your device is unavailable, and the platform has no dictation provider.",
+    },
+}
+_BOTH_DEVICE = "Your device is used for voice and dictation."
+_BOTH_PLATFORM = "The platform's speech provider is used for voice and dictation."
+# The admin policy's values. The three released ones keep their stored
+# strings. Every value applies per modality. Native preferred, Platform only
+# and User's choice take the other side's engine where the chosen one is
+# missing; Native only never does.
+POLICIES = ("native_only", "native_preferred", "platform_only", "user_choice")
+
+
+def _resolve_modality(
+    provider_type: str, policy: str, has_native: bool, *, apple_webkit: bool = False,
+) -> tuple[str, int | None, str, int | None]:
+    """``(availability, provider id, reason, usable provider id)``: the
+    last is the chat default's id whenever it is usable, whatever the
+    answer (the Automatic language pick mints a platform session with it).
+
+    A device recognizer that is Apple's WebKit (Safari, every browser on
+    iOS) is one language per start with its own ends, so under native
+    preferred it is offered beside the platform rather than instead of it:
+    ``either``, the platform the dashboard's default pick. Platform only
+    takes the provider wherever one is usable and the device where none
+    is, so a voice provider without a dictation provider gives the
+    platform for voice and the device for dictation."""
     default = audio_provider_store.get_default_provider(provider_type, "chat")
     platform_ok = _provider_usable(default)
     pid = default["id"] if (default and platform_ok) else None
 
+    words = _REASONS[provider_type]
     if policy == "native_only":
         if has_native:
-            return "native_only", None, "admin policy is native-only"
-        return "unavailable", None, "native-only policy and no native support on this device"
+            return "native_only", None, words["device"], pid
+        return "unavailable", None, words["unavailable"], pid
     if policy == "native_preferred":
+        if has_native and apple_webkit and platform_ok:
+            return "either", pid, words["either"], pid
         if has_native:
-            return "native_only", None, "native available (admin policy: native preferred)"
+            return "native_only", None, words["device"], pid
         if platform_ok:
-            return "platform", pid, "no native support; using platform provider"
-        return "unavailable", None, "no native support and no platform provider configured"
+            return "platform", pid, words["platform"], pid
+        return "unavailable", None, words["nothing"], pid
+    if policy == "platform_only":
+        if platform_ok:
+            return "platform", pid, words["platform_only"], pid
+        if has_native:
+            return "native_only", None, words["device"], pid
+        return "unavailable", None, words["nothing"], pid
     # user_choice
     if has_native and platform_ok:
-        return "either", pid, "user choice"
+        return "either", pid, words["either"], pid
     if platform_ok:
-        return "platform", pid, "no native support; using platform provider"
+        return "platform", pid, words["platform"], pid
     if has_native:
-        return "native_only", None, "no platform provider; using native"
-    return "unavailable", None, "no native support and no platform provider configured"
+        return "native_only", None, words["device"], pid
+    return "unavailable", None, words["nothing"], pid
+
+
+def platform_provider_usable(provider_type: str) -> bool:
+    """The chat default provider of one modality exists and is usable."""
+    return _provider_usable(audio_provider_store.get_default_provider(provider_type, "chat"))
 
 
 def chat_audio_enabled() -> bool:
@@ -300,23 +360,39 @@ def chat_audio_enabled() -> bool:
     return task_store.get_platform_setting("audio_chat_enabled") != "false"
 
 
-def resolve_chat_audio_capability(*, has_native_tts: bool, has_native_stt: bool) -> ChatAudioCapability:
+def resolve_chat_audio_capability(
+    *, has_native_tts: bool, has_native_stt: bool, apple_webkit: bool = False,
+) -> ChatAudioCapability:
     """Resolve what the chat sound/mic icons can do for this request.
 
     Read on-demand (never cached) so a mid-session admin policy / kill-switch
     change is reflected on the next interaction. Gated by ``audio_chat_enabled``
-    (default on).
+    (default on). ``apple_webkit``: the device recognizer is Apple's WebKit.
     """
     if not chat_audio_enabled():
         return ChatAudioCapability(
             "unavailable", "unavailable", None, None,
-            "chat audio is turned off by the administrator", False,
+            "Chat audio is turned off by the administrator.", False,
         )
     policy = task_store.get_platform_setting("audio_chat_user_policy") or "native_preferred"
-    tts, tpid, treason = _resolve_modality("tts", policy, has_native_tts)
-    stt, spid, sreason = _resolve_modality("stt", policy, has_native_stt)
-    return ChatAudioCapability(tts, stt, tpid, spid, f"TTS: {treason}. STT: {sreason}.", True,
-                               language_identify=language_identify_enabled())
+    tts, tpid, treason, _ = _resolve_modality("tts", policy, has_native_tts)
+    stt, spid, sreason, usable = _resolve_modality("stt", policy, has_native_stt, apple_webkit=apple_webkit)
+    # The Automatic language pick runs on the platform whenever a provider
+    # is there for it and the policy allows the platform at all: its id
+    # rides along even where the answer is the device.
+    platform_for_automatic = usable is not None and policy != "native_only"
+    if platform_for_automatic and spid is None:
+        spid = usable
+    pair = (treason, sreason)
+    if pair == (_REASONS["tts"]["device"], _REASONS["stt"]["device"]):
+        both = _BOTH_DEVICE
+    elif pair == (_REASONS["tts"]["platform_only"], _REASONS["stt"]["platform_only"]):
+        both = _BOTH_PLATFORM
+    else:
+        both = f"{treason} {sreason}"
+    return ChatAudioCapability(tts, stt, tpid, spid, both, True,
+                               language_identify=language_identify_enabled(),
+                               stt_automatic="platform" if platform_for_automatic else "device")
 
 
 def duplex_capability() -> dict:

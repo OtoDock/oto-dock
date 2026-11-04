@@ -135,6 +135,31 @@ describe('Send again', () => {
     expect(again?.images.map((i) => i.path)).toEqual(['users/x/p.jpg'])
   })
 
+  it("stops at a card: another agent's or the platform's message is nobody's turn", async () => {
+    const { lastTurnPrompt } = await import('@/lib/messageBlocks')
+    const card = (id: string, role: 'user' | 'assistant', kind: string, content: string) =>
+      ({ id, role, blocks: [{ type: 'text', content }], createdAt: '', delegateCard: { kind, key: id } })
+    // The wake's own turn ended short: the person's earlier, answered
+    // message is not sent again.
+    expect(lastTurnPrompt([
+      user('u0', [{ type: 'text', content: 'watch the upload' }]),
+      answer('a0', [{ type: 'text', content: 'watching' }]),
+      card('w1', 'assistant', 'wake', 'Check the log.'),
+      answer('a1', [{ type: 'system', subtype: 'turn_ended', reason: 'exited', message: 'x' }]),
+    ] as any)).toBeNull()
+    // A worker lane's task is the delegating agent's words, not the person's.
+    expect(lastTurnPrompt([
+      card('p1', 'user', 'prompt', 'Review the plan.'),
+      answer('a1', [{ type: 'system', subtype: 'turn_ended', reason: 'exited', message: 'x' }]),
+    ] as any)).toBeNull()
+    // The person's steer after a card is theirs.
+    expect(lastTurnPrompt([
+      card('p1', 'user', 'prompt', 'Review the plan.'),
+      user('u1', [{ type: 'text', content: 'and the docs' }]),
+      answer('a1', [{ type: 'system', subtype: 'turn_ended', reason: 'exited', message: 'x' }]),
+    ] as any)?.text).toBe('and the docs')
+  })
+
   it('stops at the last answer text and has nothing without a message', async () => {
     const { lastTurnPrompt } = await import('@/lib/messageBlocks')
     expect(lastTurnPrompt([answer('a0', [{ type: 'text', content: 'hi' }])] as any)).toBeNull()

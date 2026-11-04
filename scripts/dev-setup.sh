@@ -55,8 +55,8 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 # ── pinned versions — read straight from VERSIONS.md (single source of truth) ─
 # shellcheck source=versions.sh
 source "$PLATFORM_ROOT/scripts/versions.sh"
-PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.17}"
-NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-26.12.1}"
+PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.18}"
+NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-26.13.0}"
 NODE_MAJOR="${NODE_VERSION%%.*}"                               # 26
 UV_VERSION="$(otodock_version_get UV_VERSION)";       export UV_VERSION   # honored by install-baseline-tools.sh
 PNPM_VERSION="$(otodock_version_get PNPM_VERSION)";   export PNPM_VERSION
@@ -194,7 +194,7 @@ setup_proxy() {
 start_postgres() {
     [ -f "$PLATFORM_ROOT/config.env" ] || die "config.env missing — proxy/setup.sh should have created it"
     local DC="docker"; docker info >/dev/null 2>&1 || DC="sudo docker"
-    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36}) in Docker..."
+    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}) in Docker..."
     $DC compose --env-file "$PLATFORM_ROOT/config.env" -f "$PLATFORM_ROOT/docker-compose.t1.yml" up -d postgres
     ok "Postgres up on 127.0.0.1:5432 (container otodock-postgres)"
 }

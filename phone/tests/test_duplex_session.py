@@ -610,6 +610,56 @@ async def test_send_hangup_reason_provider():
         await conn.close()
 
 
+def test_the_conversations_speech_is_reported_under_the_speaker(monkeypatch):
+    """The duplex's seam reports the stream's and the second listen's seconds
+    with the chat and the speaker the session config carried; a config that
+    names neither (an older proxy) keeps the call's relisten row."""
+    from pipeline_fakes import FakeSTT, FakeTTS, FakeVAD
+
+    import duplex.session as dsession
+    from config_manager import ConfigManager
+    from pipeline import core as plcore, providers as plproviders
+
+    monkeypatch.setattr(dsession, "SileroVad", FakeVAD)
+    monkeypatch.setattr(plproviders, "get_provider_class", lambda kind, name: FakeSTT if kind == "stt" else FakeTTS)
+    sent = []
+
+    async def duplex_report(**kw):
+        sent.append(("duplex", kw))
+
+    async def relisten_report(**kw):
+        sent.append(("relisten", kw))
+    monkeypatch.setattr(dsession, "report_duplex_usage", duplex_report)
+    monkeypatch.setattr(plcore, "report_relisten_usage", relisten_report)
+
+    class FakeDuplexConn:
+        call_uuid = "dx-usage-test"
+        peer_addr = "duplex:usage"
+        sample_rate_in = 16000
+        sample_rate_out = 24000
+        frame_bytes_out = 960
+        is_closed = False
+        on_barge_in = None
+
+        def send_event(self, payload):
+            pass
+
+    base = {"stt": {"provider_name": "deepgram"}, "tts": {"provider_name": "cartesia"},
+            "language": "el", "chat_endpointing_ms": 1500}
+    async def gathered(reports):
+        await asyncio.gather(*reports)
+
+    s = dsession.DuplexSession(FakeDuplexConn(), ConfigManager(), {**base, "chat_id": "chat-9", "sub": "user-9"})
+    asyncio.run(gathered(s._speech_usage_reports(streamed=61.5, relistened=4.0, session_id="dx-usage-test")))
+    assert sent == [("duplex", {"chat_id": "chat-9", "sub": "user-9", "provider": "deepgram",
+                                "stream_seconds": 61.5, "relisten_seconds": 4.0, "session_id": "dx-usage-test"})]
+    assert s._speech_usage_reports(streamed=0.0, relistened=0.0, session_id="x") == []
+    sent.clear()
+    older = dsession.DuplexSession(FakeDuplexConn(), ConfigManager(), dict(base))
+    asyncio.run(gathered(older._speech_usage_reports(streamed=61.5, relistened=4.0, session_id="dx-old")))
+    assert sent == [("relisten", {"agent": "", "provider": "deepgram", "seconds": 4.0, "session_id": "dx-old"})]
+
+
 def test_session_stt_provider_injects_chat_endpointing():
     cfg = {"stt": {"provider_name": "deepgram",
                    "advanced": {"call_endpointing_ms": 500}},
@@ -663,6 +713,8 @@ def test_duplex_session_wiring(monkeypatch):
     assert s.vad.kwargs["sample_rate"] == 16000
     assert s._filler_key[-1] == 24000
     assert s._locked_language == "el"
+    # The second listen's wide form: a window with words is heard again too.
+    assert s.stt.turn_relisten is True and s.stt.turn_relisten_wide is True
     assert s._route_settings.backchannel_enabled is False
     assert s._route_settings.thinking_filler_enabled is True
     assert s._ambience is None and s._texture is None and s._breath_pcm is None

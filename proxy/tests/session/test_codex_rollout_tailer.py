@@ -48,6 +48,7 @@ class _Captured(list):
     order: list
     sync: list       # each message row's sync_search flag
     rebuilds: list   # the chat ids whose search row was rebuilt, in order
+    data: list       # each message row's event_data ('{"note": true}' on a note)
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +58,7 @@ def _capture(monkeypatch):
     rows.order = []
     rows.sync = []
     rows.rebuilds = []
+    rows.data = []
     updates = []
     import storage.database as db
 
@@ -68,10 +70,13 @@ def _capture(monkeypatch):
             rows.append((role, content))
             rows.order.append((role, content))
             rows.sync.append(kw.get("sync_search", True))
+            rows.data.append(event_data)
 
     monkeypatch.setattr(db, "add_chat_message", _add)
     monkeypatch.setattr(db, "rebuild_chat_search", rows.rebuilds.append)
     monkeypatch.setattr(db, "update_chat", lambda cid, **kw: updates.append(kw))
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: updates.append({"title": title}) or True)
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": "", "codex_thread_id": ""})
     monkeypatch.setattr(db, "get_chat_messages", lambda cid, limit=500: [])
     C._offsets.clear()
@@ -213,10 +218,10 @@ def test_resume_prefix_merge_no_duplicates(tmp_path, monkeypatch, _capture):
     )
     import storage.database as db
     persisted = [("user", "q1"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a2")]
-    # get_chat_messages returns newest-first.
+    # get_chat_messages returns the newest rows in chronological order.
     monkeypatch.setattr(
         db, "get_chat_messages",
-        lambda cid, limit=500: [{"role": r, "content": c} for r, c in reversed(persisted)],
+        lambda cid, limit=500: [{"role": r, "content": c} for r, c in persisted],
     )
     res = C.tail_rollout("s4", "c4", path)
     assert res["persisted"] == 0
@@ -556,7 +561,7 @@ def test_first_tail_event_prefix_skips_persisted_rows(tmp_path, monkeypatch, _ca
         _msg("assistant", "a1"),
     )
     import storage.database as db
-    db_rows = [  # chronological; get_chat_messages returns newest-first
+    db_rows = [  # chronological, as get_chat_messages returns them
         {"role": "user", "content": "q1"},
         {"role": "event", "event_type": "thinking",
          "event_data": json.dumps({"type": "thinking", "content": "old thought"})},
@@ -565,7 +570,7 @@ def test_first_tail_event_prefix_skips_persisted_rows(tmp_path, monkeypatch, _ca
         {"role": "assistant", "content": "a1"},
     ]
     monkeypatch.setattr(db, "get_chat_messages",
-                        lambda cid, limit=500: list(reversed(db_rows)))
+                        lambda cid, limit=500: list(db_rows))
     res = C.tail_rollout("st9", "ct9", path)
     assert res["persisted"] == 0
     assert _capture == [] and _capture.events == []
@@ -703,10 +708,10 @@ def test_question_row_dedupes_on_restart_reread(tmp_path, monkeypatch, _capture)
         _fn_call("request_user_input", "call_q5", _Q_ARGS),
     )
     monkeypatch.setattr(db, "get_chat_messages", lambda cid, limit=500: [
+        {"role": "user", "content": "set it up"},
         {"role": "event", "event_type": "question", "event_data": json.dumps(
             {"type": "question", "tool_name": "request_user_input",
              "tool_input": _Q_ARGS, "tool_id": "call_q5"})},
-        {"role": "user", "content": "set it up"},
     ])
     stats = C.tail_rollout("sq5", "cq5", path)
     assert stats["question_pending"] is True
@@ -1122,7 +1127,7 @@ def test_first_tail_prefix_matches_raw_rows_against_stamped_lines(tmp_path, monk
     ]
     monkeypatch.setattr(
         db, "get_chat_messages",
-        lambda cid, limit=500: [{"role": r, "content": c} for r, c in reversed(persisted)],
+        lambda cid, limit=500: [{"role": r, "content": c} for r, c in persisted],
     )
     res = C.tail_rollout("s-bs", "c-bs", path)
     assert _capture == [("user", f"{stamp}\n\nthe new one")]
@@ -1137,7 +1142,7 @@ def test_first_tail_prefix_keeps_assistant_rows_byte_equal(tmp_path, monkeypatch
     persisted = [("user", "q1"), ("assistant", "a1")]
     monkeypatch.setattr(
         db, "get_chat_messages",
-        lambda cid, limit=500: [{"role": r, "content": c} for r, c in reversed(persisted)],
+        lambda cid, limit=500: [{"role": r, "content": c} for r, c in persisted],
     )
     assert C.tail_rollout("s-bs2", "c-bs2", path)["persisted"] == 1
     assert _capture == [("assistant", "a1 revised")]
@@ -1158,3 +1163,158 @@ def test_a_batch_rebuilds_the_search_row_once(tmp_path, _capture):
     assert _capture.rebuilds == ["c9"]
     C.tail_rollout("s9", "c9", path)
     assert _capture.rebuilds == ["c9"]
+
+
+# ───────────────── the platform's prompts typed into the terminal ────────────
+# Their row is the card the typing site wrote, the note made when the bytes
+# went in; the journaled copy (single-lined on a satellite) is skipped, a
+# person's own line never.
+
+
+def test_a_platform_prompt_typed_and_noted_leaves_no_plain_row(tmp_path, _capture):
+    from core.session import transcript_tool_events as TE
+    TE._sent_prompts.clear()
+    typed = "[Current time: Friday, July 10, 2026 22:30 (10:30 PM) UTC]\n\nCheck the upload log."
+    TE.note_sent_prompt("c-plat-cx", typed, owner="sid-plat")
+    path = _write(
+        tmp_path,
+        _meta("t-plat"),
+        _msg("user", typed.replace("\n\n", " ")),
+        _msg("assistant", "clean"),
+        _evt("task_complete", last_agent_message="clean"),
+    )
+    stats = C.tail_rollout("s-plat-cx", "c-plat-cx", path)
+    assert _capture == [("assistant", "clean")]
+    assert stats["persisted"] == 1 and stats["last_signal"] == "end_turn"
+
+
+def test_a_persons_identical_line_after_a_dropped_note_keeps_its_row(tmp_path, _capture):
+    from core.session import transcript_tool_events as TE
+    TE._sent_prompts.clear()
+    TE.note_sent_prompt("c-drop-cx", "go on", owner="sid-d")
+    assert TE.drop_sent_prompt("c-drop-cx", "go on", owner="sid-d") is True
+    path = _write(tmp_path, _meta("t-drop"), _msg("user", "go on"))
+    assert C.tail_rollout("s-drop-cx", "c-drop-cx", path)["persisted"] == 1
+    assert _capture == [("user", "go on")]
+
+
+def test_two_queued_platform_prompts_give_two_cards_and_no_plain_row(tmp_path, _capture):
+    from core.session import transcript_tool_events as TE
+    TE._sent_prompts.clear()
+    TE.note_sent_prompt("c-two-cx", "first wake", owner="sid-t")
+    TE.note_sent_prompt("c-two-cx", "second wake", owner="sid-t")
+    path = _write(
+        tmp_path,
+        _meta("t-two"),
+        _msg("user", "first wake"),
+        _msg("assistant", "one"),
+        _evt("task_complete", last_agent_message="one"),
+        _msg("user", "second wake"),
+        _msg("assistant", "two"),
+        _evt("task_complete", last_agent_message="two"),
+    )
+    assert C.tail_rollout("s-two-cx", "c-two-cx", path)["persisted"] == 2
+    assert _capture == [("assistant", "one"), ("assistant", "two")]
+
+
+def test_a_rename_between_the_read_and_the_write_is_kept(monkeypatch):
+    # The row read untitled, but a rename landed before the write: the
+    # conditional write refuses, so nothing is announced.
+    import storage.database as db
+    from services.notifications import notification_manager
+    sent = []
+    monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
+    monkeypatch.setattr(db, "set_chat_title_if_unset", lambda cid, title: False)
+    monkeypatch.setattr(notification_manager, "broadcast_chat_title", lambda *a, **k: sent.append(a))
+    assert C._maybe_backfill_title("s-race", "c-race", "Fix the flaky login test") is False
+    assert sent == []
+
+
+def test_a_photo_alone_leaves_a_terminal_chat_for_its_next_message(tmp_path, _capture, monkeypatch):
+    # A photo alone typed into a live Codex terminal, as the rollout keeps it
+    # (the stamp, then the platform's attachments block): no backfill write,
+    # no frame; the next real message titles the chat.
+    import storage.database as db
+    from services.notifications import notification_manager
+    titles: list = []
+    sent: list = []
+    monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": titles[-1] if titles else "",
+                                                     "codex_thread_id": ""})
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: False if titles else (titles.append(title) or True))
+    monkeypatch.setattr(notification_manager, "broadcast_chat_title", lambda *a, **k: sent.append(a[2]))
+    photo = ("[Current time: Monday, October 26, 2026 20:30 (8:30 PM) UTC (UTC+00:00)] The user has attached 1 image(s). Read and analyze them using the Read tool:\n"
+             "- /users/u/workspace/uploads/photos/a.jpg\n")
+    p = tmp_path / "r-photo.jsonl"
+    p.write_text(_meta("tid-photo") + _msg("user", photo))
+    assert C.tail_rollout("s-cphoto", "c-cphoto", str(p))["title_set"] is False
+    assert titles == [] and sent == []
+    with open(p, "a") as fh:
+        fh.write(_msg("user", "what colours are these?"))
+    assert C.tail_rollout("s-cphoto", "c-cphoto", str(p))["title_set"] is True
+    assert titles == sent == ["what colours are these?"]
+
+
+# ─── Progress notes: a commentary message is the preamble before a step ───
+
+_NOTE = json.dumps({"note": True})
+
+
+def _phased(text: str, phase) -> str:
+    payload = {"type": "message", "role": "assistant",
+               "content": [{"type": "output_text", "text": text}]}
+    if phase is not None:
+        payload["phase"] = phase
+    return _line({"type": "response_item", "payload": payload})
+
+
+@pytest.mark.parametrize(("phase", "data"), [
+    ("commentary", _NOTE), ("final_answer", ""), ("partial_answer", ""), (None, ""), ("later", ""),
+])
+def test_only_a_commentary_message_is_a_note(_capture, phase, data):
+    C.tail_lines("s-ph", "c-ph", [_meta("tph"), _phased("Words.", phase)])
+    assert _capture == [("assistant", "Words.")]
+    assert _capture.data == [data]
+
+
+def test_a_commentary_turn_keeps_its_signal_and_last_message(_capture):
+    stats = C.tail_lines("s-ct", "c-ct", [
+        _meta("tct"),
+        _msg("user", "three steps"),
+        _phased("I'll list the files.\n", "commentary"),
+        _fn_call("exec_command", "call_l", {"cmd": "ls"}),
+        _line({"type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "call_l", "output": "a"}}),
+        _phased("One file.", "final_answer"),
+        _evt("task_complete", last_agent_message="One file."),
+    ])
+    assert _capture.order == [("user", "three steps"), ("assistant", "I'll list the files.\n"),
+                              ("event", "tool"), ("assistant", "One file.")]
+    assert _capture.data == ["", _NOTE, ""]
+    assert stats["turn_complete"] is True and stats["last_message"] == "One file."
+    assert stats["last_signal"] == "end_turn"
+
+
+def test_a_first_tail_skips_a_persisted_note_row(tmp_path, monkeypatch, _capture):
+    # A restart's re-read from line 0: the note row the earlier life wrote is
+    # matched by role and words like any assistant row; only what follows lands.
+    import storage.database as db
+    persisted = [
+        {"role": "user", "content": "three steps"},
+        {"role": "assistant", "content": "I'll look first.", "event_type": "", "event_data": _NOTE},
+        {"role": "assistant", "content": "Done."},
+    ]
+    monkeypatch.setattr(db, "get_chat_messages", lambda cid, limit=500: list(persisted))
+    path = _write(
+        tmp_path,
+        _meta("tfp"),
+        _msg("user", "three steps"),
+        _phased("I'll look first.", "commentary"),
+        _phased("Done.", "final_answer"),
+        _msg("user", "one more"),
+        _phased("Checking again.", "commentary"),
+    )
+    stats = C.tail_rollout("s-fp", "c-fp", path)
+    assert _capture == [("user", "one more"), ("assistant", "Checking again.")]
+    assert _capture.data == ["", _NOTE]
+    assert stats["persisted"] == 2

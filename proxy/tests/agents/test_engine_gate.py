@@ -1,13 +1,16 @@
-"""Platform-level engine-enablement gate + availability flags.
+"""The engine allowlist's gate + availability flags.
 
-PATCH/POST /v1/agents: a non-admin manager may only NEWLY enable an execution
-engine when the platform POOL has a subscription for it
-(``subscription_pool.layer_platform_configured`` — agent-scoped background
-runs can only use the pool, so personal connections never qualify).
-Grandfathering: already-enabled engines always keep
-(reorders/removals pass untouched). The admin bypass is COOKIE-principal only
-— a session-token identity carrying an admin sub (the config-MCP inside an
-admin-created session) must NOT bypass (prompt-injection surface).
+PATCH /v1/agents: the engines are an allowlist a person's own account may
+serve, so ticking one is free. The agent's DEFAULT engine is what its own
+work (tasks, calls, meetings) runs on, and that draws on the platform POOL
+alone (``subscription_pool.layer_platform_configured``; personal connections
+never qualify): a write that MOVES the default onto an engine the pool lacks
+is refused for a non-admin manager. The admin bypass is COOKIE-principal
+only: a session-token identity carrying an admin sub (the config-MCP inside
+an admin-created session) must NOT bypass (prompt-injection surface). POST
+/v1/agents with an explicit engine keeps the same pool gate, and a new agent
+allows every registered engine. The local-only toggle takes known engines
+that declare a local provider.
 
 Also: the per-layer ``configured`` flag on GET /v1/execution-layers (now
 authenticated) and the per-user ``can_run`` flag on
@@ -80,16 +83,44 @@ def _enabled_paths(slug: str) -> list[str]:
 
 
 class TestEnableGate:
-    def test_manager_add_unconfigured_refused(self, client, agent):
+    def test_manager_ticks_an_unpooled_engine_freely(self, client, agent):
+        # An extra engine serves whoever holds it personally: no pool needed.
         _assign_manager(MEMBER)
         r = client.patch(
             f"/v1/agents/{SLUG}",
             json={"execution_paths": ["claude-code-cli", "codex-cli"]},
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
+        assert r.status_code == 200, r.text
+        assert _enabled_paths(SLUG) == ["claude-code-cli", "codex-cli"]
+
+    def test_manager_moving_the_default_to_an_unpooled_engine_refused(self, client, agent):
+        _assign_manager(MEMBER)
+        r = client.patch(
+            f"/v1/agents/{SLUG}",
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
+            headers=_cookie(MEMBER, "viewer@test.com", "member"),
+        )
         assert r.status_code == 403
-        assert "No OpenAI Codex subscription" in r.json()["detail"]  # the engine's display_name
+        assert "no OpenAI Codex subscription" in r.json()["detail"]  # the engine's display_name
+        # A manager is told the step a manager can take.
+        assert "Ask an administrator to connect one in Setup, AI Engines" in r.json()["detail"]
+        assert "keep Claude Code CLI as the default" in r.json()["detail"]
         assert _enabled_paths(SLUG) == ["claude-code-cli"]
+
+    def test_a_default_model_of_an_unpooled_engine_refused(self, client, agent):
+        # A default model of another engine moves the default there
+        # (_reconcile_primary_layer): the same gate judges the result.
+        _assign_manager(MEMBER)
+        from storage.agents import agent_store
+        agent_store.update_agent(SLUG, execution_paths=json.dumps(["codex-cli"]))
+        r = client.patch(
+            f"/v1/agents/{SLUG}",
+            json={"default_model": "gpt-6.1-sol"},
+            headers=_cookie(MEMBER, "viewer@test.com", "member"),
+        )
+        assert r.status_code == 403
+        assert _enabled_paths(SLUG)[0] == "claude-code-cli"
 
     def test_admin_pool_sub_counts(self, client, agent):
         # The gate keys on the PLATFORM POOL: agent-scoped background work
@@ -98,21 +129,21 @@ class TestEnableGate:
         _add_sub("codex-cli", owner=ADMIN, personal=False, pool=True)
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"execution_paths": ["claude-code-cli", "codex-cli"]},
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
         assert r.status_code == 200
-        assert set(_enabled_paths(SLUG)) == {"claude-code-cli", "codex-cli"}
+        assert _enabled_paths(SLUG) == ["codex-cli", "claude-code-cli"]
 
-    def test_personal_sub_alone_does_not_count(self, client, agent):
+    def test_personal_sub_alone_does_not_count_for_the_default(self, client, agent):
         # A user's personal connection backs only THEIR user-scope chats —
-        # never the pool that agent-scoped runs need — so it must not make
-        # an engine enableable (operator decision 2026-07-25).
+        # never the pool that agent-scoped runs need — so it must not move
+        # the default there.
         _assign_manager(MEMBER)
         _add_sub("codex-cli", owner=CREATOR, personal=True)
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"execution_paths": ["claude-code-cli", "codex-cli"]},
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
         assert r.status_code == 403
@@ -124,26 +155,52 @@ class TestEnableGate:
         _add_sub("codex-cli", owner=CREATOR, personal=False, pool=True)
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"execution_paths": ["claude-code-cli", "codex-cli"]},
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
         assert r.status_code == 403
 
-    def test_grandfathered_reorder_passes(self, client, agent):
+    def test_local_only_engines_take_known_engines_with_local_models(self, client, agent):
+        _assign_manager(MEMBER)
+        headers = _cookie(MEMBER, "viewer@test.com", "member")
+        r = client.patch(f"/v1/agents/{SLUG}", json={"local_only_engines": ["acme-cli"]}, headers=headers)
+        assert r.status_code == 400
+        r = client.patch(f"/v1/agents/{SLUG}", json={"local_only_engines": ["claude-code-cli"]}, headers=headers)
+        assert r.status_code == 400
+        assert "has no local models" in r.json()["detail"]
+        r = client.patch(f"/v1/agents/{SLUG}", json={"local_only_engines": ["codex-cli"]}, headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["local_only_engines"] == json.dumps(["codex-cli"])
+        from storage.agents import agent_store
+        from storage.agents.agent_store import _get_local_only_engines
+        assert _get_local_only_engines(agent_store.get_agent(SLUG)) == ["codex-cli"]
+        r = client.patch(f"/v1/agents/{SLUG}", json={"local_only_engines": []}, headers=headers)
+        assert r.status_code == 200
+        assert _get_local_only_engines(agent_store.get_agent(SLUG)) == []
+
+    def test_a_stored_set_stays_editable_while_the_default_holds(self, client, agent):
         # A stored set the platform can no longer "configure" must stay
-        # editable: reorders are a set-identity save (the MCP's
-        # update_default_layer and the UI's toggle both send them).
+        # editable: a save that keeps the default is a set-identity save
+        # (the UI's toggle sends the whole list); a reorder that MOVES the
+        # default onto the unpooled engine is the one write refused.
         from storage.agents import agent_store
         agent_store.update_agent(SLUG, execution_path="claude-code-cli",
                                  execution_paths=json.dumps(["codex-cli"]))
         _assign_manager(MEMBER)
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
+            json={"execution_paths": ["claude-code-cli", "codex-cli"], "description": "kept"},
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
         assert r.status_code == 200
-        assert _enabled_paths(SLUG)[0] == "codex-cli"
+        assert _enabled_paths(SLUG) == ["claude-code-cli", "codex-cli"]
+        r = client.patch(
+            f"/v1/agents/{SLUG}",
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
+            headers=_cookie(MEMBER, "viewer@test.com", "member"),
+        )
+        assert r.status_code == 403
+        assert _enabled_paths(SLUG)[0] == "claude-code-cli"
 
     def test_uncheck_always_allowed(self, client, agent):
         from storage.agents import agent_store
@@ -161,11 +218,11 @@ class TestEnableGate:
     def test_cookie_admin_bypasses(self, client, agent):
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"execution_paths": ["claude-code-cli", "codex-cli"]},
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
             headers=_cookie(ADMIN, "admin@test.com", "admin"),
         )
         assert r.status_code == 200
-        assert "codex-cli" in _enabled_paths(SLUG)
+        assert _enabled_paths(SLUG)[0] == "codex-cli"
 
     def test_session_token_admin_does_not_bypass(self, client, agent):
         # The config-MCP authenticates with the session JWT of the session's
@@ -173,11 +230,14 @@ class TestEnableGate:
         # admin role but is_api_key=True, so the gate still applies.
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"execution_paths": ["claude-code-cli", "codex-cli"]},
+            json={"execution_paths": ["codex-cli", "claude-code-cli"]},
             headers=_bearer_session(ADMIN),
         )
         assert r.status_code == 403
-        assert "No OpenAI Codex subscription" in r.json()["detail"]  # the engine's display_name
+        assert "no OpenAI Codex subscription" in r.json()["detail"]  # the engine's display_name
+        # An admin, on a session token, is told their own step.
+        assert "Connect one in Setup, AI Engines" in r.json()["detail"]
+        assert "Ask an administrator" not in r.json()["detail"]
 
     def test_create_explicit_path_gated_for_non_admin(self, client, temp_db):
         r = client.post(
@@ -206,6 +266,9 @@ class TestEnableGate:
         )
         assert r.status_code == 200
         assert r.json()["execution_path"] == "claude-code-cli"
+        # A new agent allows every registered engine (the allowlist).
+        assert set(_enabled_paths("bare-create")) == {"claude-code-cli", "codex-cli", "direct-llm"}
+        assert _enabled_paths("bare-create")[0] == "claude-code-cli"
 
 
 class TestAvailabilityFlags:

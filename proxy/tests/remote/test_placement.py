@@ -226,6 +226,32 @@ def test_may_run_on_is_the_placement_guard():
                                     user_paired_allowed=True)
 
 
+def test_an_admin_machine_admits_every_role_of_its_own_agents_by_its_switch():
+    on = {"id": "m-a", "pairing_scope": "admin", "registered_by": "a", "all_roles_run_here": True}
+    off = dict(on, all_roles_run_here=False)
+    assert placement.admits_every_role(on, "m-a")
+    assert placement.admits_every_role(on, placement.offline_sentinel("m-a"))
+    assert not placement.admits_every_role(off, "m-a")
+    # Only the agent's own default: another agent's, the sandbox, or none.
+    assert not placement.admits_every_role(on, "m-b")
+    assert not placement.admits_every_role(on, placement.LOCAL)
+    assert not placement.admits_every_role(on, "")
+    assert not placement.admits_every_role(on, None)
+    # A personal machine, a row with no id, no row.
+    assert not placement.admits_every_role(dict(on, pairing_scope="user"), "m-a")
+    assert not placement.admits_every_role(dict(on, id=""), "")
+    assert not placement.admits_every_role(None, "m-a")
+    # The guard: a person below the owner tier runs there only by the switch.
+    kw = {"run_sub": "u-1", "run_can_manage": False, "user_paired_allowed": True}
+    assert placement.may_run_on(on, agent_default="m-a", **kw)
+    assert not placement.may_run_on(on, agent_default="m-b", **kw)
+    assert not placement.may_run_on(on, **kw)
+    assert not placement.may_run_on(off, agent_default="m-a", **kw)
+    # A personal machine stays its owner's whatever the flag says.
+    theirs = dict(on, pairing_scope="user", registered_by="u-2")
+    assert not placement.may_run_on(theirs, agent_default="m-a", **kw)
+
+
 def test_the_browser_settings_read_takes_the_placement(monkeypatch):
     from storage import remote_store
     assert remote_store.get_target_browser_settings(placement.LOCAL_PLACEMENT) == remote_store.BrowserTargetSettings()

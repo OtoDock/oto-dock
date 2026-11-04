@@ -238,7 +238,7 @@ def test_macos_permissions_non_mac(monkeypatch):
     monkeypatch.setattr(environment, "os_kind", lambda: "linux")
     perms = environment.check_macos_permissions()
     assert perms["accessibility"] is None and perms["screen_recording"] is None
-    assert "macOS-only" in perms["notes"]
+    assert "macOS only" in perms["notes"]
 
 
 def test_session_active_unknown_on_linux(monkeypatch):
@@ -445,3 +445,94 @@ def test_list_tools_shape():
     computer = next(t for t in tools if t.name == "computer")
     assert "action" in computer.inputSchema["required"]
     assert set(computer.inputSchema["properties"]["action"]["enum"]) == server._ALL_ACTIONS
+
+
+# ===========================================================================
+# macOS grants: refuse what macOS would silently drop, and say what to turn on
+# ===========================================================================
+
+@pytest.fixture
+def mac(monkeypatch):
+    """A Mac whose grants the test sets; records each read's prompt flag."""
+    state = {"accessibility": True, "screen_recording": True, "prompts": []}
+
+    def perms(prompt=False):
+        state["prompts"].append(prompt)
+        return {"accessibility": state["accessibility"], "screen_recording": state["screen_recording"], "notes": ""}
+
+    monkeypatch.setattr(environment, "os_kind", lambda: "darwin")
+    monkeypatch.setattr(environment, "check_macos_permissions", perms)
+    monkeypatch.setattr(environment, "_asked", False)
+    monkeypatch.setattr(environment, "_macos_major", lambda: 27)
+    monkeypatch.setattr(environment, "responsible_app",
+                        lambda: ("OtoDock Satellite", "/Users/p/.oto-dock/OtoDock Satellite.app"))
+    return state
+
+
+def test_the_first_action_asks_macos_once(mac):
+    environment.check_macos_grants(input_needed=True)
+    environment.check_macos_grants(input_needed=True)
+    assert mac["prompts"] == [True, False]
+
+
+def test_input_is_refused_without_accessibility_and_capture_still_runs(mac):
+    mac["accessibility"] = False
+    environment.check_macos_grants(input_needed=False)
+    with pytest.raises(environment.DeviceUnavailable) as e:
+        environment.check_macos_grants(input_needed=True)
+    assert str(e.value) == (
+        "macOS does not let OtoDock Satellite control the mouse and keyboard yet. Turn on OtoDock "
+        "Satellite in System Settings, Privacy & Security, under Device Control and Data Access. "
+        "Then start a new chat on this machine.")
+
+
+def test_a_capture_is_refused_without_screen_recording(mac):
+    mac["screen_recording"] = False
+    mac["accessibility"] = False
+    with pytest.raises(environment.DeviceUnavailable) as e:
+        environment.check_macos_grants(input_needed=True)
+    assert "see the screen or control the mouse and keyboard" in str(e.value)
+    assert "under Screen & System Audio Recording and under Device Control and Data Access" in str(e.value)
+
+
+def test_an_unreadable_grant_never_refuses(mac):
+    mac["accessibility"] = mac["screen_recording"] = None
+    environment.check_macos_grants(input_needed=True)
+
+
+def test_older_macos_names_its_own_lists_and_another_app(monkeypatch, mac):
+    monkeypatch.setattr(environment, "_macos_major", lambda: 14)
+    monkeypatch.setattr(environment, "responsible_app",
+                        lambda: ("Python", "/opt/homebrew/Cellar/python@3.13/3.13.18/Python.app"))
+    msg = environment.grant_message(["screen", "accessibility"])
+    assert "under Screen Recording and under Accessibility" in msg
+    assert "Turn on Python (/opt/homebrew/Cellar/python@3.13/3.13.18/Python.app)" in msg
+    assert ";" not in msg and "—" not in msg
+
+
+@pytest.mark.parametrize("app", [("sshd-session", "/usr/libexec/sshd-session"), None])
+def test_a_bare_program_is_never_named_as_the_one_to_turn_on(monkeypatch, mac, app):
+    # Over SSH macOS credits sshd: its switch would open the screen to every
+    # SSH sign-in. The person is pointed at the satellite's app instead.
+    monkeypatch.setattr(environment, "responsible_app", lambda: app)
+    msg = environment.grant_message(["accessibility"])
+    assert "sshd" not in msg
+    assert "Turn on the satellite's app in System Settings, Privacy & Security, under Device Control" in msg
+    assert ("Start the satellite from its login item" in msg) is (app is not None)
+
+
+def test_a_click_macos_would_drop_is_never_sent(monkeypatch, open_gates, mac):
+    mac["accessibility"] = False
+    monkeypatch.setattr(server, "check_macos_grants", environment.check_macos_grants)
+    sent = []
+    monkeypatch.setattr(screen, "resolve_target", lambda d, m: (geometry.Monitor(1, 0, 0, 100, 100, 100, 100), 1.0))
+    monkeypatch.setattr(executor, "click", lambda *a, **k: sent.append(a) or (0, 0))
+    with pytest.raises(environment.DeviceUnavailable):
+        server._run_action({"action": "left_click", "coordinate": [1, 1]})
+    assert sent == []
+
+
+def test_permissions_off_a_mac_say_so_plainly(monkeypatch):
+    monkeypatch.setattr(environment, "os_kind", lambda: "linux")
+    assert environment.check_macos_permissions()["notes"] == "Permission checks are macOS only. This is not macOS."
+    assert environment.responsible_app() is None

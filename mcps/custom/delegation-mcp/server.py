@@ -5,7 +5,9 @@ stdio MCP server for visible parallel delegation: spawn worker sessions
 into delegated lanes, send file copies to a target's inbox (send_files,
 the passive half of cross-agent handoff), as a delegated worker, attach
 deliverables to the result (attach_result_files), and move a chat to
-another place (move_chat). Scheduling (recurring/one-time/trigger tasks)
+another place (move_chat), and post to and read the Notebook, the dated
+record agents one delegation step apart share (notebook_post,
+notebook_read). Scheduling (recurring/one-time/trigger tasks)
 lives in the separate schedules-mcp.
 
 Environment variables (set in per-agent mcp-config.json):
@@ -119,6 +121,10 @@ _WORDS = {
     "adopt_project": _Words(
         "the project was not adopted", "adopt a project",
         maybe="The project may still have been adopted. Ask again to be sure."),
+    "notebook_post": _Words(
+        "the entry was not posted", "post to the Notebook",
+        maybe="The entry may still have been posted. Read the Notebook before you post it again."),
+    "notebook_read": _Words("the Notebook could not be read", "read the Notebook"),
 }
 # The codes the call never got past: each a sentence of the tool's words.
 _REFUSED = {
@@ -260,11 +266,16 @@ async def _get(path: str, params: dict | None = None) -> dict:
 _MACHINE_ARG_SCHEMA = {
     "type": "string",
     "description": (
-        "OPTIONAL machine for the worker's runs: one of your own paired machines "
-        "or, for an admin, an admin machine, by its name or id; 'default' (or "
-        "omit) for the agent's default. A machine that is offline at run time: "
-        "the run uses the agent's default and its record says so. Ignored with "
-        "continue_id (the worker's chat keeps its own machine)."
+        "OPTIONAL machine for the worker's runs: one of your person's own paired "
+        "machines or, for an admin, an admin machine, by its name or id. 'default' "
+        "(or omit) for the agent's default. A surface='chat' worker may run on the "
+        "person's own computer, even one that works for the whole agent. There it "
+        "runs as that person, with their role and AI account, without the agent's "
+        "own accounts. A surface='task' worker never runs on a personal computer. "
+        "Offline at run time: a chat worker on the person's own computer waits for "
+        "it (the round ends and says so), any other run uses the agent's default. "
+        "With continue_id: the worker stays on the person's own computer when they "
+        "continue it themselves, else the agent's default."
     ),
 }
 
@@ -377,7 +388,8 @@ async def list_tools() -> list[Tool]:
                             "pick by the capability tier tagged there, [t1] frontier "
                             "for judgement-heavy work down to [t4] fast for routine "
                             "work; the Model tiers list explains each). Omit to "
-                            "inherit the agent's default. With continue_id it moves "
+                            "take the model of the engine the lane runs on. With "
+                            "continue_id it moves "
                             "the continued worker to this model: the worker resumes "
                             "its conversation on it (background work it still ran "
                             "ends), and the model must be an enabled one of the "
@@ -391,8 +403,14 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "OPTIONAL execution-layer override for this worker (e.g. "
-                            "'claude-code-cli', 'codex-cli') — must be enabled for the "
-                            "agent. Omit to inherit. Ignored with continue_id."
+                            "'claude-code-cli', 'codex-cli') — must be allowed on the "
+                            "agent. Omit to run on the engine your person's own chat "
+                            "on that agent would take (the agent's default for a lane "
+                            "that runs as the agent or on a Shared-only agent). A "
+                            "model pinned without a layer runs on the engine the lane "
+                            "would take unpinned when that engine offers it, else on the "
+                            "first engine of the agent's own order that does, which is "
+                            "not always the `layers:` line's order. Ignored with continue_id."
                         ),
                     },
                     "mode": {
@@ -649,6 +667,63 @@ async def list_tools() -> list[Tool]:
                 "required": ["project_id"],
             },
             annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+        ),
+        Tool(
+            name="notebook_post",
+            description=(
+                "Post an entry to the Notebook: a dated note about YOUR OWN work, "
+                "read by every agent one delegation step away (either direction) "
+                "and the people who use them, in their prompts and in the "
+                "dashboard. Post when a piece of work lands, when you take a "
+                "decision that affects the agents around you, when you hand work "
+                "over, or when you are blocked. One to three sentences, at most "
+                "1,200 characters, one line. Never a turn's status, chatter, a "
+                "secret, or anything from a person's own files, memory or "
+                "messages. Entries cannot be edited; a manager of this agent can "
+                "delete one. Posting needs an editor or a manager in a person's "
+                "session, or a run of the agent itself."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The entry: one to three plain sentences.",
+                    },
+                },
+                "required": ["text"],
+            },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+        ),
+        Tool(
+            name="notebook_read",
+            description=(
+                "Read the Notebook: the entries of this agent and of every agent "
+                "one delegation step away, newest first. Your prompt already "
+                "carries the latest ones; use this for older entries, one "
+                "agent's entries, or entries posted after this session started."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "OPTIONAL: one agent of the read set (its slug). Omit for all of them.",
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "OPTIONAL: only entries from this date on (2026-10-28) or this date and time.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "description": "Max entries to return (default 20).",
+                    },
+                },
+            },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
     ])
 
@@ -1002,6 +1077,66 @@ async def _tool_adopt_project(arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text="\n".join(lines))]
 
 
+# FastAPI's own 404 for a path no route serves: a platform older than the
+# Notebook answers the tools so.
+_NO_ROUTE_DETAIL = "Not Found"
+
+
+def _notebook_refusal(key: str, e: httpx.HTTPStatusError) -> str:
+    """The platform's sentence for a refused Notebook call, or the tunnel's."""
+    if (tunnel := _tunnel_failure(key, e)) is not None:
+        return tunnel
+    try:
+        detail = e.response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if e.response.status_code == 404 and detail == _NO_ROUTE_DETAIL:
+        return "This platform does not have the Notebook yet."
+    return str(detail) if isinstance(detail, str) and detail else (
+        f"{_WORDS[key].outcome[0].upper()}{_WORDS[key].outcome[1:]} (HTTP {e.response.status_code})."
+    )
+
+
+# The prompt's own quoting (``services/notebook/notebook_prompt.py``; this
+# process cannot import the platform, a test pins the two equal): a read
+# entry can never pass for another line in the tool's answer either.
+_FRAME_CHARS = str.maketrans({'"': "'", "\u00b7": ".", "\u0387": "."})
+_SEPARATOR = "\u00b7"
+
+
+def _notebook_line(entry: dict) -> str:
+    text = str(entry.get("text") or "").translate(_FRAME_CHARS)
+    return f'- {entry.get("when", "")} {_SEPARATOR} {entry.get("agent", "?")}: "{text}"'
+
+
+async def _tool_notebook_post(arguments: dict) -> list[TextContent]:
+    try:
+        result = await _post("/v1/delegation/notebook", {"text": arguments.get("text") or ""})
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=_notebook_refusal("notebook_post", e))]
+    entry = result.get("entry") or {}
+    return [TextContent(type="text", text=f"Posted to the Notebook: {entry.get('text', '')}")]
+
+
+async def _tool_notebook_read(arguments: dict) -> list[TextContent]:
+    params: dict = {"limit": arguments.get("limit", 20)}
+    for key in ("agent", "since"):
+        if arguments.get(key):
+            params[key] = arguments[key]
+    try:
+        result = await _get("/v1/delegation/notebook", params=params)
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=_notebook_refusal("notebook_read", e))]
+    entries = result.get("entries") or []
+    readers = ", ".join(result.get("read_set") or [])
+    if not entries:
+        return [TextContent(type="text", text=f"No entries. The Notebook here reads: {readers}.")]
+    zone = result.get("timezone") or "the platform's timezone"
+    lines = [f"Notebook entries ({len(entries)}, newest first, times in {zone}; read set: {readers}):"]
+    lines.extend(_notebook_line(e) for e in entries)
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 _TOOL_HANDLERS = {
     "delegate": _tool_delegate,
     "send_files": _tool_send_files,
@@ -1010,6 +1145,8 @@ _TOOL_HANDLERS = {
     "peek_session": _tool_peek_session,
     "adopt_project": _tool_adopt_project,
     "move_chat": _tool_move_chat,
+    "notebook_post": _tool_notebook_post,
+    "notebook_read": _tool_notebook_read,
 }
 
 

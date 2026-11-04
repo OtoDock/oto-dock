@@ -19,6 +19,7 @@ import psycopg
 
 from core.permission_modes import ASK_MODE, chat_row
 from core.session import session_kind
+from storage.chat.search_anchor import stamp_match_anchors
 from storage.pg import get_conn
 
 logger = logging.getLogger("db_chats")
@@ -101,21 +102,23 @@ def _rebuild_chat_search_row(conn, chat_id: str) -> None:
 SEARCH_QUERY_MAX = 200
 
 
-def _tsquery_lexeme(lexeme: str) -> str:
+def _tsquery_lexeme(lexeme: str, weight: str = "") -> str:
     """One lexeme as a quoted tsquery operand with prefix matching: inside the
     quotes a quote is doubled and a backslash escaped, so any lexeme the
-    parser yields (a path, an address, an email) stays one operand."""
-    return "'" + lexeme.replace("\\", "\\\\").replace("'", "''") + "':*"
+    parser yields (a path, an address, an email) stays one operand.
+    ``weight`` holds it to the vector's lexemes of that weight."""
+    return "'" + lexeme.replace("\\", "\\\\").replace("'", "''") + "':*" + weight
 
 
-def _prefix_tsquery(conn, query: str) -> str:
+def _query_words(conn, query: str) -> list[tuple[str, list[str]]]:
     """The query as the index reads text: each word parsed by the same parser
-    and dictionary as ``chat_search.search_vector`` (english), every lexeme a
-    prefix, every word required. ``config.env``, ``1.8.0`` or ``chats.py``
+    and dictionary as ``chat_search.search_vector`` (english), with the
+    lexemes it yields (``_format_tsquery`` makes the tsquery: every lexeme a
+    prefix, every word required). ``config.env``, ``1.8.0`` or ``chats.py``
     stay the one token the index holds; a word the parser splits
     (``dashboard_warmup``) also matches as the start of one token
     (``dashboard_warmup.py``); a stop word drops out; a query with no lexeme
-    at all answers "" (no rows)."""
+    at all yields no words, and the searches answer no rows."""
     text = (query or "").strip()
     if len(text) > SEARCH_QUERY_MAX:
         # Cut at a word boundary: a word cut short would stem to something
@@ -124,7 +127,7 @@ def _prefix_tsquery(conn, query: str) -> str:
         text = cut if text[SEARCH_QUERY_MAX].isspace() else cut.rsplit(None, 1)[0] if " " in cut.strip() else cut
     words = text.split()
     if not words:
-        return ""
+        return []
     rows = conn.execute(
         """SELECT w.i, l.lexeme
              FROM unnest(%s::text[]) WITH ORDINALITY AS w(word, i),
@@ -136,12 +139,18 @@ def _prefix_tsquery(conn, query: str) -> str:
     for r in rows:
         if r["lexeme"]:
             by_word.setdefault(r["i"], []).append(r["lexeme"])
+    return [(words[i - 1], lexemes) for i, lexemes in sorted(by_word.items())]
+
+
+def _format_tsquery(words: list[tuple[str, list[str]]], weight: str = "") -> str:
+    """The parsed words as a tsquery, every word required; ``weight`` holds
+    every operand to that weight (``B``: the chat's text, not its title)."""
     operands: list[str] = []
-    for i, lexemes in sorted(by_word.items()):
-        parts = " & ".join(_tsquery_lexeme(lx) for lx in dict.fromkeys(lexemes))
-        whole = words[i - 1].lower().strip(".,;:!?()[]{}<>\"'`")
+    for word, lexemes in words:
+        parts = " & ".join(_tsquery_lexeme(lx, weight) for lx in dict.fromkeys(lexemes))
+        whole = word.lower().strip(".,;:!?()[]{}<>\"'`")
         if len(lexemes) > 1 and whole and whole not in lexemes:
-            parts = f"({_tsquery_lexeme(whole)} | ({parts}))"
+            parts = f"({_tsquery_lexeme(whole, weight)} | ({parts}))"
         operands.append(parts)
     return " & ".join(operands)
 
@@ -154,6 +163,13 @@ def _prefix_tsquery(conn, query: str) -> str:
 _TASK_SOURCE_TYPES = session_kind.source_types(session_kind.TASK)
 _NOT_TASK_ROW = "NOT (c.source_type = ANY(%s)) AND c.id NOT LIKE 'task-%%'"
 _TASK_ROW = "(c.source_type = ANY(%s) OR c.id LIKE 'task-%%')"
+# The sidebar lists' order, total: the id breaks a tie of rows written with
+# one timestamp, so a cursor neither skips nor repeats a row. The cursor's
+# plain bound repeats the row comparison's first column so the scan of
+# idx_chats_agent_updated can start at it instead of filtering every newer
+# row.
+_LIST_ORDER = "c.updated_at DESC, c.id DESC"
+_AFTER_CURSOR = "c.updated_at <= %s AND (c.updated_at, c.id) < (%s, %s)"
 
 
 def _search_failed(kind: str, query: str, exc: Exception) -> list[dict]:
@@ -163,7 +179,8 @@ def _search_failed(kind: str, query: str, exc: Exception) -> list[dict]:
     return []
 
 
-def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list[dict]:
+def search_chats(user_sub: str, agent: str, query: str, limit: int = 50, *,
+                 hide_agent_runs: bool = False) -> list[dict]:
     """Chats whose title or text holds every word of ``query`` (each as a
     prefix), newest first: the sidebar groups the answer by day, and a
     recent chat that names a word once must not lose its place to an old
@@ -171,25 +188,31 @@ def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list
 
     Chat mode only — task-run chats are excluded (a user-scoped task chat
     carries the creator's sub, so the owner filter alone would leak it here);
-    task mode searches through ``search_task_chats``."""
+    task mode searches through ``search_task_chats``. ``hide_agent_runs``
+    leaves out the chats that carry an agent-scope run (below the editor
+    tier)."""
+    hidden = f"AND {_NO_AGENT_RUN}" if hide_agent_runs else ""
     with get_conn() as conn:
         try:
-            tsquery = _prefix_tsquery(conn, query)
+            words = _query_words(conn, query)
+            tsquery = _format_tsquery(words)
             if not tsquery:
                 return []
             rows = conn.execute(
                 f"""SELECT c.* FROM chat_search s
                    JOIN chats c ON c.id = s.chat_id
                    WHERE s.user_sub = %s AND s.agent = %s
-                   AND {_NOT_TASK_ROW}
+                   AND {_NOT_TASK_ROW} {hidden}
                    AND s.search_vector @@ %s::tsquery
-                   ORDER BY c.updated_at DESC
+                   ORDER BY {_LIST_ORDER}
                    LIMIT %s""",
                 (user_sub, agent, _TASK_SOURCE_TYPES, tsquery, limit),
             ).fetchall()
-            return [chat_row(r) for r in rows]
         except psycopg.Error as e:
             return _search_failed("chats", query, e)
+        results = [chat_row(r) for r in rows]
+        stamp_match_anchors(conn, results, tsquery, _format_tsquery(words, "B"))
+        return results
 
 
 # Latest-run join for task-run chats: multi-round continues share one chat, so
@@ -257,46 +280,60 @@ _TASK_RUN_COLS = """
 # for their creator. NULL scope (legacy rows) counts as agent-scoped.
 _TASK_SCOPE_COND = ("(tr.scope IS DISTINCT FROM 'user' "
                     "OR tr.created_by = %s)")
+# Below the editor tier only the caller's own user-scope runs: what the agent
+# does on its own behalf stays with the editors.
+_OWN_TASK_COND = "(tr.scope = 'user' AND tr.created_by = %s)"
+# A chat that carries an agent-scope run (a delegated worker in a shared
+# pool): left out of a below-editor listing of that pool.
+_NO_AGENT_RUN = ("NOT EXISTS (SELECT 1 FROM task_runs wr WHERE wr.chat_id = c.id "
+                 "AND wr.scope IS DISTINCT FROM 'user')")
 
 
 def list_task_chats(agent: str, scope_user_sub: str | None = None,
-                    limit: int = 50) -> list[dict]:
+                    limit: int = 50, *, own_only: bool = False,
+                    before: tuple[str, str] | None = None) -> list[dict]:
     """Task-run chats for an agent (the sidebar's task mode), newest first,
     each joined with its latest run. ``scope_user_sub=None`` skips the
-    user-scope filter (service callers only). Tasks carry no unread state —
-    every row reports ``unread=false``."""
+    user-scope filter (service callers only); ``own_only`` keeps only that
+    user's own user-scope runs (below the editor tier). ``before`` is the
+    last shown row's ``(updated_at, id)``: the rows after it (``_LIST_ORDER``).
+    Tasks carry no unread state — every row reports ``unread=false``."""
     conditions = ["c.agent=%s", _TASK_ROW]
     params: list[Any] = [agent, _TASK_SOURCE_TYPES]
     if scope_user_sub is not None:
-        conditions.append(_TASK_SCOPE_COND)
+        conditions.append(_OWN_TASK_COND if own_only else _TASK_SCOPE_COND)
         params.append(scope_user_sub)
+    if before is not None:
+        conditions.append(_AFTER_CURSOR)
+        params.extend((before[0], before[0], before[1]))
     params.append(limit)
     with get_conn() as conn:
         rows = conn.execute(
             f"""SELECT c.*, {_TASK_RUN_COLS}
                   FROM chats c {_TASK_RUN_JOIN}
                  WHERE {' AND '.join(conditions)}
-              ORDER BY c.updated_at DESC LIMIT %s""",
+              ORDER BY {_LIST_ORDER} LIMIT %s""",
             params,
         ).fetchall()
         return [chat_row(r) for r in rows]
 
 
 def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
-                      limit: int = 50) -> list[dict]:
+                      limit: int = 50, *, own_only: bool = False) -> list[dict]:
     """Task-mode FTS: task-run chats of one agent, gated by the same run rules
     as ``list_task_chats``, newest first like the chat mode. The search row's
     ``user_sub`` is the chat's synthetic owner (``task::``/creator), so
     scoping joins the run instead."""
     with get_conn() as conn:
         try:
-            tsquery = _prefix_tsquery(conn, query)
+            words = _query_words(conn, query)
+            tsquery = _format_tsquery(words)
             if not tsquery:
                 return []
             conditions = ["s.agent = %s", _TASK_ROW, "s.search_vector @@ %s::tsquery"]
             params: list[Any] = [agent, _TASK_SOURCE_TYPES, tsquery]
             if scope_user_sub is not None:
-                conditions.append(_TASK_SCOPE_COND)
+                conditions.append(_OWN_TASK_COND if own_only else _TASK_SCOPE_COND)
                 params.append(scope_user_sub)
             params.append(limit)
             rows = conn.execute(
@@ -304,13 +341,15 @@ def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
                       FROM chat_search s
                       JOIN chats c ON c.id = s.chat_id {_TASK_RUN_JOIN}
                      WHERE {' AND '.join(conditions)}
-                  ORDER BY c.updated_at DESC
+                  ORDER BY {_LIST_ORDER}
                      LIMIT %s""",
                 params,
             ).fetchall()
-            return [chat_row(r) for r in rows]
         except psycopg.Error as e:
             return _search_failed("tasks", query, e)
+        results = [chat_row(r) for r in rows]
+        stamp_match_anchors(conn, results, tsquery, _format_tsquery(words, "B"))
+        return results
 
 
 # --- Chat CRUD ---
@@ -350,19 +389,29 @@ def get_chats_by_ids(chat_ids: list[str]) -> dict[str, dict]:
         return {r["id"]: chat_row(r) for r in rows}
 
 
-def list_chats(user_sub: str, agent: str | None = None, limit: int = 50) -> list[dict]:
+def list_chats(user_sub: str, agent: str | None = None, limit: int = 50, *,
+               hide_agent_runs: bool = False,
+               before: tuple[str, str] | None = None) -> list[dict]:
     """List a chat-history owner's chats, newest first. Each row carries a
     computed ``unread`` bool: the last assistant response landed after the
     owner identity's read marker (``chat_reads`` is keyed by the same owner
     identity as this listing, so shared-only chats clear for everyone once
-    any user opens them)."""
+    any user opens them). ``hide_agent_runs`` leaves out the chats that carry
+    an agent-scope run (a shared pool's workers, below the editor tier).
+    ``before`` is the last shown row's ``(updated_at, id)``: the rows after
+    it in ``_LIST_ORDER``."""
     # Task-run chats never list in chat mode — their single home is the
     # sidebar's task mode (list_task_chats), delegate workers included.
     conditions = ["c.user_sub=%s", _NOT_TASK_ROW]
+    if hide_agent_runs:
+        conditions.append(_NO_AGENT_RUN)
     params: list[Any] = [user_sub, user_sub, _TASK_SOURCE_TYPES]
     if agent:
         conditions.append("c.agent=%s")
         params.append(agent)
+    if before is not None:
+        conditions.append(_AFTER_CURSOR)
+        params.extend((before[0], before[0], before[1]))
     where = f"WHERE {' AND '.join(conditions)}"
     params.append(limit)
     with get_conn() as conn:
@@ -373,7 +422,7 @@ def list_chats(user_sub: str, agent: str | None = None, limit: int = 50) -> list
                              OR c.last_response_at > r.last_read_at)) AS unread
                   FROM chats c
              LEFT JOIN chat_reads r ON r.chat_id = c.id AND r.user_sub = %s
-                {where} ORDER BY c.updated_at DESC LIMIT %s""",
+                {where} ORDER BY {_LIST_ORDER} LIMIT %s""",
             params,
         ).fetchall()
         return [chat_row(r) for r in rows]
@@ -791,6 +840,23 @@ def claim_title_generation(chat_id: str) -> tuple[bool, str | None]:
         return True, row["title"]
 
 
+def release_title_claim(chat_id: str, expected_title: str | None) -> bool:
+    """Give back a title claim whose generation failed, so a later turn can
+    try again (``services/title_generator.py`` bounds the attempts). ONE
+    statement reads the flag and the title: only while the flag is still
+    set and the title is still the claim-time one. A rename sets both (the
+    flag and a new title), so a chat a person renamed is never re-armed."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE chats SET title_generated = FALSE
+                WHERE id=%s AND title_generated
+                  AND title IS NOT DISTINCT FROM %s""",
+            (chat_id, expected_title),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def set_chat_title_if_unset(chat_id: str, title: str) -> bool:
     """The deterministic first-message title: ONE conditional write, so a
     rename that landed meanwhile (a REST rename, the LLM upgrade) wins over
@@ -1101,18 +1167,22 @@ def add_chat_message(chat_id: str, role: str, content: str = "",
 
 def _stamp_task_title(conn, chat_id: str, first_prompt: str) -> None:
     """The deterministic title of a scheduler-driven task chat, from its first
-    prompt (never overwrites a title). Runs inside a savepoint: its failure
-    never costs the rows it rides with."""
+    prompt (never overwrites a title, so a chat given a name keeps it; a
+    prompt with nothing a person wrote stamps nothing). Runs inside a
+    savepoint: its failure never costs the rows it rides with."""
     try:
         with conn.transaction():
             title_row = conn.execute(
                 "SELECT title FROM chats WHERE id=%s", (chat_id,),
             ).fetchone()
-            if title_row is not None and not (title_row["title"] or "").strip():
-                from storage.chat.chat_titles import deterministic_title
+            if title_row is None or (title_row["title"] or "").strip():
+                return
+            from storage.chat.chat_titles import title_from_prompt
+            title = title_from_prompt(first_prompt)
+            if title:
                 conn.execute(
                     "UPDATE chats SET title=%s WHERE id=%s",
-                    (deterministic_title(first_prompt), chat_id),
+                    (title, chat_id),
                 )
     except psycopg.Error:
         logger.debug("task title stamp failed for %s", chat_id, exc_info=True)

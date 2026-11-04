@@ -1,7 +1,14 @@
-"""Agent-Creator-MCP — agents create new agents from template folders.
+"""Agent-Creator-MCP — agents create new agents from template folders, and
+propose community agents, department sets and moves as cards.
 
-The agent authors a community-agent template folder somewhere it can write
-(its workspace), then hands the path to this server. The proxy loads the
+The community first: ``search_community_agents`` finds a template or a
+department set in the catalog, and the three ``propose_*`` tools draw a
+card in the chat (the proxy's services/cards) that anyone in the chat may press; the
+press installs, moves or wires through the platform's own routes with the presser's
+role, never through this server. ``check_card`` reads who pressed and what happened. For
+an agent nothing in the catalog fits, the agent authors a community-agent
+template folder somewhere it can write (its workspace), then hands the
+path to this server. The proxy loads the
 folder through the same pipeline that installs catalog templates, so the
 whole manifest surface — persona, required MCPs, skill packages, scheduled
 tasks/triggers/notifications, agent-wide and per-user setup guides, auto
@@ -14,7 +21,7 @@ Permission resolution lives in :func:`_resolve_tool_set` and runs once at
 module load using the auto-injected ``OTO_*`` env vars (mirror of
 ``agent-config-mcp/server.py``):
 
-- platform ``admin`` / ``creator`` → all three tools.
+- platform ``admin`` / ``creator`` → every tool.
 - everyone else (platform ``member``, service sessions with no human
   identity) → zero tools; ``tools/list`` returns an empty list.
 
@@ -27,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import urllib.parse
 from typing import Any, Literal
 
 import httpx
@@ -47,12 +55,32 @@ CAN_CREATE = os.environ.get("OTO_CAN_CREATE_AGENTS", "") == "true"
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
+# The session a card is drawn in (the cards route binds it to its chat).
+SESSION_ID = os.environ.get("OTO_SESSION_ID", "")
 
 _ALL_TOOLS = {
+    "search_community_agents",
+    "list_departments",
+    "propose_install",
+    "propose_department_install",
+    "propose_move",
+    "check_card",
     "list_building_blocks",
     "validate_agent_template",
     "create_agent",
 }
+
+CARDS_PATH = "/v1/cards"
+# What the person reads on a refusal of the cards route: its own sentences
+# (a 400, 403, 404 or 409 whose detail is a full sentence) are repeated,
+# anything else is this one.
+NO_ANSWER = "The platform did not answer. Say what you proposed and ask the person to do it in the dashboard."
+#: The satellite tunnel of a machine older than 0.5.163 refuses the call itself
+#: (the catalog reads, the departments, the card's draw and read).
+OLDER_SATELLITE = ("This machine runs an older OtoDock satellite, which does not pass this call on. "
+                   "Say what you wanted to do and ask the person to do it in the dashboard, "
+                   "or to open a chat that runs on the platform.")
+CARD_DRAWN = "A card is in the chat. Anyone in the chat may press it: nothing changes until someone does."
 
 
 def _resolve_tool_set() -> set[str]:
@@ -130,6 +158,162 @@ async def _request(
     if last_exc:
         raise _ApiError(f"{method} {path}: {last_exc}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# The community, the departments, the cards
+# ---------------------------------------------------------------------------
+
+def _refusal_sentence(exc: _ApiError) -> str:
+    """A refusal the person may read: the route's own sentence (it ends
+    with a full stop) or the one sentence for everything else."""
+    text = str(exc)
+    detail = text.split(": ", 2)[-1] if "→" in text else text
+    if exc.status == 403 and "path-not-allowlisted" in detail:
+        return OLDER_SATELLITE
+    if exc.status in (400, 403, 404, 409) and detail.endswith("."):
+        return detail
+    return NO_ANSWER
+
+
+def _score(words: list[str], *fields: tuple[str, int]) -> int:
+    score = 0
+    for text, weight in fields:
+        low = (text or "").lower()
+        for w in words:
+            if w and w in low:
+                score += weight
+    return score
+
+
+async def _tool_search_community_agents(query: str) -> str:
+    words = [w for w in query.lower().split() if len(w) > 1]
+    try:
+        agents = await _request("GET", "/v1/community/agents", retry="connect")
+        sets = await _request("GET", "/v1/community/departments", retry="connect")
+    except _ApiError as exc:
+        return f"The catalog could not be read: {_refusal_sentence(exc)}"
+    rows: list[tuple[int, str]] = []
+    set_of: dict[str, list[str]] = {}
+    for s in (sets or {}).get("departments") or []:
+        for m in s.get("members") or []:
+            set_of.setdefault(str(m.get("template") or ""), []).append(str(s.get("slug") or ""))
+    for a in (agents or {}).get("agents") or []:
+        score = _score(words, (a.get("display_name", ""), 5), (a.get("slug", ""), 4),
+                       (" ".join(a.get("tags") or []), 3), (a.get("description", ""), 1))
+        if words and not score:
+            continue
+        installed = ", ".join(a.get("installed_as") or []) or "not installed"
+        line = (f"- template `{a.get('slug')}` ({a.get('display_name')}, {a.get('version')}): "
+                f"{(a.get('description') or '').strip()[:160]} Installed: {installed}.")
+        if set_of.get(a.get("slug")):
+            line += f" Part of the set: {', '.join(set_of[a['slug']])}."
+        rows.append((score, line))
+    for s in (sets or {}).get("departments") or []:
+        score = _score(words, (s.get("name", ""), 5), (s.get("slug", ""), 4),
+                       (" ".join(s.get("tags") or []), 3), (s.get("description", ""), 1),
+                       (" ".join(m.get("display_name", "") for m in s.get("members") or []), 2))
+        if words and not score:
+            continue
+        members = ", ".join(f"{m.get('display_name')} ({m.get('level')})" for m in s.get("members") or [])
+        installed = ", ".join(d.get("name", "") for d in s.get("installed") or []) or "not installed"
+        problems = "; ".join(s.get("problems") or [])
+        line = (f"- department set `{s.get('slug')}` ({s.get('name')}, {s.get('version')}): "
+                f"{(s.get('description') or '').strip()[:160]} Members: {members}. Installed: {installed}.")
+        if problems or s.get("missing_members"):
+            line += " Cannot be installed on this platform: " + (problems or "a member template is not in the catalog.")
+        rows.append((score + 1, line))
+    rows.sort(key=lambda r: -r[0])
+    if not rows:
+        return ("Nothing in the community catalog matches. Ask the person whether to write a new agent "
+                "from a template folder instead.")
+    head = ["The community catalog, best matches first. Propose one with `propose_install` (a template), "
+            "`propose_department_install` (a set) or write a new one only when nothing fits.", ""]
+    return "\n".join(head + [r[1] for r in rows[:12]])
+
+
+async def _tool_list_departments() -> str:
+    try:
+        data = await _request("GET", "/v1/departments", retry="connect")
+    except _ApiError as exc:
+        return f"The departments could not be read: {_refusal_sentence(exc)}"
+    depts = (data or {}).get("departments") or []
+    if not depts:
+        return "There is no department yet. A set from the community catalog makes one, or a person makes one on the Agents page."
+    lines = ["The departments this person may see, with the ids a move names:"]
+    for d in depts:
+        levels = ", ".join(f"{lv.get('name')} (`{lv.get('id')}`)" for lv in d.get("levels") or [])
+        members = ", ".join(f"{m.get('display_name')} ({m.get('name')})" for m in d.get("members") or []) or "nobody"
+        lines.append(f"- {d.get('name')} (`{d.get('id')}`), delegation {d.get('mode')}, reach {d.get('reach')}. "
+                     f"Levels: {levels}. Members: {members}.")
+    return "\n".join(lines)
+
+
+async def _draw(buttons: list[dict[str, Any]], note: str) -> str:
+    """One card through the cards route; the person's refusal sentence back
+    to the agent when the route refuses."""
+    try:
+        data = await _request("POST", CARDS_PATH, json={"session_id": SESSION_ID, "buttons": buttons,
+                                                        "note": note.strip()[:1000]}, retry="connect")
+    except _ApiError as exc:
+        return f"No card was drawn: {_refusal_sentence(exc)}"
+    card_id = (data or {}).get("card_id", "")
+    return f"{CARD_DRAWN} The card's id is {card_id}: `check_card` reads who pressed it and what happened."
+
+
+async def _tool_propose_install(template_slug: str, target_slug: str, display_name: str,
+                                department_id: str, level_id: str, note: str) -> str:
+    params: dict[str, Any] = {"template_slug": template_slug.strip()}
+    if target_slug.strip():
+        params["target_slug"] = target_slug.strip()
+    if display_name.strip():
+        params["display_name"] = display_name.strip()
+    if department_id.strip() or level_id.strip():
+        params["department_id"] = department_id.strip()
+        params["level_id"] = level_id.strip()
+    return await _draw([{"id": "install", "kind": "do", "action": "install_agent", "params": params}], note)
+
+
+async def _tool_propose_department_install(set_slug: str, department_name: str, note: str) -> str:
+    params: dict[str, Any] = {"set_slug": set_slug.strip()}
+    if department_name.strip():
+        params["department_name"] = department_name.strip()
+    return await _draw([{"id": "install", "kind": "do", "action": "install_department_set", "params": params}], note)
+
+
+async def _tool_propose_move(agent: str, department_id: str, level_id: str, note: str) -> str:
+    params = {"agent": agent.strip(), "department_id": department_id.strip(), "level_id": level_id.strip()}
+    return await _draw([{"id": "move", "kind": "do", "action": "move_agent", "params": params}], note)
+
+
+async def _tool_check_card(card_id: str) -> str:
+    try:
+        # The id is the agent's text: quoted, it names one card and no other route.
+        s = await _request("GET", f"{CARDS_PATH}/{urllib.parse.quote(card_id.strip(), safe='')}",
+                           retry="connect")
+    except _ApiError as exc:
+        return f"The card could not be read: {_refusal_sentence(exc)}"
+    if not isinstance(s, dict):
+        return NO_ANSWER
+    if s.get("expired"):
+        return f"The card expired: {s['expired']}"
+    clicks = [c for c in s.get("clicks") or [] if isinstance(c, dict)]
+    # Who pressed: an older platform's state names nobody.
+    by = str(clicks[0].get("by") or "Someone") if clicks else "Someone"
+    outcome = s.get("outcome") or {}
+    if outcome:
+        text = outcome.get("text") or ""
+        lines = [f"{by} pressed the button. {text}".strip()]
+        if outcome.get("status") == "running":
+            lines.append("It is still running. Read the card again in a moment.")
+        for extra in outcome.get("lines") or []:
+            lines.append(f"- {extra}")
+        return "\n".join(lines)
+    said = [c for c in clicks if c.get("status") == "said"]
+    if said:
+        labels = ", ".join(c.get("detail") or c.get("button") for c in said)
+        return f"{by} answered: {labels}"
+    return "Nobody has pressed a button yet."
 
 
 # ---------------------------------------------------------------------------
@@ -236,13 +420,14 @@ async def _engine_lines() -> list[str]:
     lines.append(
         "These are this install's engines and models; another install has its own. "
         "A task in `tasks.json` may pin `layer` (an engine id) and `override_model` "
-        "(a model id). An install enables ONE engine on the new agent: the first "
-        "engine below that can be the agent's engine and that both the platform and "
-        "the installing person have connected, else the platform's default engine. "
-        "A pin holds only when `layer`, if set, names that engine and "
-        "`override_model`, if set, is one of its models; any other pin is dropped at install "
-        "and on every update, and the task runs on the agent's default. Leave a "
-        "task unpinned unless it truly needs another model.\n"
+        "(a model id). An install allows every engine below on the new agent and makes "
+        "one its default: the first engine below that can be the agent's engine and that "
+        "both the platform and the installing person have connected, else the platform's "
+        "default engine. A pin holds when `layer`, if set, is an engine below and "
+        "`override_model`, if set, is one of its models, or, with no `layer`, a model of "
+        "any engine below; any other pin is dropped at install and on every update, and "
+        "the task runs with no model choice. Leave a task unpinned unless it truly needs "
+        "another model.\n"
     )
     lines.append("| engine | can be the agent's engine | connected here | models |")
     lines.append("|---|---|---|---|")
@@ -464,7 +649,109 @@ async def _tool_create_agent(path: str, target_slug: str) -> str:
 # Tool schemas
 # ---------------------------------------------------------------------------
 
+_NOTE = {"type": "string", "description": "Your own words for the person, one or two sentences, shown on the card apart from the platform's."}
+
 _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "search_community_agents": {
+        "description": (
+            "Search the community catalog for an agent template or a department set "
+            "before writing a new agent: the best matches with their slugs, versions, "
+            "what is installed already and which set a template belongs to. Call this "
+            "FIRST when asked for a new agent, a team or a department."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "A few words: the job, the domain, a name."}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    "list_departments": {
+        "description": (
+            "The departments this person may see, each with its id, its levels and their ids, "
+            "its members and its delegation wiring. A move or an install into a department names "
+            "these ids."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    "propose_install": {
+        "description": (
+            "Draw a card proposing to install a community agent template. Whoever presses it "
+            "installs it with their own role through the platform. Nothing is installed by this "
+            "call. Optionally the department and level it goes into. When the person manages "
+            "this agent, the card offers to let this agent hand work to the new one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_slug": {"type": "string", "description": "The template's slug from the search."},
+                "target_slug": {"type": "string", "description": "The slug the agent is installed as, when the template's is taken or another is wanted."},
+                "display_name": {"type": "string", "description": "The agent's name on its card, when another than the template's."},
+                "department_id": {"type": "string", "description": "A department's id from list_departments, with level_id."},
+                "level_id": {"type": "string", "description": "A level's id of that department."},
+                "note": _NOTE,
+            },
+            "required": ["template_slug"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    },
+    "propose_department_install": {
+        "description": (
+            "Draw a card proposing to install a department set from the community catalog: "
+            "the department with its levels and wiring, every member agent at its level, the "
+            "head's library shared with the team, the schedules paused. An agent the person "
+            "manages that was installed from one of the set's templates and sits in no "
+            "department joins it instead of a new copy, and the card names it. Whoever presses "
+            "it runs it with their own role. Nothing is installed by this call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "set_slug": {"type": "string", "description": "The set's slug from the search."},
+                "department_name": {"type": "string", "description": "The department's name, when another than the set's (a boat's name, a team's)."},
+                "note": _NOTE,
+            },
+            "required": ["set_slug"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    },
+    "propose_move": {
+        "description": (
+            "Draw a card proposing to move an agent into a department at a level. Whoever "
+            "presses it moves it with their own role (an admin, or a creator who manages the agent); "
+            "nothing moves by this call. Use list_departments for the ids."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "The agent's slug."},
+                "department_id": {"type": "string", "description": "The department's id."},
+                "level_id": {"type": "string", "description": "The level's id in that department."},
+                "note": _NOTE,
+            },
+            "required": ["agent", "department_id", "level_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    },
+    "check_card": {
+        "description": (
+            "What happened to a card you drew: not yet pressed, who answered a say button and "
+            "with what, or who pressed it and what the action did (an install still running says "
+            "so). Read it when someone says they pressed it, never in a loop."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"card_id": {"type": "string", "description": "The card's id the draw answered with."}},
+            "required": ["card_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
     "list_building_blocks": {
         "description": (
             "List the MCPs and skill packages a new agent can be given, the "
@@ -510,7 +797,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "scheduled tasks, triggers, notifications, setup guides, apps and "
             "checks seeded. Apps deploy waiting for approval on their cards "
             "and checks are offered, never mandatory: an agent cannot consent "
-            "on a person's behalf."
+            "on a person's behalf. The mode in agent.json fits the team: "
+            "default_scope user for people who work alone and hand finals over, "
+            "agent for a department's desk. Propose several agents only when "
+            "asked to automate a company function, a department or several "
+            "projects with different people."
         ),
         "inputSchema": {
             "type": "object",
@@ -536,6 +827,19 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 _TOOL_HANDLERS = {
+    "search_community_agents": lambda args: _tool_search_community_agents(args.get("query", "")),
+    "list_departments": lambda args: _tool_list_departments(),
+    "propose_install": lambda args: _tool_propose_install(
+        args.get("template_slug", ""), args.get("target_slug", ""), args.get("display_name", ""),
+        args.get("department_id", ""), args.get("level_id", ""), args.get("note", ""),
+    ),
+    "propose_department_install": lambda args: _tool_propose_department_install(
+        args.get("set_slug", ""), args.get("department_name", ""), args.get("note", ""),
+    ),
+    "propose_move": lambda args: _tool_propose_move(
+        args.get("agent", ""), args.get("department_id", ""), args.get("level_id", ""), args.get("note", ""),
+    ),
+    "check_card": lambda args: _tool_check_card(args.get("card_id", "")),
     "list_building_blocks": lambda args: _tool_list_building_blocks(),
     "validate_agent_template": lambda args: _tool_validate_agent_template(
         args.get("path", ""),

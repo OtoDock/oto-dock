@@ -103,6 +103,7 @@ def test_color_temperature_direction_matches_docs(tmp_path, monkeypatch):
     }))
     arr = np.asarray(Image.open(out), dtype=float)
     assert arr[..., 0].mean() > arr[..., 2].mean()  # warmer: R > B
+    assert "above 5500 is warmer, below cooler" in images.CATALOG.help("color_temperature")
 
 
 def test_tone_stats_values_sane():
@@ -206,6 +207,6 @@ def test_unparseable_operations_error_not_silent_copy(tmp_path, monkeypatch):
         "path": src, "output_path": out,
         "operations": ["grayscale", "sharpen"],  # bare strings — unusable
     }))
-    assert result.startswith("Error:")
-    assert "no edit was applied" in result
+    assert result.startswith("Nothing saved:")
+    assert "2 of 2 operations are not valid, so none ran" in result
     assert not Path(out).exists()

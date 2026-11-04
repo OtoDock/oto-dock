@@ -70,6 +70,11 @@ def recently_captured(session_id: str, within_s: float = 60.0) -> bool:
     return ts is not None and (time.monotonic() - ts) <= within_s
 
 
+def captured_at(session_id: str) -> float | None:
+    """The monotonic time the session's last wake turn finished capturing."""
+    return _last_wake_capture.get(session_id)
+
+
 def note_captured(session_id: str) -> None:
     _last_wake_capture[session_id] = time.monotonic()
 

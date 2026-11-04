@@ -243,3 +243,76 @@ def test_a_built_task_started_on_a_machine_names_the_builders_person(rig, scope,
              if c is not None]
     assert len(found) >= 3
     assert {c["user_sub"] for c in found} == {person}
+
+
+def _worker(sid: str, created_by: str = CREATOR):
+    from core.config.task_config_builder import build_task_agent_config
+    from services.scheduler import task_kinds
+    task = SimpleNamespace(scope="agent", created_by=created_by, task_type=task_kinds.DELEGATE,
+                           target_chat_id=f"chat-{sid}", agent=AGENT, notification_mode="none",
+                           name="lane", id=f"dyn-{sid}", override_execution_path="claude-code-cli")
+    return run(build_task_agent_config(AGENT, task, sid))
+
+
+@pytest.fixture
+def on_the_creators_computer(rig, monkeypatch):
+    """A user machine of the creator (an editor on the agent) that the run's
+    target decision names."""
+    from core.config import task_config_builder as tcb
+    from storage import remote_store
+    remote_store.create_remote_machine("m-vic", "vic-laptop", CREATOR, pairing_scope="user")
+    monkeypatch.setattr(tcb, "task_target",
+                        lambda task, identity, agent="": tcb.TaskTarget("m-vic", None, ""))
+    return rig
+
+
+def test_a_chat_worker_on_its_delegators_computer_runs_as_that_person(on_the_creators_computer):
+    """As the person's own Shared-only chat moved there: their role, their
+    token, their name; the mount stays the agent's, and the workspace
+    fan-out judges the session at their role, so no ``config/`` file of the
+    agent's is pushed to an editor's computer."""
+    from core.remote.file_sync import should_sync_to_target
+    sid = "tok-worker-own"
+    cfg = _worker(sid)
+    assert _claims(cfg.credential_env["PROXY_API_KEY"])["user_sub"] == CREATOR
+    sec = cfg.security_context
+    assert (sec.role, sec.username, sec.session_scope) == ("editor", "vic", "agent")
+    assert sec.mount_username == ""
+    assert not should_sync_to_target("config/persona.md", sec.username, sec.role)
+    assert should_sync_to_target("workspace/notes.md", sec.username, sec.role)
+    oto = [c for c in on_the_creators_computer.calls if c["call"] == "build_oto_env"][-1]["kwargs"]
+    assert (oto["user_sub"], oto["user_role"]) == (CREATOR, "editor")
+    assert cfg.placement_sub == CREATOR and cfg.subscription_user_sub == CREATOR
+
+
+def test_a_delegator_who_lost_the_tier_is_no_machine_owner(on_the_creators_computer):
+    """Below the editor tier (or gone from the agent) the delegator names no
+    computer: the run is the agent's, refused there by the start guard."""
+    from storage.identity import db_users
+    db_users.set_user_agent_role(CREATOR, AGENT, "contributor")
+    cfg = _worker("tok-worker-demoted")
+    assert _claims(cfg.credential_env["PROXY_API_KEY"])["user_sub"] == ""
+    assert cfg.placement_sub == "" and cfg.security_context.role == "manager"
+
+
+def test_the_same_worker_on_the_platform_keeps_the_agents_identity(rig):
+    cfg = _worker("tok-worker-platform")
+    assert _claims(cfg.credential_env["PROXY_API_KEY"])["user_sub"] == ""
+    assert cfg.security_context.role == "manager" and cfg.placement_sub == CREATOR
+
+
+
+def test_a_left_out_mcp_describes_nothing_on_the_persons_computer(on_the_creators_computer, monkeypatch):
+    """An MCP the build leaves out (one signing in with the agent's own
+    account, on a person's computer) adds no dynamic context, so its
+    accounts' labels and addresses stay off the prompt there."""
+    from services.mcp import mcp_registry
+    real = mcp_registry.build_session_mcp_config
+
+    def _left_out(*args, **kwargs):
+        cfg, cred, _excluded, bundles, keys = real(*args, **kwargs)
+        return cfg, cred, {"char-files": "uses the agent's own account"}, bundles, keys
+    monkeypatch.setattr(mcp_registry, "build_session_mcp_config", _left_out)
+    _worker("tok-worker-ctx")
+    dyn = [c for c in on_the_creators_computer.calls if c["call"] == "get_dynamic_contexts"][-1]
+    assert "char-files" not in dyn["args"][1] and "phone-mcp" in dyn["args"][1]

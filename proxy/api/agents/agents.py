@@ -108,6 +108,8 @@ class UpdateAgentRequest(BaseModel):
     display_name: str | None = None
     admin_only: bool | None = None
     execution_paths: list[str] | None = None  # first = primary execution_path
+    # The engines of the allowlist on which the agent runs local models only.
+    local_only_engines: list[str] | None = None
     default_model: str | None = None
     default_effort: str | None = None
     color: str | None = None
@@ -193,7 +195,7 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
             status_code=402,
             detail=(
                 f"Agent limit reached ({current}/{max_agents}). "
-                "Upgrade your plan or renew your license to add more agents."
+                "The license in Setup, OtoDock sets the limit."
             ),
         )
 
@@ -250,13 +252,18 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
             500, "Could not create the agent's files. The server log has the details.",
         ) from e
 
-    # Insert DB record
+    # Insert DB record. Every registered engine is allowed on a new agent:
+    # the switches are an allowlist a person's own account may serve
+    # (services/engines/engine_resolution.py), the default stays the one
+    # resolved above.
+    from services.engines.engine_resolution import every_engine
     try:
         agent = await asyncio.to_thread(
             agent_store.create_agent,
             slug, req.display_name,
             admin_only=req.admin_only,
             execution_path=execution_path,
+            execution_paths=every_engine(execution_path),
             default_model=req.default_model,
             default_effort=req.default_effort,
             created_by=u.sub,
@@ -323,12 +330,16 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
 
     fields = req.model_dump(exclude_none=True)
     fields.pop("confirm_removals", None)
+    if "department_id" in fields or "department_level_id" in fields:
+        # The pair is cleared together: one empty value empties the other.
+        fields["department_id"] = (fields.get("department_id") or "").strip()
+        fields["department_level_id"] = (fields.get("department_level_id") or "").strip()
     if switch is not None and switch["clear_default"]:
         # The new-user default follows the rule with the mode, in the same write.
         fields["default_for_new_users_role"] = ""
     # Keep the PRIMARY execution layer consistent with the default model whenever
     # EITHER is updated. A no-picker session/task uses (primary layer + default
-    # model), and a model only runs on its OWN layer (e.g. gpt-6.1-sol is codex-cli-
+    # model), and a model only runs on its OWN layer (e.g. gpt-6-astra is codex-cli-
     # only), so a mismatch makes delegated/no-picker runs hard-reject the model
     # (the personal-assistant delegate bug). resolve_execution_path reads the
     # scalar `execution_path`, so reconciling it here is what fixes those runs.
@@ -337,6 +348,10 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     # otherwise leave a stale primary that can't run the new model.
     if "execution_paths" in fields or "default_model" in fields:
         _reconcile_primary_layer(name, fields)
+    if "local_only_engines" in fields:
+        import json as _json
+        _lo = [p for p in fields.pop("local_only_engines") if p]
+        fields["local_only_engines"] = _json.dumps(_lo) if _lo else ""
 
     # Route execution-target changes through remote_store so BOTH stores stay
     # in lockstep: `agents.execution_target` (what the resolver reads) AND
@@ -362,8 +377,9 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
 
 
 async def _check_engines(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
-    """The engines: known ones, at least one, and a newly added one
-    connected on the platform (a cookie admin excepted)."""
+    """The engines: known ones, at least one; the local-only engines known
+    and able to serve a local model; and the agent's DEFAULT engine, when the
+    write moves it, connected on the platform (a cookie admin excepted)."""
     from core.session.session_manager import valid_execution_paths
     valid_paths = valid_execution_paths()
 
@@ -375,28 +391,48 @@ async def _check_engines(name: str, req: UpdateAgentRequest, u: UserContext) -> 
                     f"Invalid execution path: {p}. Valid: {sorted(valid_paths)}")
         if len(req.execution_paths) == 0:
             raise HTTPException(400, "At least one execution path required")
-        # Platform-configured gate on NEWLY-ADDED engines only (set difference
-        # vs the stored set — reorders and removals always pass, and an engine
-        # whose platform subscription has since vanished stays grandfathered so
-        # a saved config can never become unsavable). Bypass is COOKIE admins
-        # only: the config-MCP authenticates with a session token carrying the
-        # session owner's sub, so an admin-created task/trigger session would
-        # otherwise hand the bypass to a prompt-injectable LLM turn.
+    if req.local_only_engines is not None:
+        from services.engines.engine_resolution import local_providers_of
+        for p in req.local_only_engines:
+            if p not in valid_paths:
+                raise HTTPException(
+                    400,
+                    f"Invalid execution path: {p}. Valid: {sorted(valid_paths)}")
+            if not local_providers_of(p):
+                raise HTTPException(
+                    400,
+                    f"{_engine_label(p)} has no local models, so it cannot be "
+                    "limited to them.")
+    if req.execution_paths is not None or req.default_model is not None:
+        # The engines are an allowlist a person's own account may serve, so
+        # ticking one is free. The DEFAULT engine is what the agent's own
+        # work (its scheduled tasks, calls, meetings) runs on, and that work
+        # draws on the platform pool alone: a write that MOVES the default
+        # onto an engine the pool lacks is refused. Bypass is COOKIE admins
+        # only: the config-MCP authenticates with a session token carrying
+        # the session owner's sub, so an admin-created task/trigger session
+        # would otherwise hand the bypass to a prompt-injectable LLM turn.
         if not (u.is_admin and not u.is_api_key):
             from services.engines import subscription_pool
             _stored = agent_store.get_agent(name) or {}
-            _current_set = set(_get_execution_paths(_stored))
-            for p in req.execution_paths:
-                if p in _current_set:
-                    continue
-                if not await asyncio.to_thread(
-                    subscription_pool.layer_platform_configured, p
-                ):
-                    raise HTTPException(
-                        403,
-                        f"No {_engine_label(p)} subscription is "
-                        "connected on this platform",
-                    )
+            _old = _stored.get("execution_path") or DEFAULT_EXECUTION_PATH
+            _fields = req.model_dump(exclude_none=True)
+            _reconcile_primary_layer(name, _fields)
+            _new = _fields.get("execution_path") or _old
+            if _new != _old and not await asyncio.to_thread(
+                subscription_pool.layer_platform_configured, _new
+            ):
+                # The step a manager can take is the ask; the admin's own
+                # step is named to an admin alone (an admin on a session
+                # token lands here too).
+                step = ("Connect one" if u.is_admin
+                        else "Ask an administrator to connect one")
+                raise HTTPException(
+                    403,
+                    f"The platform has no {_engine_label(_new)} subscription, so "
+                    f"the agent's own tasks cannot run there. {step} in "
+                    f"Setup, AI Engines, or keep {_engine_label(_old)} as the default.",
+                )
 
 
 async def _check_scope_and_effort(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
@@ -501,30 +537,13 @@ async def _check_department(name: str, req: UpdateAgentRequest, u: UserContext) 
     _req_dept = getattr(req, "department_id", None)
     _req_dept_level = getattr(req, "department_level_id", None)
     if _req_dept is not None or _req_dept_level is not None:
-        if u.acting_sub is None or not roles.is_creator_or_above(u.role):
-            raise HTTPException(
-                403,
-                "Only admins and creators can change an agent's department.",
-            )
-        _dept = (_req_dept or "").strip()
-        _level = (_req_dept_level or "").strip()
-        if bool(_dept) != bool(_level):
-            raise HTTPException(
-                400,
-                "department_id and department_level_id must be set together "
-                "(or both empty to clear the assignment).",
-            )
-        if _dept:
-            from storage.agents import db_departments
-            dept_row = await asyncio.to_thread(
-                db_departments.get_department, _dept
-            )
-            if not dept_row:
-                raise HTTPException(400, "Department not found")
-            if _level not in {lv["id"] for lv in dept_row["levels"]}:
-                raise HTTPException(
-                    400, "Level does not belong to that department"
-                )
+        # The rule is the placement service's (the move card and the set
+        # installer read the same one).
+        from services.departments import assignment
+        try:
+            await asyncio.to_thread(assignment.validate, name, _req_dept, _req_dept_level, u)
+        except assignment.AssignmentRefused as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
 
 
 # update_agent's field checks in the order they run; each raises on its

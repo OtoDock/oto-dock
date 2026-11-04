@@ -4,7 +4,7 @@
  * tap or a long press (touch) and keyboard focus reveal the detail.
  *
  * Colour depends on state AND `scope`:
- *   online                      → green
+ *   online                      → green (amber while its local link is down)
  *   stale / paused / fell-back  → amber
  *   disconnected/never (user)   → amber  — the caller's OWN machine soft-falls
  *                                          back to local, so it's not critical
@@ -20,7 +20,7 @@
 
 import Tooltip from './ui/Tooltip'
 import { PAIRING_SCOPE } from '../lib/placement'
-import { MACHINE_STATE, isReachableMachine } from '../lib/status/machine'
+import { MACHINE_STATE, isReachableMachine, machineLinkNotice } from '../lib/status/machine'
 import { FELLBACK_LOCAL, dotColorClass, type BadgeScope, type BadgeState } from './remoteBadgeDot'
 
 interface Props {
@@ -32,6 +32,11 @@ interface Props {
   fallbackReason?: string | null
   size?: 'xs' | 'sm'
   className?: string
+  // Online, but its sessions cannot reach OtoDock (the machine's local link
+  // is down): the dot turns amber and the detail says what the row says
+  // (`machineLinkNotice`, by how long it has been down).
+  linkDown?: boolean
+  linkDownS?: number | null
   // When true, suppresses the tooltip entirely. Used where a bare dot is
   // wanted (e.g. the task-run header).
   noTooltip?: boolean
@@ -45,6 +50,8 @@ const LABELS: Record<Exclude<BadgeState, null>, string> = {
   never_connected: 'Never connected',
   fellback_local: 'Running locally while the remote machine is offline',
 }
+
+const LINK_DOWN_LABEL = 'Connected, local link down'
 
 function formatAge(seconds: number): string {
   if (seconds < 60) return `${seconds}s ago`
@@ -78,18 +85,21 @@ export default function RemoteBadge({
   size = 'sm',
   className = '',
   noTooltip = false,
+  linkDown = false,
+  linkDownS = null,
 }: Props) {
   if (!state) return null
 
   const dotSize = size === 'xs' ? 'w-2 h-2' : 'w-2.5 h-2.5'
-  const colorClass = dotColorClass(state, scope)
+  const degraded = linkDown && state === MACHINE_STATE.ONLINE
+  const colorClass = degraded ? 'bg-status-warning-solid' : dotColorClass(state, scope)
 
   if (noTooltip) {
     return (
       <span className={`inline-flex items-center ${className}`}>
         <span
           className={`inline-block ${dotSize} rounded-full ${colorClass}`}
-          aria-label={LABELS[state]}
+          aria-label={degraded ? LINK_DOWN_LABEL : LABELS[state]}
         />
       </span>
     )
@@ -97,8 +107,9 @@ export default function RemoteBadge({
 
   // --- Tooltip content -----------------------------------------------------
   const reachable = isReachableMachine(state)
-  const label = LABELS[state]
+  const label = degraded ? LINK_DOWN_LABEL : LABELS[state]
   const parts: string[] = [machineName ? `${machineName}: ${label}` : label]
+  if (degraded) parts.push(machineLinkNotice(false, linkDownS) ?? '')
   if (state === MACHINE_STATE.ONLINE && heartbeatAgeS != null) {
     parts.push(`Last ping: ${formatAge(heartbeatAgeS)}`)
   } else if (state === MACHINE_STATE.STALE && heartbeatAgeS != null) {
@@ -119,6 +130,8 @@ export default function RemoteBadge({
     parts.push("The agent's remote target is offline")
   } else if (fallbackReason === 'viewer-on-admin-remote') {
     parts.push('Sessions below manager run locally')
+  } else if (fallbackReason === 'all-roles-on-admin-remote') {
+    parts.push('Its admin lets every role run here')
   }
   const tipText = parts.join(' · ')
 
@@ -145,5 +158,24 @@ export default function RemoteBadge({
         <span className={`inline-block ${dotSize} rounded-full ${colorClass}`} aria-hidden="true" />
       </span>
     </Tooltip>
+  )
+}
+
+/** A machine row's line while its local link is down (the words are
+ *  `machineLinkNotice`'s), with the satellite's own reason when `detail`. */
+export function MachineLinkNotice({ linkOk, downS, error, detail = false, className = '' }: {
+  linkOk?: boolean
+  downS?: number | null
+  error?: string
+  detail?: boolean
+  className?: string
+}) {
+  const words = machineLinkNotice(linkOk, downS)
+  if (!words) return null
+  return (
+    <div className={`text-xs text-status-warning-fg ${className}`} data-testid="machine-link-notice">
+      <p>{words}</p>
+      {detail && error && <p className="text-3xs text-tertiary mt-0.5">Last problem: {error}</p>}
+    </div>
   )
 }

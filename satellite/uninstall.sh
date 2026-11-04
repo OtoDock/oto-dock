@@ -67,9 +67,10 @@ fi
 # still proceeds. The conf file is read BEFORE the dir wipe below.
 CONF="$OTO_DIR/satellite.conf"
 if [ -f "$CONF" ]; then
-    MACHINE_ID=$(grep -E '^\s*machine_id\s*=' "$CONF" | head -1 | sed 's/^[^=]*=\s*//; s/\s*$//')
-    MACHINE_SECRET=$(grep -E '^\s*machine_secret\s*=' "$CONF" | head -1 | sed 's/^[^=]*=\s*//; s/\s*$//')
-    PLATFORM_WSS=$(grep -E '^\s*platform_url\s*=' "$CONF" | head -1 | sed 's/^[^=]*=\s*//; s/\s*$//')
+    # POSIX classes, never \s: macOS sed reads \s as a literal s.
+    MACHINE_ID=$(grep -E '^[[:space:]]*machine_id[[:space:]]*=' "$CONF" | head -1 | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
+    MACHINE_SECRET=$(grep -E '^[[:space:]]*machine_secret[[:space:]]*=' "$CONF" | head -1 | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
+    PLATFORM_WSS=$(grep -E '^[[:space:]]*platform_url[[:space:]]*=' "$CONF" | head -1 | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
     # Strip ws:// or wss:// → http:// or https://, strip /v1/satellite suffix
     PLATFORM_HTTP=$(echo "$PLATFORM_WSS" | sed -e 's|^wss://|https://|' -e 's|^ws://|http://|' -e 's|/v1/satellite$||' -e 's|/v1/satellite/.*$||')
     if [ -n "$MACHINE_ID" ] && [ -n "$MACHINE_SECRET" ] && [ -n "$PLATFORM_HTTP" ]; then
@@ -117,14 +118,36 @@ if [ "$OS" = "Linux" ] && command -v systemctl &>/dev/null; then
     # Linger is left in place — disabling it could stop OTHER user services.
     # Remove manually with `loginctl disable-linger $USER` if desired.
 elif [ "$OS" = "Darwin" ]; then
-    PLIST_FILE="$HOME/Library/LaunchAgents/com.otodock.satellite.plist"
+    LABEL="com.otodock.satellite"
+    PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
+    # The desktop session's domain, and the user domain an older pairing
+    # over SSH may have loaded it into.
+    info "Stopping the satellite's login item..."
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootout "user/$(id -u)/$LABEL" 2>/dev/null || true
     if [ -f "$PLIST_FILE" ]; then
-        info "Unloading launchd plist..."
         launchctl unload "$PLIST_FILE" 2>/dev/null || true
         rm -f "$PLIST_FILE"
         ok "launchd plist removed"
     fi
+    # The permissions macOS gave OtoDock Satellite go with it.
+    tccutil reset Accessibility "$LABEL" >/dev/null 2>&1 || true
+    tccutil reset ScreenCapture "$LABEL" >/dev/null 2>&1 || true
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -u "$OTO_DIR/OtoDock Satellite.app" >/dev/null 2>&1 || true
 fi
+
+# The `otodock` command the satellite put on PATH, when it points into this
+# install (a file of the person's own there stays).
+remove_cli_link() {
+    local link="$HOME/.local/bin/otodock" target
+    [ -L "$link" ] || return 0
+    target="$(readlink "$link")"
+    case "$target" in
+        "$OTO_DIR"/*) rm -f "$link"; ok "Removed the otodock command ($link)" ;;
+    esac
+}
+remove_cli_link
 
 # --- Remove install dir ---
 if [ -d "$OTO_DIR" ]; then
@@ -153,14 +176,17 @@ echo -e "breaking unrelated tooling. For a full cleanup, remove them"
 echo -e "manually:${NC}"
 echo ""
 if [ "$OS" = "Darwin" ]; then
-    echo "  brew uninstall git gh python@3 node pnpm uv jq ripgrep \\"
+    echo "  brew uninstall git gh python python@3.13 node pnpm uv jq ripgrep \\"
     echo "                 poppler sqlite"
+    echo "  rm \"\$(brew --prefix)/bin/oto-git-credential-helper\""
+    # pnpm is Homebrew's on a Mac: the brew line takes it.
+    echo "  npm uninstall -g @anthropic-ai/claude-code @openai/codex"
 else
     echo "  sudo apt remove --purge git gh python3 python3-venv python3-pip \\"
     echo "                          nodejs jq ripgrep poppler-utils sqlite3"
     echo "  # uv lives in ~/.local/bin/uv — rm it directly if installed via Astral installer"
+    echo "  npm uninstall -g @anthropic-ai/claude-code @openai/codex pnpm"
 fi
-echo "  npm uninstall -g @anthropic-ai/claude-code @openai/codex pnpm"
 echo ""
 echo "To re-pair this machine, run the install command from the platform"
 echo "dashboard (Remote Machines → Pair new machine)."

@@ -26,6 +26,9 @@ def test_successor_model_follows_the_chain_to_its_end():
     assert app_config.successor_model("gpt-5.6-luna") == "gpt-6-luna"
     assert app_config.successor_model("claude-sonnet-5") == "claude-sonnet-5-5"
     assert app_config.successor_model("claude-haiku-4-5") == "claude-haiku-5-5"
+    # 5.6 Terra → 6.1 Terra on both engines; Qwen 3.6 → Qwen 3.8 on Groq.
+    assert app_config.successor_model("gpt-5.6-terra") == "gpt-6.1-terra"
+    assert app_config.successor_model("qwen/qwen3.6-27b") == "qwen/qwen3.8-27b"
     # A current id, a custom id and nothing pass through unchanged.
     assert app_config.successor_model("claude-opus-5-5") == "claude-opus-5-5"
     assert app_config.successor_model("my-custom") == "my-custom"
@@ -43,6 +46,46 @@ def test_every_successor_is_a_current_builtin_and_every_retired_id_is_not():
         assert end in app_config.MODEL_REGISTRY, (old, end)
         assert old not in app_config.MODEL_REGISTRY, old
         assert new != old
+
+
+# The retired rows as the registry carried them on their last day: the
+# successors are judged against these, since the rows themselves are gone.
+_GPT_5_6_TERRA = {"pricing": (2.0, 12.0, 2.50, 0.20), "layers": {"codex-cli", "direct-llm"},
+                  "context_window": 1_050_000, "tier": 3,
+                  "good_at": "drafting, summaries and bounded analysis"}
+_QWEN_3_6 = {"pricing": (0.60, 3.00, 0.0, 0.30), "layers": {"direct-llm"},
+             "context_window": 131_072, "tier": 4,
+             "good_at": "general-purpose answers served on Groq"}
+
+
+def test_gpt_6_1_terra_succeeds_gpt_5_6_terra_losslessly():
+    e = app_config.MODEL_REGISTRY["gpt-6.1-terra"]
+    assert e["provider"] == "openai" and set(e["layers"]) == _GPT_5_6_TERRA["layers"]
+    assert e["tier"] == _GPT_5_6_TERRA["tier"] and e["good_at"] == _GPT_5_6_TERRA["good_at"]
+    assert e["context_window"] == _GPT_5_6_TERRA["context_window"]
+    # Cheaper on every element, and the same 272k tier multiplies both alike.
+    assert all(new < old for new, old in zip(e["pricing"], _GPT_5_6_TERRA["pricing"], strict=True))
+    assert app_config.get_model_long_context("gpt-6.1-terra") == (272_000, 2.0, 1.5)
+    assert e["supports_reasoning"] and e["supports_xhigh"] and e["supports_ultra"]
+    assert e["server_tools"]
+
+
+def test_qwen_3_8_succeeds_qwen_3_6_at_a_third_more():
+    # The one successor that is not lossless: the same engine, window, flags
+    # and tier, at Groq's new price.
+    e = app_config.MODEL_REGISTRY["qwen/qwen3.8-27b"]
+    assert e["provider"] == "groq" and set(e["layers"]) == _QWEN_3_6["layers"]
+    assert e["tier"] == _QWEN_3_6["tier"] and e["good_at"] == _QWEN_3_6["good_at"]
+    assert e["context_window"] == _QWEN_3_6["context_window"]
+    assert not e.get("supports_reasoning") and not e.get("server_tools")
+    old_in, old_out, _, old_cr = _QWEN_3_6["pricing"]
+    p_in, p_out, p_cw, p_cr = e["pricing"]
+    assert (p_in, p_out, p_cw, p_cr) == (0.80, 4.00, 0.0, 0.40)
+    assert p_in == pytest.approx(old_in * 4 / 3) and p_out == pytest.approx(old_out * 4 / 3)
+    # Groq bills a cached input token at half; it caches no Qwen model today.
+    assert p_cr == p_in / 2 and old_cr == old_in / 2
+    assert app_config.price_usage("qwen/qwen3.8-27b", input_tokens=10_000, output_tokens=2_000) == (
+        pytest.approx((10_000 * 0.80 + 2_000 * 4.00) / 1_000_000))
 
 
 def test_haiku_5_5_succeeds_haiku_4_5_losslessly():
@@ -83,18 +126,23 @@ def test_the_gpt_rows_carry_their_window_and_the_272k_tier():
     # OpenAI bills the WHOLE request at 2x input / 1.5x output once its input
     # passes 272K; the rows carried that line as their window until the tier
     # could be priced, now they carry the vendor's 1.05M window and the tier.
-    for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-6-luna"):
+    for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"):
         assert app_config.MODEL_REGISTRY[model]["context_window"] == 1_050_000, model
         assert app_config.get_model_long_context(model) == (272_000, 2.0, 1.5), model
     cost = app_config.price_usage
-    # Terra ($2 / $12 / $2.50 / $0.20): under the line the base tuple, one token
-    # past it every rate at its multiplier, output at 1.5x.
-    assert cost("gpt-5.6-terra", input_tokens=200_000, output_tokens=1_000,
-                cache_read_tokens=72_000) == pytest.approx(
-        (200_000 * 2.0 + 1_000 * 12.0 + 72_000 * 0.20) / 1_000_000)
-    assert cost("gpt-5.6-terra", input_tokens=200_001, output_tokens=1_000,
-                cache_read_tokens=72_000) == pytest.approx(
-        (200_001 * 4.0 + 1_000 * 18.0 + 72_000 * 0.40) / 1_000_000)
+    # 6.1 Terra ($1 / $5 / $1.25 / $0.05): under the line the base tuple, one
+    # token past it every rate at its multiplier, output at 1.5x.
+    assert cost("gpt-6.1-terra", input_tokens=200_000, output_tokens=1_000,
+                cache_write_tokens=10_000, cache_read_tokens=62_000) == pytest.approx(
+        (200_000 * 1.0 + 1_000 * 5.0 + 10_000 * 1.25 + 62_000 * 0.05) / 1_000_000)
+    assert cost("gpt-6.1-terra", input_tokens=200_001, output_tokens=1_000,
+                cache_write_tokens=10_000, cache_read_tokens=62_000) == pytest.approx(
+        (200_001 * 2.0 + 1_000 * 7.5 + 10_000 * 2.50 + 62_000 * 0.10) / 1_000_000)
+    # 6.1 Sol ($2 / $10 / $2.50 / $0.10), the same line.
+    assert cost("gpt-6.1-sol", input_tokens=272_000, output_tokens=1_000) == pytest.approx(
+        (272_000 * 2.0 + 1_000 * 10.0) / 1_000_000)
+    assert cost("gpt-6.1-sol", input_tokens=272_001, output_tokens=1_000) == pytest.approx(
+        (272_001 * 4.0 + 1_000 * 15.0) / 1_000_000)
 
 
 def _pin(slug: str) -> str:
@@ -157,6 +205,35 @@ class TestBootWalk:
         assert first == {"gpt-5.6-luna": 1} and second == {"gpt-5.6-luna": 0}
         assert _pin("walk-d") == "gpt-6-luna"
 
+    def test_the_walk_moves_terra_and_qwen_pins_in_every_column(self):
+        # The registry's own table, on a DB whose builtin rows are synced the
+        # way boot syncs them: an agent's default, a chat's model and a
+        # task's model, each on a retired id, land on the successor.
+        from core.session.session_manager import get_all_capabilities
+        from storage import database as db
+        for path, caps in get_all_capabilities().items():
+            subscription_store.sync_builtin_models(path, caps.get("models", []))
+        offered = {m["model_id"] for m in subscription_store.list_models("direct-llm")}
+        assert {"gpt-6.1-terra", "gpt-6.1-sol", "qwen/qwen3.8-27b"} <= offered
+        assert not offered & {"gpt-5.6-terra", "qwen/qwen3.6-27b"}
+        agent_store.create_agent("walk-t", "Walk T", execution_path="codex-cli",
+                                 default_model="gpt-5.6-terra")
+        db.create_chat("walk-t-chat", "u-walk", "walk-t", model="gpt-5.6-terra",
+                       execution_path="direct-llm")
+        db.create_dynamic_task("walk-t-task", "walk-t", "t", "go", "default", "one-time",
+                               None, None, None, 600, "u-walk",
+                               override_model="qwen/qwen3.6-27b",
+                               override_execution_path="direct-llm")
+        remapped = subscription_store.remap_retired_models(app_config.MODEL_SUCCESSORS)
+        assert remapped["gpt-5.6-terra"] == 2 and remapped["qwen/qwen3.6-27b"] == 1
+        assert _pin("walk-t") == "gpt-6.1-terra"
+        assert (db.get_chat("walk-t-chat") or {}).get("model") == "gpt-6.1-terra"
+        from storage.pg import get_conn
+        with get_conn() as conn:
+            row = conn.execute("SELECT override_model FROM dynamic_tasks WHERE id = %s",
+                               ("walk-t-task",)).fetchone()
+        assert row["override_model"] == "qwen/qwen3.8-27b"
+
 
 def _raw_pin(slug: str, model: str) -> None:
     """A pin written after the boot walk (an old MCP call, a restore): the
@@ -205,6 +282,26 @@ class TestReadTimeSuccession:
         agent_store.create_agent("late-a", "Late A", execution_path="claude-code-cli")
         _raw_pin("late-a", "claude-opus-5")
         assert app_config.resolve_agent_model("late-a") == "claude-opus-5-5"
+
+    def test_a_terra_or_qwen_pin_written_after_the_walk_runs_on_its_successor(self):
+        agent_store.create_agent("late-t", "Late T", execution_path="codex-cli")
+        _raw_pin("late-t", "gpt-5.6-terra")
+        assert app_config.resolve_agent_model("late-t") == "gpt-6.1-terra"
+        agent_store.create_agent("late-q", "Late Q", execution_path="direct-llm")
+        assert app_config.resolve_run_model("late-q", "qwen/qwen3.6-27b") == "qwen/qwen3.8-27b"
+
+    def test_a_sol_pin_without_its_engine_runs_on_the_runs_first_engine(self):
+        # GPT-6.1 Sol is on Codex and Direct LLM: a model-only pin takes the
+        # run's first engine when it offers the id, else the allowlist's
+        # order (engine_for_model), the rule of every two-engine id.
+        from services.engines import engine_resolution
+        agent_store.create_agent("sol-a", "Sol A", execution_path="claude-code-cli",
+                                 execution_paths=["codex-cli", "direct-llm"])
+        agent = agent_store.get_agent("sol-a") or {}
+        assert engine_resolution.engine_for_model(agent, "gpt-6.1-sol", first="direct-llm") == "direct-llm"
+        assert engine_resolution.engine_for_model(agent, "gpt-6.1-sol", first="codex-cli") == "codex-cli"
+        assert engine_resolution.engine_for_model(agent, "gpt-6.1-sol", first="claude-code-cli") == "codex-cli"
+        assert engine_resolution.engine_for_model(agent, "gpt-6-astra", first="direct-llm") == "codex-cli"
 
     def test_a_run_and_its_chat_row_name_the_same_model(self):
         # The runner stamps the chat row (billing reads it) and the config

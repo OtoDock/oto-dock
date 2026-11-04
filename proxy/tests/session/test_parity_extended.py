@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from core.layers.cli.layer import cli_chunk_to_events
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 
@@ -782,3 +784,59 @@ def test_codex_translator_rate_limits_recorded_not_emitted():
         assert CodexEventTranslator().translate(
             CodexEvent(type="account/rateLimits/updated", data={"rateLimits": snapshot})) == []
         rec.assert_not_called()
+
+
+@pytest.mark.parametrize("message,level", [
+    ("`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.",
+     "DEBUG"),
+    ("Falling back from WebSockets to HTTPS transport. unexpected status 401", "INFO"),
+    ("failed to parse hooks config /x/.codex/hooks.json: expected value", "WARNING"),
+])
+def test_codex_warning_is_logged_by_kind_and_never_shown(caplog, message, level):
+    """A ``warning`` (0.163 to 0.166): the platform's own hook-trust flag, a
+    fallback Codex recovers from, or the operator's (a hooks file that did
+    not load) by its log level; none is chat content."""
+    import logging
+
+    from core.layers.codex import CodexEvent, CodexEventTranslator
+
+    t = CodexEventTranslator()
+    with caplog.at_level(logging.DEBUG, logger="codex-layer"):
+        out = t.translate(CodexEvent(type="warning", data={"threadId": "main", "message": message}))
+    assert out == []
+    [rec] = [r for r in caplog.records if r.getMessage().startswith("Codex warning:")]
+    assert rec.levelname == level
+    assert "unhandled notification" not in caplog.text
+
+
+@pytest.mark.parametrize("method", ["thread/settings/updated", "remoteControl/status/changed",
+                                    "model/verification"])
+def test_codex_housekeeping_notifications_are_quiet(caplog, method):
+    import logging
+
+    from core.layers.codex import CodexEvent, CodexEventTranslator
+
+    t = CodexEventTranslator()
+    with caplog.at_level(logging.DEBUG, logger="codex-layer"):
+        assert t.translate(CodexEvent(type=method, data={"threadId": "main"})) == []
+    assert "unhandled notification" not in caplog.text
+
+
+@pytest.mark.parametrize("method,params,level,text", [
+    ("guardianWarning", {"threadId": "main", "message": "Automatic approval review timed out"},
+     "INFO", "Automatic approval review timed out"),
+    ("windows/worldWritableWarning", {"samplePaths": ["C:\\Temp"], "extraCount": 2, "failedScan": False},
+     "WARNING", "C:\\Temp"),
+])
+def test_codex_operator_notices_are_logged_not_shown(caplog, method, params, level, text):
+    """Auto's reviewer message and a Windows machine's unprotectable folders
+    leave a log line for the operator; neither is chat content."""
+    import logging
+
+    from core.layers.codex import CodexEvent, CodexEventTranslator
+
+    t = CodexEventTranslator()
+    with caplog.at_level(logging.DEBUG, logger="codex-layer"):
+        assert t.translate(CodexEvent(type=method, data=params)) == []
+    [rec] = [r for r in caplog.records if text in r.getMessage()]
+    assert rec.levelname == level

@@ -2,8 +2,7 @@ import { useRef, useCallback, useEffect } from 'react'
 import { Capacitor } from '@capacitor/core'
 import { isDictationActive, isSpeaking } from '../audio/speechActivity'
 import { isNativePlatform } from '../audio/types'
-
-type Severity = 'info' | 'success' | 'warning' | 'danger'
+import { NOTIFICATION_SEVERITY, type NotificationSeverity } from '../lib/status/notificationSeverity'
 
 // Each chime stays under five seconds on purpose: for a short file whose
 // length is known as it starts, the WebView asks other apps only to lower
@@ -110,7 +109,7 @@ export function useNotificationSound() {
     window.speechSynthesis.speak(utterance)
   }, [])
 
-  const playForSeverity = useCallback((severity: Severity, title: string, body: string) => {
+  const playForSeverity = useCallback((severity: NotificationSeverity, title: string, body: string) => {
     // Stop any existing danger loop
     if (dangerLoop.current) {
       dangerLoop.current.stop()
@@ -122,14 +121,14 @@ export function useNotificationSound() {
     // alarm is never held.
     const quiet = isSpeaking() || isDictationActive()
     switch (severity) {
-      case 'info':
-      case 'success':
+      case NOTIFICATION_SEVERITY.INFO:
+      case NOTIFICATION_SEVERITY.SUCCESS:
         if (!quiet) playSound('success')
         break
-      case 'warning':
+      case NOTIFICATION_SEVERITY.WARNING:
         if (!quiet) playSound('warning')
         break
-      case 'danger': {
+      case NOTIFICATION_SEVERITY.DANGER: {
         // Loop alarm + TTS until stopped
         let running = true
         const loop = async () => {

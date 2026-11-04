@@ -53,7 +53,7 @@ def _clean():
 
 async def test_a_fan_out_writes_its_rows_in_one_job_and_delivers_concurrently(monkeypatch):
     subs = [f"u{i}" for i in range(12)]
-    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target: list(subs))
+    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target, audience=None: list(subs))
     jobs: list[str] = []
     created: list[str] = []
 
@@ -121,7 +121,7 @@ def _wire_audience(monkeypatch, users: dict[str, _Conn]):
     deltas: list[tuple[list[str], str, str]] = []
     monkeypatch.setattr(catalog, "file_changed",
                         lambda told, agent, rel, **kw: deltas.append((sorted(told), rel, kw.get("source"))))
-    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target: list(users))
+    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target, audience=None: list(users))
     monkeypatch.setattr(nm, "acting_role_of", lambda sub, agent: "editor")
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: sub)
     monkeypatch.setattr(file_sync, "should_sync_to_target", lambda rel, username, role: True)
@@ -274,7 +274,7 @@ async def test_offline_recipients_with_pushes_never_deadlock_the_fan_out(monkeyp
     slot on a send slot none of them can free)."""
     from services.notifications import push_sender as ps
     subs = [f"u{i}" for i in range(10)]
-    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target: list(subs))
+    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target, audience=None: list(subs))
     monkeypatch.setattr(notification_store, "create_delivery", lambda **kw: {
         "id": "d", "user_sub": kw["user_sub"], "title": "t", "body": "b", "severity": "info",
         "scope": "agent", "source": "", "delivered_at": "t", "notification_id": None,

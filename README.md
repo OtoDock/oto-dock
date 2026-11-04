@@ -18,7 +18,7 @@ chats, on schedules, on the phone and on your own machines.
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-ALv2" src="https://img.shields.io/badge/license-FSL--1.1--ALv2-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.9.0-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.9.1-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
@@ -127,8 +127,9 @@ ChatGPT subscription. Every user connects their own subscription or API key,
 or an admin shares theirs with the team.
 
 Local models on your own hardware work as well, through Ollama or any
-OpenAI-compatible server. You pick the engine per agent, and you can switch
-it per chat ([AI engines](https://docs.otodock.io/concepts/ai-engines)).
+OpenAI-compatible server. Each agent can use every engine. A new chat opens
+on the one you use most, and you can switch it per chat
+([AI engines](https://docs.otodock.io/concepts/ai-engines)).
 
 ## They work while you are away
 
@@ -265,7 +266,8 @@ One platform, the whole toolkit.
 - **Community catalog.** Ready-made agents, tools and skills install in one
   click, with GitHub, Notion, Home Assistant, Nextcloud, Prometheus, UniFi
   and Uptime Kuma among them, and many more landing regularly. Agent
-  templates arrive with their apps and checks, and follow new versions.
+  templates arrive with their apps and checks, and follow new versions. A
+  whole department installs in one step.
 - **Extensible by design.** Any MCP tool server installs from a manifest,
   and tools are assigned per agent.
 - **Usage and budgets.** Costs are tracked per user and per agent, with
@@ -280,7 +282,7 @@ See all features at [otodock.io/features](https://otodock.io/features).
 ```
  proxy/       The platform core (FastAPI): sessions, security, scheduling,
               the agent sandbox and the WebSocket hub the dashboard talks to
- dashboard/   The React dashboard, and android/ wraps it in the Android app
+ dashboard/   The React dashboard, and android/ and ios/ wrap it in the two apps
  mcps/        The first-party MCP tool servers and the community mirrors
  audio/       The speech package: speech to text, text to speech, voice activity
  phone/       The phone service: live calls over Twilio or Asterisk and FreePBX

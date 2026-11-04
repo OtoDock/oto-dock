@@ -27,7 +27,9 @@ _MODELS = [
      "enabled": True, "tier": 3, "created_at": "2026-01-01"},
     {"model_id": "claude-haiku-4-5", "provider": "anthropic", "is_builtin": True,
      "enabled": True, "tier": 4, "created_at": "2026-01-01"},
-    {"model_id": "gpt-5.6-terra", "provider": "openai", "is_builtin": True,
+    {"model_id": "gpt-6.1-sol", "provider": "openai", "is_builtin": True,
+     "enabled": True, "tier": 2, "created_at": "2026-01-01"},
+    {"model_id": "gpt-6.1-terra", "provider": "openai", "is_builtin": True,
      "enabled": True, "tier": 3, "created_at": "2026-01-01"},
     {"model_id": "gpt-5.6-luna", "provider": "openai", "is_builtin": True,
      "enabled": True, "tier": 4, "created_at": "2026-01-01"},
@@ -102,11 +104,11 @@ def test_disabled_default_on_codex_lands_on_terra_not_astra(monkeypatch):
          "enabled": True, "tier": 1, "created_at": "2026-01-01"},
         {"model_id": "gpt-6-sol", "provider": "openai", "is_builtin": True,
          "enabled": False, "tier": 2, "created_at": "2026-01-01"},
-        {"model_id": "gpt-5.6-terra", "provider": "openai", "is_builtin": True,
+        {"model_id": "gpt-6.1-terra", "provider": "openai", "is_builtin": True,
          "enabled": True, "tier": 3, "created_at": "2026-01-01"},
     ]
     _wire(monkeypatch, ["openai"], models=rows, layer="codex-cli")
-    assert config.resolve_agent_model("caller") == "gpt-5.6-terra"
+    assert config.resolve_agent_model("caller") == "gpt-6.1-terra"
 
 
 def test_tier_one_is_reached_only_when_nothing_at_or_below_the_default_is_enabled(monkeypatch):
@@ -137,9 +139,28 @@ def test_pool_provider_without_an_enabled_model_ignores_the_filter(monkeypatch):
 
 
 def test_openai_only_pool_falls_to_the_best_served_tier(monkeypatch):
-    # Sonnet is declared but not servable; Terra (tier 3) is the best served.
+    # Sonnet is declared but not servable; Terra (tier 3) is the best served
+    # at or below it. GPT-6.1 Sol (tier 2) is above the declared default, so
+    # the fall-down never reaches it while a tier 3 or 4 row is enabled.
     _wire(monkeypatch, ["openai"])
-    assert config.resolve_agent_model("caller") == "gpt-5.6-terra"
+    assert config.resolve_agent_model("caller") == "gpt-6.1-terra"
+
+
+def test_sol_on_direct_llm_is_reached_only_when_nothing_below_is_enabled(monkeypatch):
+    rows = [dict(m, enabled=(m["model_id"] == "gpt-6.1-sol" or m["provider"] != "openai"))
+            for m in _MODELS]
+    _wire(monkeypatch, ["openai"], models=rows)
+    assert config.resolve_agent_model("caller") == "gpt-6.1-sol"
+
+
+def test_the_direct_llm_order_puts_sol_after_every_tier_at_or_below_sonnet():
+    # The person's resolution walks this order for the first provider they
+    # hold: one who holds only OpenAI lands on Terra, never on Sol.
+    rows = [dict(m) for m in _MODELS]
+    order = [m["model_id"] for m in config.ordered_layer_models("direct-llm", rows)]
+    assert order[0] == "claude-sonnet-5-5"
+    assert order.index("gpt-6.1-terra") < order.index("gpt-6.1-sol")
+    assert order[-1] == "gpt-6.1-sol"
 
 
 # --- the pin -----------------------------------------------------------------

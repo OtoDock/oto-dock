@@ -15,9 +15,7 @@ vi.mock('@/api/chats', async (importOriginal) => {
     ...orig,
     useDeleteChat: () => ({ mutate: vi.fn() }),
     useRenameChat: () => ({ mutate: vi.fn() }),
-    useRenameTask: () => ({ mutate: vi.fn() }),
     useSearchChats: (...args: unknown[]) => searchMock(...args as []),
-    useTaskChats: () => ({ data: [] }),
   }
 })
 

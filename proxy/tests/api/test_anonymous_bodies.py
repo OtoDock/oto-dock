@@ -31,10 +31,10 @@ GUARDED = (
     "api.auth.agent_api_keys", "api.auth.claude_oauth", "api.auth.openai_oauth",
     "api.auth.user_api_keys", "api.billing.billing", "api.billing.usage",
     "api.checks.checks", "api.departments.departments", "api.duplex.duplex",
-    "api.events.subscriptions", "api.mcp.community", "api.mcp.credentials",
+    "api.events.subscriptions", "api.mcp.bearer_allowlist", "api.mcp.community", "api.mcp.credentials",
     "api.mcp.icons", "api.mcp.local_templates", "api.mcp.mcps",
     "api.media.uploads", "api.meetings.meetings",
-    "api.notifications.notifications", "api.phone.phone", "api.sharing.shares",
+    "api.notifications.notifications", "api.phone.phone", "api.settings.settings", "api.sharing.shares",
     "api.tasks.continuations", "api.tasks.delegation", "api.tasks.tasks",
 )
 

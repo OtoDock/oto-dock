@@ -286,9 +286,9 @@ class DeepgramSTT(STTProvider):
                                       norm=_norm_word, rate=self._active_rate,
                                       stream_seconds=self._budget_stream_seconds, spent=self._budget_spent)
 
-    def enable_turn_relisten(self) -> None:
+    def enable_turn_relisten(self, *, wide: bool = False) -> None:
         if self._turn_relisten is None and not self.dictation_mode:
-            self._turn_relisten = TurnRelisten(transcribe=self._relisten_transcribe, norm=_norm_word,
+            self._turn_relisten = TurnRelisten(wide=wide, transcribe=self._relisten_transcribe, norm=_norm_word,
                                                rate=self._active_rate, stream_seconds=self._budget_stream_seconds,
                                                spent=self._budget_spent)
 

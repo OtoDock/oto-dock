@@ -31,6 +31,7 @@ from core import placement
 from core.execution_layer import ExecutionLayer, LayerCapabilities
 from core.permission_modes import AUTO_REVIEW_MODE
 from core.remote.satellite_connection import SatelliteConnectionManager
+from core.remote.tunnel_state import session_port_moved
 from core.session.session_state import (
     cleanup_session_permission_state,
     clear_starting,
@@ -367,11 +368,38 @@ class RemoteExecutionLayer(
             return False
         # cli_dead → the persistent CLI subprocess crashed/was aborted but the
         # entry isn't reaped yet; report not-alive so callers don't reuse it.
+        # A session started on a local link port its machine no longer serves
+        # cannot reach the platform: not alive either (its next message
+        # resumes it on the live port).
         return (
             info.alive
             and not info.cli_dead
             and self._cm.is_connected(info.machine_id)
+            and not session_port_moved(info, self._cm)
         )
+
+    def moved_port_idle_sessions(self, machine_id: str) -> list[str]:
+        """The idle sessions on a machine started on a local link port it no
+        longer serves (``tunnel_state``). A session mid-turn finishes first."""
+        return [
+            sid for sid, info in self._sessions.items()
+            if info.machine_id == machine_id and info.alive and not info.turn_active
+            and session_port_moved(info, self._cm)
+        ]
+
+    async def retire_moved_port_sessions(self, machine_id: str) -> None:
+        """Close them, as the capacity eviction does: each resumes with its
+        context at its next message, on the live port."""
+        for sid in self.moved_port_idle_sessions(machine_id):
+            info = self._sessions.get(sid)
+            if info is None or info.turn_active:
+                continue
+            logger.info(
+                "Remote session %s: started on %s's old local link port %d; "
+                "closed, it resumes at its next message",
+                sid[:8], machine_id[:8], info.tunnel_port,
+            )
+            await self.close_session(sid)
 
     @asynccontextmanager
     async def session_lock(self, session_id: str):

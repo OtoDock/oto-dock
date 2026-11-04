@@ -245,10 +245,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
     async def _stream_turn(self, info: RemoteSessionInfo, cm, turn: dict) -> AsyncIterator[CommonEvent]:
         from core.events import wake_capture
         from core.session import engine_prompts
-        from core.session.session_state import (
-            reconcile_background_snapshot,
-            resolve_bg_command_frame,
-        )
+        from core.session.background_frames import resolve_background_frame
         state = cast("ClaudeRemoteState", info.engine_state)
         assert state is not None  # invariant: begin_turn / adopt_state ran
         translator, settle = state.translator, state.settle
@@ -455,8 +452,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                             )
                             continue
                         if nxt is not None:
-                            resolve_bg_command_frame(info.session_id, nxt)
-                            reconcile_background_snapshot(info.session_id, nxt)
+                            resolve_background_frame(info.session_id, nxt)
                             engine_prompts.note_frame(info.session_id, nxt)
                     # Interactive chat: no settle — tell satellite to stop.
                     await send_stop_turn(cm, info)
@@ -486,14 +482,15 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 settle.enter_settle()
 
     async def drain_bg_commands(self, info: RemoteSessionInfo, cm, *, budget: float) -> bool:
-        """Resolve background bash-command completions between turns. The
-        satellite forwards claude's stdout CONTINUOUSLY into the per-session
-        ``event_queue`` (a persistent WS pipe), so post-turn
-        ``system task_updated{patch.status:completed}`` frames just accumulate
-        there. This pulls them with a short budget, resolving each via
-        ``resolve_bg_command_frame`` (badge clear + registry). Returns True if any
-        resolved. The post-turn bg-command monitor (stream_pump.py) polls this —
-        bg bash has no completion hook, so this active read is the only signal.
+        """Read the background work's lines between turns. The satellite
+        forwards claude's stdout CONTINUOUSLY into the per-session
+        ``event_queue`` (a persistent WS pipe), so post-turn frames (a
+        command's ``task_updated{patch.status:completed}``, a sub-agent's own
+        lines and its completion) accumulate there. This pulls them with a
+        short budget, resolving each via ``resolve_background_frame`` (badge
+        clear + registry). Returns True if any work ended. Both post-turn
+        monitors poll this: bg bash has no completion hook, and a sub-agent's
+        stdout completion heals a stop hook the proxy never received.
         Acquires the session lock with a short timeout so it never races an
         in-flight turn (the lock blocks the next turn's send_message, so we only
         ever see idle post-turn frames)."""
@@ -506,10 +503,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             from core.events import wake_capture
             from core.remote.remote_bg_commands import queue_frame_reader
             from core.session import engine_prompts
-            from core.session.session_state import (
-                reconcile_background_snapshot,
-                resolve_bg_command_frame,
-            )
+            from core.session.background_frames import resolve_background_work
             deadline = time.monotonic() + budget
             while time.monotonic() < deadline:
                 try:
@@ -531,9 +525,8 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                     )
                     progressed = True
                     continue
-                if resolve_bg_command_frame(info.session_id, raw):
+                if resolve_background_work(info.session_id, raw):
                     progressed = True
-                reconcile_background_snapshot(info.session_id, raw)
                 engine_prompts.note_frame(info.session_id, raw)
         finally:
             info.lock.release()
@@ -774,10 +767,13 @@ async def send_stop_turn(cm, info: RemoteSessionInfo) -> None:
     proxy (the satellite's per-turn forwarder otherwise stops here,
     stranding the badge + skipping the autonudge). Armed for pending
     SUBAGENTS too — their completion also triggers the CLI's self-wake turn
-    on stdout, which the proxy-side drain captures; the satellite's drain
-    loop forwards every frame unfiltered (verified 0.5.110
-    ``_bg_drain_loop``), so no satellite change/gate is needed."""
+    on stdout, which the proxy-side drain captures, and their own lines
+    and stdout completions reach the agent monitor's drain; the satellite's
+    drain loop forwards every frame unfiltered (verified 0.5.110
+    ``_bg_drain_loop``). ``drain_bg_s`` bounds it: before 0.5.167 the
+    satellite stopped after ten minutes whatever ran."""
     from core.events.bg_command_state import get_bg_command_registry
+    from core.session import background_leash
     from core.session.session_state import get_subagent_registry
     drain_bg = (get_bg_command_registry(info.session_id).has_pending
                 or get_subagent_registry(info.session_id).has_pending)
@@ -785,6 +781,10 @@ async def send_stop_turn(cm, info: RemoteSessionInfo) -> None:
         "type": STOP_TURN_FRAME,
         "session_id": info.session_id,
         "drain_bg": drain_bg,
+        # How long the satellite keeps forwarding (0.5.167; an older one
+        # stops at ten minutes): the background-work ceiling, as long as
+        # the proxy waits for the work itself.
+        "drain_bg_s": background_leash.background_work_ceiling(),
     })
 
 
@@ -848,6 +848,17 @@ async def drain_until_turn_ended(
                 # Stale marker from a previous turn — keep draining.
                 continue
             return
+        if isinstance(raw, dict):
+            # The turn is over: what arrives here is mostly background work (a
+            # sub-agent's lines, a command's or an agent's end, a sub-agent's
+            # ask for the engine prompts). It can also be the CLI's own next
+            # turn (a steer it took late, a wake), whose lines are read here
+            # and lost, its init included: the stale drain before the next
+            # turn captures a wake only when its init reaches it.
+            from core.session import engine_prompts
+            from core.session.background_frames import resolve_background_frame
+            resolve_background_frame(info.session_id, raw)
+            engine_prompts.note_frame(info.session_id, raw)
 
 
 def _server_to_manifest_name() -> dict[str, str]:

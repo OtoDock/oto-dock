@@ -7,12 +7,14 @@ with the connection's full attribute state; nothing here is standalone.
 Behavior is pinned by tests/session/test_ws_dashboard_*.
 """
 
+import functools
 import json
 import logging
 from typing import TYPE_CHECKING, cast
 
 import config
-from core.events import input_queue
+from core.events import chat_writer, input_queue
+from core.events.common_events import photos_not_attached
 from core.session import visibility as _vis
 from storage import database as task_store
 from storage.automation import run_status
@@ -62,6 +64,8 @@ def result_event_from_notify(notification: dict) -> dict:
         event.update({k: notification[k] for k in _RESULT_ENDING_KEYS if k in notification})
     if notification.get("verdict"):
         event["verdict"] = notification["verdict"]
+    if notification.get("worker_chat_id"):
+        event["worker_chat_id"] = notification["worker_chat_id"]
     event.update({k: notification[k] for k in _RESULT_LIST_KEYS if k in notification})
     if notification.get("background_pending"):
         event["background_pending"] = notification["background_pending"]
@@ -161,7 +165,7 @@ class ServerNotificationController(_Host):
             kick_text = notification.get("text", "")
             kick_images = notification.get("images", [])
             kick_files = notification.get("files", [])
-            if not kick_text or not kick_cid:
+            if not kick_cid or not (kick_text or kick_images or kick_files):
                 return
             # The kick is taken: this socket's own warmup owes the chat
             # nothing more (a Stop on it from here is a joined page's).
@@ -195,6 +199,7 @@ class ServerNotificationController(_Host):
                     "chat_id": kick_cid,
                     "_server_kick": True,
                     "_focus_line": notification.get("focus_line", ""),
+                    "_photos_dropped": notification.get("_photos_dropped", 0),
                 })
                 input_queue.first_turn_not_run(kick_cid)
             else:
@@ -366,6 +371,19 @@ class ServerNotificationController(_Host):
                         "prompt": wake_prompt,
                         "task_id": notification.get("task_id", ""),
                     }))
+                # The card: to this socket ahead of the wake turn it starts
+                # below, and to every other viewer of the chat (a second
+                # tab, another person) through their queues, as the rungs
+                # with no socket send it.
+                from core.session.session_state import broadcast_chat_frame
+                wake_frame = {
+                    "type": wire.SCHEDULE_WAKE, "chat_id": wake_chat_id,
+                    "prompt": wake_prompt, "task_id": notification.get("task_id", ""),
+                }
+                if wake_chat_id == self.chat_id:
+                    await self._send(wake_frame)
+                broadcast_chat_frame(wake_chat_id, wake_frame,
+                                     skip=getattr(self, "notify_queue", None))
             wake_layer = self.layer if wake_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", wake_chat_id))
             await self._run_server_turn_or_keep(
                 wake_prompt,
@@ -518,6 +536,19 @@ class ServerNotificationController(_Host):
         except AttachmentsRefused as e:
             await self._send_error(str(e))
             return
+        if not (text or _meta or _vfiles):
+            # No text, and none of its photos and files reached the agent:
+            # the warm-up wrote no row, and nothing is sent.
+            logger.info("WS dashboard: headless server kick for chat=%s has nothing "
+                        "that reached the agent; not run", wcid[:8])
+            return
+        if dropped := photos_not_attached(images, _meta):
+            # The person's row is written (at the warm-up): the notice
+            # follows it before any reply.
+            await chat_writer.submit(wcid, functools.partial(
+                task_store.add_chat_message, wcid, "event", "", event_type=wire.SYSTEM,
+                event_data=json.dumps(wire.photos_not_attached_block(dropped)),
+            ), label="photos_not_attached")
         try:
             pump = await self._run_server_turn(
                 cli_text,

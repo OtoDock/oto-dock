@@ -22,6 +22,8 @@ export interface InstallProgressEntry {
   phase: string
   pct: number
   message: string
+  /** The workspace copy's file count (its row only). */
+  filesTotal?: number
 }
 
 export interface InstallFailure {
@@ -64,6 +66,7 @@ interface InstallStoreState {
       phase: string
       pct: number
       message: string
+      files_total?: number
     },
   ) => void
   recordFailure: (
@@ -161,7 +164,7 @@ export const useInstallStore = create<InstallStoreState>((set) => ({
             mcps,
             progress: {
               ...prev.progress,
-              [data.mcp]: { phase: data.phase, pct: data.pct, message: data.message },
+              [data.mcp]: { phase: data.phase, pct: data.pct, message: data.message, filesTotal: data.files_total },
             },
             lastEventAt: Date.now(),
           },

@@ -61,3 +61,16 @@ def test_the_baseline_probe_accepts_the_floor():
 def test_the_readme_names_the_floor():
     major, minor = _floor()
     assert f"Python {major}.{minor} or newer" in _read("satellite/README.md")
+
+
+def _platform_minor() -> str:
+    m = re.search(r"^PYTHON_VERSION=(\d+\.\d+)\.\d+\s*$", _read("VERSIONS.md"), re.M)
+    assert m, "VERSIONS.md has no PYTHON_VERSION pin"
+    return m.group(1)
+
+
+@pytest.mark.parametrize("rel", ["scripts/install-baseline-tools.sh", "satellite/install.sh"])
+def test_the_macos_python_is_the_platforms_minor(rel):
+    # A Mac runs the satellite and its MCP environments on the platform's own
+    # minor (Homebrew's python@<minor>): the scripts carry it as a default.
+    assert re.findall(r'OTODOCK_PYTHON_MINOR:-(\d+\.\d+)\}', _read(rel)) == [_platform_minor()]

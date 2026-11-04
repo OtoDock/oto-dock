@@ -1,0 +1,45 @@
+{
+ "source": "A stop inside the restart delay: no new recognizer, the session ends as stopped.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "a."
+    }
+   ]
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 50
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "wait",
+   "ms": 300
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "a."
+  ],
+  "replaces": [],
+  "interims": [],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

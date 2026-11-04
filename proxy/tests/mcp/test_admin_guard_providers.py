@@ -21,7 +21,7 @@ def _dashboard_admin():
     return UserContext(sub="admin-sub", email="a@b", name="A", role="admin")
 
 
-@pytest.mark.parametrize("module", ["credentials", "mcps", "community"])
+@pytest.mark.parametrize("module", ["credentials", "bearer_allowlist", "mcps", "community"])
 def test_the_module_guard_is_gone_and_require_admin_is_imported(module):
     import importlib
     mod = importlib.import_module(f"api.mcp.{module}")

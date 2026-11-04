@@ -1,8 +1,10 @@
 // Report flag: the reply footer's action that reports an agent's reply to
 // the admins of this OtoDock (the stores ask for it: Google Play's AI
 // content policy, Apple's guideline 1.2). Sits beside copy and the sound
-// icon under a complete agent reply; filled once this person reported it
-// (for this view of the chat).
+// icon under a complete agent reply, alone under one with no text (tools,
+// a card, images, an app); filled once this person reported it, across a
+// reload (the replies they reported in the chat, read once per chat). A
+// shared copy of a chat has its own flag, which reports through the share.
 
 import { useEffect, useId, useState } from 'react'
 
@@ -11,6 +13,10 @@ import {
   REPLY_REPORT_REASONS,
   fetchRowsPage,
   reportReply,
+  reportSharedReply,
+  reportedBubble,
+  useAddMyReportedReply,
+  useMyReportedReplies,
   type ReplyReportReason,
 } from '../../api/replyReports'
 import type { DbMessageRow } from '../../api/wireEvents'
@@ -53,17 +59,21 @@ async function storedReply(
   return null
 }
 
-function ReportReplyDialog({ chatId, messages, index, onClose, onReported }: {
-  chatId: string
-  messages: DisplayMessage[]
-  index: number
+type ReportBody = { message_id: number; reason: ReplyReportReason; note: string }
+
+function ReportReplyDialog({ known, lookup, sendReport, onClose, onReported }: {
+  /** The reply's stored row when the page has it; else `lookup` finds it. */
+  known: number | null
+  lookup: ((alive: () => boolean) => Promise<number | null>) | null
+  /** Sends the report; the first row of the reply it names. */
+  sendReport: (body: ReportBody) => Promise<number>
   onClose: () => void
-  onReported: () => void
+  onReported: (messageId: number) => void
 }) {
   const id = useId()
-  // The list as it stood when the dialog opened: the stream goes on beside it.
-  const [opened] = useState(messages)
-  const [target, setTarget] = useState<number | null | undefined>(() => storedRowId(messages[index].id) ?? undefined)
+  // The lookup as the dialog opened with it: the page re-renders beside it.
+  const [find] = useState(() => lookup)
+  const [target, setTarget] = useState<number | null | undefined>(() => known ?? (lookup ? undefined : null))
   const [reason, setReason] = useState<ReplyReportReason | null>(null)
   const [note, setNote] = useState('')
   const [lookupError, setLookupError] = useState('')
@@ -73,9 +83,9 @@ function ReportReplyDialog({ chatId, messages, index, onClose, onReported }: {
 
   // A streamed reply's stored row, looked up once as the dialog opens.
   useEffect(() => {
-    if (target !== undefined) return
+    if (target !== undefined || !find) return
     let alive = true
-    storedReply(chatId, opened, index, () => alive)
+    find(() => alive)
       .then((found) => { if (alive) setTarget(found) })
       .catch((e) => {
         if (!alive) return
@@ -83,16 +93,16 @@ function ReportReplyDialog({ chatId, messages, index, onClose, onReported }: {
         setTarget(null)
       })
     return () => { alive = false }
-  }, [chatId, opened, index, target])
+  }, [find, target])
 
   const send = async () => {
     if (!reason || typeof target !== 'number') return
     setSending(true)
     setError('')
     try {
-      await reportReply(chatId, { message_id: target, reason, note: note.trim() })
+      const reported = await sendReport({ message_id: target, reason, note: note.trim() })
       setDone(true)
-      onReported()
+      onReported(reported)
     } catch (e) {
       setError(errorText(e) || NOT_SENT)
     } finally {
@@ -154,30 +164,73 @@ function ReportReplyDialog({ chatId, messages, index, onClose, onReported }: {
   )
 }
 
+function Flag({ reported, onClick }: { reported: boolean; onClick: () => void }) {
+  const label = reported ? 'Reported' : 'Report this reply'
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`p-1 rounded-sm transition-colors ${reported ? 'text-link' : 'text-tertiary hover:text-link'}`}
+    >
+      <svg className="w-3.5 h-3.5" fill={reported ? 'currentColor' : 'none'} stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={FLAG_PATH} />
+      </svg>
+    </button>
+  )
+}
+
 export function ReportReplyButton({ chatId, messages, index }: {
   chatId: string
   messages: DisplayMessage[]
   index: number
 }) {
-  const [open, setOpen] = useState(false)
-  const [reported, setReported] = useState(false)
-  const label = reported ? 'Reported' : 'Report this reply'
+  // The list as it stood when the dialog opened: the stream goes on beside it.
+  const [opened, setOpened] = useState<DisplayMessage[] | null>(null)
+  // A streamed reply has no stored row to find in the chat's set until the
+  // chat reloads: this view remembers its own report.
+  const [reportedHere, setReportedHere] = useState(false)
+  const mine = useMyReportedReplies(chatId)
+  const addMine = useAddMyReportedReply()
+  const reported = reportedHere || reportedBubble(mine.data, messages, index)
+  const known = storedRowId(messages[index].id)
   return (
     <>
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        title={label}
-        aria-label={label}
-        className={`p-1 rounded-sm transition-colors ${reported ? 'text-link' : 'text-tertiary hover:text-link'}`}
-      >
-        <svg className="w-3.5 h-3.5" fill={reported ? 'currentColor' : 'none'} stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={FLAG_PATH} />
-        </svg>
-      </button>
+      <Flag reported={reported} onClick={() => setOpened(messages)} />
+      {opened && (
+        <ReportReplyDialog
+          known={known}
+          lookup={known === null ? (alive) => storedReply(chatId, opened, index, alive) : null}
+          sendReport={(body) => reportReply(chatId, body)}
+          onClose={() => setOpened(null)}
+          onReported={(messageId) => {
+            setReportedHere(true)
+            addMine(chatId, messageId)
+          }}
+        />
+      )}
+    </>
+  )
+}
+
+/** The flag under an agent's reply in a shared copy of a chat: the copy names
+ *  the reply by its row, and the share decides who may report. "Reported"
+ *  lasts for the page's life (the reader may not open the chat itself). */
+export function ReportSharedReplyButton({ shareId, messageId }: { shareId: string; messageId: number }) {
+  const [open, setOpen] = useState(false)
+  const [reported, setReported] = useState(false)
+  return (
+    <>
+      <Flag reported={reported} onClick={() => setOpen(true)} />
       {open && (
-        <ReportReplyDialog chatId={chatId} messages={messages} index={index}
-          onClose={() => setOpen(false)} onReported={() => setReported(true)} />
+        <ReportReplyDialog
+          known={messageId}
+          lookup={null}
+          sendReport={(body) => reportSharedReply(shareId, body)}
+          onClose={() => setOpen(false)}
+          onReported={() => setReported(true)}
+        />
       )}
     </>
   )

@@ -499,7 +499,9 @@ async def hook_app_import(req: HookImportRequest, authorization: str | None = He
         _scoped(ctx, username, f"{layout.scope_workspace(username)}/apps/{slug}")
         out = await app_blueprints.import_folder(
             ctx.agent, username, owner_sub, slug, folder,
-            template_slug=f"bundle:{slug}", tasks=blueprint.get("tasks") or [])
+            template_slug=f"bundle:{slug}", tasks=blueprint.get("tasks") or [],
+            origin=app_blueprints.clean_origin(blueprint) or ("", ""),
+            follows=app_blueprints.clean_source(blueprint))
     except (app_blueprints.BlueprintError, app_deploy.DeployError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:

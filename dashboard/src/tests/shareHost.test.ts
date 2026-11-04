@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, webUrl } from '@/sharehost/host'
+import { attachmentsLine, classify, frameSrc, linkQuery, listPlaceholder, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settingsPlaceholder, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, webUrl } from '@/sharehost/host'
 
 // The external link's host is a smaller AppFrame: a link is a viewer of one
 // page. The pure half is pinned here; the DOM half is exercised on T1.
@@ -10,6 +10,23 @@ const cfg = { token: 'tok', share_id: 's1', kind: 'app' as const, title: 'Ops', 
 const { token: _t, ...served } = cfg
 
 describe('share host', () => {
+  it("counts a person's photos and files for a snapshot bubble", () => {
+    expect(attachmentsLine(undefined)).toBe('')
+    expect(attachmentsLine({ photos: 0, files: 0 })).toBe('')
+    expect(attachmentsLine({ photos: 1, files: 0 })).toBe('1 photo attached')
+    expect(attachmentsLine({ photos: 3, files: 2 })).toBe('3 photos and 2 files attached')
+  })
+
+  it("names the setting behind a settings card's placeholder, never a value", () => {
+    expect(settingsPlaceholder('Wake word')).toBe('A settings card for Wake word. It shows in the chat only.')
+    expect(settingsPlaceholder(undefined)).toBe('A settings card for a setting. It shows in the chat only.')
+  })
+
+  it("names the list behind a list card's placeholder, never a row", () => {
+    expect(listPlaceholder('Your scheduled tasks')).toBe('A list card: Your scheduled tasks. It shows in the chat only.')
+    expect(listPlaceholder(undefined)).toBe('A list card: a list. It shows in the chat only.')
+  })
+
   it('reads its config from the page and the token from the address, and refuses a malformed one', () => {
     expect(readConfig(JSON.stringify(served), '/s/tok')).toEqual(cfg)
     expect(readConfig(JSON.stringify(served), '/s/t%2Fok/')?.token).toBe('t/ok')

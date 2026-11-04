@@ -188,6 +188,19 @@ def set_delegation_targets(agent_name: str, targets: list[str]) -> None:
         conn.commit()
 
 
+def add_manual_delegation_target(agent_name: str, target: str) -> bool:
+    """One manual edge, added without reading the set back (a card's tick
+    beside the config page's whole-set save). True when the row is new."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_delegation_targets (agent_name, target_agent, source) "
+            "VALUES (%s, %s, 'manual') ON CONFLICT DO NOTHING",
+            (agent_name, target),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def replace_department_edges(desired: set[tuple[str, str]]) -> None:
     """Atomically swap ALL department-compiled edges for the desired set.
 
@@ -287,8 +300,13 @@ def create_agent(
     community_template_version: str | None = None,
     default_scope: str = "user",
     collaborative: bool = True,
+    execution_paths: list[str] | None = None,
 ) -> dict:
     """Insert a new agent and return its record.
+
+    ``execution_paths`` is the list of engines the agent may run on besides
+    ``execution_path`` (the API's create passes every registered engine:
+    the switches are an allowlist); None stores none.
 
     ``community_template`` + ``community_template_version`` are set when the
     agent was installed from a community-agents template. NULL for
@@ -308,6 +326,7 @@ def create_agent(
     if default_scope not in ("user", "agent"):
         raise ValueError(f"default_scope must be 'user' or 'agent', got {default_scope!r}")
     now = _now()
+    extras = [p for p in (execution_paths or []) if p and p != execution_path]
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO agents
@@ -315,13 +334,13 @@ def create_agent(
                 default_model, default_effort, created_by,
                 color, description, created_at, updated_at,
                 community_template, community_template_version, default_scope,
-                collaborative)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                collaborative, execution_paths)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (slug, display_name, admin_only,
              execution_path, default_model, default_effort,
              created_by, color, description, now, now,
              community_template, community_template_version, default_scope,
-             collaborative),
+             collaborative, json.dumps(extras) if extras else ""),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM agents WHERE slug = %s", (slug,)).fetchone()
@@ -453,6 +472,7 @@ def update_agent(slug: str, **fields) -> dict | None:
     allowed = {
         "display_name", "admin_only", "execution_path",
         "execution_paths", "default_model", "default_effort",
+        "local_only_engines",
         "color", "description", "execution_target", "default_scope",
         "default_for_new_users_role", "collaborative",
         "default_execution_mode", "department_id", "department_level_id",
@@ -543,6 +563,7 @@ def delete_agent(slug: str) -> bool:
         # MCP + RBAC
         conn.execute("DELETE FROM agent_mcps WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_skills WHERE agent_name = %s", (slug,))
+        conn.execute("DELETE FROM chat_cards WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM user_agents WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM agent_delegation_targets WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_delegation_targets WHERE target_agent = %s", (slug,))
@@ -662,7 +683,9 @@ def reserved_slug_refusal(slug: str) -> str | None:
 
 
 def _get_execution_paths(agent_data: dict | None) -> list[str]:
-    """Compute the full list of execution paths for an agent."""
+    """The engines an agent may run on: the primary first, then the stored
+    extras (the allowlist; a person's session takes its own engine among
+    them, ``services/engines/engine_resolution.py``)."""
     primary = ((agent_data or {}).get("execution_path")
                or DEFAULT_EXECUTION_PATH)
     extra_json = (agent_data or {}).get("execution_paths", "")
@@ -678,3 +701,24 @@ def _get_execution_paths(agent_data: dict | None) -> list[str]:
         if p not in paths:
             paths.append(p)
     return paths
+
+
+
+def _get_local_only_engines(agent_data: dict | None) -> list[str]:
+    """The engines of the allowlist on which the agent runs local models
+    only (``agents.local_only_engines``, a JSON list; a bad value reads as
+    none)."""
+    raw = (agent_data or {}).get("local_only_engines", "")
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item and item not in out:
+            out.append(item)
+    return out

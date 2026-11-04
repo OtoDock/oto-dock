@@ -48,6 +48,11 @@ from .pty_session_base import BasePtySession
 
 logger = logging.getLogger("satellite")
 
+# Why a resume started fresh (``_apply_resume_guard``): the rollout is not on
+# this machine, or it was recorded with another model provider.
+_DEGRADED_MISSING = "missing"
+_DEGRADED_PROVIDER = "provider"
+
 # Fresh-spawn lower bound slack: Codex writes its rollout within ~1 s of spawn; allow
 # clock/race slack so we never miss it but still exclude a sibling chat's older
 # rollout. Mirrors the proxy's codex_rollout_tailer._RESOLVE_MTIME_MARGIN_S.
@@ -359,11 +364,13 @@ class CodexPtySession(BasePtySession):
             # Visible, replay-surviving notice (scrollback-backed) — the user
             # must know why the conversation isn't continuing in the TUI. The
             # full chat history still lives in the platform DB/chat view.
+            why = (b"was recorded with another model provider, so a fresh CLI "
+                   b"session starts" if self._resume_degraded == _DEGRADED_PROVIDER
+                   else b"isn't on this machine \xe2\x80\x94 starting a fresh CLI "
+                        b"session")
             self.pty.inject_output(
-                b"\r\n\x1b[2m\xe2\x9a\xa0 This conversation's Codex history "
-                b"isn't on this machine \xe2\x80\x94 starting a fresh CLI "
-                b"session (chat history is still in the dashboard).\x1b[0m"
-                b"\r\n\r\n"
+                b"\r\n\x1b[2m\xe2\x9a\xa0 This conversation's Codex history " + why
+                + b" (chat history is still in the dashboard).\x1b[0m\r\n\r\n"
             )
 
     # --- transcript forwarding (Codex: discover the rollout) -----------------
@@ -388,18 +395,50 @@ class CodexPtySession(BasePtySession):
         machine or proxy-local (CLI session state is deliberately never
         synced) — and its one-line error drowns in the TUI teardown escapes,
         so the terminal just looks dead. A cold start re-reports the fresh
-        thread id to the proxy; a visible notice is injected post-spawn."""
-        self._resume_degraded = False
-        if self._resume and not self._rollout_on_disk(self._thread_id):
+        thread id to the proxy; a visible notice is injected post-spawn.
+        Codex 0.166 also refuses a thread recorded with another model
+        provider (``modelProviderMismatch``: a chat moved between a local
+        model and OpenAI while no session ran): the same cold start."""
+        self._resume_degraded = ""
+        if not self._resume:
+            return
+        if not self._rollout_on_disk(self._thread_id):
             logger.warning(
                 "codex resume: no rollout for thread %s in %s — starting a "
                 "fresh session instead",
                 self._thread_id,
                 (self._codex_dir / "sessions") if self._codex_dir else "?",
             )
+            self._resume_degraded = _DEGRADED_MISSING
+        else:
+            recorded = self._rollout_provider(self._thread_id)
+            current = "oto_local" if self.config.get("local_model_provider") else "openai"
+            if recorded and recorded != current:
+                logger.warning("codex resume: thread %s was recorded with provider %s, this "
+                               "spawn writes %s; starting a fresh session instead",
+                               self._thread_id, recorded, current)
+                self._resume_degraded = _DEGRADED_PROVIDER
+        if self._resume_degraded:
             self._resume = False
             self._transcript_skip_existing = False
-            self._resume_degraded = True
+
+    def _rollout_provider(self, thread_id: str) -> str:
+        """The model provider the thread's rollout recorded (its first line,
+        ``session_meta``), or "" when it cannot be read."""
+        if not thread_id or self._codex_dir is None:
+            return ""
+        try:
+            paths = glob.glob(str(self._codex_dir / "sessions" / "**" / f"rollout-*-{thread_id}.jsonl"),
+                              recursive=True)
+            if not paths:
+                return ""
+            with open(paths[0], encoding="utf-8", errors="replace") as fh:
+                meta = json.loads(fh.readline() or "{}")
+        except (OSError, ValueError):
+            return ""
+        payload = meta.get("payload") if isinstance(meta, dict) else None
+        provider = payload.get("model_provider") if isinstance(payload, dict) else None
+        return provider if isinstance(provider, str) else ""
 
     def _rollout_on_disk(self, thread_id: str) -> bool:
         """True iff a rollout for ``thread_id`` exists under this CODEX_HOME —

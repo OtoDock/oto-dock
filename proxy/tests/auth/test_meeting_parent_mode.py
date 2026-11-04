@@ -13,7 +13,7 @@ import storage.database as db
 from api.hooks import permission, routing
 from api.hooks.hooks import decide_tool_permission
 from auth.path_policy import SecurityContext
-from core.session import session_events, session_state
+from core.session import engine_prompts, session_events, session_state
 
 PART = "part-mode-1"
 HOST = "host-mode-1"
@@ -107,13 +107,16 @@ async def _first_decision(sid: str, decide, monkeypatch) -> tuple[dict, list]:
     queued: list = []
 
     class _Queue:
-        async def put(self, item):
+        def put_nowait(self, item):
             queued.append(item)
 
     async def _no_answer(request_id, session_id, timeout):
         return False
 
     monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Queue())
+    # Whether a card is raised is the subject, not where it shows: a live
+    # pump reads the queue.
+    monkeypatch.setattr(engine_prompts, "queue_has_reader", lambda queue: True)
     monkeypatch.setattr(permission, "wait_for_permission", _no_answer)
     result = await asyncio.wait_for(
         decide(sid, "Bash", {"command": "touch /workspace/x"}), timeout=10)

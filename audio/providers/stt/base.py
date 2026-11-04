@@ -170,9 +170,10 @@ class STTProvider(ABC):
     # A call's second listen (Deepgram's ``relisten.TurnRelisten``): the
     # phone pipeline turns it on for every call STT; a provider without one
     # keeps these no-ops.
-    def enable_turn_relisten(self) -> None:
+    def enable_turn_relisten(self, *, wide: bool = False) -> None:
         """Listen again, in the background, to a live final that came back
-        with no word over speech (calls and live voice). Default: never."""
+        with no word over speech (calls and live voice); ``wide`` also to a
+        window's stretches no word covers (live voice). Default: never."""
         return
 
     async def complete_turn(self, text: str, bound: float) -> str:

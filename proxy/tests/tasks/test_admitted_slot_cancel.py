@@ -145,7 +145,7 @@ async def test_a_cancel_between_the_config_build_and_the_session_start_gives_the
     from core.session import session_manager, session_state
     from services.remote import remote_status
 
-    cfg = SimpleNamespace(execution_target="local", execution_path="claude-code-cli",
+    cfg = SimpleNamespace(placement_sub=None, execution_target="local", execution_path="claude-code-cli",
                           interactive=False, resume=False, extra_env={}, chat_id="",
                           subscription_id="sub-1")
     starting = asyncio.Event()

@@ -78,6 +78,10 @@ function mockApi(state: unknown, calls: Call[], onState?: () => unknown) {
     if (url.endsWith('/v1/admin/mcps')) return { ok: true, json: async () => MCPS } as Response
     if (url.includes('/update-state')) return { ok: true, json: async () => (onState ? onState() : state) } as Response
     if (url.includes('/check-updates')) return { ok: true, json: async () => state } as Response
+    // The page reads which addresses wait for an Allow once, for every row.
+    if (url.endsWith('/v1/admin/oauth-bearer-allowlist')) {
+      return { ok: true, json: async () => ({ entries: [], pending: [] }) } as Response
+    }
     calls.push({ url, method })
     return { ok: true, json: async () => ({}) } as Response
   })

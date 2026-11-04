@@ -1,6 +1,7 @@
-"""Relay registration mode (hosted event delivery) — effective-mode
-resolution, the register lifecycle (mint/rotate forward secret), and
-delete behavior. Pure unit tests: stores + relay_client monkeypatched.
+"""Relay registration mode (hosted event delivery): effective-mode
+resolution and the create's gating. The relay endpoint's lifecycle is
+``test_relay_events.py``. Pure unit tests: stores + relay_client
+monkeypatched.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ import config
 from services.billing import relay_client
 from services.webhooks import subscription_manager
 from storage.automation import webhook_subscription_store
-from storage.identity import credential_store
 
 _WB = {
     "available": True,
@@ -81,198 +81,7 @@ def test_resolve_effective_registration_mode_unknown_mcp(monkeypatch):
     ) == "manual"
 
 
-# --- register lifecycle ----------------------------------------------------------
-
-def test_relay_register_requires_public_url(monkeypatch):
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
-    with pytest.raises(subscription_manager.SubscriptionError):
-        asyncio.run(
-            subscription_manager._relay_register_events(provider_id="slack"))
-
-
-def test_relay_register_mints_via_rotate_when_no_local_secret(monkeypatch):
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example/")
-    monkeypatch.setattr(credential_store, "get_infra_credentials", lambda slug: {})
-    saved: dict = {}
-    monkeypatch.setattr(
-        credential_store, "set_infra_credentials",
-        lambda slug, creds: saved.update({slug: creds}))
-    calls: dict = {}
-
-    async def fake_register(**kw):
-        calls.update(kw)
-        return {"ok": True, "enabled": True, "forward_secret": "fs-new"}
-
-    monkeypatch.setattr(relay_client, "events_register", fake_register)
-    asyncio.run(subscription_manager._relay_register_events(provider_id="slack"))
-    assert calls["rotate_secret"] is True
-    assert calls["events_url"] == "https://inst.example/v1/webhooks/relay/slack"
-    assert saved[relay_client.EVENTS_FORWARD_SECRET_SLUG] == {
-        relay_client.EVENTS_FORWARD_SECRET_KEY: "fs-new"}
-
-
-def test_relay_register_keeps_existing_local_secret(monkeypatch):
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
-    monkeypatch.setattr(
-        credential_store, "get_infra_credentials",
-        lambda slug: {relay_client.EVENTS_FORWARD_SECRET_KEY: "fs-old"})
-    saved: dict = {}
-    monkeypatch.setattr(
-        credential_store, "set_infra_credentials",
-        lambda slug, creds: saved.update({slug: creds}))
-    calls: dict = {}
-
-    async def fake_register(**kw):
-        calls.update(kw)
-        return {"ok": True, "enabled": True, "forward_secret": None}
-
-    monkeypatch.setattr(relay_client, "events_register", fake_register)
-    asyncio.run(subscription_manager._relay_register_events(provider_id="slack"))
-    assert calls["rotate_secret"] is False
-    assert saved == {}  # nothing rewritten
-
-
-# --- delete behavior -------------------------------------------------------------
-
-def test_delete_relay_row_skips_vendor_and_disables_when_last(monkeypatch):
-    row = {"id": "s1", "delivery_mode": "relay", "provider_id": "slack"}
-    monkeypatch.setattr(
-        webhook_subscription_store, "get_subscription", lambda sid: row)
-    monkeypatch.setattr(
-        webhook_subscription_store, "delete_subscription", lambda sid: True)
-    monkeypatch.setattr(
-        webhook_subscription_store, "list_subscriptions", lambda **kw: [])
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
-
-    async def fail_vendor_delete(r):
-        raise AssertionError("vendor delete must not run for relay rows")
-
-    monkeypatch.setattr(subscription_manager, "_vendor_delete", fail_vendor_delete)
-    reg: dict = {}
-
-    async def fake_register(**kw):
-        reg.update(kw)
-        return {"ok": True, "enabled": False}
-
-    monkeypatch.setattr(relay_client, "events_register", fake_register)
-    ok = asyncio.run(subscription_manager.delete_subscription(
-        subscription_id="s1"))
-    assert ok == (True, True)
-    assert reg["enabled"] is False and reg["provider_id"] == "slack"
-
-
-def test_delete_relay_row_keeps_forwarding_when_others_remain(monkeypatch):
-    row = {"id": "s1", "delivery_mode": "relay", "provider_id": "slack"}
-    monkeypatch.setattr(
-        webhook_subscription_store, "get_subscription", lambda sid: row)
-    monkeypatch.setattr(
-        webhook_subscription_store, "delete_subscription", lambda sid: True)
-    monkeypatch.setattr(
-        webhook_subscription_store, "list_subscriptions",
-        lambda **kw: [{"id": "s2", "delivery_mode": "relay"}])
-
-    async def fail_register(**kw):
-        raise AssertionError("must not disable while relay rows remain")
-
-    monkeypatch.setattr(relay_client, "events_register", fail_register)
-    assert asyncio.run(subscription_manager.delete_subscription(
-        subscription_id="s1")) == (True, True)
-
-
-def test_the_last_relay_subscription_keeps_forwarding_for_a_hosted_app_account(monkeypatch):
-    """OtoDock's hosted GitHub App: an account's installation changes reach
-    its card through the forwarding, with a subscription or without."""
-    from types import SimpleNamespace
-
-    from services.mcp import mcp_registry
-    row = {"id": "s1", "delivery_mode": "relay", "provider_id": "github"}
-    monkeypatch.setattr(webhook_subscription_store, "get_subscription", lambda sid: row)
-    monkeypatch.setattr(webhook_subscription_store, "delete_subscription", lambda sid: True)
-    monkeypatch.setattr(webhook_subscription_store, "list_subscriptions", lambda **kw: [])
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
-    monkeypatch.setattr(mcp_registry, "get_mcps_by_provider",
-                        lambda provider_id: [SimpleNamespace(name="github-mcp")])
-    hosted = {"held": True}
-    asked: list[list[str]] = []
-    monkeypatch.setattr(credential_store, "any_hosted_app_account",
-                        lambda names: (asked.append(list(names)), hosted["held"])[1])
-    reg: list[dict] = []
-
-    async def fake_register(**kw):
-        reg.append(kw)
-        return {"ok": True, "enabled": False}
-
-    monkeypatch.setattr(relay_client, "events_register", fake_register)
-    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (True, True)
-    assert reg == [] and asked == [["github-mcp"]]
-    hosted["held"] = False
-    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (True, True)
-    assert len(reg) == 1 and reg[0]["enabled"] is False and reg[0]["provider_id"] == "github"
-
-
-def test_two_first_registrations_at_once_rotate_the_secret_once(monkeypatch):
-    """A hosted connect beside a subscribe, with no forward secret held:
-    the second registration sees the first one's secret."""
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
-    store: dict = {}
-    monkeypatch.setattr(credential_store, "get_infra_credentials", lambda slug: dict(store.get(slug) or {}))
-    monkeypatch.setattr(credential_store, "set_infra_credentials", lambda slug, creds: store.update({slug: creds}))
-    rotations: list[int] = []
-
-    async def fake_register(**kw):
-        await asyncio.sleep(0)          # the other registration runs here
-        if kw["rotate_secret"]:
-            rotations.append(1)
-            return {"ok": True, "enabled": True, "forward_secret": f"fs-{len(rotations)}"}
-        return {"ok": True, "enabled": True, "forward_secret": None}
-
-    monkeypatch.setattr(relay_client, "events_register", fake_register)
-
-    async def both():
-        await asyncio.gather(*(subscription_manager._relay_register_events(provider_id="github")
-                               for _ in range(2)))
-    asyncio.run(both())
-    asyncio.run(both())                 # a later loop gets a lock of its own
-    assert rotations == [1]
-    assert store[relay_client.EVENTS_FORWARD_SECRET_SLUG] == {relay_client.EVENTS_FORWARD_SECRET_KEY: "fs-1"}
-
-
-def test_a_disable_never_lands_after_a_hosted_registration(monkeypatch):
-    """The last relay subscription goes while a hosted connect registers:
-    the forwarding ends on, whichever came first."""
-    import time
-    from types import SimpleNamespace
-
-    from services.mcp import mcp_registry
-    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
-    monkeypatch.setattr(webhook_subscription_store, "list_subscriptions", lambda **kw: [])
-    monkeypatch.setattr(mcp_registry, "get_mcps_by_provider",
-                        lambda provider_id: [SimpleNamespace(name="github-mcp")])
-    monkeypatch.setattr(credential_store, "get_infra_credentials",
-                        lambda slug: {relay_client.EVENTS_FORWARD_SECRET_KEY: "fs"})
-    held = {"on": False}
-
-    def any_hosted(names):
-        seen = held["on"]
-        time.sleep(0.05)                # the connect writes its account meanwhile
-        return seen
-    monkeypatch.setattr(credential_store, "any_hosted_app_account", any_hosted)
-    calls: list[bool] = []
-
-    async def fake_register(**kw):
-        calls.append(kw["enabled"])
-        return {"ok": True, "enabled": kw["enabled"], "forward_secret": None}
-    monkeypatch.setattr(relay_client, "events_register", fake_register)
-
-    async def scenario():
-        disable = asyncio.create_task(subscription_manager._maybe_disable_relay_events("github"))
-        await asyncio.sleep(0.01)
-        held["on"] = True
-        await subscription_manager._relay_register_events(provider_id="github")
-        await disable
-    asyncio.run(scenario())
-    assert calls == [False, True]
-
+# --- relay rows at the vendor -----------------------------------------------------
 
 def test_vendor_delete_noop_for_relay_rows(monkeypatch):
     def boom(name):
@@ -420,10 +229,11 @@ def _create_notion(monkeypatch, *, uv_kind="verification_token_capture",
         subscription_manager, "_effective_registration_mode",
         lambda **kw: mode)
     if mode == "relay":
-        async def fake_register(**kw):
+        async def fake_register(provider_id):
             return None
+        monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
         monkeypatch.setattr(
-            subscription_manager, "_relay_register_events", fake_register)
+            subscription_manager.relay_events, "sync_provider_locked", fake_register)
 
     def fake_create(**kw):
         created.update(kw)

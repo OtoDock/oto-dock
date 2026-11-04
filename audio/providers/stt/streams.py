@@ -187,10 +187,10 @@ class _Stream:
                           for h in self.heard), self.born_at)
 
 
-def _enable_turn_relisten(provider: STTProvider) -> None:
+def _enable_turn_relisten(provider: STTProvider, wide: bool = False) -> None:
     enable = getattr(provider, "enable_turn_relisten", None)
     if enable is not None:
-        enable()
+        enable(wide=wide)
 
 
 def _relisten_seconds(provider: STTProvider) -> float:
@@ -259,6 +259,7 @@ class LanguageStreams(STTProvider):
         self._tasks: set[asyncio.Task] = set()
         # A call's second listen, on every stream built (``enable_turn_relisten``).
         self._turn_relisten = False
+        self._turn_relisten_wide = False
         # The default stream's provider exists from construction (the VAD
         # reads its padding, the consumer asks it which languages stream); it
         # connects at ``start``.
@@ -275,7 +276,7 @@ class LanguageStreams(STTProvider):
         if self.dictation_mode:
             provider.enable_dictation_mode()
         if self._turn_relisten:
-            _enable_turn_relisten(provider)
+            _enable_turn_relisten(provider, self._turn_relisten_wide)
         stream = _Stream(language, provider)
         provider.on_partial_final = lambda text, s=stream: self._forward_partial(s, text)
         # Only the stream the person sees re-listens a window it answered
@@ -299,10 +300,11 @@ class LanguageStreams(STTProvider):
         for stream in self._streams.values():
             stream.provider.enable_dictation_mode()
 
-    def enable_turn_relisten(self) -> None:
+    def enable_turn_relisten(self, *, wide: bool = False) -> None:
         self._turn_relisten = True
+        self._turn_relisten_wide = wide
         for stream in self._streams.values():
-            _enable_turn_relisten(stream.provider)
+            _enable_turn_relisten(stream.provider, wide)
 
     async def complete_turn(self, text: str, bound: float) -> str:
         """The turn's text is the active stream's: its second listen

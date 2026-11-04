@@ -126,7 +126,7 @@ def test_create_user_topic_writes_file_and_index(client):
     d = _user_mem_dir("acme", "manager")
     assert (d / "preferences.md").exists()
     index = (d / "MEMORY.md").read_text()
-    assert "- preferences.md — Prefers metric units (updated " in index
+    assert "- preferences.md: Prefers metric units (48 B, 1 entry, newest 2026-06-12" in index
     # Per-user context repo got the commit.
     from services.infra import git_writer
     log = git_writer.log(d.parent)
@@ -263,17 +263,236 @@ def test_index_write_denied_via_api(client):
     assert "auto-generated" in r.json()["output"]
 
 
-def test_rename_across_scopes_refused(client):
+def test_rename_from_the_shared_scope_to_a_personal_one_is_refused(client):
     _seed_agent("acme")
     _assign_role("user-manager", "acme", "manager")
     h = _headers("s-11", "acme", "user-manager")
-    _op(client, h, command="create", path="/memories/user/a.md", file_text="x")
+    _op(client, h, command="create", path="/memories/agent/a.md", file_text="# A\n")
+    r = _op(
+        client, h, command="rename", old_path="/memories/agent/a.md",
+        new_path="/memories/user/a.md",
+    )
+    assert r.json()["is_error"] is True
+    assert r.json()["output"].startswith("Error: rename cannot move a topic from the shared scope")
+    assert (_agent_mem_dir("acme") / "a.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Promotion: a personal topic shared through `rename` and through the route
+# ---------------------------------------------------------------------------
+
+def _personal_topic(client, h, name: str = "suppliers.md") -> None:
+    r = _op(
+        client, h, command="create", path=f"/memories/user/{name}",
+        file_text="# Suppliers\nWho ships what.\n\n- Acme ships in two days (2026-10-01)\n",
+    )
+    assert r.json()["is_error"] is False, r.text
+
+
+def _subjects(repo: Path) -> list[str]:
+    from services.infra import git_writer
+    return [e["subject"] for e in git_writer.log(repo)]
+
+
+@pytest.mark.parametrize("role", ["editor", "manager"])
+def test_rename_into_the_shared_scope_promotes_with_two_commits(client, role):
+    _seed_agent("acme")
+    sub = f"user-{role}"
+    _assign_role(sub, "acme", role)
+    h = _headers("s-20", "acme", sub)
+    _personal_topic(client, h)
+    r = _op(
+        client, h, command="rename", old_path="/memories/user/suppliers.md",
+        new_path="/memories/agent/suppliers.md",
+    )
+    assert r.json() == {
+        "output": "Successfully renamed /memories/user/suppliers.md to /memories/agent/suppliers.md",
+        "is_error": False, "warnings": [],
+    }
+    assert (_agent_mem_dir("acme") / "suppliers.md").read_text().startswith("# Suppliers")
+    assert not (_user_mem_dir("acme", role) / "suppliers.md").exists()
+    assert "- suppliers.md: Suppliers (" in (_agent_mem_dir("acme") / "MEMORY.md").read_text()
+    assert "suppliers.md" not in (_user_mem_dir("acme", role) / "MEMORY.md").read_text()
+    assert f"memory: promote (agent scope, by {role})" in _subjects(_agent_mem_dir("acme").parent)
+    assert f"memory: delete (user scope, by {role})" in _subjects(_user_mem_dir("acme", role).parent)
+
+
+def test_a_promotion_may_rename_and_refuses_a_taken_name(client):
+    _seed_agent("acme")
+    _assign_role("user-editor", "acme", "editor")
+    h = _headers("s-21", "acme", "user-editor")
+    _personal_topic(client, h)
+    _op(client, h, command="create", path="/memories/agent/vendors.md", file_text="# V\n")
+    r = _op(
+        client, h, command="rename", old_path="/memories/user/suppliers.md",
+        new_path="/memories/agent/vendors.md",
+    )
+    assert r.json()["is_error"] is True
+    assert "The destination vendors.md already exists" in r.json()["output"]
+    assert (_user_mem_dir("acme", "editor") / "suppliers.md").exists()
+    r = _op(
+        client, h, command="rename", old_path="/memories/user/suppliers.md",
+        new_path="/memories/agent/our-suppliers.md",
+    )
+    assert r.json()["is_error"] is False
+    assert (_agent_mem_dir("acme") / "our-suppliers.md").exists()
+
+
+@pytest.mark.parametrize("role", ["viewer", "contributor"])
+def test_a_promotion_below_the_editor_tier_is_refused(client, role):
+    _seed_agent("acme")
+    sub = f"user-{role}"
+    _assign_role(sub, "acme", role)
+    h = _headers("s-22", "acme", sub)
+    _personal_topic(client, h)
+    r = _op(
+        client, h, command="rename", old_path="/memories/user/suppliers.md",
+        new_path="/memories/agent/suppliers.md",
+    )
+    assert r.json()["is_error"] is True
+    assert r.json()["output"].startswith("agent memory is read-only for your role")
+    assert (_user_mem_dir("acme", role) / "suppliers.md").exists()
+    assert not (_agent_mem_dir("acme") / "suppliers.md").exists()
+
+
+def test_a_session_without_a_user_cannot_promote(client):
+    _seed_agent("acme")
+    h = _headers("s-23", "acme")  # no X-On-Behalf-Of
     r = _op(
         client, h, command="rename", old_path="/memories/user/a.md",
         new_path="/memories/agent/a.md",
     )
     assert r.json()["is_error"] is True
-    assert "across memory scopes" in r.json()["output"]
+    assert "no user owner" in r.json()["output"]
+
+
+def _cookie(sub: str, platform_role: str = "member") -> dict[str, str]:
+    from auth.providers import create_session_jwt
+    return {"Cookie": f"session={create_session_jwt(sub, f'{sub}@test.com', sub, platform_role)}"}
+
+
+def test_the_promote_route_follows_the_persons_role(client):
+    _seed_agent("acme")
+    _assign_role("user-editor", "acme", "editor")
+    _assign_role("user-contributor", "acme", "contributor")
+    for who in ("user-editor", "user-contributor"):
+        _personal_topic(client, _headers(f"s-{who}", "acme", who))
+    r = client.post("/v1/internal/memory/promote",
+                    json={"agent": "acme", "path": "/memories/user/suppliers.md"},
+                    headers=_cookie("user-contributor"))
+    assert (r.status_code, r.json()["detail"]) == (
+        403, "Only editors and managers can share a memory with everyone on this agent. Your topic stays private.",
+    )
+    assert (_user_mem_dir("acme", "contributor") / "suppliers.md").exists()
+    r = client.post("/v1/internal/memory/promote",
+                    json={"agent": "acme", "path": "/memories/user/suppliers.md",
+                          "new_path": "/memories/agent/suppliers.md"},
+                    headers=_cookie("user-editor"))
+    assert r.status_code == 200 and r.json()["is_error"] is False, r.text
+    assert (_agent_mem_dir("acme") / "suppliers.md").exists()
+    assert "memory: promote (agent scope, by editor)" in _subjects(_agent_mem_dir("acme").parent)
+
+
+def test_the_promote_route_refusals(client):
+    _seed_agent("acme")
+    _assign_role("user-editor", "acme", "editor")
+    _personal_topic(client, _headers("s-30", "acme", "user-editor"))
+    editor = _cookie("user-editor")
+    # An unknown agent, a wrong agent on a session token, no user, a path
+    # that is not personal, a shared name outside the shared scope.
+    r = client.post("/v1/internal/memory/promote", json={"agent": "ghost", "path": "/memories/user/a.md"}, headers=editor)
+    assert (r.status_code, r.json()["detail"]) == (404, "This agent no longer exists.")
+    r = client.post("/v1/internal/memory/promote", json=["not", "an", "object"], headers=editor)
+    assert (r.status_code, r.json()["detail"]) == (404, "This agent no longer exists.")
+    _seed_agent("other")
+    r = client.post("/v1/internal/memory/promote", json={"agent": "other", "path": "/memories/user/a.md"},
+                    headers=_headers("s-31", "acme", "user-editor"))
+    assert r.status_code == 403
+    r = client.post("/v1/internal/memory/promote", json={"agent": "acme", "path": "/memories/user/a.md"},
+                    headers=_headers("s-32", "acme"))
+    assert (r.status_code, r.json()["detail"]) == (400, "Only a person signed in can share a memory topic.")
+    r = client.post("/v1/internal/memory/promote", json={"agent": "acme", "path": "/memories/agent/a.md"}, headers=editor)
+    assert r.json() == {"output": "Only a topic under /memories/user/ can be shared.", "is_error": True, "warnings": []}
+    r = client.post("/v1/internal/memory/promote",
+                    json={"agent": "acme", "path": "/memories/user/suppliers.md", "new_path": "/memories/user/b.md"},
+                    headers=editor)
+    assert r.json()["output"] == "A shared topic's new name must be under /memories/agent/."
+    r = client.post("/v1/internal/memory/promote", json={"agent": "acme", "path": "/memories/user/nope.md"}, headers=editor)
+    assert r.json()["is_error"] is True and "does not exist" in r.json()["output"]
+    # An admin promotes on any agent, with no per-agent role (the seeded
+    # admin only needs a username).
+    from storage.pg import get_conn
+    with get_conn() as c:
+        c.execute("UPDATE users SET username='admin' WHERE sub='user-admin'")
+        c.commit()
+    _personal_topic(client, _headers("s-33", "acme", "user-admin"))
+    r = client.post("/v1/internal/memory/promote", json={"agent": "acme", "path": "/memories/user/suppliers.md"},
+                    headers=_admin_cookie())
+    assert r.status_code == 200 and r.json()["is_error"] is False, r.text
+
+
+# ---------------------------------------------------------------------------
+# The settings' ranges, the cap log lines and the nudge reset
+# ---------------------------------------------------------------------------
+
+def test_the_two_caps_are_settings_with_ranges(client):
+    admin = _admin_cookie()
+    r = client.get("/v1/internal/memory/settings", headers=admin)
+    assert (r.json()["topic_grow_cap_bytes"], r.json()["entry_cap_bytes"]) == (32768, 2048)
+    r = client.patch("/v1/internal/memory/settings",
+                     json={"topic_grow_cap_bytes": 40960, "entry_cap_bytes": 4096}, headers=admin)
+    assert (r.json()["topic_grow_cap_bytes"], r.json()["entry_cap_bytes"]) == (40960, 4096)
+    for body, sentence in (
+        ({"topic_grow_cap_bytes": 100}, "The growth cap must be a whole number of bytes from 16,384 to 65,536."),
+        ({"topic_grow_cap_bytes": True}, "The growth cap must be a whole number of bytes from 16,384 to 65,536."),
+        ({"entry_cap_bytes": 70000}, "The entry cap must be a whole number of bytes from 256 to 65,536."),
+        ({"inline_budget_bytes": "big"}, "The inline budget must be a whole number of bytes, at least 1."),
+        ({"inline_budget_bytes": 0}, "The inline budget must be a whole number of bytes, at least 1."),
+        ({"nudge_turns": 10**10}, "The turns before a nudge must be a whole number."),
+        ({"nudge_turns": -1}, "The turns before a nudge must be a whole number."),
+    ):
+        r = client.patch("/v1/internal/memory/settings", json=body, headers=admin)
+        assert (r.status_code, r.json()["detail"]) == (400, sentence), body
+    r = client.get("/v1/internal/memory/settings", headers=admin)
+    assert r.json()["topic_grow_cap_bytes"] == 40960
+
+
+def test_a_cap_refusal_and_a_size_warning_log_at_info_the_reminder_does_not(client, caplog):
+    import logging
+    _seed_agent("acme")
+    _assign_role("user-manager", "acme", "manager")
+    h = _headers("s-40", "acme", "user-manager")
+    lines = "# Big\n" + "- fact (2026-10-01)\n" * 1000
+    with caplog.at_level(logging.INFO, logger="otodock.memory-api"):
+        r = _op(client, h, command="create", path="/memories/agent/big.md", file_text=lines)
+        assert r.json()["is_error"] is False and r.json()["warnings"]
+        r = _op(client, h, command="insert", path="/memories/agent/big.md",
+                insert_line=1, insert_text="- " + "x" * 3000)
+        assert r.json()["is_error"] is True
+        r = _op(client, h, command="create", path="/memories/agent/small.md", file_text="# Small\n")
+        r = _op(client, h, command="insert", path="/memories/agent/small.md",
+                insert_line=1, insert_text="- undated line")
+        assert r.json()["warnings"] == ["Date this entry (YYYY-MM-DD) so its age stays visible."]
+    texts = [rec.getMessage() for rec in caplog.records if rec.name == "otodock.memory-api"]
+    assert any(t.startswith("memory: create on big.md (agent acme, agent scope) left it at ") for t in texts)
+    assert any(t.startswith("memory: insert on big.md refused (agent acme, agent scope): Error: this edit adds") for t in texts)
+    assert not any("small.md" in t for t in texts)
+
+
+def test_a_landed_write_resets_the_nudge_a_view_and_a_refused_write_do_not(client):
+    from services.memory import memory_nudge
+    _seed_agent("acme")
+    _assign_role("user-manager", "acme", "manager")
+    h = _headers("s-nudge-api", "acme", "user-manager")
+    memory_nudge._counters["s-nudge-api"] = 4
+    _op(client, h, command="view", path="/memories")
+    assert memory_nudge._counters["s-nudge-api"] == 4
+    r = _op(client, h, command="create", path="/memories/agent/a.md", file_text="x" * 70_000)
+    assert r.json()["is_error"] is True
+    assert memory_nudge._counters["s-nudge-api"] == 4
+    _op(client, h, command="create", path="/memories/agent/a.md", file_text="# A\n")
+    assert memory_nudge._counters["s-nudge-api"] == 0
+    memory_nudge._counters.pop("s-nudge-api", None)
 
 
 # ---------------------------------------------------------------------------
@@ -608,3 +827,104 @@ def test_git_history_refusals_name_no_identifier(temp_db):
     assert refused("user", "acme", None) == (400, "Choose whose history to show.")
     assert refused("user", "acme", "sub-ghost-7") == (404, "That person's account no longer exists.")
     assert refused("bogus", "acme", None) == (400, "That history does not exist.")
+
+
+def test_a_promotion_is_refused_where_the_agent_has_one_scope(client):
+    from storage.agents import agent_store
+    if not agent_store.agent_exists("solo"):
+        agent_store.create_agent("solo", "Solo", default_scope="user", collaborative=False)
+    _assign_role("user-editor", "solo", "editor")
+    h = _headers("s-50", "solo", "user-editor")
+    _personal_topic(client, h)
+    r = _op(client, h, command="rename", old_path="/memories/user/suppliers.md",
+            new_path="/memories/agent/suppliers.md")
+    assert r.json()["is_error"] is True
+    # A Personal-only agent has no shared scope: the promotion refuses it.
+    assert r.json()["output"] == (
+        "Error: the agent memory scope is not available on this agent, so nothing can be promoted."
+    )
+
+
+def test_a_promotion_that_cannot_move_the_file_answers_a_sentence(client, monkeypatch):
+    from services.memory import memory_file
+    _seed_agent("acme")
+    _assign_role("user-editor", "acme", "editor")
+    h = _headers("s-51", "acme", "user-editor")
+    _personal_topic(client, h)
+
+    def boom(*_a, **_kw):
+        raise OSError("quota")
+    monkeypatch.setattr(memory_file, "op_promote", boom)
+    r = _op(client, h, command="rename", old_path="/memories/user/suppliers.md",
+            new_path="/memories/agent/suppliers.md")
+    assert r.json() == {"output": "Error: suppliers.md could not be moved. Try again.",
+                        "is_error": True, "warnings": []}
+
+
+def test_a_promotion_resets_the_nudge_and_refuses_a_bare_scope_as_new_path(client):
+    from services.memory import memory_nudge
+    _seed_agent("acme")
+    _assign_role("user-editor", "acme", "editor")
+    h = _headers("s-52", "acme", "user-editor")
+    _personal_topic(client, h)
+    r = _op(client, h, command="rename", old_path="/memories/user/suppliers.md",
+            new_path="/memories/agent/")
+    assert r.json()["output"] == "new_path must name a topic under /memories/agent/ or /memories/user/."
+    memory_nudge._counters["s-52"] = 6
+    r = _op(client, h, command="rename", old_path="/memories/user/suppliers.md",
+            new_path="/memories/agent/suppliers.md")
+    assert r.json()["is_error"] is False
+    assert memory_nudge._counters["s-52"] == 0
+    memory_nudge._counters.pop("s-52", None)
+
+
+def test_a_promotion_of_a_hand_written_topic_still_commits_the_persons_index(client):
+    """A topic saved through the Files UI was never tracked in the person's
+    repo: the promotion commits the index change there and skips the
+    untracked deletion instead of failing the whole commit."""
+    _seed_agent("acme")
+    _assign_role("user-editor", "acme", "editor")
+    h = _headers("s-60", "acme", "user-editor")
+    _op(client, h, command="create", path="/memories/user/first.md", file_text="# First\n")
+    root = _user_mem_dir("acme", "editor")
+    (root / "by-hand.md").write_text("# By hand\n- noted (2026-10-01)\n")
+    _op(client, h, command="view", path="/memories")  # heals the index: by-hand.md listed
+    assert "by-hand.md" in (root / "MEMORY.md").read_text()
+    r = _op(client, h, command="rename", old_path="/memories/user/by-hand.md",
+            new_path="/memories/agent/by-hand.md")
+    assert r.json()["is_error"] is False, r.text
+    assert not (root / "by-hand.md").exists() and (_agent_mem_dir("acme") / "by-hand.md").exists()
+    # The person's repo commits the index change; the untracked file's
+    # removal is not a change git can record.
+    assert "memory: delete (user scope, by editor)" in _subjects(root.parent)
+    assert "by-hand.md" not in (root / "MEMORY.md").read_text()
+    assert "memory: promote (agent scope, by editor)" in _subjects(_agent_mem_dir("acme").parent)
+
+
+# ---------------------------------------------------------------------------
+# promote() validates its own input, whoever calls it
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rel,dst,words", [
+    ("../x.md", None, "invalid segment"),
+    ("MEMORY.md", None, "auto-generated"),
+    (".memlock", None, "invalid segment"),
+    ("x.exe", None, "unsupported extension"),
+    ("x.md", "y.exe", "unsupported extension"),
+    ("x.md", "folder", "no extension"),
+    ("", None, "names one topic file"),
+])
+def test_promote_validates_its_own_paths(temp_db, rel, dst, words):
+    from services.memory import memory_promote
+    from services.memory.memory_file import MemoryOpError
+    _seed_agent("acme")
+    with pytest.raises(MemoryOpError, match=words):
+        asyncio.run(memory_promote.promote("acme", "editor", rel, role="editor", dst_rel=dst))
+
+
+def test_promote_refuses_a_missing_person(temp_db):
+    from services.memory import memory_promote
+    from services.memory.memory_file import MemoryOpError
+    _seed_agent("acme")
+    with pytest.raises(MemoryOpError, match="person's own memory scope"):
+        asyncio.run(memory_promote.promote("acme", "", "x.md", role="editor"))

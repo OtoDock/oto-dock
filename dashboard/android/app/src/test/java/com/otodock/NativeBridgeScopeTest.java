@@ -26,7 +26,8 @@ public class NativeBridgeScopeTest {
             "flushCookies", "dashboardReady", "firstScreen", "setAuthInProgress", "setSwitchBusy",
             "openAuthBrowser", "saveImageFromBase64", "getInstallations", "setFavorite",
             "renameInstallation", "switchInstallation", "switchToInstall", "openAddInstallation",
-            "removeInstallation", "disconnectServer", "openPrivacyPolicy", "foldNote"));
+            "removeInstallation", "disconnectServer", "openPrivacyPolicy", "foldNote",
+            "getBatteryAdvice", "openBatterySettings", "requestStoreReview"));
 
     private static final Set<String> SETUP_METHODS = new HashSet<>(Arrays.asList(
             "addInstallation", "switchFromSetup", "cancelAddInstallation",
@@ -109,6 +110,22 @@ public class NativeBridgeScopeTest {
         assertEquals(new TreeSet<>(CHANNEL_METHODS), found);
     }
 
+    /** The page asks for a review sheet and passes nothing to the store; the
+     *  app answers true only for a build Play installed and can show it in. */
+    @Test
+    public void aStoreReviewTakesNothingFromThePageAndOnlyPlaysBuildsAnswerTrue() {
+        String dispatch = SourceText.body(main, "void dispatchNative(");
+        assertTrue(dispatch.contains("case \"requestStoreReview\": requestStoreReview(reply, id); break;"));
+        String review = SourceText.body(main, "private void requestStoreReview(");
+        assertTrue(review.contains("OneTimeOffers.reviewDue("));
+        assertTrue(review.contains("if (!debuggable && !installedByPlay())"));
+        assertTrue(review.contains("new FakeReviewManager(this)"));
+        assertTrue("a debuggable build records no ask in the page", review.contains("answer.accept(!debuggable);"));
+        assertTrue("no late launch", review.indexOf("if (answered.get()) return;")
+                < review.indexOf("manager.launchReviewFlow("));
+        assertTrue(SourceText.body(main, "private boolean installedByPlay(").contains("\"com.android.vending\".equals(installer)"));
+    }
+
     @Test
     public void aSaveBelowApi29WaitsForTheStoragePermission() {
         String save = SourceText.body(main, "private void saveImageFromBase64(");
@@ -145,6 +162,17 @@ public class NativeBridgeScopeTest {
                 dispatch.contains("case \"openPrivacyPolicy\": openPrivacyPolicyInBrowser(); break;"));
         String setup = SourceText.body(SourceText.body(main, "class SetupBridge"), "public void openPrivacyPolicy(");
         assertTrue(setup.contains("openPrivacyPolicyInBrowser();"));
+    }
+
+    @Test
+    public void theBatteryRowOpensOnlyThisAppsSettings() {
+        String open = SourceText.body(main, "private void openBatterySettings(");
+        assertTrue(open.contains("startActivity(appDetailsSettings())"));
+        assertTrue(SourceText.body(main, "private Intent appDetailsSettings(")
+                .contains("Uri.parse(\"package:\" + getPackageName())"));
+        String dispatch = SourceText.body(main, "void dispatchNative(");
+        assertTrue("the channel passes no target",
+                dispatch.contains("case \"openBatterySettings\": openBatterySettings(); break;"));
     }
 
     @Test

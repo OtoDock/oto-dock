@@ -11,6 +11,8 @@ import {
   useDeleteSubscription,
   useUpdateModel,
   useDeleteModel,
+  loginEndingChip,
+  loginEndsIn,
   type Subscription,
   type LayerModel,
 } from '../../api/executionLayers'
@@ -28,7 +30,7 @@ import { ENGINE_SUBSCRIPTION_STATUS, type EngineSubscriptionStatus } from '../..
 import { useDialogs } from '../../components/ui/dialogs'
 import { toastError } from '../../lib/http/apiJson'
 import Button from '../../components/ui/Button'
-import { CARD_BORDERED, FIELD, FIELD_BORDER, FIELD_COMPACT } from '../../components/ui/classes'
+import { CARD_BORDERED, FIELD, FIELD_BORDER, FIELD_COMPACT, HOVER_REVEAL_FADE } from '../../components/ui/classes'
 
 const AUTH_TYPE_LABELS: Record<string, string> = {
   api_key: 'API Key',
@@ -70,6 +72,15 @@ export function SubscriptionRow({
   // platform infra (owner_sub=''); other admins' accounts are read-only.
   const ownerless = !sub.owner_sub
   const manageable = sub.is_mine || ownerless
+  // A login that ends inside the notice's window. The connect exchange
+  // renews only a row its caller owns, so the hint names who can renew it.
+  const ending = loginEndsIn(sub)
+  const endingLabel = ending ? loginEndingChip(ending) : ''
+  const renewHint = ownerless
+    ? 'Nobody owns this account, so it cannot be renewed in place. Connect it again with Connect Account above, then remove this row.'
+    : sub.is_mine
+      ? 'To renew it, press Connect Account above and sign in as the same account.'
+      : 'Its owner renews it by signing in to the same account again.'
 
   return (
     <div className="flex flex-wrap items-center gap-2 sm:gap-3 py-2 px-3 rounded-card hover:bg-surface-hover group">
@@ -80,6 +91,12 @@ export function SubscriptionRow({
             {sub.label || sub.oauth_email || `${sub.provider} ${AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}`}
           </span>
           <Badge variant={STATUS_VARIANT[sub.status] || 'neutral'}>{sub.status}</Badge>
+          {endingLabel && (
+            <span className="inline-flex items-center">
+              <Badge variant="warning">{endingLabel}</Badge>
+              <InfoTip label={endingLabel}>{renewHint}</InfoTip>
+            </span>
+          )}
           <Badge>{AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}</Badge>
           {sub.provider !== vendorId && <Badge variant="info">{sub.provider}</Badge>}
         </div>
@@ -135,7 +152,7 @@ export function SubscriptionRow({
         {onDiscover && sub.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE && sub.auth_type !== 'oauth' && (
           <button
             onClick={() => onDiscover(sub)}
-            className="text-xs text-link hover:text-link-hover transition-colors sm:opacity-0 sm:group-hover:opacity-100"
+            className={`text-xs text-link hover:text-link-hover transition-colors ${HOVER_REVEAL_FADE}`}
             title="Discover available models from this provider"
           >
             Discover
@@ -167,7 +184,7 @@ export function SubscriptionRow({
                 }
               }
             }}
-            className="text-xs text-status-danger-fg hover:underline sm:opacity-0 sm:group-hover:opacity-100"
+            className={`text-xs text-status-danger-fg hover:underline ${HOVER_REVEAL_FADE}`}
           >
             Remove
           </button>
@@ -267,7 +284,7 @@ export function ModelRow({ model, layer, pricingEditable: enginePricesModels, xh
         {(pricingEditable || tierEditable) && (
           <button
             onClick={() => setExpanded(!expanded)}
-            className="text-xs text-secondary hover:text-link transition-colors opacity-0 group-hover:opacity-100"
+            className={`text-xs text-secondary hover:text-link transition-colors ${expanded ? '' : HOVER_REVEAL_FADE}`}
             title={pricingEditable ? 'Edit pricing, context and tier' : 'Edit tier'}
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -292,7 +309,7 @@ export function ModelRow({ model, layer, pricingEditable: enginePricesModels, xh
                 deleteMut.mutateAsync({ layer, id: model.id }).catch(toastError('The model was not removed'))
               }
             }}
-            className="text-xs text-status-danger-fg hover:underline opacity-0 group-hover:opacity-100"
+            className={`text-xs text-status-danger-fg hover:underline ${HOVER_REVEAL_FADE}`}
           >
             Remove
           </button>

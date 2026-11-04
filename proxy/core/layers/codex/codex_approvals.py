@@ -67,9 +67,9 @@ APPROVAL_METHODS = _EXEC_APPROVALS | _PATCH_APPROVALS | {_ESCALATION}
 DecideFn = Callable[[str, dict], Awaitable[dict]]
 
 # A question call: (questions) -> the answers MAP {<question_id>: {"answers": [str, ...]}}.
-# Surfaces the codex ``request_user_input`` questions to the dashboard, blocks for
-# the human answer, and returns it keyed by the VERBATIM question id. ``None`` (task
-# runs / not wired) ⇒ the bridge declines with empty answers.
+# Shows the codex ``request_user_input`` questions in the chat as a card and answers
+# at once, keyed by the VERBATIM question id (the person's next message is the real
+# answer). ``None`` (task runs / not wired) ⇒ the bridge declines with empty answers.
 AskFn = Callable[[list], Awaitable[dict]]
 
 
@@ -280,10 +280,11 @@ def approvals_reviewer(permission_mode: str) -> str:
 def tui_reviewer_flags(permission_mode: str) -> list[str]:
     """The Codex terminal's reviewer switch for a platform mode: Auto starts
     it with Codex's own reviewer (its ``-a on-request`` requests go to it);
-    every other mode keeps the terminal's own prompt."""
-    if permission_mode != AUTO_REVIEW_MODE:
-        return []
-    return ["-c", f'approvals_reviewer="{REVIEWER_AUTO}"']
+    every other mode names the terminal's own prompt, because a resumed
+    thread otherwise keeps the reviewer it was saved with
+    (``tui/src/resume_permissions.rs``): a chat moved out of Auto would
+    resume with Codex's reviewer still deciding."""
+    return ["-c", f'approvals_reviewer="{approvals_reviewer(permission_mode)}"']
 
 
 def build_sandbox_policy(sandbox_mode: str, writable_root: str = "") -> dict:
@@ -355,12 +356,14 @@ async def _handle_request_user_input(params: dict, ask: AskFn | None, log) -> di
     """Answer ``item/tool/requestUserInput`` (the AskUserQuestion analogue).
 
     Codex holds the turn OPEN on this server→client request (core waits
-    indefinitely — no server timeout) until we answer. With ``ask`` wired we
-    surface the questions to the dashboard, block for the human answer, and
-    return it keyed by the VERBATIM question id:
-    ``{"answers": {<id>: {"answers": [<label|free-text>, ...]}}}`` (multi-value
-    + free-text accepted, verified live). Without ``ask`` (autonomous task runs,
-    or an old satellite) we decline with empty answers so the turn continues.
+    indefinitely — no server timeout) until we answer. It arrives only when
+    the PreToolUse hook did not see the call (the hook denies a headless
+    question). With ``ask`` wired the authority shows the card and answers at
+    once, keyed by the VERBATIM question id:
+    ``{"answers": {<id>: {"answers": [<text>, ...]}}}``, so the turn ends and
+    the person's next message is the answer. Without ``ask`` (autonomous task
+    runs, or an old satellite) we decline with empty answers so the turn
+    continues.
     """
     questions = params.get("questions")
     if ask is None or not isinstance(questions, list) or not questions:
@@ -406,14 +409,14 @@ def make_server_request_handler(
     translation + response shaping either way; only *who answers* differs.
 
     ``ask_question`` (optional) is the analogous authority for
-    ``request_user_input`` questions — surface + block for the human answer. When
-    omitted (autonomous task runs, or an old satellite) questions decline empty.
+    ``request_user_input`` questions — the card, answered at once. When omitted
+    (autonomous task runs, or an old satellite) questions decline empty.
     """
     async def handler(method: str, params: dict) -> dict:
         # MCP tool calls are gated by an elicitation, not an approval method.
         if method == "mcpServer/elicitation/request":
             return await _handle_mcp_elicitation(params, decide, log)
-        # request_user_input (AskUserQuestion analogue) — held open until answered.
+        # request_user_input (AskUserQuestion analogue): the card, answered at once.
         if method == "item/tool/requestUserInput":
             return await _handle_request_user_input(params, ask_question, log)
         if method in APPROVAL_METHODS:

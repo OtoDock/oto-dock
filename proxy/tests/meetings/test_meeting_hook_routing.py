@@ -150,7 +150,7 @@ def test_subagent_stop_resolves_to_parent_chat(meeting_participant, temp_db):
         "active_agents": [{"tool_use_id": "tu-ag1", "active": True}],
     }
     with patch("api.hooks.lifecycle.verify_session_match_async", new_callable=AsyncMock), \
-         patch("api.hooks.lifecycle.push_pump_event", return_value=True) as push:
+         patch("core.session.session_state.push_pump_event", return_value=True) as push:
         resp = client.post(
             "/v1/hooks/subagent",
             json={"session_id": meeting_participant, "agent_id": "ag1"},

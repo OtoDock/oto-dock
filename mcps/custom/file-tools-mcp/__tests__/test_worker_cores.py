@@ -6,6 +6,7 @@ import-safety (conftest's inline mode is delenv'd here). Wrapper behavior
 """
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -28,7 +29,7 @@ async def _async_ident(p, writing=False, **kw):
 @pytest.fixture(autouse=True)
 def _bypass_platform(monkeypatch):
     """Identity path resolution (both namespaces — handlers resolve via
-    their module import, `_resolve_or_mark` via shared's) + swallowed
+    their module import, the batch writers via shared's) + swallowed
     preview pushes."""
     monkeypatch.setattr(pdf_mod, "_resolve_path", _async_ident)
     monkeypatch.setattr(shared, "_resolve_path", _async_ident)
@@ -39,6 +40,25 @@ def _bypass_platform(monkeypatch):
 
     monkeypatch.setattr(pdf_mod, "_push_preview", _noop_preview)
     monkeypatch.setattr(pdf_mod, "_push_image_preview", _noop_preview)
+
+
+_MCP_DIR = Path(__file__).resolve().parent.parent
+
+
+def _bypass_everywhere(monkeypatch):
+    """Identity resolution and silent previews in every loaded module of the
+    folder: a writer calls them through its own import or through shared."""
+    async def _noop(*a, **kw):
+        pass
+
+    for mod in list(sys.modules.values()):
+        if Path(getattr(mod, "__file__", "") or "/").resolve().parent != _MCP_DIR:
+            continue
+        if hasattr(mod, "_resolve_path"):
+            monkeypatch.setattr(mod, "_resolve_path", _async_ident)
+        for name in ("_push_preview", "_push_image_preview", "_notify_file_written"):
+            if hasattr(mod, name):
+                monkeypatch.setattr(mod, name, _noop)
 
 
 @pytest.fixture()
@@ -85,11 +105,15 @@ def test_spawn_excel_prepare_core(tmp_path, spawn):
     wb.active.title = "Alpha"
     wb.create_sheet("Beta")
     wb.save(str(src))
-    temp_path, names = asyncio.run(isolation.run_parse(
-        pdf_mod._excel_prepare_for_screenshot, str(src), str(tmp_path)))
+    from formats.pdf.screenshot import select_sheet
+    from formats.xlsx.screenshot import prepare_for_screenshot
+
+    work = tmp_path / "work"
+    work.mkdir()
+    temp_path, names = asyncio.run(isolation.run_parse(prepare_for_screenshot, str(src), str(work)))
     assert Path(temp_path).exists()
     assert names == ["Alpha", "Beta"]
-    assert pdf_mod._sheet_index_from_names(names, "Beta") == 1
+    assert select_sheet(temp_path, "Beta") == (1, ["Alpha", "Beta"])
 
 
 def test_spawn_pdf_to_images_core(tmp_path, spawn):
@@ -126,42 +150,40 @@ def test_spawn_temp_pdf_core(tmp_path, spawn):
     assert out.read_bytes()[:5] == b"%PDF-"
 
 
-def test_spawn_write_xlsx_core(tmp_path, spawn):
-    import excel as excel_mod
-    out = tmp_path / "book.xlsx"
-    msg = asyncio.run(isolation.run_parse(
-        excel_mod._write_xlsx_core, str(out), [], 0, True))
-    assert "0 operations applied" in msg
-    assert out.exists()
+@pytest.mark.parametrize("tool, name, library", [
+    ("write_xlsx", "book.xlsx", "openpyxl"),
+    ("write_docx", "doc.docx", "docx"),
+    ("write_pptx", "deck.pptx", "pptx"),
+])
+def test_spawn_write_core_through_its_handler(tmp_path, spawn, monkeypatch, tool, name, library):
+    """A writer's handler with no operations and create_new runs its core in
+    a real child and creates the file; the first result line keeps its
+    frozen form."""
+    pytest.importorskip(library)
+    import importlib
 
+    import server
 
-def test_spawn_write_docx_core(tmp_path, spawn):
-    pytest.importorskip("docx")
-    import word as word_mod
-    out = tmp_path / "doc.docx"
-    msg = asyncio.run(isolation.run_parse(
-        word_mod._write_docx_core, str(out), [], 0, True))
-    assert "0 operations applied" in msg
-    assert out.exists()
-
-
-def test_spawn_write_pptx_core(tmp_path, spawn):
-    pytest.importorskip("pptx")
-    import powerpoint as pptx_mod
-    out = tmp_path / "deck.pptx"
-    msg = asyncio.run(isolation.run_parse(
-        pptx_mod._write_pptx_core, str(out), [], 0, True))
-    assert "0 operations applied" in msg
+    module, function = server.HANDLER_TARGETS[tool]
+    handler = getattr(importlib.import_module(module), function)
+    _bypass_everywhere(monkeypatch)
+    out = tmp_path / name
+    msg = asyncio.run(handler({"path": str(out), "operations": [], "create_new": True}))
+    assert re.match(r"^\w+ saved: .* \(0 operations applied", msg), msg
     assert out.exists()
 
 
 def test_spawn_edit_pdf_core(tmp_path, spawn):
     src = tmp_path / "doc.pdf"
     _make_pdf(src)
-    msg = asyncio.run(isolation.run_parse(
-        pdf_mod._edit_pdf_core, str(src),
-        [{"type": "rotate_page", "pages": "all", "degrees": 90}], 0))
-    assert "1 operations applied" in msg
+    from batch import WriteCall
+
+    work = tmp_path / "work"
+    work.mkdir()
+    call = WriteCall(path=str(src), ops=[(0, {"op": "rotate_page", "pages": "all", "degrees": 90})],
+                     work_dir=str(work), original=None)
+    report = asyncio.run(isolation.run_parse(pdf_mod._edit.edit_pdf_core, call))
+    assert report.saved and "1 operations applied" in report.text
     doc = fitz.open(str(src))
     assert doc[0].rotation == 90
     doc.close()
@@ -207,12 +229,13 @@ def test_edit_pdf_per_op_containment(tmp_path, monkeypatch):
     _make_pdf(src)
     msg = asyncio.run(pdf_mod.handle_edit_pdf({
         "path": str(src),
+        "best_effort": True,
         "operations": [
             {"type": "merge", "files": ["/missing/nope.pdf"]},
             {"type": "rotate_page", "pages": "all", "degrees": 90},
         ],
     }))
-    assert "Op #0 merge" in msg and "Cannot resolve" in msg
+    assert re.search(r"[Oo]p #0 merge", msg) and "Cannot resolve" in msg
     doc = fitz.open(str(src))
     assert doc[0].rotation == 90
     doc.close()
@@ -249,6 +272,7 @@ def test_edit_pdf_ocr_runs_in_parent_not_worker(tmp_path, monkeypatch):
     async def _no_spawn(*a, **kw):
         raise AssertionError("run_parse must not be called for ocr op sets")
 
+    monkeypatch.setattr(isolation, "run_parse", _no_spawn)
     monkeypatch.setattr(pdf_mod, "run_parse", _no_spawn)
     src = tmp_path / "doc.pdf"
     _make_pdf(src)
@@ -256,6 +280,6 @@ def test_edit_pdf_ocr_runs_in_parent_not_worker(tmp_path, monkeypatch):
         "path": str(src),
         "operations": [{"action": "ocr", "pages": "1"}],
     }))
-    # tesseract may be missing on dev boxes — the op may warn, but the call
-    # must complete through the in-parent path and save.
-    assert "PDF saved" in msg
+    # Tesseract may be missing on a dev box: the call still completes through
+    # the in-parent path, saved or with the OCR failure named.
+    assert msg.startswith("PDF saved") or "OCR failed" in msg

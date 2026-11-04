@@ -178,7 +178,7 @@ def token_source(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         cr, "_bound_token_source",
-        lambda mcp, pid, *, user_sub, task_scope, agent_name: (
+        lambda mcp, pid, *, user_sub, task_scope, agent_name, **_kw: (
             token_dir, "alice@gmail.com", "alice"
         ),
     )

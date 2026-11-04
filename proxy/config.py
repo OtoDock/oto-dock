@@ -53,6 +53,7 @@ from configuration.models import (
     model_catalog_sort_key as model_catalog_sort_key,
     model_supports_reasoning as model_supports_reasoning,
     model_supports_server_tools as model_supports_server_tools,
+    ordered_layer_models as ordered_layer_models,
     price_usage as price_usage,
     resolve_agent_model as resolve_agent_model,
     resolve_layer_default_model as resolve_layer_default_model,
@@ -1678,6 +1679,26 @@ COLLABORA_SERVICE_ROOT = _cfg("COLLABORA_SERVICE_ROOT", _default_service_root())
 # ignored in subdomain / central-cloud modes where the proxy doesn't intercept
 # /collabora/* at all.
 COLLABORA_BACKEND_URL = _cfg("COLLABORA_BACKEND_URL", "http://localhost:9981")
+
+
+def collabora_bind_ip_for(value: str) -> str:
+    """The host address a bare-metal install publishes Collabora's port 9981
+    on: an IP address as given, else loopback. Only the proxy on this host
+    needs that port; a reverse proxy on another host (subdomain mode) needs
+    0.0.0.0 or this host's LAN address."""
+    import ipaddress
+
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return "127.0.0.1"
+
+
+_collabora_bind_raw = _cfg("COLLABORA_BIND_IP", "")
+COLLABORA_BIND_IP = collabora_bind_ip_for(_collabora_bind_raw)
+if _collabora_bind_raw.strip() and COLLABORA_BIND_IP != _collabora_bind_raw.strip():
+    _boot_note(f"WARNING: COLLABORA_BIND_IP={_collabora_bind_raw!r} is not an IP address: the document "
+               "editor's port 9981 stays on 127.0.0.1")
 
 # Google Workspace OAuth
 GOOGLE_OAUTH_CLIENT_ID = _cfg("GOOGLE_OAUTH_CLIENT_ID", "")

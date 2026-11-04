@@ -2,8 +2,10 @@
  * The chat-routed queue frames: every socket of the chat's audience gets
  * them, so a chip lands in its chat's slice whichever chat this view shows,
  * the page's callbacks and the socket's own turn state move only for the
- * viewed chat, a clear removes only its listed chips, and the author's
- * returned copy goes back to the composer of the chat it was typed into.
+ * viewed chat, a clear removes only its listed chips (a card's answer among
+ * them has its card read again, since the card opened again), and the
+ * author's returned copy goes back to the composer of the chat it was typed
+ * into.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
@@ -22,7 +24,7 @@ function openSocket(viewedChatId: string, extra: Record<string, unknown> = {}) {
   act(() => { hook.result.current.connect() })
   const ws = FakeWebSocket.instances[0]
   act(() => { ws.onopen?.() })
-  return { hook, ws, cb }
+  return { hook, ws, cb, qc }
 }
 
 function frame(ws: FakeWebSocket, obj: Record<string, unknown>) {
@@ -80,6 +82,19 @@ describe('the chat-routed queue frames', () => {
     }
     frame(ws, { type: 'queue_cleared', queue_ids: ['mine'], reason: 'cancel', chat_id: 'chat-1' })
     expect(chips('chat-1').map((m) => m.queueId)).toEqual(['theirs'])
+  })
+
+  it("a cleared card answer has its card read again, and a typed chip's clear does not", () => {
+    const { ws, qc } = openSocket('chat-1')
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    frame(ws, { type: 'queued', index: 0, queue_id: 'q-card', text: 'Yes.', author_sub: 'u', chat_id: 'chat-1',
+                card: { card_id: 'card-1', button: 'yes' } })
+    frame(ws, { type: 'queued', index: 1, queue_id: 'q-typed', text: 'typed', author_sub: 'u', chat_id: 'chat-1' })
+    frame(ws, { type: 'queue_cleared', queue_ids: ['q-typed'], reason: 'cancel', chat_id: 'chat-1' })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['card', 'card-1'] })
+    frame(ws, { type: 'queue_cleared', queue_ids: ['q-card'], reason: 'turn_failed', chat_id: 'chat-1' })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['card', 'card-1'] })
+    expect(chips('chat-1')).toEqual([])
   })
 
   it('a returned message goes back to the composer of the chat it was typed into', () => {
@@ -168,6 +183,20 @@ describe('the chat-routed queue frames', () => {
     expect(id).toBe(sent.queue_id)
     act(() => { hook.result.current.warmup('dev', 'chat-1') })
     expect(JSON.parse(ws.sent[ws.sent.length - 1]).queue_id).toBeUndefined()
+  })
+
+  it('a cold warmup of photos alone carries them, with a queue id', () => {
+    const { hook, ws } = openSocket('chat-1')
+    act(() => {
+      hook.result.current.warmup('dev', 'chat-1', 'ask', 'm', undefined, {
+        text: '', images: [{ base64: 'data:image/png;base64,AA==', name: 'p.png' }, { path: 'users/u/workspace/uploads/photos/a.jpg', name: 'a.jpg' }],
+      })
+    })
+    const sent = JSON.parse(ws.sent[ws.sent.length - 1])
+    expect(sent.text).toBe('')
+    expect(sent.images).toEqual([{ data: 'data:image/png;base64,AA==', name: 'p.png' },
+                                 { path: 'users/u/workspace/uploads/photos/a.jpg', name: 'a.jpg' }])
+    expect(sent.queue_id).toMatch(/^[0-9a-f]{32}$/)
   })
 
   it('a refusal naming a send hands what was sent back; the chip or the turn forgets it', () => {

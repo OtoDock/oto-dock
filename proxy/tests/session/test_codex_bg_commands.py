@@ -357,6 +357,76 @@ def test_drain_resolves_item_missing_from_list():
         _bg_command_registries.pop(sid, None)
 
 
+def test_a_drain_after_the_turn_s_reset_clears_the_badge_on_the_chat_s_pump(monkeypatch):
+    # A task run's producer drains its commands while the run's pump is still
+    # alive, after the Codex session's per-turn reset: the chat the pump bound
+    # at its start outlives that reset, so the frame reaches the pump.
+    from core.events.bg_command_state import reset_bg_command_registry
+    from core.events.stream_pump import _active_pumps
+    from core.session import session_state
+    sid = "s-cx-bound"
+    frames: list[dict] = []
+
+    class _Pump:
+        def push_ws_event(self, event):
+            frames.append(event)
+            return True
+
+    def _push_to_pump(chat_id, event):    # startup._push_to_pump
+        pump = _active_pumps.get(chat_id)
+        return pump.push_ws_event(event) if pump else False
+
+    monkeypatch.setattr(session_state, "_push_pump_event_fn", _push_to_pump)
+    monkeypatch.setitem(_active_pumps, "chat-cx", _Pump())
+
+    async def run():
+        tr = _tr(sid)
+        _swept_candidate(tr)
+        get_bg_command_registry(sid).chat_id = "chat-cx"   # the pump's turn-start bind
+        reset_bg_command_registry(sid)                       # CodexAppServerSession.send_message
+        session = _make_session(sid, _FakeClient(terminals=[]), tr)
+        assert await session.drain_bg_commands() is True
+
+    try:
+        asyncio.run(run())
+        assert frames == [{"type": "bg_command_done", "tool_use_id": "i1", "status": "completed"}]
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_the_first_of_two_terminals_clears_at_its_own_end_between_turns(monkeypatch):
+    # Two terminals outlive their turn; the first's exit lands on the idle
+    # router. No pump consumes the translated BG_COMMAND_END between turns, so
+    # its badge clears through the chat's viewers at once, not at the
+    # cohort's bg_commands_complete when the second ends too.
+    from core.session import session_state
+    sid = "s-cx-two"
+    monkeypatch.setattr(session_state, "_push_pump_event_fn", lambda cid, ev: False)
+    viewer: asyncio.Queue = asyncio.Queue()
+    monkeypatch.setitem(session_state._dashboard_notify_queues, "s-viewer", viewer)
+
+    async def run():
+        tr = _tr(sid)
+        _feed(tr, "item/started", item=_cmd_item("i1", command="sleep 20"))
+        _feed(tr, "item/started", item=_cmd_item("i2", command="sleep 40"))
+        _feed(tr, "turn/completed", turn={"status": "completed"})
+        get_bg_command_registry(sid).chat_id = "chat-cx-two"
+        session = _make_session(sid, _FakeClient(), tr)
+        session._apply_bg_command_oob("item/completed", {
+            "threadId": MAIN,
+            "item": _cmd_item("i1", status="completed", exitCode=0, aggregatedOutput="done"),
+        })
+        assert get_bg_command_registry(sid).pending_count == 1
+
+    try:
+        asyncio.run(run())
+        assert viewer.get_nowait() == {"type": "chat_ui_frame", "chat_id": "chat-cx-two", "frame": {
+            "type": "bg_command_done", "tool_use_id": "i1", "status": "completed"}}
+        assert viewer.empty()
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
 def test_drain_keeps_item_present_in_list():
     # The list row names our tracked itemId → still running, NOT resolved
     # (works even when the processId was never learned).

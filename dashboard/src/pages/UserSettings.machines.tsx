@@ -4,7 +4,7 @@ import { useFlag } from '../hooks/useFlag'
 import { roleBadge, type AgentRole } from '../lib/permissions'
 import { useMyRemoteMachines, usePairMyMachine, useDeleteMyMachine, useSetMyRemoteTarget, useRemoveMyRemoteTarget, useSetMyAllowFullFs, useSetMyDeviceGrants, DEVICE_CAPABILITY_INFO, deviceGrantBody, type PairResult } from '../api/remoteMachines'
 import { PAIRING_SCOPE } from '../lib/placement'
-import RemoteBadge from '../components/RemoteBadge'
+import RemoteBadge, { MachineLinkNotice } from '../components/RemoteBadge'
 import PairInstallCommand from '../components/PairInstallCommand'
 import { BrowserModeSelect, BrowserTokenField } from '../components/BrowserModeControls'
 import { browserModeDesc, browserModeOf } from '../lib/remote/browserMode'
@@ -133,6 +133,8 @@ export function MyMachinesSection() {
                     machineName={m.name}
                     lastSeenIso={m.last_seen}
                     heartbeatAgeS={m.last_heartbeat_age_s ?? null}
+                    linkDown={m.link_ok === false}
+                    linkDownS={m.link_down_s}
                   />
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -150,6 +152,7 @@ export function MyMachinesSection() {
                       {m.id.slice(0, 8)} · {m.status}
                       {m.capabilities?.os_user ? ` · ${m.capabilities.os_user}` : ''}
                     </p>
+                    <MachineLinkNotice linkOk={m.link_ok} downS={m.link_down_s} error={m.link_error} detail={expanded} />
                   </div>
                 </div>
                 <svg

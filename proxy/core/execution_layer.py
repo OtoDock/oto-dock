@@ -104,6 +104,10 @@ class AgentConfig:
                                        # user-less phone paths. Used to route MCP-install
                                        # progress to exactly the engaging user's dashboard
                                        # tabs (install_registry participants).
+    # The person the placement guard judges a machine for, when it is not
+    # ``user_sub`` (a task: its creds person or a chat worker's delegator,
+    # "" for a run of no person). None = ``user_sub``.
+    placement_sub: str | None = None
     system_prompt: str = ""
     mcp_config_path: str = ""          # path to generated mcp-config.json
     credential_env: dict = field(default_factory=dict)  # per-user MCP creds
@@ -115,6 +119,12 @@ class AgentConfig:
     # instead of being baked into config files. Direct-LLM ignores this field
     # (it provisions from its own build_session_mcp_config call).
     mcp_secret_bundles: dict = field(default_factory=dict)
+    # The MCPs the session's builder left out, by manifest name (its kind's
+    # ``exclude_from``, the external set, an audience or credential
+    # refusal). The CLI engines read none of them from the config file the
+    # builder wrote; the Direct LLM pool, which rebuilds the agent's set in
+    # process, starts none of these. The prompt lists them as unavailable.
+    excluded_mcps: frozenset[str] = frozenset()
     permission_mode: str = ASK_MODE    # a PERMISSION_MODES word, or the unattended / judge word
     client_type: str = ""              # the session kind's name (core/session/session_kind.py); "" = unrecorded
     model: str = ""                    # override model (empty = agent default)
@@ -350,11 +360,11 @@ class BehaviourProfile:
     declared name to a canonical name of its declared role. Read by the
     engine's own config-dir and argv builders (the shell and write tools a
     session may not have) and by the codex-question route (the question
-    tool's name on the card). ``question_tool_holds_turn``: the engine's
-    question tool RUNS and holds the turn open for the platform's answers
-    (Codex: ``request_user_input`` → ``ask_user_question``); False when the
-    platform must deny the call, surface the card and let the answer arrive
-    as the next message (Claude headless).
+    tool's name on the card). ``nonblocking_question_tools``: the question
+    tools that open no dialog holding the turn in the engine's own terminal
+    (Codex's ``request_user_input_async``): the terminal does not park on
+    them. Headless, every question tool is denied with the card shown and
+    the answer arriving as the next message.
 
     ``repository_instruction_files``: the instruction files of the
     repositories in a person's workspace that the platform lifts into the
@@ -376,7 +386,7 @@ class BehaviourProfile:
     supports_compact: bool = False
     supports_interrupt_for_queued: bool = False
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    question_tool_holds_turn: bool = False
+    nonblocking_question_tools: tuple[str, ...] = ()
     repository_instruction_files: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
@@ -394,7 +404,7 @@ class BehaviourProfile:
             "supports_compact": self.supports_compact,
             "supports_interrupt_for_queued": self.supports_interrupt_for_queued,
             "tools": {role: list(names) for role, names in self.tools.items()},
-            "question_tool_holds_turn": self.question_tool_holds_turn,
+            "nonblocking_question_tools": list(self.nonblocking_question_tools),
             "repository_instruction_files": list(self.repository_instruction_files),
         }
 
@@ -405,7 +415,10 @@ class ModelPolicy:
 
     ``default_model`` is DECLARED, not derived: the operator's rule is the
     best tier the engine serves with tier 1 offered but never defaulted, so
-    a frontier model is always a deliberate choice. The resolver honours it
+    a frontier model is always a deliberate choice. Direct LLM is the one
+    exception: it declares Sonnet 5.5 (tier 3, the operator's call, phone
+    calls included) though it serves GPT-6.1 Sol at tier 2 and the same
+    price per token, until the operator decides again. The resolver honours it
     when its row is enabled and the platform pool can serve its provider;
     otherwise it falls DOWN the tiers from it, never up
     (``configuration/models.py`` ``resolve_agent_model``). ``model_filter_policy`` is how the engine's
@@ -431,6 +444,9 @@ class ModelPolicy:
 #: The ``auth_type`` values a subscription row may carry — the storage
 #: vocabulary of ``execution_layer_subscriptions.auth_type``.
 AUTH_TYPES: tuple[str, ...] = ("oauth", "api_key", "local_endpoint", "relay")
+#: The ``auth_type`` of a self-hosted model server's row (an agent that
+#: allows only local models on an engine takes these rows alone).
+AUTH_LOCAL = "local_endpoint"
 
 #: What a ``providers[]`` entry's ``kind`` may be (see ``LayerCapabilities``).
 PROVIDER_KINDS: tuple[str, ...] = ("vendor", "local")
@@ -982,6 +998,16 @@ class LayerCapabilities:
 RECONNECT_WAIT_S = 10.0
 
 
+def cli_version_key(version: str) -> tuple[int, ...]:
+    """A CLI or satellite version ``x.y.z`` as numbers; a part with no
+    digits reads as 0."""
+    out = []
+    for part in (version or "").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
 class ExecutionLayer(ABC):
     """Abstract interface for all execution backends.
 
@@ -1080,8 +1106,16 @@ class ExecutionLayer(ABC):
     def iter_session_files(self, home: Path) -> Iterator[tuple[Path, str]]:
         """Every session file of this engine under a scope home, with the
         session id or resume handle it belongs to (raw — the caller keeps its
-        own id shape and liveness guards): the orphan sweep. Default: none."""
+        own id shape and liveness guards): the orphan sweep. A folder the
+        engine keeps for a session whose file is already gone is one too.
+        Default: none."""
         return iter(())
+
+    def session_file_companions(self, path: Path) -> list[Path]:
+        """What the engine keeps beside one session file and goes with it
+        (the caller checks each is a real folder, never a link). Default:
+        none."""
+        return []
 
     def transcript_tailer(self):
         """The module that persists this engine's INTERACTIVE transcript
@@ -1102,6 +1136,22 @@ class ExecutionLayer(ABC):
         tests read the live value. Layers with a binary override this.
         """
         return ""
+
+    #: ``(the first satellite version whose spawn runs the pinned CLI right,
+    #: the newest CLI an older satellite runs right)`` for an engine whose
+    #: newer CLI needs a newer spawn; None for every other engine.
+    older_satellite_cap: tuple[str, str] | None = None
+
+    def pinned_cli_version_for(self, satellite_version: str) -> str:
+        """The pin a paired machine on ``satellite_version`` installs: the
+        engine's pin, capped at ``older_satellite_cap``'s CLI for a satellite
+        older than its version. No version reads as old; an empty pin stays
+        empty; the cap never raises a pin."""
+        pin = self.pinned_cli_version()
+        cap = self.older_satellite_cap
+        if not pin or cap is None or cli_version_key(satellite_version) >= cli_version_key(cap[0]):
+            return pin
+        return min(pin, cap[1], key=cli_version_key)
 
     def cli_binary_path(self) -> str:
         """The CLI executable this host runs for the engine — the configured

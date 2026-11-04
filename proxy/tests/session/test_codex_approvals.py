@@ -354,7 +354,10 @@ def test_auto_runs_on_codexs_reviewer_every_other_mode_on_the_bridge():
     assert approvals_reviewer("autoReview") == "auto_review"
     assert {approvals_reviewer(m) for m in ("ask", "plan", "dontAsk", "auto", "judge", "")} == {"user"}
     assert tui_reviewer_flags("autoReview") == ["-c", 'approvals_reviewer="auto_review"']
-    assert tui_reviewer_flags("ask") == []
+    # Every other mode names the person's prompt: a resumed thread keeps the
+    # reviewer it was saved with unless the terminal says otherwise.
+    for mode in ("ask", "plan", "dontAsk", "auto", ""):
+        assert tui_reviewer_flags(mode) == ["-c", 'approvals_reviewer="user"'], mode
 
 
 def test_the_untrusted_policy_is_gone():

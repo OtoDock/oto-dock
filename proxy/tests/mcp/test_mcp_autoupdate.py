@@ -100,6 +100,27 @@ async def test_stdio_updates_immediately_no_defer(monkeypatch, log_rows, notify_
 
 
 @pytest.mark.asyncio
+async def test_each_update_runs_as_a_job_the_page_reads(monkeypatch, log_rows, notify_calls):
+    m = _Manifest("foo", runtime="python")
+    _patch_updater(monkeypatch, targets=[m], updates={"foo": {"current": "1.0", "latest": "2.0"}})
+    await au.run_auto_update()
+    assert au.mcp_updater.job_state()["finished"]["foo"]["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_an_admin_is_updating_is_skipped_not_failed(monkeypatch, log_rows, notify_calls):
+    m = _Manifest("foo", runtime="python")
+    called = _patch_updater(monkeypatch, targets=[m],
+                            updates={"foo": {"current": "1.0", "latest": "2.0"}})
+    au.mcp_updater._register("foo")
+    summary = await au.run_auto_update()
+    assert called["update"] == []
+    assert summary["counts"][log_store.STATUS_SKIPPED_IN_USE] == 1
+    assert [r["status"] for r in log_rows] == [log_store.STATUS_SKIPPED_IN_USE]
+    assert notify_calls == []
+
+
+@pytest.mark.asyncio
 async def test_docker_free_updates_now(monkeypatch, log_rows, notify_calls):
     m = _Manifest("bar", runtime="docker")
     called = _patch_updater(

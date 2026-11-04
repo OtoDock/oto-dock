@@ -7,7 +7,7 @@ services:
       # Loopback-only: file-tools RW-mounts the whole agents tree, so its port
       # must never be reachable off-host. The host-local proxy reaches it on
       # localhost; nothing external should. (The Docker-compose sibling model
-      # finalizes this via the otodock network + service-DNS instead.)
+      # finalizes this via the otodock-internal network + service-DNS instead.)
       - "127.0.0.1:8932:8932"
     volumes:
       # HOST_AGENTS_DIR is consumed at compose time only — the bind-mount source.
@@ -16,6 +16,12 @@ services:
     env_file: .env
     # MCP_PORT is delivered via .env (auto-generated from manifest by
     # `services/docker_manager.py::_inject_mcp_env`).
+    environment:
+      # Where file-tools reaches the Collabora beside it to render and
+      # recalculate documents (convert-to, the preview's own engine); its
+      # LibreOffice takes over when Collabora does not answer. The service
+      # root comes from the generated .env, as Collabora's own settings read it.
+      COLLABORA_INTERNAL_URL: "http://collabora:9980${COLLABORA_SERVICE_ROOT:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -42,7 +48,12 @@ services:
     container_name: collabora-agent
     restart: always
     ports:
-      - "9981:9980"
+      # Loopback unless config.env sets COLLABORA_BIND_IP (it reaches the
+      # generated .env): the proxy on this host forwards /collabora/* here,
+      # and a published port would also let any host on the network use
+      # Collabora's convert-to. A reverse proxy on another host (subdomain
+      # mode) needs COLLABORA_BIND_IP=0.0.0.0 or this host's LAN address.
+      - "${COLLABORA_BIND_IP:-127.0.0.1}:9981:9980"
     environment:
       - aliasgroup1=${WOPI_BASE_URL:-http://host.docker.internal:8400}
       # The image has no shell: its own entrypoint (coolwsd --use-env-vars)

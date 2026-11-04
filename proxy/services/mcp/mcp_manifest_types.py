@@ -662,7 +662,9 @@ class McpManifest:
     # already says "built into the platform".
     author: str = ""
     author_url: str = ""
-    assignment_mode: str = "auto"  # "auto" (managers can add) or "explicit" (admin assigns)
+    # "auto" (managers can add), "explicit" (an admin assigns an instance) or
+    # "platform" (the platform attaches it itself; nobody assigns it).
+    assignment_mode: str = "auto"
     # The tier of ``auth/roles.py`` a person needs for this MCP to be part of
     # their session (the skills' vocabulary, ``SKILL_AUDIENCES``); empty admits
     # everyone. A session the agent runs as itself (agent scope) is not a
@@ -730,6 +732,17 @@ RUNTIME_PYTHON = "python"
 RUNTIME_NODE = "node"
 RUNTIME_DOCKER = "docker"
 RUNTIME_NONE = "none"
+
+# The manifest's ``assignment_mode``: managers add the MCP themselves, an
+# admin assigns an instance, or the platform attaches it to the sessions that
+# need it (``extra_mcps``: call-control on every call) and nobody assigns it.
+ASSIGNMENT_AUTO = "auto"
+ASSIGNMENT_EXPLICIT = "explicit"
+ASSIGNMENT_PLATFORM = "platform"
+# The refusal of a request for a platform-attached MCP (the request route and
+# its approval).
+PLATFORM_NOT_REQUESTABLE = ("This MCP is attached by the platform to the sessions that need it, "
+                            "so it cannot be requested.")
 
 
 @dataclass(frozen=True)

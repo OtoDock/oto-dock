@@ -5,6 +5,7 @@ import { useAgentInfo, useAgentUsers } from '../../api/agents'
 import { useRuns } from '../../api/runs'
 import { MODE_LABEL, MODE_SUMMARY, isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import GroupedRunsTable from '../../components/GroupedRunsTable'
+import AgentNotebookCard from '../../components/notebook/AgentNotebookCard'
 import { BADGE_BASE, BADGE_TONE, CARD } from '../../components/ui/classes'
 
 export default function AgentOverview() {
@@ -64,6 +65,8 @@ export default function AgentOverview() {
 
       {/* Users — managers/admins only. Who's attached to this agent + their role. */}
       {canManage && <AgentUsersCard name={name!} sharedOnly={!!info && isSharedOnly(modeOfAgent(info))} />}
+
+      <AgentNotebookCard name={name!} />
 
       {/* Recent Activity */}
       <div className={`${CARD} p-4`}>

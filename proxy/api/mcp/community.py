@@ -625,8 +625,10 @@ async def create_mcp_request(
                 f"Skill package '{body.mcp_name}' not found in skills catalog",
             )
     else:
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_types, mcp_registry
         installed = await asyncio.to_thread(mcp_registry.get_manifest, body.mcp_name)
+        if installed is not None and installed.assignment_mode == mcp_manifest_types.ASSIGNMENT_PLATFORM:
+            raise HTTPException(409, mcp_manifest_types.PLATFORM_NOT_REQUESTABLE)
         if installed is None:
             try:
                 registry = await community_catalog.fetch_registry()
@@ -969,10 +971,12 @@ async def preview_community_agent_install(
     before the user commits.
     """
     require_creator_or_admin(user, detail=_CREATOR_DETAIL)
-    from services.community import community_agents_catalog
-    from services.mcp import mcp_registry
+    from services.community import (
+        community_agents_catalog,
+        community_department_sets,
+        department_set_installer,
+    )
     from storage.agents import agent_store
-    from storage.mcp import mcp_store
 
     try:
         registry = await community_agents_catalog.fetch_registry()
@@ -997,95 +1001,13 @@ async def preview_community_agent_install(
         from services.community.community_agent_installer import _propose_free_slug
         suggested = await asyncio.to_thread(_propose_free_slug, proposed_slug)
 
-    # Walk the required-MCPs list and classify.
-    required = entry.get("required_mcps") or []
-    mcp_status = []
-    for raw in required:
-        name = raw.get("name") if isinstance(raw, dict) else None
-        if not name:
-            continue
-        local_manifest = await asyncio.to_thread(mcp_registry.get_manifest, name)
-        catalog_name = None
-        try:
-            mcps_registry = await community_catalog.fetch_registry()
-            catalog_name = next(
-                (m["name"] for m in mcps_registry.get("mcps", []) if m.get("name") == name),
-                None,
-            )
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
-            logger.debug("Community registry lookup for MCP %s failed: %s", name, exc)
-        if local_manifest is None:
-            mcp_status.append({
-                "name": name,
-                "installed": False,
-                "request_type": "install" if catalog_name else None,
-                "blocked": catalog_name is None,
-                "needs_request": True,
-                "reason": "Not installed" + ("; in community catalog" if catalog_name else "; NOT in any catalog"),
-            })
-            continue
-        # Installed
-        assignment = getattr(local_manifest, "assignment_mode", "auto")
-        if assignment != "explicit":
-            mcp_status.append({
-                "name": name, "installed": True, "request_type": None,
-                "blocked": False, "needs_request": False,
-                "reason": "Auto-mode — ready",
-            })
-            continue
-        instances = await asyncio.to_thread(mcp_store.get_mcp_instances, name)
-        if any(i.get("assigned_to_all") for i in instances) or any(
-            proposed_slug in (i.get("agents") or []) for i in instances
-        ):
-            mcp_status.append({
-                "name": name, "installed": True, "request_type": None,
-                "blocked": False, "needs_request": False,
-                "reason": "Explicit-mode — instance authorizes this agent",
-            })
-            continue
-        if instances:
-            mcp_status.append({
-                "name": name, "installed": True, "request_type": "access",
-                "blocked": False, "needs_request": not user.is_admin,
-                "reason": "Explicit-mode — agent will be attached to an instance",
-            })
-        else:
-            mcp_status.append({
-                "name": name, "installed": True, "request_type": "access",
-                "blocked": True, "needs_request": True,
-                "reason": "Explicit-mode — no instances configured (admin must create one first)",
-            })
-
-    # The apps and checks the template ships, the way the approval card
-    # shows them, with the signature the dialog consents to
-    # (COMMUNITY-AGENTS-REGISTRY.md "Consent"); an older registry entry
-    # carries none.
-    from services.community import template_app_seeder
-    apps = []
-    for a in entry.get("apps") or []:
-        if not isinstance(a, dict) or not isinstance(a.get("app_json"), dict):
-            continue
-        visibility = "user" if a.get("visibility") == "user" else "agent"
-        bp = a.get("blueprint_json") if isinstance(a.get("blueprint_json"), dict) else None
-        row = template_app_seeder.preview_shape(a["app_json"], visibility, bp)
-        row["slug"] = str(a.get("slug") or "")
-        apps.append({
-            "slug": row["slug"], "title": row["title"] or row["slug"], "visibility": visibility,
-            "sig": str(a.get("sig") or ""), "owner_approval": bool(a.get("owner_approval")),
-            "row": row,
-            "blueprint_tasks": [{"slug": str(t.get("slug") or ""), "description": str(t.get("description") or ""),
-                                 "prompt": str(t.get("prompt") or "")}
-                                for t in (bp or {}).get("tasks") or [] if isinstance(t, dict)],
-            "blueprint_triggers": [{"slug": str(t.get("slug") or ""), "handler": str(t.get("handler") or ""),
-                                    "description": str(t.get("description") or "")}
-                                   for t in (bp or {}).get("triggers") or [] if isinstance(t, dict)],
-        })
-    checks = [{
-        "name": str(c.get("name") or ""), "description": str(c.get("description") or ""),
-        "mandatory": bool(c.get("mandatory")), "applies": list(c.get("applies") or []),
-        "script": str(c.get("script") or ""), "sig": str(c.get("sig") or ""),
-        "words": template_app_seeder.check_words(c),
-    } for c in (entry.get("checks") or []) if isinstance(c, dict) and c.get("name")]
+    # The MCPs classified, the apps and checks the template ships the way
+    # the approval card shows them (the consent signatures),
+    # and the offer when the template belongs to a set whose other members
+    # the person holds as standalone agents (department_set_installer.offer_for).
+    mcp_status = await community_agents_catalog.mcp_plan(entry, proposed_slug, user.is_admin)
+    apps, checks = community_department_sets.consent_preview(entry)
+    offer = await asyncio.to_thread(department_set_installer.offer_for, registry, template_slug, user)
     return {
         "template_slug": template_slug,
         "target_slug": proposed_slug,
@@ -1103,6 +1025,7 @@ async def preview_community_agent_install(
         # Whose copies the caller's consent may cover: an admin's every
         # member's, anyone else's the shared apps and their own copy.
         "consent_scope": "everyone" if user.is_admin else "own",
+        "set": offer,
     }
 
 
@@ -1188,6 +1111,10 @@ class InstallFromCommunityBody(BaseModel):
     # signature the caller saw per app and check they approve.
     approve_apps: dict[str, str] | None = None
     approve_checks: dict[str, str] | None = None
+    # The offer taken (department_set_installer.place_from_set): the set's slug and the
+    # department's name; the new agent and the person's standalone agents
+    # of the set are placed after the install.
+    department_set: dict[str, str] | None = None
 
 
 @router.post("/v1/agents/install-from-community")
@@ -1225,11 +1152,37 @@ async def install_from_community(
             check_consent=body.approve_checks,
             consent_by=u.sub if (body.approve_apps or body.approve_checks) else "",
         )
-        return result
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Community agent install failed for %s", body.template_slug)
         raise HTTPException(500, "Could not install the agent. The server log has the details.") from exc
+    if body.department_set:
+        # The agent is installed whatever happens here: a refusal is a line.
+        result.update(await _place_in_set(body.department_set, result["agent_slug"], u))
+    return result
+
+
+async def _place_in_set(chosen: dict[str, str], new_slug: str, u: UserContext) -> dict:
+    from services.community import (
+        community_agents_catalog,
+        community_department_sets,
+        department_set_installer,
+    )
+    from services.departments import assignment
+    try:
+        registry = await community_agents_catalog.fetch_registry()
+        entry = community_department_sets.find_set(registry, str(chosen.get("slug") or ""))
+        dset, problems = community_department_sets.read_entry(entry) if entry else (None, ["no such set"])
+        if dset is None:
+            return {"department": None, "department_lines": ["The department set is not in the catalog any more."]}
+        out = await department_set_installer.place_from_set(
+            dset, registry, str(chosen.get("name") or dset.name), u, new_slug)
+        return {"department": out["department"], "department_lines": out["lines"]}
+    except (department_set_installer.SetInstallRefused, assignment.AssignmentRefused) as exc:
+        return {"department": None, "department_lines": [exc.detail]}
+    except Exception:
+        logger.exception("the set's placement failed after installing %s", new_slug)
+        return {"department": None, "department_lines": ["The agent was installed, the department was not made."]}
 
 

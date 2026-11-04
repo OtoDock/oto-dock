@@ -466,3 +466,58 @@ async def test_the_build_judges_the_audience_with_the_persons_role_and_scope(mon
     assert await servers_for("admin", "user", "s-admin") == {"notes", "hosts"}
     assert await servers_for("viewer", "agent", "s-shared") == {"notes", "hosts"}
     assert await servers_for("", "user", "s-nobody") == {"notes", "hosts"}
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_never_answers_initialize_is_left_out(monkeypatch):
+    """An HTTP MCP whose handshake never returns (an address that does not
+    resolve) does not hold the session start: the bound fires, the
+    entered contexts exit in the owner task, the server has no tools."""
+    streams_cm = _RecordingCM((object(), object(), object()))
+
+    class _SilentSession:
+        async def initialize(self):
+            await asyncio.Event().wait()
+
+    session_cm = _RecordingCM(_SilentSession())
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
+    monkeypatch.setattr(mcpmod, "MCP_START_TIMEOUT_S", 0.1)
+
+    conn = mcpmod.MCPServerConnection(
+        "silent", {"type": "streamable-http", "url": "http://file-tools:8901/mcp/"},
+        session_id="s-silent",
+    )
+    await asyncio.wait_for(conn.start(), timeout=5)
+    assert conn.tools == []
+    assert streams_cm.exit_task is streams_cm.enter_task
+    assert session_cm.exit_task is session_cm.enter_task
+    await asyncio.wait_for(conn.close(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_a_transport_stuck_in_its_own_task_group_is_left_out(monkeypatch):
+    """The client's transports are anyio context managers that start a task
+    group on entry (``mcp/client/sse.py``): one stuck there ends with the
+    bound too, and ``start()`` returns."""
+    import contextlib
+
+    import anyio
+
+    @contextlib.asynccontextmanager
+    async def _stuck(url, headers=None):
+        async with anyio.create_task_group() as tg:
+            async def _never(*, task_status=anyio.TASK_STATUS_IGNORED):
+                await anyio.sleep_forever()
+            await tg.start(_never)
+            yield (object(), object(), object())
+
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", _stuck)
+    monkeypatch.setattr(mcpmod, "MCP_START_TIMEOUT_S", 0.1)
+    conn = mcpmod.MCPServerConnection(
+        "stuck", {"type": "streamable-http", "url": "http://file-tools:8901/mcp/"},
+        session_id="s-stuck",
+    )
+    await asyncio.wait_for(conn.start(), timeout=5)
+    assert conn.tools == [] and conn.session is None
+    await asyncio.wait_for(conn.close(), timeout=5)

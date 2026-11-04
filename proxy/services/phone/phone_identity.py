@@ -155,12 +155,15 @@ def resolve_route_identity(
     - ``pin_verified`` counts only when the route actually has a PIN.
     - An external call ALWAYS runs in the local sandbox on the server, on
       every engine: the external principal's role is :data:`EXTERNAL_ROUTE_ROLE`
-      (viewer) and ``remote_status.resolve_execution_target`` forces every
-      non-owner role to local (a satellite has no bwrap isolation), whatever
-      the agent's execution target says. Codex takes external calls there
-      like every other engine (no shell tool + the PreToolUse floor). Only a
-      ``user`` route (the caller IS a platform user) can run on a remote
-      machine, with that user's capped role.
+      (viewer) and ``remote_status.resolve_execution_target`` keeps a
+      session below the owner tier with no person (an external identity) on
+      the platform host (a satellite has no bwrap isolation), whatever the
+      agent's execution target and the machine's every-role switch say.
+      Codex takes external calls there like every other engine (no shell
+      tool + the PreToolUse floor). Only a ``user`` route (the caller IS a
+      platform user) can run on a remote machine, with that user's capped
+      role, which the machine's every-role switch may admit below the owner
+      tier.
     """
     if route is None or not route.get("enabled", True) or route.get("agent") != agent:
         if route is not None:

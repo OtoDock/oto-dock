@@ -652,8 +652,9 @@ async def share_snapshot(token: str, request: Request):
         "created_at": doc.get("created_at") or "",
         "shared_by_name": creator.get("display_name") or creator.get("name") or "",
         # A link viewer is anonymous: no author's internal id (an SSO
-        # account's is its provider subject) leaves with the text.
-        "messages": [{k: v for k, v in m.items() if k != "author_sub"}
+        # account's is its provider subject) leaves with the text, nor a
+        # row's id (an install-wide counter, kept for a reader's report).
+        "messages": [{k: v for k, v in m.items() if k not in ("author_sub", "id")}
                      for m in doc.get("messages") or []],
     }
 

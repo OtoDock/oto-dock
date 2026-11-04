@@ -19,7 +19,7 @@ from core.session.interactive_session import MIN_TURN_S, InteractiveSession
 pytestmark = pytest.mark.asyncio
 
 # Recorded calls into the (patched) collaborators.
-_calls = {"ready": [], "ephemeral": [], "title": [], "routing": [], "status": [],
+_calls = {"ready": [], "ephemeral": [], "title": [], "routing": [], "status": [], "bodies": [],
           "read": [], "read_bcast": []}
 
 
@@ -41,6 +41,7 @@ async def _fake_fire_ephemeral(user_sub, title, body, chat_id=None,
                                interactive=False, cli_attached=False):
     _calls["ephemeral"].append((user_sub, title, chat_id))
     _calls["routing"].append((interactive, cli_attached))
+    _calls["bodies"].append(body)
 
 
 async def _fake_request_title(chat_id, assistant_excerpt=""):
@@ -143,6 +144,20 @@ async def test_question_pending_words_ping_as_needs_input():
     assert _calls["ephemeral"] == [
         ("user-1", "researcher needs your input", "chat-1")
     ], _calls["ephemeral"]
+    # The headless turn-end notice's words (notification_manager.turn_end_words).
+    assert _calls["bodies"][-1] == "Waiting for your answer"
+
+
+async def test_a_plain_turn_and_a_compaction_have_their_words():
+    s = _new_session()
+    s._maybe_fire_turn_complete("done", persisted=1)
+    await _drain()
+    assert _calls["bodies"][-1] == "Response ready"
+    s = _new_session()
+    s._maybe_fire_turn_complete("", persisted=1, compacted=True)
+    await _drain()
+    assert _calls["ephemeral"][-1] == ("user-1", "researcher compacted the conversation", "chat-1")
+    assert _calls["bodies"][-1] == "Context compacted. The session is ready."
 
 
 async def test_question_never_fires_task_callback():

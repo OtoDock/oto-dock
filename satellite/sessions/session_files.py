@@ -62,6 +62,13 @@ def _session_dir(session_id: str) -> Path:
     return _secrets_root() / session_id
 
 
+# PROXY_URL is this machine's own loopback tunnel: the fetch never goes
+# through a proxy (urllib's default opener takes the environment's and, on
+# Windows, Internet Options', whose <local> exemption never covers 127.0.0.1).
+# A module opener, never a process-wide one: the vendor gateway may need one.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _fetch(proxy_url: str, token: str) -> dict[str, dict] | None:
     """POST the capability token to the session-files endpoint → files map."""
     req = urllib.request.Request(
@@ -74,7 +81,7 @@ def _fetch(proxy_url: str, token: str) -> dict[str, dict] | None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_S) as resp:
+        with _DIRECT.open(req, timeout=_FETCH_TIMEOUT_S) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             return body.get("files") or {}
     except (urllib.error.URLError, OSError, ValueError) as e:

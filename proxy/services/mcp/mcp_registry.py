@@ -178,7 +178,12 @@ async def rescan() -> dict[str, McpManifest]:
     if _rescan_lock is None or _rescan_lock[0] is not loop:
         _rescan_lock = (loop, asyncio.Lock())
     async with _rescan_lock[1]:
-        return await asyncio.to_thread(scan_manifests)
+        found = await asyncio.to_thread(scan_manifests)
+    # An MCP installed, updated or removed changes what the relay should
+    # forward here (a narrowing during the window is undone).
+    from services.webhooks import relay_events
+    relay_events.sync_all_soon()
+    return found
 
 
 def scan_manifests() -> dict[str, McpManifest]:
@@ -291,15 +296,16 @@ def get_all_manifests() -> dict[str, McpManifest]:
 
 
 def core_mcp_names() -> list[str]:
-    """Core MCPs every agent gets.
+    """Core MCPs every agent gets: the ``auto`` ones.
 
-    ``assignment_mode == "explicit"`` disqualifies an MCP — that mode means
-    an admin authorizes it per-agent via an instance. ``exclude_from`` does
-    NOT: it filters at session-config time, not at assignment time.
+    ``explicit`` means an admin authorizes it per agent through an instance,
+    ``platform`` that the platform attaches it itself (call-control on a
+    call): neither is assigned. ``exclude_from`` does NOT disqualify: it
+    filters at session-config time, not at assignment time.
     """
     return [
         name for name, m in _manifests.items()
-        if m.category == "core" and m.assignment_mode != "explicit"
+        if m.category == "core" and m.assignment_mode == _mt.ASSIGNMENT_AUTO
     ]
 
 
@@ -517,6 +523,8 @@ def _agent_base_manifests(agent_name: str) -> list[McpManifest]:
       - "auto": always visible
       - "explicit": visible only if at least one mcp_instance authorizes the
         agent (agent in instance.agents OR instance.assigned_to_all=True)
+      - "platform": never from an ``agent_mcps`` row (a stray one is
+        ignored); the sessions that need it get it through ``extra_mcps``
     Manager-enablement is the agent_mcps row presence. Platform-enabled is
     mcp_state.enabled. All three must be True for the manifest to be returned.
     """
@@ -539,6 +547,8 @@ def _agent_base_manifests(agent_name: str) -> list[McpManifest]:
             continue
         if manifest.assignment_mode == "explicit" and name not in visible_explicit:
             # admin revoked authorization; preserve agent_mcps row but skip at runtime
+            continue
+        if manifest.assignment_mode == _mt.ASSIGNMENT_PLATFORM:
             continue
         if not manifest_capability_available(manifest):
             # backing platform feature (STT / call providers) removed → skip at runtime
@@ -994,6 +1004,14 @@ def get_agent_mcps_all_placements(agent_name: str) -> list[McpManifest]:
 #: external sessions with ``"exclude_from": ["external"]``.
 EXTERNAL_CONTEXT = "external"
 
+#: Exclusion context of a session that is not the token-named person's own
+#: chat: a Shared-only agent's chat (the session runs as the agent), a task
+#: chat reopened in the dashboard, a delegated worker's chat, a chat another
+#: person's sign-in drives, an unattended wake, a build with no person. A
+#: manifest lists it to load only where a person drives their own chat;
+#: the chat builder passes it and an agent-scope mount implies it.
+SHARED_CHAT_CONTEXT = "shared_chat"
+
 #: MCPs that never attach to an external session regardless of what any
 #: manifest declares: they manage the platform, schedule deferred execution
 #: that would later run with the agent's full rights, or expose infrastructure
@@ -1298,8 +1316,9 @@ def get_visible_mcps_for_agent(agent_name: str) -> list[McpManifest]:
 
     Used by the agent settings MCPs tab to render the unified list. Shows ALL
     MCPs the agent could enable (auto-mode + admin-authorized explicit-mode),
-    platform-enabled. The API endpoint joins this with the manager-enabled set
-    to compute the per-row `enabled` flag.
+    platform-enabled; a platform-mode MCP is nobody's to enable. The API
+    endpoint joins this with the manager-enabled set to compute the per-row
+    `enabled` flag.
     """
     state_enabled = mcp_store.get_all_mcp_states()
     visible_explicit = mcp_store.get_visible_explicit_mcps(agent_name)
@@ -1324,7 +1343,8 @@ def get_unauthorized_explicit_mcps_for_agent(agent_name: str) -> list[McpManifes
 
     These are the MCPs a manager can *request* (the admin attaches the agent
     to an instance on approval) but cannot self-enable. Auto-mode MCPs never
-    appear here — they are always visible once platform-enabled.
+    appear here — they are always visible once platform-enabled — nor do
+    platform-mode ones, which nobody assigns.
     Platform-disabled MCPs are excluded on purpose: the admin turned them
     off deliberately, so they are not offered for request either.
     """
@@ -1549,6 +1569,7 @@ def build_available_mcps_section(
     skip_http_mcps: bool = False,
     external: bool = False,
     user_role: str | None = None,
+    shared_chat: bool = False,
 ) -> str:
     """Build the ``# Available Tools (MCPs)`` prompt section.
 
@@ -1596,7 +1617,7 @@ def build_available_mcps_section(
         if m.category == "skill":
             continue
         if session_exclusion_reason(
-            m, contexts={context} if context else set(), external=external,
+            m, contexts=_prompt_contexts(context, shared_chat), external=external,
         ):
             continue
         label = (m.label or m.name).strip()
@@ -1660,6 +1681,7 @@ def get_skills_for_agent(
     skip_http_mcps: bool = False,
     external: bool = False,
     user_role: str | None = None,
+    shared_chat: bool = False,
 ) -> list[tuple[str, str, str]]:
     """Return (skill_id, prompt_content, loading) for an agent, context-filtered.
 
@@ -1687,7 +1709,7 @@ def get_skills_for_agent(
     for manifest, skill_def in _iter_agent_skills(
         agent_name, context, placement=placement,
         skip_http_mcps=skip_http_mcps,
-        external=external, user_role=user_role,
+        external=external, user_role=user_role, shared_chat=shared_chat,
     ):
         # The file must be a regular file inside this MCP's own folder; a
         # value that escapes it is never read.
@@ -1715,6 +1737,7 @@ def _iter_agent_skills(
     skip_http_mcps: bool = False,
     external: bool = False,
     user_role: str | None = None,
+    shared_chat: bool = False,
 ):
     """``(manifest, skill_def)`` for every ENABLED skill of the agent's
     assigned MCPs that is not excluded from ``context`` — the one filter
@@ -1733,7 +1756,7 @@ def _iter_agent_skills(
         if skip_http_mcps and _is_http_transport(manifest):
             continue
         if session_exclusion_reason(
-            manifest, contexts={context} if context else set(), external=external,
+            manifest, contexts=_prompt_contexts(context, shared_chat), external=external,
         ):
             continue
         for skill_def in manifest.skills:
@@ -1750,6 +1773,8 @@ def _iter_agent_skills(
                 continue
             if external and EXTERNAL_CONTEXT in exclude_from:
                 continue
+            if shared_chat and SHARED_CHAT_CONTEXT in exclude_from:
+                continue
             yield manifest, skill_def
 
 
@@ -1761,6 +1786,7 @@ def get_skill_catalog_for_agent(
     skip_http_mcps: bool = False,
     external: bool = False,
     user_role: str | None = None,
+    shared_chat: bool = False,
 ) -> list[tuple[str, str]]:
     """``(skill_id, description)`` of the agent's enabled ON-DEMAND skills in
     this context, sorted by id — the ``# Skills`` catalog of a Direct-LLM
@@ -1773,7 +1799,7 @@ def get_skill_catalog_for_agent(
         for _m, skill_def in _iter_agent_skills(
             agent_name, context, placement=placement,
             skip_http_mcps=skip_http_mcps,
-            external=external, user_role=user_role,
+            external=external, user_role=user_role, shared_chat=shared_chat,
         )
         if skill_def.loading == "on_demand"
     ]
@@ -2083,6 +2109,7 @@ def env_instance_values(manifest, agent_name: str) -> dict[str, str]:
 
 def _gateway_bearer_source(
     manifest: McpManifest, user_sub: str | None, agent_name: str, task_scope: str,
+    only_owner: str | None = None,
 ) -> tuple["TokenRef | None", str | None]:
     """The token-file reference a bearer MCP's account resolves to for this
     session, or the reason it cannot: the person's bound account in user
@@ -2098,6 +2125,7 @@ def _gateway_bearer_source(
         picked = credential_resolver._bound_token_source(
             manifest.name, provider_id, user_sub=user_sub, task_scope=task_scope,
             agent_name=agent_name, purpose=credential_resolver.PURPOSE_MCP,
+            only_owner=only_owner,
         )
     except credential_resolver.AccountNeedsReconnect as needs:
         return None, f"{manifest.label}: {credential_resolver.reconnect_wording(str(needs))}"
@@ -2127,6 +2155,7 @@ def gateway_entry(
     agent_name: str,
     task_scope: str,
     bundle_env: dict[str, str],
+    only_owner: str | None = None,
 ) -> tuple["GatewayCredential | None", str | None]:
     """The one writer of a credentialed remote-HTTP entry, for every builder
     and both config formats: the entry's URL becomes the credential gateway
@@ -2147,6 +2176,8 @@ def gateway_entry(
     ``localhost`` allowlist row; a vendor host under its own name. The
     allowlist is checked again at forward time: this check only keeps an
     unapproved MCP out of the session with an actionable sentence.
+    ``only_owner``: the owner filter of an agent-scope session on a personal
+    machine (``credential_resolver.pick_account``), for every binding read.
     """
     from urllib.parse import urlsplit
 
@@ -2175,11 +2206,19 @@ def gateway_entry(
 
     if bearer:
         allowlist_key = oauth.get("provider_id", "")
-        token_ref, reason = _gateway_bearer_source(manifest, user_sub, agent_name, task_scope)
+        token_ref, reason = _gateway_bearer_source(manifest, user_sub, agent_name, task_scope,
+                                                   only_owner)
         if reason:
             return None, reason
-        from services.oauth.credential_resolver import binding_reach
-        reach = binding_reach(manifest.name, agent_name, user_sub=user_sub, task_scope=task_scope)
+        from services.oauth.credential_resolver import (
+            CredentialUnavailable,
+            binding_reach,
+        )
+        try:
+            reach = binding_reach(manifest.name, agent_name, user_sub=user_sub,
+                                  task_scope=task_scope, only_owner=only_owner)
+        except CredentialUnavailable as why:
+            return None, f"{manifest.label}: {why}"
         cred = GatewayCredential(
             upstream=origin, path=path, allowlist_key=allowlist_key,
             token_ref=token_ref, proxy_local=proxy_local, manifest=manifest.name,
@@ -2303,6 +2342,10 @@ _BROWSER_MODE_ENV_KEYS = (
     "OTO_BROWSER_MODE",
     "OTO_BROWSER_UNATTENDED",
     "OTO_BROWSER_TOKEN_EXPECTED",
+    "OTO_BROWSER_TOKEN_WITHHELD",
+    "OTO_BROWSER_PROFILE",
+    "OTO_BROWSER_PROFILE_DIR",
+    "PLAYWRIGHT_MCP_PROFILE_DIR_NAME",
     "PLAYWRIGHT_MCP_EXTENSION",
     "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
     "PLAYWRIGHT_MCP_USER_DATA_DIR",
@@ -2312,8 +2355,16 @@ _BROWSER_MODE_ENV_KEYS = (
 )
 
 
+# The browser-control MCP's server key and its extension-token env name: the
+# token is the one secret of that bundle an agent-scope session carries to
+# its owner's computer (``config_builder.personal_machine_bundles``).
+BROWSER_SERVER_KEY = "local"
+BROWSER_TOKEN_ENV = "PLAYWRIGHT_MCP_EXTENSION_TOKEN"
+
+
 def _apply_browser_mode(
     entry: dict[str, Any], secret_bundles: dict, target_browser, *, unattended: bool,
+    withheld: bool = False,
 ) -> None:
     """Apply the target machine's browser-control mode to the ``local`` entry.
 
@@ -2329,21 +2380,34 @@ def _apply_browser_mode(
     opts in (``BrowserTargetSettings.unattended``, F47): a token left for an
     attended person is not spent by a task, a call or a meeting that happens
     to target the machine unless its owner chose to.
+
+    ``withheld``: an agent-scope session on a personal machine that does not
+    run as the machine's owner (``_finish_session_servers``). It gets no
+    token and ``OTO_BROWSER_TOKEN_WITHHELD=1``, so the wrapper refuses the
+    owner's browser instead of asking for a click there. The machine's
+    ``Browser profile`` rides the plain env as ``OTO_BROWSER_PROFILE``.
     """
     env = entry.get("env") or {}
     for key in _BROWSER_MODE_ENV_KEYS:
         env.pop(key, None)
     if target_browser is not None and target_browser.mode == "own":
         env["OTO_BROWSER_MODE"] = "own"
+        profile = getattr(target_browser, "profile", "")
+        if profile:
+            env["OTO_BROWSER_PROFILE"] = profile
         token_allowed = bool(target_browser.extension_token) and (
             not unattended or getattr(target_browser, "unattended", False)
         )
-        if token_allowed:
+        if withheld:
+            logger.info("browser token withheld: an agent-scope session on a personal "
+                        "machine runs as someone else than its owner")
+            env["OTO_BROWSER_TOKEN_WITHHELD"] = "1"
+        elif token_allowed:
             from core.credentials.mcp_broker import SecretBundle
             env["OTO_BROWSER_TOKEN_EXPECTED"] = "1"
-            bundle = secret_bundles.get("local") or SecretBundle()
-            bundle.env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = target_browser.extension_token
-            secret_bundles["local"] = bundle
+            bundle = secret_bundles.get(BROWSER_SERVER_KEY) or SecretBundle()
+            bundle.env[BROWSER_TOKEN_ENV] = target_browser.extension_token
+            secret_bundles[BROWSER_SERVER_KEY] = bundle
         elif unattended:
             env["OTO_BROWSER_UNATTENDED"] = "1"
     if env:
@@ -2360,6 +2424,8 @@ def build_session_mcp_config(
     task_mode: bool = False,
     meeting_mode: bool = False,
     interactive_local: bool = False,
+    shared_chat: bool = False,
+    chat_worker: bool = False,
     task_scope: str = "user",
     delegation_targets: list[str] | None = None,
     extra_mcps: list[str] | None = None,
@@ -2375,6 +2441,7 @@ def build_session_mcp_config(
     only_mcps: list[str] | None = None,
     session_id: str = "",
     call_ask_back: bool = False,
+    personal_owner: str = "",
 ) -> tuple[Path | None, dict[str, str], dict[str, str], dict, set]:
     """Main entry point: build a complete MCP config for a session.
 
@@ -2391,6 +2458,12 @@ def build_session_mcp_config(
     of what the agent's assignment and the gates above resolved — an
     intersection, never an addition (``[]`` = no MCP at all).
 
+    ``personal_owner``: an agent-scope session on a user-paired machine whose
+    person is that machine's owner (``config_builder.personal_owner_of``).
+    Such a build reads every binding of the agent through the owner filter
+    (``credential_resolver.pick_account``): the owner's own accounts go,
+    nobody's when it is empty. It also decides the machine's browser token.
+
     Args:
         target_browser: the target machine's ``remote_store.BrowserTargetSettings``
             (browser-control mode + extension token) — None / dedicated
@@ -2406,6 +2479,14 @@ def build_session_mcp_config(
             (which IS ``"meeting"`` there), so without this a
             meeting-excluded manifest would vanish from the prompt while its
             tools still loaded.
+        chat_worker: a chat lane a person delegated from their own chat
+            (``task_config_builder.attended_chat_worker``): it rides the task
+            lane (``task_mode``) but matches the chat's context, not
+            ``"task"``, so the MCPs that need a person present load in it.
+        shared_chat: the session is not the person's own chat (the chat
+            builder's fact; an agent-scope ``task_scope`` implies it): the
+            ``shared_chat`` context joins the set, so a manifest that lists
+            it loads only where a person drives their own chat.
         extra_mcps: MCP names to force-include even if not assigned to the agent
                     (e.g. meetings-mcp for meeting participants).
         mcp_config_format: "json" (Claude CLI) or "toml" (Codex CLI).
@@ -2435,10 +2516,12 @@ def build_session_mcp_config(
     interceptor re-injects identical values at spawn.
     """
     from core.credentials.mcp_broker import SecretBundle
+    from core.session.visibility import SCOPE_AGENT
     from services.oauth import credential_resolver
 
     exclusion_contexts = _exclusion_contexts(
-        phone_mode, task_mode, interactive_local, meeting_mode, external)
+        phone_mode, task_mode, interactive_local, meeting_mode, external,
+        shared_chat=shared_chat or task_scope == SCOPE_AGENT, chat_worker=chat_worker)
     # Get assigned + enabled MCPs for this agent. Device-local placement /
     # consent / display filtering happens here; the dropped device MCPs
     # come back as exclusion reasons so the prompt can surface them.
@@ -2458,10 +2541,14 @@ def build_session_mcp_config(
         # session that resolves to zero MCPs ("not enough values to unpack").
         return None, {}, exclusion_reasons, {}, set()
 
+    # An agent-scope session on a person's own machine: the owner filter,
+    # on even when no owner was found (then it matches nobody).
+    only_owner = personal_owner if task_scope == SCOPE_AGENT and placement.user_paired else None
+    owner_kw = {"only_owner": only_owner} if only_owner is not None else {}
     # Resolve credentials for all assigned MCPs
     cred_result = credential_resolver.resolve_credentials(
         agent_name, user_sub,
-        task_scope=task_scope,
+        task_scope=task_scope, **owner_kw,
     )
 
     # The flat env that reaches the CLI/daemon process + the codex TOML is
@@ -2497,6 +2584,7 @@ def build_session_mcp_config(
         is_remote=is_remote,
         servers=servers,
         secret_bundles=secret_bundles,
+        only_owner=only_owner,
     )
     for manifest in assigned:
         build.add(manifest)
@@ -2504,21 +2592,25 @@ def build_session_mcp_config(
         return None, flat_env, exclusion_reasons, {}, cred_result.bash_env_keys
     _finish_session_servers(
         servers, secret_bundles, cred_result, agent_name, delegation_targets, target_browser,
-        task_mode=task_mode, phone_mode=phone_mode, meeting_mode=meeting_mode)
+        task_mode=task_mode, phone_mode=phone_mode, meeting_mode=meeting_mode,
+        only_owner=only_owner)
     config_path = _write_session_mcp_config(
         servers, agent_name, user_sub, session_id, mcp_config_format)
     return config_path, flat_env, exclusion_reasons, secret_bundles, cred_result.bash_env_keys
 
 
 def _exclusion_contexts(phone_mode: bool, task_mode: bool, interactive_local: bool,
-                        meeting_mode: bool, external: bool) -> set[str]:
+                        meeting_mode: bool, external: bool, *,
+                        shared_chat: bool = False, chat_worker: bool = False) -> set[str]:
     """The ``exclude_from`` contexts a session matches (its kind, ``meeting``
-    besides it for a participant, ``external`` for a caller)."""
+    besides it for a participant, ``external`` for a caller, ``shared_chat``
+    for a session that is not the person's own chat; a person's own chat
+    lane matches the chat's kind, not ``task``)."""
     # Determine context for exclusion checks
     context = "dashboard"
     if phone_mode:
         context = "phone"
-    elif task_mode:
+    elif task_mode and not chat_worker:
         context = "task"
     elif interactive_local:
         # Interactive terminal: a local CLI session (Claude Code / Codex on the
@@ -2536,7 +2628,19 @@ def _exclusion_contexts(phone_mode: bool, task_mode: bool, interactive_local: bo
     # ``session_exclusion_reason``; the prompt builders apply the same rule.
     if external:
         exclusion_contexts.add(EXTERNAL_CONTEXT)
+    if shared_chat:
+        exclusion_contexts.add(SHARED_CHAT_CONTEXT)
     return exclusion_contexts
+
+
+def _prompt_contexts(context: str, shared_chat: bool) -> set[str]:
+    """The contexts a prompt-side filter matches: the session's kind word
+    and, for a session that is not the person's own chat, ``shared_chat``
+    (the same set the config build matched, so the two agree)."""
+    contexts = {context} if context else set()
+    if shared_chat:
+        contexts.add(SHARED_CHAT_CONTEXT)
+    return contexts
 
 
 def _force_include(assigned: list[McpManifest], extra_mcps: list[str] | None,
@@ -2590,6 +2694,9 @@ class _SessionMcpBuild:
     is_remote: bool
     servers: dict[str, dict]
     secret_bundles: dict[str, Any]
+    # The owner filter of an agent-scope session on a personal machine
+    # (``build_session_mcp_config``); None elsewhere.
+    only_owner: str | None = None
 
     def add(self, manifest: McpManifest) -> None:
         """One assigned MCP: its entry and secret bundle, or the reason it
@@ -2660,6 +2767,7 @@ class _SessionMcpBuild:
         gateway_cred, gateway_reason = gateway_entry(
             server_entry, manifest, srv_key=srv_key, user_sub=user_sub,
             agent_name=agent_name, task_scope=task_scope, bundle_env=bundle_env,
+            **({"only_owner": self.only_owner} if self.only_owner is not None else {}),
         )
         if gateway_reason:
             exclusion_reasons[mcp_name] = gateway_reason
@@ -2743,10 +2851,13 @@ class _SessionMcpBuild:
 
         # An agent-scope session (a Shared-only chat) on a person's own
         # machine: the agent's own accounts stay on the platform (the config
-        # builder withholds their secret files there too).
+        # builder withholds their secret files there too), except an account
+        # of the machine's owner, which the owner filter alone let resolve.
         from core.session.visibility import SCOPE_AGENT
+        from services.oauth.credential_resolver import carries_to_personal_machine
         if (task_scope == SCOPE_AGENT and is_remote and placement.user_paired
-                and cred_result.env_by_mcp.get(mcp_name)):
+                and cred_result.env_by_mcp.get(mcp_name)
+                and not (self.only_owner and carries_to_personal_machine(manifest))):
             exclusion_reasons[mcp_name] = (
                 f"{manifest.label} uses the agent's own account, which stays "
                 "on the platform"
@@ -2884,9 +2995,11 @@ class _SessionMcpBuild:
 def _finish_session_servers(servers: dict[str, dict], secret_bundles: dict, cred_result,
                             agent_name: str, delegation_targets: list[str] | None,
                             target_browser, *, task_mode: bool, phone_mode: bool,
-                            meeting_mode: bool) -> None:
+                            meeting_mode: bool, only_owner: str | None = None) -> None:
     """The entries' session-wide settings: the delegation targets, the
-    browser entry's origins and mode, the command-line token blanked."""
+    browser entry's origins and mode, the command-line token blanked. With
+    the owner filter (``only_owner``) the machine's browser token goes only
+    when the filter names the machine's owner."""
     # Inject delegation targets into delegation-mcp env
     if delegation_targets is not None and "delegation-mcp" in servers:
         servers["delegation-mcp"].setdefault("env", {})["DELEGATION_MCP_TARGETS"] = ",".join(delegation_targets)
@@ -2900,9 +3013,11 @@ def _finish_session_servers(servers: dict[str, dict], secret_bundles: dict, cred
         _apply_browser_allowed_origins(
             servers["local"], _agent_store.get_browser_allowed_origins(agent_name)
         )
+        owner = getattr(target_browser, "owner_sub", "")
         _apply_browser_mode(
             servers["local"], secret_bundles, target_browser,
             unattended=bool(task_mode or phone_mode or meeting_mode),
+            withheld=only_owner is not None and not (only_owner and only_owner == owner),
         )
         # A bundle created here (token) gets the same shell-key stripping the
         # loop applies to credentialed stdio MCPs.

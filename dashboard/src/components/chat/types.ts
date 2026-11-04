@@ -1,5 +1,6 @@
 import type { GalleryImage } from './media/ImageGallery'
 import type { DelegateBlockStatus } from '../../lib/status/run'
+import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
 
 // --- Types ---
 
@@ -17,10 +18,9 @@ export type MessageBlock =
   // ones that did not land with the proxy's reason. Rides the worker's
   // response bubble; a files-only result shows the list alone.
   | { type: 'delegate_files'; files: Array<{ path: string; bytes: number }>; skipped: Array<{ path: string; reason: string }> }
-  | { type: 'schedulewake'; prompt: string; source?: string }
   // A check's verdict on this turn (CHECKS.md): the compact card.
   | { type: 'checkverdict'; check: string; status: string; pass: boolean; score?: number | null; summary: string; findings: Array<{ location: string; severity: string; text: string }>; findingsTotal: number; round: number; rounds: number; ranOn: string; costUsd: number; verdictId?: string }
-  | { type: 'bgcommand'; command: string; description?: string; isActive?: boolean; failed?: boolean; _toolId?: string | null }
+  | { type: typeof BG_COMMAND_BLOCK; command: string; description?: string; isActive?: boolean; failed?: boolean; _toolId?: string | null }
   | {
       type: 'permission'
       requestId: string
@@ -37,6 +37,17 @@ export type MessageBlock =
   // interactive chats only, since a headless turn's closing metadata block
   // follows every card.
   | { type: 'question'; toolName: string; toolInput: unknown; answered?: boolean; requestId?: string; followedInTurn?: boolean }
+  // A setting's card (SettingCard): the catalog's id and label, never a value.
+  | { type: 'setting'; settingId: string; label: string; catalogVersion: number }
+  // An action card (ActionCard): the server's words, the agent's note, the
+  // buttons' ids, labels and kinds (a say button's message too), the
+  // options; never a parameter. The card's state is read by its id.
+  | { type: 'card'; cardId: string; title: string; text: string; note: string
+      buttons: { id: string; label: string; kind: string; message?: string }[]; options: { id: string; label: string; default: boolean }[] }
+  // A list card (ListCard): the kind of list, the filters the agent asked
+  // for, the title and the person it was drawn for; the rows are fetched
+  // with the viewer's own sign-in when the card renders.
+  | { type: 'list'; kind: string; filters: Record<string, string>; title: string; person: string }
   // `resolved`: a later message followed the approval card — an interactive
   // terminal's read-only hint stands down (`followedInTurn` as above).
   | { type: 'plan'; action: string; toolInput?: unknown; superseded?: boolean; resolved?: boolean; followedInTurn?: boolean }
@@ -83,6 +94,10 @@ export interface DisplayMessage {
    *  rows. Drawn joined to that bubble (no header), still its own bubble.
    *  Set by the builders (`lib/messageBlocks.ts`, the live handlers). */
   continuation?: boolean
+  /** A card's say button sent this message for the person (the row's
+   *  `event_data.card`, the `queue_sent` frame's `card`): the bubble wears
+   *  the caption. */
+  fromCard?: boolean
 }
 
 /** What the page may ask of the message list (`ChatMessages`' ref). */
@@ -92,7 +107,16 @@ export interface ChatMessagesHandle {
   pinToBottom: () => void
 }
 
+/** A message to the agent from another agent or from the platform, drawn as a
+ *  card on the person's side: a worker's report (`result`), a worker lane's
+ *  incoming prompt (`prompt`: a delegated task, a steer, a task run's prompt)
+ *  or the platform's own prompt (`wake`: a scheduled wake, the resume after a
+ *  move, `source`). A result's title names its task and links the worker's
+ *  chat when the row knows it. */
 export interface DelegateCardMark {
-  kind: 'result' | 'prompt'
+  kind: 'result' | 'prompt' | 'wake'
   key: string
+  source?: string
+  taskName?: string
+  workerChatId?: string
 }

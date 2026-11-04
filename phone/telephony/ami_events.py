@@ -18,9 +18,10 @@ AudioSocket connection arrive in either order; ``bind_outbound`` and
 ``_on_originate`` meet in the middle. Uniqueids are only unique per Asterisk
 instance, so events match registrations for their own server only.
 
-The event connection doubles as the actions surface for the future
-transfer feature (AMI ``Redirect`` rides ``send_action`` on the same live
-socket; the registration map keeps each call's channel for exactly that).
+The event connection doubles as the actions surface of a transfer (AMI
+``Redirect`` rides ``send_action`` on the same live socket; the registration
+map keeps each call's channel for exactly that), on an inbound call and on
+an outbound one once its ``OriginateResponse`` bound it.
 
 Digit VALUES are PIN material — never logged (grep-guarded by
 ``tests/test_pin_log_hygiene.py``); only counts and sources are.
@@ -504,13 +505,22 @@ class AmiListenerManager:
     def outbound_bound(self, server_key: str, audio_uuid: str) -> bool:
         return (server_key, audio_uuid) in self._outbound_regs
 
+    def outbound_call(self, server_key: str, audio_uuid: str) -> tuple[str, str] | None:
+        """The ``(uniqueid, channel)`` of an outbound call bound to its
+        channel, None until the PBX reported it and after the call ended."""
+        uniqueid = self._outbound_regs.get((server_key, audio_uuid))
+        if uniqueid is None:
+            return None
+        entry = self._calls.get((server_key, uniqueid))
+        return (uniqueid, entry[1]) if entry else None
+
     def _bind_outbound(self, key: tuple[str, str], conn) -> None:
         uniqueid, channel, _ = self._originated.pop(key)
         self.register_call(key[0], uniqueid, conn, channel)
         self._outbound_regs[key] = uniqueid
         logger.info(
             "AMI events [%s] outbound call %s bound to its channel "
-            "(signalled DTMF)", key[0], key[1][:8]
+            "(signalled DTMF, transfers)", key[0], key[1][:8]
         )
 
     def _on_originate(

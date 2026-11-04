@@ -72,10 +72,14 @@ def _mk_task_chat(*, scope="agent", created_by=None, status="completed",
 # View: the task-run branch of can_access_chat (REST parity with the listing)
 # ---------------------------------------------------------------------------
 
-def test_agent_scoped_run_chat_visible_to_any_agent_user(temp_db, _as):
+def test_agent_scoped_run_chat_opens_from_the_editor_tier(temp_db, _as):
+    # What the agent does on its own behalf: an editor reads it, a viewer
+    # does not.
     cid, _ = _mk_task_chat(created_by="user-ed")
-    _as(VIEWER)
+    _as(EDITOR2)
     assert client.get(f"/v1/chats/{cid}").status_code == 200
+    _as(VIEWER)
+    assert client.get(f"/v1/chats/{cid}").status_code == 403
 
 
 def test_user_scoped_run_chat_creator_only(temp_db, _as):
@@ -269,6 +273,19 @@ def test_task_listing_flags_per_role(temp_db, _as):
     assert all(not r["can_rename"] and not r["can_delete"] for r in rows.values())
 
 
+def test_a_transferred_task_s_runs_are_renamed_as_they_are_deleted(temp_db, _as):
+    # The definition is the editor's (an offboarding transfer), its runs carry
+    # the prompt's author: a task row's Rename edits the run's chat, so it
+    # follows the run as Delete does and as PATCH /v1/chats answers.
+    cid, _ = _mk_named_task_chat(task_creator="user-ed", run_creator="user-ed2")
+    _as(EDITOR)
+    rows = {c["id"]: c for c in
+            client.get(f"/v1/chats?agent={AGENT}&kind=tasks").json()["chats"]}
+    assert rows[cid]["can_rename"] is False
+    assert rows[cid]["can_rename"] == rows[cid]["can_delete"]
+    assert client.patch(f"/v1/chats/{cid}", json={"title": "x"}).status_code == 403
+
+
 def test_search_carries_flags(temp_db, _as):
     _mk_named_task_chat(task_creator="user-ed")
     _as(EDITOR)
@@ -315,6 +332,16 @@ def test_definition_rename_broadcasts_live_run_chats(temp_db, _as, monkeypatch):
     task_store.create_run(live, task_id, AGENT, "schedule", None, "p",
                           scope="agent", created_by="user-ed")
     task_store.update_run(live, status="running", chat_id=live_cid,
+                          started_at="2026-07-12T01:00:00+00:00")
+    # A second live run whose chat has its own title (generated or renamed):
+    # its rows lead with that title, so the task's new name is not sent to it.
+    titled = f"run-{uuid.uuid4().hex[:12]}"
+    titled_cid = f"task-{titled}"
+    task_store.create_chat(titled_cid, f"task::{AGENT}", AGENT)
+    task_store.update_chat(titled_cid, title="📦 Backup sweep", title_generated=True)
+    task_store.create_run(titled, task_id, AGENT, "schedule", None, "p",
+                          scope="agent", created_by="user-ed")
+    task_store.update_run(titled, status="running", chat_id=titled_cid,
                           started_at="2026-07-12T01:00:00+00:00")
     _as(EDITOR)
     r = client.patch(f"/v1/tasks/{task_id}", json={"name": "Renamed nightly"})

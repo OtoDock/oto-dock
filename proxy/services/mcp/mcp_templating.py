@@ -72,6 +72,8 @@ def _resolve_template(
         service-DNS name (T2)
       ``${platform.wopi_base_url}``         — current ``config.WOPI_BASE_URL``
       ``${platform.collabora_frame_ancestors}``, ``${platform.collabora_service_root}``
+      ``${platform.collabora_bind_ip}``     — where a bare-metal Collabora's
+        port 9981 is published (``config.COLLABORA_BIND_IP``, loopback unless set)
       ``${platform.host_agents_dir}``       — ``str(config.AGENTS_DIR)``
       ``${platform.mcp_port}``              — current MCP's ``server.port``
       ``${platform.oauth_insecure_transport}`` — ``"1"`` if dashboard uses
@@ -128,6 +130,7 @@ def _resolve_template(
         "${platform.collabora_frame_ancestors}": _dashboard_host(),
         "${platform.collabora_service_root}":    config.COLLABORA_SERVICE_ROOT,
         "${platform.collabora_ssl_termination}": config.COLLABORA_SSL_TERMINATION,
+        "${platform.collabora_bind_ip}":         config.COLLABORA_BIND_IP,
         "${platform.host_agents_dir}":    str(config.AGENTS_DIR),
         "${platform.mcp_port}":           str(manifest.server.port),
         "${platform.oauth_insecure_transport}": "1" if config.DASHBOARD_PUBLIC_URL.startswith("http://") else "",

@@ -5,7 +5,6 @@
 import { useCallback, useEffect, useEffectEvent, useRef } from 'react'
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import * as THREE from 'three'
-import type { User } from '../../api/auth'
 import { pushEscHandler } from '../../lib/escStack'
 import { blockedByModal } from '../../lib/ui/modalLayers'
 import { stageExitPath } from './camera'
@@ -16,7 +15,7 @@ import { mapPoseFor, viewScale, type SceneBag } from './sceneBag'
 
 export function useStageMachine({
   bagRef, layout, stage, setStage, mapDept, setMapDept, stageData,
-  setPopup, setMenu, user, favDeptRef,
+  setPopup, setMenu, anchorSlug, anchorDeptRef,
 }: {
   bagRef: RefObject<SceneBag | null>
   layout: MapLayout
@@ -27,8 +26,9 @@ export function useStageMachine({
   stageData: { cluster: MapCluster; arc: StageLayout } | null
   setPopup: Dispatch<SetStateAction<PopupState | null>>
   setMenu: Dispatch<SetStateAction<MenuState | null>>
-  user: User | null
-  favDeptRef: RefObject<string | null>
+  /** The agent the map opened on (the chat's agent, else the favorite). */
+  anchorSlug: string
+  anchorDeptRef: RefObject<string | null>
 }) {
   // --- the semantic-zoom state machine ------------------------------------
   const enterStage = useCallback((deptId: string) => {
@@ -157,20 +157,20 @@ export function useStageMachine({
 
   // Remembered across sessions: the next open parks the camera at this pose
   // while the data loads (see the renderer-setup note). Written ONLY when
-  // the stage IS the favorite's department — the parked pose is by
-  // construction the favorite's own stage, so the next open can never park
-  // rotated to the last-visited department. An effect event: a favorite
+  // the stage IS the anchor's department — the parked pose is by
+  // construction the anchor's own stage, so the next open can never park
+  // rotated to the last-visited department. An effect event: an anchor
   // change alone never re-runs the stage pose.
   const rememberStagePose = useEffectEvent((
     deptId: string, cam: THREE.Vector3, look: THREE.Vector3,
   ) => {
     try {
-      if (user?.default_agent && deptId === favDeptRef.current) {
+      if (anchorSlug && deptId === anchorDeptRef.current) {
         localStorage.setItem('odk-map-pose-v2', JSON.stringify({
           c: cam.toArray(),
           t: look.toArray(),
           d: deptId,
-          f: user.default_agent,
+          f: anchorSlug,
         }))
       }
     } catch { /* storage blocked — cosmetic only */ }

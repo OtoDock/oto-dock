@@ -23,7 +23,8 @@
 # Every OS:                    sympy in the agents' python
 # CLIs:                        claude (Anthropic), codex (OpenAI) — via npm
 # Git credential helper:       /usr/local/bin/oto-git-credential-helper +
-#                              `/etc/gitconfig` wiring so sandboxed `git`
+#                              `/etc/gitconfig` wiring (on macOS Homebrew's
+#                              bin and etc/gitconfig) so sandboxed `git`
 #                              consults `GH_TOKEN` (from manifest
 #                              `env_injection`) for github.com URLs.
 #
@@ -94,6 +95,11 @@ SKIP_CREDENTIAL_HELPER="${SKIP_CREDENTIAL_HELPER:-false}"
 # auto (build the pinned release, else fall back to what the distro offers),
 # required (build it or fail: the Docker image), distro (no build or download).
 OTODOCK_PASST_BUILD="${OTODOCK_PASST_BUILD:-auto}"
+# macOS: the platform's Python minor (a test holds it equal to VERSIONS.md's
+# PYTHON_VERSION), brew's standard places, and Homebrew's own installer.
+OTODOCK_PYTHON_MINOR="${OTODOCK_PYTHON_MINOR:-3.13}"
+BREW_CANDIDATES="${BREW_CANDIDATES:-/opt/homebrew/bin/brew /usr/local/bin/brew}"
+HOMEBREW_INSTALL_URL="${HOMEBREW_INSTALL_URL:-https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh}"
 
 # --- Auto-restart flag ---
 RESTART_PLATFORM=false
@@ -163,7 +169,7 @@ install_linux_tier_1() {
     # (pnpm + the claude/codex CLI installs) falls over with "npm not
     # present" — first hit on a fresh dev-VM satellite pairing. Same keyring
     # pattern as the gh repo above; idempotent.
-    local node_ver="${NODE_VERSION:-26.12.1}"
+    local node_ver="${NODE_VERSION:-26.13.0}"
     local node_major="${node_ver%%.*}"
     if ! command -v npm &>/dev/null; then
         info "Adding NodeSource apt repo (node ${node_major}.x)..."
@@ -191,7 +197,7 @@ install_linux_tier_1() {
     # A copy that does not run without $HOME is removed and the pin installed.
     # The install itself also replaces the installing user's ~/.local/bin/uv:
     # pipx --force takes that path whatever sits there.
-    local uv_ver="${UV_VERSION:-0.13.5}" uv_have="" uv_bin="/usr/local/bin/uv"
+    local uv_ver="${UV_VERSION:-0.13.7}" uv_have="" uv_bin="/usr/local/bin/uv"
     local uv_install=true uv_clean=""
     [ -x "$uv_bin" ] || uv_bin="$(command -v uv 2>/dev/null || true)"
     if [ -n "$uv_bin" ]; then uv_have="$(_cli_ver "$uv_bin")"; uv_have="${uv_have:-0}"; fi
@@ -253,7 +259,7 @@ install_linux_tier_1() {
     # with the uv rule above: absent or older is installed, newer is left alone.
     # --allow-scripts: pnpm 12's install step puts its native binary at the bin
     # path; npm 12 skips it by default and leaves a shim that needs Node.
-    local pnpm_ver="${PNPM_VERSION:-12.15.0}" pnpm_have=""
+    local pnpm_ver="${PNPM_VERSION:-12.16.1}" pnpm_have=""
     if command -v pnpm &>/dev/null; then pnpm_have="$(_cli_ver pnpm)"; pnpm_have="${pnpm_have:-0}"; fi
     if ! command -v npm &>/dev/null; then
         warn "npm not present — install Node ${node_major} LTS first, then re-run for pnpm."
@@ -261,9 +267,9 @@ install_linux_tier_1() {
         [ "$pnpm_have" = "$pnpm_ver" ] || warn "pnpm ${pnpm_have} is newer than the pin ${pnpm_ver} — left as it is"
     elif [ -z "$pnpm_have" ]; then
         info "Installing pnpm ${pnpm_ver} via npm..."
-        $SUDO npm install -g --allow-scripts=pnpm "pnpm@${pnpm_ver}"
+        $(_npm_sudo) npm install -g --allow-scripts=pnpm "pnpm@${pnpm_ver}"
     elif info "Upgrading pnpm $(_shown "$pnpm_have") → ${pnpm_ver} via npm..." \
-            && $SUDO npm install -g --allow-scripts=pnpm "pnpm@${pnpm_ver}"; then
+            && $(_npm_sudo) npm install -g --allow-scripts=pnpm "pnpm@${pnpm_ver}"; then
         hash -r
         _verify_resolved_cli "pnpm" "pnpm" "$pnpm_ver"
     else
@@ -383,7 +389,7 @@ install_netns_tools() {
     fi
     rm -rf "$tmp"
     err "Could not obtain 'pasta' (sandbox network isolation is mandatory). Build passt ${passt_ver}"
-    err "  from https://passt.top/passt (make passt) into /usr/local/bin, pasta linked to it, and re-run."
+    err "  from https://passt.top/passt (make passt, plus passt.avx2 on x86_64) into /usr/local/bin, pasta linked to it, and re-run."
     exit 1
 }
 
@@ -395,25 +401,27 @@ _passt_date() {
     fi
 }
 
-# passt into /usr/local/bin with pasta linked to it (argv0 picks the mode):
-# copied beside first, so a failed copy keeps the old one, then the old
-# static layout (pasta the file, passt a link to it) is replaced.
+# passt into /usr/local/bin, pasta linked to it (argv0 picks the mode), and its AVX2 build when given
+# first (passt execs "<its path>.avx2" on an AVX2 CPU; else a stale one goes): each copied beside, so a
+# failed copy keeps the old one, then the old static layout (pasta the file, passt a link) is replaced.
 _install_passt() {
+    if [ -n "${2:-}" ]; then $SUDO install -m 0755 "$2" /usr/local/bin/passt.avx2.new \
+        && $SUDO mv /usr/local/bin/passt.avx2.new /usr/local/bin/passt.avx2 || return 1; else $SUDO rm -f /usr/local/bin/passt.avx2; fi
     $SUDO install -m 0755 "$1" /usr/local/bin/passt.new && $SUDO rm -f /usr/local/bin/pasta /usr/local/bin/passt \
         && $SUDO mv /usr/local/bin/passt.new /usr/local/bin/passt && $SUDO ln -sf passt /usr/local/bin/pasta && hash -r
 }
 
-# Clone the release tag (the pinned commit, or for another tag one its short
-# sha prefixes) and build it with Tier 1's C toolchain; the licence texts and
+# Clone the release tag (the pinned commit, or for another tag one its short sha prefixes) and build it, with
+# passt.avx2 on x86_64 (the only one upstream has it for), with Tier 1's C toolchain; the licence texts and
 # the source tarball (GPL-2.0) go to /usr/local/share/doc/passt.
 _build_pinned_passt() {
-    local ver="$1" commit="$2" tmp head built=1
-    tmp="$(mktemp -d)"
+    local ver="$1" commit="$2" tmp head built=1 avx2=""
+    tmp="$(mktemp -d)"; [ "$(uname -m)" = x86_64 ] && avx2="passt.avx2"
     if git -c advice.detachedHead=false clone -q --depth 1 --branch "$ver" https://passt.top/passt "$tmp/passt"; then
         head="$(git -C "$tmp/passt" rev-parse HEAD)"
         if [[ "$commit" == "${ver##*.}"* && "$head" != "$commit" ]] || [[ "$head" != "${ver##*.}"* ]]; then
             err "passt ${ver} resolves to commit ${head}, not the pinned one"
-        elif make -s -C "$tmp/passt" passt >/dev/null && _install_passt "$tmp/passt/passt"; then
+        elif make -s -C "$tmp/passt" passt $avx2 >/dev/null && _install_passt "$tmp/passt/passt" "${avx2:+$tmp/passt/$avx2}"; then
             $SUDO install -d /usr/local/share/doc/passt
             git -C "$tmp/passt" archive --format=tar.gz --prefix="passt-${ver}/" -o "$tmp/passt-${ver}.tar.gz" HEAD
             $SUDO install -m 0644 "$tmp/passt/LICENSES/"*.txt "$tmp/passt-${ver}.tar.gz" /usr/local/share/doc/passt/
@@ -443,33 +451,57 @@ install_quota_tools() {
 }
 
 # ──────────────────────────────────────────────────────────────────────
-# macOS — brew path (best-effort, CI matrix not fully exercised)
+# macOS — brew path (Homebrew installed when missing)
 # ──────────────────────────────────────────────────────────────────────
 
 install_macos_all() {
-    info "macOS — installing via Homebrew (best-effort)..."
-
-    if ! command -v brew &>/dev/null; then
-        err "Homebrew not found — install from https://brew.sh and re-run,"
-        err "or install the tools listed at the top of this script manually."
-        exit 1
-    fi
-
-    brew install \
-        git gh \
-        python uv \
-        node pnpm \
-        jq ripgrep tree make \
+    info "macOS — installing via Homebrew..."
+    # Homebrew refuses root, and all of this is the pairing person's own.
+    [ "$(id -u)" -ne 0 ] || {
+        err "Run the installer as yourself, not as root. Homebrew does not run as root."; exit 1; }
+    local brew_bin; brew_bin="$(_find_brew)" || { _install_homebrew; brew_bin="$(_find_brew)" || _brew_failed; }
+    # An SSH command runs no login shell: brew's bin goes on this run's PATH.
+    eval "$("$brew_bin" shellenv)"; hash -r
+    xcode-select -p >/dev/null 2>&1 || {
+        err "Apple's Command Line Tools are missing. Run 'xcode-select --install', then pair again."; exit 1; }
+    # python@<minor>, the platform's own, runs the satellite and its MCPs.
+    brew install git gh python "python@${OTODOCK_PYTHON_MINOR}" uv node pnpm jq ripgrep tree make \
         || warn "Some Tier 1 brew installs failed — check output."
-
     if [ "$SKIP_TIER_2" != "true" ]; then
-        brew install poppler sqlite \
-            || warn "Some Tier 2 brew installs failed — check output."
+        brew install poppler sqlite || warn "Some Tier 2 brew installs failed — check output."
     fi
-
-    ok "macOS install complete (best-effort)"
+    ok "macOS install complete"
 }
 
+_find_brew() {
+    local b
+    for b in "$(command -v brew 2>/dev/null || true)" $BREW_CANDIDATES; do
+        if [ -n "$b" ] && [ -x "$b" ]; then echo "$b"; return 0; fi
+    done
+    return 1
+}
+
+# Homebrew's installer, unattended: sudo once and kept fresh, downloaded first,
+# stdin closed (under `curl … | bash` it would read this script).
+_install_homebrew() {
+    info "Homebrew is not installed. Installing it now (your password is asked once)..."
+    { $SUDO -n true 2>/dev/null || $SUDO -v; } || {
+        err "Installing Homebrew needs an administrator account and its password. Install it from https://brew.sh, then pair again."; exit 1; }
+    # The loop ends with this script, also on Ctrl-C (it ignores SIGINT itself).
+    ( while kill -0 "$$" 2>/dev/null; do $SUDO -n true 2>/dev/null; sleep 60; done ) >/dev/null 2>&1 &
+    local keep=$! tmp rc=0; disown "$keep" 2>/dev/null || true  # no "Terminated" line
+    tmp="$(mktemp -d)"
+    if curl -fsSL -o "$tmp/install.sh" "$HOMEBREW_INSTALL_URL"; then
+        NONINTERACTIVE=1 /bin/bash "$tmp/install.sh" </dev/null || rc=$?
+    else
+        rc=1; err "Could not download Homebrew's installer from $HOMEBREW_INSTALL_URL"
+    fi
+    kill "$keep" 2>/dev/null || true
+    rm -rf "$tmp"
+    [ "$rc" -eq 0 ] || _brew_failed
+    ok "Homebrew installed"
+}
+_brew_failed() { err "Homebrew did not install. Install it from https://brew.sh, then pair again."; exit 1; }
 # ──────────────────────────────────────────────────────────────────────
 # sympy — symbolic maths in the agents' python (the file-tools maths
 # workflow: transcribe LaTeX → compute → write equations back). The agent
@@ -490,6 +522,14 @@ install_sympy() {
         return 0
     fi
     info "Installing sympy ${sympy_ver}..."
+    # A Mac session runs as the person (no sandbox): the user site of brew's
+    # python3. Brew has no sympy formula and refuses a plain pip (PEP 668).
+    if [ "$OS_TYPE" = "macos" ]; then
+        python3 -m pip install --quiet --user --break-system-packages "sympy==${sympy_ver}" \
+            && ok "sympy ${sympy_ver} installed via pip (your user site)" \
+            || warn "Could not install sympy — agents can still 'pip install sympy' per session."
+        return 0
+    fi
     # pip first, WITH $SUDO: lands in the system site of whatever `python3`
     # resolves to (notably the Docker image's /usr/local python). Without
     # sudo, pre-PEP-668 pips silently fall back to the installing user's
@@ -503,8 +543,6 @@ install_sympy() {
     elif [ "$OS_TYPE" = "linux" ] \
         && $SUDO apt-get install -y --no-install-recommends python3-sympy; then
         ok "sympy installed via apt (python3-sympy)"
-    elif [ "$OS_TYPE" = "macos" ] && brew install sympy; then
-        ok "sympy installed via brew"
     else
         warn "Could not install sympy — agents can still 'pip install sympy' per session."
     fi
@@ -515,30 +553,21 @@ install_sympy() {
 # CLIs — claude + codex (via npm globals on both Linux and macOS)
 # ──────────────────────────────────────────────────────────────────────
 
-# Pinned CLI versions — keep in sync with VERSIONS.md (CLAUDE_CODE_VERSION /
-# CODEX_VERSION). We pin exact versions because the platform runs against a
-# verified CLI (auto-update is disabled in-app). These defaults are what every
-# Docker image installs: the proxy image runs this script before VERSIONS.md is
-# copied in, and nothing passes the VERSIONS.md values down (a pairing or a
-# bare-metal run may override them through the matching env vars);
+# Pinned CLI versions (VERSIONS.md's CLAUDE_CODE_VERSION / CODEX_VERSION): the
+# platform runs a verified CLI. Every Docker image installs these defaults (it
+# runs this script before VERSIONS.md is copied in; a pairing or a bare-metal
+# run may override them by the env vars), and
 # proxy/tests/execution/test_engine_descriptor.py holds them equal to the rows.
-# _install_pinned_cli upgrades an existing install to the exact pin rather than
-# skipping it.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.296}"
-CODEX_VERSION="${CODEX_VERSION:-0.163.0}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.312}"
+CODEX_VERSION="${CODEX_VERSION:-0.166.0}"
 
-# Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
-# "codex-cli 0.139.0").
-# Never fails (a tool whose --version breaks reads as empty under set -e) and
-# never waits on stdin (a corepack shim may ask before downloading).
+# The bare x.y.z of a CLI's --version ("2.1.177 (Claude Code)", "codex-cli
+# 0.139.0"). Never fails under set -e, never waits on stdin (a corepack shim).
 _cli_ver() { { "$1" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; } || true; }
 
-# After an install/upgrade, verify what the shell NOW resolves. The install
-# places the pinned copy in its own location (npm's global prefix,
-# /usr/local/bin for uv), but PATH may still resolve another
-# install (e.g. the vendor's standalone installer under ~/.local/bin) — the
-# upgrade then silently changes nothing for anything that spawns "$bin".
-# Warn with every resolvable copy and its version so the shadow is obvious.
+# After an install, verify what the shell NOW resolves: another copy earlier on
+# PATH (a vendor's standalone install in ~/.local/bin) would leave the upgrade
+# changing nothing for whatever spawns "$bin". Every copy is listed, versioned.
 _verify_resolved_cli() {
     local label="$1" bin="$2" want="$3"
     local now; now="$(_cli_ver "$bin")"
@@ -557,14 +586,41 @@ _verify_resolved_cli() {
     return 0
 }
 
-# Install OR upgrade an npm-global CLI to the EXACT pinned version. The platform
-# runs against a verified CLI (auto-update disabled in-app), so a mismatched
-# install is upgraded — not skipped. This is what keeps the version the proxy
-# actually spawns (resolved from PATH) in lockstep with VERSIONS.md; a plain
-# "already installed → skip" let the system /usr install drift stale while a
-# newer user-prefix copy sat unused. --allow-scripts lets the CLI's own install
-# step run under npm 12, which blocks it by default (Claude Code's puts its
-# native binary in place; without it `claude` is a stub that exits 1).
+# npm's global installs take sudo only for a prefix the person cannot write
+# (NodeSource's /usr; a missing folder judged by the one above). macOS sudo
+# keeps $HOME: a sudo npm left root's files in ~/.npm, breaking later installs.
+_npm_sudo() {
+    [ -n "$SUDO" ] || return 0
+    local prefix d
+    prefix="$(npm prefix -g 2>/dev/null || true)"
+    if [ -z "$prefix" ]; then echo "$SUDO"; return 0; fi
+    for d in "$prefix/lib/node_modules" "$prefix/bin"; do
+        while [ ! -e "$d" ] && [ -n "$d" ] && [ "$d" != / ]; do d="${d%/*}"; done
+        if [ ! -w "${d:-/}" ]; then echo "$SUDO"; return 0; fi
+    done
+}
+
+# Root's files such a run left are given back (npm's own advice): ~/.npm, and
+# the packages and their links in a prefix that is the person's own
+# (Homebrew's), which the next CLI upgrade could not replace.
+_repair_npm_files() {
+    [ "$(id -u)" -ne 0 ] || return 0
+    local me prefix="" f
+    me="$(id -u)"
+    [ -n "$(_npm_sudo)" ] || prefix="$(npm prefix -g 2>/dev/null || true)"
+    { if [ -n "$(find "$HOME/.npm" ! -user "$me" -print -quit 2>/dev/null)" ]; then echo "$HOME/.npm"; fi
+      [ -z "$prefix" ] || find "$prefix/lib/node_modules" "$prefix/bin" -mindepth 1 -maxdepth 1 ! -user "$me" \
+          \( -path "$prefix/lib/*" -o -lname '*node_modules*' \) 2>/dev/null || true
+    } | while IFS= read -r f; do
+        info "An older installer left $f owned by root. Giving it back to you..."
+        $SUDO chown -R -h "$me:$(id -g)" "$f" || warn "Could not give back $f. Run: sudo chown -R $(id -un) \"$f\""
+    done
+}
+
+# Install OR upgrade an npm-global CLI to the EXACT pin: a mismatched install is
+# upgraded, never skipped, so the copy the proxy spawns from PATH stays in step
+# with VERSIONS.md. --allow-scripts lets the CLI's own install step run under
+# npm 12, which blocks it (without it `claude` is a stub that exits 1).
 _install_pinned_cli() {
     local label="$1" pkg="$2" bin="$3" want="$4"
     if command -v "$bin" &>/dev/null; then
@@ -575,14 +631,14 @@ _install_pinned_cli() {
         fi
         if command -v npm &>/dev/null; then
             info "Upgrading ${label} ${have:-unknown} → ${want}..."
-            $SUDO npm install -g --allow-scripts="${pkg}" "${pkg}@${want}"
+            $(_npm_sudo) npm install -g --allow-scripts="${pkg}" "${pkg}@${want}"
             _verify_resolved_cli "$label" "$bin" "$want"
         else
             warn "${label} is ${have:-unknown}, want ${want}, but npm not present to upgrade."
         fi
     elif command -v npm &>/dev/null; then
         info "Installing ${label} ${want}..."
-        $SUDO npm install -g --allow-scripts="${pkg}" "${pkg}@${want}"
+        $(_npm_sudo) npm install -g --allow-scripts="${pkg}" "${pkg}@${want}"
         _verify_resolved_cli "$label" "$bin" "$want"
     else
         warn "Cannot install ${label}: npm not present."
@@ -618,15 +674,28 @@ install_credential_helper() {
         return 0
     fi
 
-    info "Installing git credential helper to $CREDENTIAL_HELPER_DST..."
-    $SUDO install -m 0755 "$CREDENTIAL_HELPER_SRC" "$CREDENTIAL_HELPER_DST"
+    local dst="$CREDENTIAL_HELPER_DST" as="$SUDO" prefix
+    if [ "$OS_TYPE" = "macos" ]; then
+        # Homebrew's bin (on every PATH a session gets) and brew git's system
+        # config, no sudo: a fresh Apple silicon Mac has no /usr/local/bin.
+        prefix="$(brew --prefix)"; dst="$prefix/bin/oto-git-credential-helper"; as=""
+        # An older run left that config root's.
+        [ ! -e "$prefix/etc/gitconfig" ] || [ -w "$prefix/etc/gitconfig" ] \
+            || $SUDO chown "$(id -u):$(id -g)" "$prefix/etc/gitconfig" \
+            || warn "$prefix/etc/gitconfig belongs to root. Give it back with: sudo chown $(id -un) $prefix/etc/gitconfig"
+    else
+        # Only a missing folder: GNU install -d resets an existing one's mode.
+        [ -d "${dst%/*}" ] || $SUDO install -d -m 0755 "${dst%/*}"
+    fi
+    info "Installing git credential helper to $dst..."
+    # A Homebrew another account owns: no helper, and the pairing goes on.
+    $as install -m 0755 "$CREDENTIAL_HELPER_SRC" "$dst" || {
+        warn "Could not install the git credential helper into ${dst%/*}. git push from agents will not use the GitHub account."; return 0; }
 
-    # Wire it into /etc/gitconfig. `git config --system` writes to
-    # /etc/gitconfig (creating the file if absent) and overwrites the
-    # key if already present — idempotent across re-runs.
-    info "Wiring credential helper into /etc/gitconfig..."
-    $SUDO git config --system \
-        credential.https://github.com.helper "$CREDENTIAL_HELPER_DST"
+    # `git config --system` creates the file and overwrites the key: idempotent.
+    info "Wiring the credential helper into git's system config..."
+    $as git config --system credential.https://github.com.helper "$dst" \
+        || warn "Could not write git's system config. git push from agents will not use the GitHub account."
 
     ok "Credential helper installed; \`git push\` to github.com now auto-uses GH_TOKEN"
 }
@@ -653,6 +722,7 @@ main() {
         install_macos_all
     fi
 
+    _repair_npm_files
     install_sympy
     install_clis
     install_credential_helper
@@ -668,7 +738,7 @@ main() {
     if [ "$SKIP_CREDENTIAL_HELPER" != "true" ]; then
         echo ""
         echo "Credential helper check:"
-        echo "    cat /etc/gitconfig | grep -A1 'credential \"https://github.com\"'"
+        echo "    git config --system --get credential.https://github.com.helper"
     fi
 
     # --- Restart platform services (opt-in) ---

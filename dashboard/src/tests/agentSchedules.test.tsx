@@ -7,8 +7,10 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 //     contract (jsdom does no layout — the width check is the browser) ───
 
 vi.mock('@/contexts/AuthContext', () => ({
-  useAuth: () => ({ user: { sub: 'u1', role: 'admin', display_name: 'Dev Admin', agent_roles: {} } }),
+  useAuth: () => ({ user: h.user }),
 }))
+
+const ADMIN_USER = { sub: 'u1', role: 'admin', display_name: 'Dev Admin', agent_roles: {} }
 
 const TASKS = [
   {
@@ -42,8 +44,10 @@ const READ_ONLY = {
 
 const h = vi.hoisted(() => ({
   tasks: null as unknown as unknown[],
+  user: null as unknown as Record<string, unknown>,
   editMachine: vi.fn(),
   editMode: vi.fn(),
+  editDetails: vi.fn(),
   runTargets: vi.fn(),
 }))
 
@@ -56,6 +60,7 @@ vi.mock('@/api/tasks', () => ({
   useResumeTask: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useEditTaskMachine: () => ({ mutateAsync: h.editMachine, isPending: false }),
   useEditTaskMode: () => ({ mutateAsync: h.editMode, isPending: false }),
+  useEditTaskDetails: () => ({ mutateAsync: h.editDetails, isPending: false }),
 }))
 
 // The places the task dialog offers for the task's scope.
@@ -77,6 +82,9 @@ const RUN_TARGETS = {
 
 beforeEach(() => {
   h.tasks = TASKS
+  h.user = ADMIN_USER
+  h.editDetails.mockReset()
+  h.editDetails.mockResolvedValue(undefined)
   h.editMachine.mockReset()
   h.editMachine.mockResolvedValue(undefined)
   h.editMode.mockReset()
@@ -210,6 +218,40 @@ describe('AgentSchedules', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent("You can't run this task there. Pick one of: Attic PC.")
     expect(h.editMachine).toHaveBeenCalledWith({ taskId: TASKS[0].id, machine: 'm-attic' })
     expect(screen.getByText('Task settings: Daily health')).toBeInTheDocument()
+  })
+
+  it("the dialog saves a new name and who a shared task tells, and keeps the rest", async () => {
+    mount()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Settings' })[0])
+    // A shared task that notifies: the field reads its audience, editors by default.
+    expect(screen.getByTestId('task-who-is-told')).toHaveValue('editor')
+    fireEvent.change(screen.getByTestId('task-name'), { target: { value: 'Morning health' } })
+    fireEvent.change(screen.getByTestId('task-who-is-told'), { target: { value: 'contributor' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(h.editDetails).toHaveBeenCalledWith({
+      taskId: TASKS[0].id, name: 'Morning health', notify_audience: 'contributor' }))
+    expect(h.editMode).not.toHaveBeenCalled()
+    expect(h.editMachine).not.toHaveBeenCalled()
+  })
+
+  it('a personal or silent task has no Who is told, and an empty name is refused', async () => {
+    h.tasks = [TASKS[1]]
+    mount()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Settings' })[0])
+    expect(screen.queryByTestId('task-who-is-told')).toBeNull()
+    fireEvent.change(screen.getByTestId('task-name'), { target: { value: '  ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('A task needs a name.')
+    expect(h.editDetails).not.toHaveBeenCalled()
+  })
+
+  it('tells a person below the editor role that the agent\'s own tasks are not listed', () => {
+    h.user = { sub: 'u1', role: 'member', display_name: 'Pat', agent_roles: { 'hosting-admin': 'contributor' } }
+    h.tasks = [TASKS[1]]
+    mount()
+    expect(screen.getByTestId('own-tasks-only')).toHaveTextContent(
+      'Tasks the agent runs on its own show for editors and managers.')
+    h.user = ADMIN_USER
   })
 
   it('renders the extra field under "Runs on"', () => {

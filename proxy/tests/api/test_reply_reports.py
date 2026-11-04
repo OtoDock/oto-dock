@@ -8,10 +8,14 @@ read from the chat's rows. The admins get one notification each (one per
 person per ten minutes), with the speaker, the time and the reason, never
 the note or the reply; the gap runs from the person's last NOTIFIED report
 and the next notice counts the ones in between. Admins read the rows through
-one paged GET (the Reports page), and may dismiss a report to the page's
-history and restore it (nothing is deleted). The table comes with the boot
-on a database from before it, the dismiss columns on one that made the table
-before them, and a chat's deletion takes its reports.
+one paged GET (the Reports page), may mark a report handled or dismiss it to
+the page's closed list, restore it, or delete it. A report outlives its
+chat and goes a year after it was filed (the retention sweep). The table
+comes with the boot on a database from before it, the later columns on one
+that made the table before them, and a table made with its reports going
+with their chat is rewritten once. A reply with no text is described, a
+notice opens the chat at the reply, a person reads back the replies they
+reported, and a reader of a shared copy reports from it.
 """
 
 import json
@@ -99,7 +103,7 @@ def test_the_owner_reports_a_reply_and_the_admins_hear_of_it(as_user, fired):
     cid, _, reply = _chat()
     as_user(OWNER)
     r = _report(cid, reply, note="It said something cruel\nsecond line")
-    assert r.status_code == 200 and r.json() == {"status": "reported"}
+    assert r.status_code == 200 and r.json() == {"status": "reported", "message_id": reply}
     [row] = _rows()
     assert (row["reporter_sub"], row["chat_id"], row["message_id"]) == ("user-viewer", cid, reply)
     assert (row["agent"], row["reason"]) == (AGENT, "harmful")
@@ -147,7 +151,10 @@ def test_an_agent_scope_task_runs_chat_is_reported_by_its_readers(as_user, fired
     task_store.update_run(run_id, status="completed", chat_id=cid)
     task_store.add_chat_message(cid, "user", "check backups")
     reply = task_store.add_chat_message(cid, "assistant", "Backups are fine.")
+    # Its readers are the editor tier: a contributor does not read the run.
     as_user(OTHER)
+    assert _report(cid, reply).status_code in (403, 404)
+    as_user(OWNER)
     assert _report(cid, reply).status_code == 200
     assert fired[0]["agent_slug"] == AGENT and fired[0]["chat_id"] == cid
 
@@ -224,9 +231,9 @@ def test_an_unknown_reason_and_a_long_note_are_refused(as_user, fired):
 def test_a_second_report_answers_the_same_and_tells_nobody(as_user, fired):
     cid, _, reply = _chat()
     as_user(OWNER)
-    assert _report(cid, reply).json() == {"status": "reported"}
+    assert _report(cid, reply).json() == {"status": "reported", "message_id": reply}
     second = _report(cid, reply, reason="other", note="again")
-    assert second.status_code == 200 and second.json() == {"status": "reported"}
+    assert second.status_code == 200 and second.json() == {"status": "reported", "message_id": reply}
     [row] = _rows()
     assert row["reason"] == "harmful"
     assert len(fired) == 1
@@ -241,7 +248,7 @@ def test_any_row_of_a_reply_names_the_reply(as_user, fired):
     last = task_store.add_chat_message(cid, "assistant", "Part two.")
     as_user(OWNER)
     for named in (last, tool, first):
-        assert _report(cid, named).json() == {"status": "reported"}
+        assert _report(cid, named).json() == {"status": "reported", "message_id": first}
     [row] = _rows()
     assert row["message_id"] == first and row["reply_text"] == "Part one.\n\nPart two."
     assert len(fired) == 1
@@ -388,6 +395,137 @@ def test_a_reply_with_no_text_is_refused(as_user, fired):
     assert not _rows() and not fired
 
 
+def _event(cid, event_type, data):
+    return task_store.add_chat_message(cid, "event", "", event_type=event_type,
+                                       event_data=json.dumps({"type": event_type, **data}))
+
+
+def test_a_reply_with_no_text_is_described_part_by_part(as_user, fired):
+    cid = "chat-parts"
+    task_store.create_chat(cid, "user-viewer", AGENT)
+    task_store.add_chat_message(cid, "user", "Set it up")
+    first = _event(cid, "tool", {"name": "mcp__settings-mcp__get_setting"})
+    _event(cid, "tool", {"name": "Bash"})
+    _event(cid, "thinking", {"text": "private"})
+    _event(cid, "action_card", {"title": "Hand it over"})
+    _event(cid, "settings_card", {"setting": "user.general.wake-word", "label": "Wake word"})
+    last = _event(cid, "images", {"images": [{"url": "a"}, {"url": "b"}]})
+    as_user(OWNER)
+    assert _report(cid, last).json() == {"status": "reported", "message_id": first}
+    [row] = _rows()
+    assert row["reply_text"] == "\n".join([
+        "Used get_setting from settings-mcp.", "Used Bash.", "Showed the card \u201cHand it over\u201d.",
+        "Showed the setting card \u201cWake word\u201d.", "Showed 2 images."])
+
+
+def test_a_reply_with_text_keeps_only_its_text(as_user, fired):
+    cid = "chat-mixed"
+    task_store.create_chat(cid, "user-viewer", AGENT)
+    task_store.add_chat_message(cid, "user", "Q")
+    first = _event(cid, "tool", {"name": "Bash"})
+    task_store.add_chat_message(cid, "assistant", "Done.")
+    as_user(OWNER)
+    _report(cid, first)
+    assert _rows()[0]["reply_text"] == "Done."
+
+
+def test_an_empty_reply_at_the_row_cap_is_still_refused(as_user, fired, monkeypatch):
+    monkeypatch.setattr(reply_reports, "ROWS_MAX", 2)
+    cid = "chat-capped-empty"
+    task_store.create_chat(cid, "user-viewer", AGENT)
+    task_store.add_chat_message(cid, "user", "Q")
+    first = _event(cid, "thinking", {"text": "a"})
+    for _ in range(3):
+        _event(cid, "thinking", {"text": "b"})
+    as_user(OWNER)
+    r = _report(cid, first)
+    assert r.status_code == 400 and r.json()["detail"] == "This reply has no text to report."
+
+
+def test_describe_reads_each_kind():
+    d = reply_reports.describe
+    assert d("images", {"images": [{"url": "a"}]}) == "Showed an image."
+    assert d("images", {"images": []}) == ""
+    assert d("ui", {"title": "Board"}) == "Showed the app \u201cBoard\u201d."
+    assert d("file", {"filename": "a.pdf"}) == "Showed the file a.pdf."
+    assert d("document_preview", {}) == "Showed a document."
+    assert d("url", {"url": "https://example.com"}) == "Sent a link to example.com."
+    # Never a path or a query: either can carry a token, and a report is kept a year.
+    assert d("url", {"url": "https://Agents.Example.com:8443/s/tok123?token=secret#x"}) == \
+        "Sent a link to agents.example.com."
+    assert d("url", {"url": "not a link"}) == "Sent a link."
+    assert d("url", {}) == "Sent a link."
+    assert d("video", {}) == "Showed a video." and d("audio", {}) == "Played an audio clip."
+    assert d("list_card", {}) == "Showed a card."
+    assert d("thinking", {"text": "x"}) == "" and d("system", {}) == ""
+    assert d("tool", {"name": "mcp__broken"}) == ""
+
+
+def test_the_notice_opens_the_chat_at_the_reply(as_user, fired):
+    cid, _, reply = _chat()
+    as_user(OWNER)
+    _report(cid, reply)
+    assert fired[0]["href"] == f"/chat/{AGENT}/{cid}?message={reply}"
+
+
+def test_a_task_runs_notice_opens_its_own_view_at_the_reply(as_user, fired):
+    run_id = "run-href-1"
+    cid = f"task-{run_id}"
+    task_store.create_chat(cid, f"task::{AGENT}", AGENT)
+    task_store.create_run(run_id, "t-href", AGENT, "schedule", None, "check", scope="agent")
+    task_store.update_run(run_id, status="completed", chat_id=cid)
+    task_store.add_chat_message(cid, "user", "check")
+    reply = task_store.add_chat_message(cid, "assistant", "Fine.")
+    as_user(OWNER)
+    assert _report(cid, reply).status_code == 200
+    assert fired[0]["href"] == f"/chat/{AGENT}/{cid}?tasks=1&message={reply}"
+
+
+def test_a_person_reads_back_the_replies_they_reported(as_user, fired):
+    cid = "chat-mine"
+    task_store.create_chat(cid, f"agent::{AGENT}", AGENT)
+    replies = []
+    for i in range(3):
+        task_store.add_chat_message(cid, "user", f"q{i}")
+        replies.append(task_store.add_chat_message(cid, "assistant", f"r{i}"))
+    as_user(OWNER)
+    _report(cid, replies[0])
+    _report(cid, replies[2])
+    as_user(OTHER)
+    _report(cid, replies[1])
+    as_user(OWNER)
+    r = client.get(f"/v1/chats/{cid}/reports/mine")
+    assert r.status_code == 200 and r.json() == {"message_ids": [replies[2], replies[0]]}
+    as_user(OTHER)
+    assert client.get(f"/v1/chats/{cid}/reports/mine").json() == {"message_ids": [replies[1]]}
+    as_user(SESSION)
+    assert client.get(f"/v1/chats/{cid}/reports/mine").status_code == 403
+    as_user(OWNER)
+    assert client.get("/v1/chats/no-such-chat/reports/mine").status_code == 404
+
+
+def test_a_person_who_cannot_read_the_chat_reads_nothing_back(as_user, fired):
+    cid, _, reply = _chat(chat_id="chat-mine-private")
+    as_user(OWNER)
+    _report(cid, reply)
+    as_user(OTHER)
+    assert client.get(f"/v1/chats/{cid}/reports/mine").status_code == 403
+
+
+def test_a_chat_deleted_before_the_row_is_written_is_not_found(as_user, fired, monkeypatch):
+    cid, _, reply = _chat(chat_id="chat-race")
+    real_add = reply_reports.reports.add
+
+    def add_after_the_delete(*a, **kw):
+        task_store.delete_chat(cid)
+        return real_add(*a, **kw)
+    monkeypatch.setattr(reply_reports.reports, "add", add_after_the_delete)
+    as_user(OWNER)
+    r = _report(cid, reply)
+    assert r.status_code == 404 and r.json()["detail"] == "Chat not found"
+    assert not _rows() and not fired
+
+
 def test_an_event_row_inside_a_reply_names_the_reply(as_user, fired):
     cid = "chat-event"
     task_store.create_chat(cid, "user-viewer", AGENT)
@@ -518,12 +656,19 @@ def test_an_admin_key_reads_no_list(as_user):
     assert client.get("/v1/admin/reply-reports").status_code == 403
 
 
-def test_deleting_the_chat_takes_its_reports(as_user, fired):
+def test_a_report_outlives_its_chat(as_user, fired):
     cid, _, reply = _chat()
+    task_store.update_chat(cid, title="Bedtime story")
     as_user(OWNER)
     _report(cid, reply)
     assert task_store.delete_chat(cid)
-    assert not _rows()
+    [row] = _rows()
+    assert row["chat_id"] is None and row["chat_title"] == "Bedtime story"
+    assert row["reply_text"] == "Once upon a time."
+    as_user(ADMIN)
+    [listed] = client.get("/v1/admin/reply-reports").json()["reports"]
+    assert (listed["chat_id"], listed["chat_agent"], listed["chat_title"]) == ("", "", "Bedtime story")
+    assert listed["reply_at"] == "" and listed["state"] == "open"
 
 
 # --- a released install's database -----------------------------------------
@@ -546,7 +691,7 @@ def test_the_table_comes_with_the_boot_on_a_database_without_it():
             "WHERE table_schema = current_schema() AND table_name = 'reply_reports'").fetchall()}
     assert cols == {"id", "reporter_sub", "chat_id", "message_id", "agent", "reason",
                     "note", "reply_text", "created_at", "notified_at", "dismissed_at",
-                    "dismissed_by"}
+                    "dismissed_by", "handled_at", "handled_by", "chat_title"}
 
 
 def test_a_table_made_before_dismiss_gains_its_columns_and_keeps_its_rows(as_user, fired):
@@ -555,7 +700,8 @@ def test_a_table_made_before_dismiss_gains_its_columns_and_keeps_its_rows(as_use
     _report(cid, reply)
     pg.close_pool()
     with get_conn() as conn:
-        conn.execute("ALTER TABLE reply_reports DROP COLUMN dismissed_at, DROP COLUMN dismissed_by")
+        conn.execute("ALTER TABLE reply_reports DROP COLUMN dismissed_at, DROP COLUMN dismissed_by, "
+                     "DROP COLUMN handled_at, DROP COLUMN handled_by, DROP COLUMN chat_title")
         conn.commit()
     pg.close_pool()
     for _ in range(2):
@@ -566,9 +712,108 @@ def test_a_table_made_before_dismiss_gains_its_columns_and_keeps_its_rows(as_use
         pg.close_pool()
     [row] = _rows()
     assert row["dismissed_at"] is None and row["dismissed_by"] == ""
+    assert row["handled_at"] is None and row["handled_by"] == "" and row["chat_title"] == ""
     as_user(ADMIN)
     page = client.get("/v1/admin/reply-reports").json()
-    assert [r["message_id"] for r in page["reports"]] == [reply] and page["dismissed_count"] == 0
+    assert [r["message_id"] for r in page["reports"]] == [reply] and page["closed_count"] == 0
+
+
+def _foreign_key(conn) -> tuple[str, bool]:
+    fk = conn.execute(
+        "SELECT c.confdeltype FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid "
+        "WHERE t.relname = 'reply_reports' AND c.contype = 'f' "
+        "AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())"
+    ).fetchone()
+    col = conn.execute(
+        "SELECT is_nullable FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND table_name = 'reply_reports' AND column_name = 'chat_id'").fetchone()
+    return fk["confdeltype"], col["is_nullable"] == "YES"
+
+
+def test_a_table_whose_reports_went_with_their_chat_is_rewritten_once(as_user, fired):
+    cid, _, reply = _chat()
+    task_store.update_chat(cid, title="Old chat")
+    as_user(OWNER)
+    _report(cid, reply)
+    pg.close_pool()
+    with get_conn() as conn:
+        _make_legacy_table(conn)
+        conn.commit()
+        assert _foreign_key(conn) == ("c", False)
+    pg.close_pool()
+    for _ in range(2):
+        with get_conn() as conn:
+            pg_schema.init_schema(conn)
+            pg_schema.run_migrations(conn)
+            conn.commit()
+        pg.close_pool()
+    with get_conn() as conn:
+        assert _foreign_key(conn) == ("n", True)
+    [row] = _rows()
+    assert row["chat_title"] == "Old chat"
+    assert task_store.delete_chat(cid)
+    [row] = _rows()
+    assert row["chat_id"] is None
+
+
+
+def _make_legacy_table(conn) -> None:
+    """The 1.9.0 table: the reports go with their chat, no stored title."""
+    name = conn.execute(
+        "SELECT conname FROM pg_constraint WHERE conrelid = 'reply_reports'::regclass "
+        "AND contype = 'f'").fetchone()["conname"]
+    conn.execute(f'ALTER TABLE reply_reports DROP CONSTRAINT "{name}"')
+    conn.execute("ALTER TABLE reply_reports ADD CONSTRAINT legacy_chat_fk FOREIGN KEY (chat_id) "
+                 "REFERENCES chats(id) ON DELETE CASCADE")
+    conn.execute("ALTER TABLE reply_reports ALTER COLUMN chat_id SET NOT NULL")
+    conn.execute("UPDATE reply_reports SET chat_title = ''")
+
+
+class _RefusesTheNewKey:
+    """A connection whose ADD CONSTRAINT fails, as a lock or a stray row would."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args, **kwargs):
+        if "ADD CONSTRAINT reply_reports_chat_id_fkey" in sql:
+            raise RuntimeError("refused for the test")
+        return self._conn.execute(sql, *args, **kwargs)
+
+
+def test_a_failed_rewrite_leaves_the_reports_with_their_chat_and_the_next_boot_retries(
+        as_user, fired, caplog):
+    from storage.chat import schema as chat_schema
+    cid, _, reply = _chat()
+    task_store.update_chat(cid, title="Old chat")
+    as_user(OWNER)
+    _report(cid, reply)
+    pg.close_pool()
+    try:
+        with get_conn() as conn:
+            _make_legacy_table(conn)
+            conn.commit()
+        pg.close_pool()
+        with get_conn() as conn, caplog.at_level("ERROR", logger="otodock"):
+            chat_schema.migrate_chat(_RefusesTheNewKey(conn))
+            # The savepoint rolled back the whole step: the boot's
+            # transaction goes on and commits.
+            conn.execute("SELECT 1")
+            conn.commit()
+            assert _foreign_key(conn) == ("c", False)
+        assert "could not be made to outlive their chat" in caplog.text
+        [row] = _rows()
+        assert row["chat_title"] == ""
+    finally:
+        pg.close_pool()
+        with get_conn() as conn:
+            pg_schema.init_schema(conn)
+            pg_schema.run_migrations(conn)
+            conn.commit()
+        pg.close_pool()
+    with get_conn() as conn:
+        assert _foreign_key(conn) == ("n", True)
+    assert _rows()[0]["chat_title"] == "Old chat"
 
 
 # --- dismiss and restore ------------------------------------------------------
@@ -585,26 +830,73 @@ def _three_reports(as_user):
     return [r["id"] for r in _rows()]
 
 
-def test_a_dismissed_report_moves_to_the_history_and_back(as_user, fired):
+def test_a_dismissed_report_moves_to_the_closed_list_and_back(as_user, fired):
     ids = _three_reports(as_user)
     as_user(ADMIN)
     r = client.post(f"/v1/admin/reply-reports/{ids[1]}/dismiss")
     assert r.status_code == 200 and r.json() == {"status": "dismissed"}
     page = client.get("/v1/admin/reply-reports").json()
     assert [x["id"] for x in page["reports"]] == [ids[2], ids[0]]
-    assert page["dismissed_count"] == 1
-    history = client.get("/v1/admin/reply-reports?state=dismissed").json()
-    assert [x["id"] for x in history["reports"]] == [ids[1]]
-    assert history["reports"][0]["dismissed_by_name"] == "Admin User"
-    assert history["reports"][0]["dismissed_at"] and "dismissed_count" not in history
+    assert page["closed_count"] == 1
+    closed = client.get("/v1/admin/reply-reports?state=closed").json()
+    assert [x["id"] for x in closed["reports"]] == [ids[1]]
+    assert closed["reports"][0]["state"] == "dismissed"
+    assert closed["reports"][0]["closed_by_name"] == "Admin User"
+    assert closed["reports"][0]["closed_at"] and "closed_count" not in closed
     r = client.post(f"/v1/admin/reply-reports/{ids[1]}/restore")
     assert r.status_code == 200 and r.json() == {"status": "open"}
     page = client.get("/v1/admin/reply-reports").json()
     assert [x["id"] for x in page["reports"]] == [ids[2], ids[1], ids[0]]
-    assert page["dismissed_count"] == 0
-    assert page["reports"][1]["dismissed_at"] == "" and page["reports"][1]["dismissed_by_name"] == ""
+    assert page["closed_count"] == 0
+    assert page["reports"][1]["state"] == "open"
+    assert page["reports"][1]["closed_at"] == "" and page["reports"][1]["closed_by_name"] == ""
     # Nothing was deleted on the way.
     assert len(_rows()) == 3
+
+
+def test_a_handled_report_leaves_the_open_list_with_its_state(as_user, fired):
+    ids = _three_reports(as_user)
+    as_user(ADMIN)
+    r = client.post(f"/v1/admin/reply-reports/{ids[0]}/handled")
+    assert r.status_code == 200 and r.json() == {"status": "handled"}
+    client.post(f"/v1/admin/reply-reports/{ids[2]}/dismiss")
+    page = client.get("/v1/admin/reply-reports").json()
+    assert [x["id"] for x in page["reports"]] == [ids[1]] and page["closed_count"] == 2
+    closed = client.get("/v1/admin/reply-reports?state=closed").json()["reports"]
+    assert [(x["id"], x["state"]) for x in closed] == [(ids[2], "dismissed"), (ids[0], "handled")]
+    assert closed[1]["closed_by_name"] == "Admin User" and closed[1]["closed_at"]
+
+
+def test_a_closed_report_keeps_its_state_and_its_first_admin(as_user, fired):
+    ids = _three_reports(as_user)
+    as_user(ADMIN)
+    client.post(f"/v1/admin/reply-reports/{ids[0]}/dismiss")
+    as_user(UserContext(sub="user-other-admin", email="o@t", name="O", role="admin"))
+    r = client.post(f"/v1/admin/reply-reports/{ids[0]}/handled")
+    assert r.status_code == 200 and r.json() == {"status": "dismissed"}
+    row = [x for x in _rows() if x["id"] == ids[0]][0]
+    assert (row["handled_at"], row["dismissed_by"]) == (None, "user-admin")
+    client.post(f"/v1/admin/reply-reports/{ids[0]}/restore")
+    assert client.post(f"/v1/admin/reply-reports/{ids[0]}/handled").json() == {"status": "handled"}
+    row = [x for x in _rows() if x["id"] == ids[0]][0]
+    assert (row["dismissed_at"], row["handled_by"]) == (None, "user-other-admin")
+
+
+def test_an_admin_deletes_a_report_and_its_copy_of_the_reply(as_user, fired, caplog):
+    ids = _three_reports(as_user)
+    as_user(OWNER)
+    assert client.delete(f"/v1/admin/reply-reports/{ids[0]}").status_code == 403
+    as_user(UserContext(sub="user-admin", email="a@t", name="A", role="admin", is_api_key=True))
+    assert client.delete(f"/v1/admin/reply-reports/{ids[0]}").status_code == 403
+    as_user(ADMIN)
+    with caplog.at_level("INFO", logger="otodock.reply-reports"):
+        r = client.delete(f"/v1/admin/reply-reports/{ids[0]}")
+    assert r.status_code == 200 and r.json() == {"status": "deleted"}
+    assert f"reply report {ids[0]} deleted by user-admin" in caplog.text
+    assert [x["id"] for x in _rows()] == [ids[1], ids[2]]
+    assert client.delete(f"/v1/admin/reply-reports/{ids[0]}").status_code == 404
+    assert client.post(f"/v1/admin/reply-reports/{ids[0]}/handled").status_code == 404
+    assert client.delete("/v1/admin/reply-reports/2147483648").status_code == 422
 
 
 def test_dismiss_and_restore_are_idempotent_and_keep_the_first_dismisser(as_user, fired):
@@ -632,14 +924,15 @@ def test_dismiss_is_for_admins_and_names_a_real_report(as_user, fired):
     assert client.post("/v1/admin/reply-reports/999999/dismiss").status_code == 404
     assert client.post("/v1/admin/reply-reports/999999/restore").status_code == 404
     assert client.post("/v1/admin/reply-reports/2147483648/dismiss").status_code == 422
-    assert client.get("/v1/admin/reply-reports?state=closed").status_code == 422
+    assert client.get("/v1/admin/reply-reports?state=dismissed").status_code == 422
+    assert client.get("/v1/admin/reply-reports?state=closed").status_code == 200
     assert all(r["dismissed_at"] is None for r in _rows())
 
 
-def test_a_dismissed_report_still_goes_with_its_chat(as_user, fired):
+def test_a_closed_report_outlives_its_chat_too(as_user, fired):
     ids = _three_reports(as_user)
     as_user(ADMIN)
     client.post(f"/v1/admin/reply-reports/{ids[0]}/dismiss")
     assert task_store.delete_chat("chat-dis")
-    assert not _rows()
-    assert client.get("/v1/admin/reply-reports").json()["dismissed_count"] == 0
+    assert len(_rows()) == 3
+    assert client.get("/v1/admin/reply-reports").json()["closed_count"] == 1

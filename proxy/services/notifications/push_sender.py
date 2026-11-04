@@ -18,13 +18,82 @@ import psycopg
 
 import config
 from services.infra.outbound_url import validate_outbound_url
-from storage.automation import notification_store
+from storage.automation import notification_severity, notification_store
 
 logger = logging.getLogger("otodock.push")
 
 #: The app platforms a push token is registered for (the FCM leg); a
 #: browser's subscription is ``web``.
 NATIVE_PUSH_PLATFORMS = ("android", "ios")
+
+# APNs refuses a payload over 4 KB, and FCM copies the data map into the Apple
+# payload beside ``aps``, so on iOS the title and the body ride twice. Both
+# copies are cut to these sizes in UTF-8 bytes (a Greek letter takes two, an
+# emoji four); the relay keeps the same numbers.
+_IOS_TITLE_MAX_BYTES = 256
+_IOS_BODY_MAX_BYTES = 1000
+_ELLIPSIS = "…"
+
+# The iOS app bundles these sounds under the Android app's names.
+_IOS_SOUNDS = {notification_severity.DANGER: "notif_danger.caf",
+               notification_severity.WARNING: "notif_warning.caf"}
+_IOS_SOUND_DEFAULT = "notif_success.caf"
+_IOS_SOUND_TURN_DONE = "notif_turn_done.caf"
+
+
+def _cap_utf8(text: str, max_bytes: int) -> str:
+    """``text`` cut on a character boundary, ending in an ellipsis, so its
+    UTF-8 form fits in ``max_bytes``; a text that fits is returned as it is."""
+    raw = text.encode()
+    if len(raw) <= max_bytes:
+        return text
+    kept = raw[: max_bytes - len(_ELLIPSIS.encode())].decode(errors="ignore")
+    return kept.rstrip() + _ELLIPSIS
+
+
+def fcm_message(platform: str, token: str, payload: dict) -> dict:
+    """The FCM v1 message for one device, the shape the relay builds too
+    (``fcm_sender.build_message`` in the commercial repo, kept identical). A
+    data-only message for Android, so the app's own service renders it even
+    in the background. iOS has no such service: the ``apns`` block makes the
+    message an alert the system shows (the title and body, the sound by
+    severity, the time-sensitive level for danger so it passes Focus, a
+    thread per kind). An ephemeral turn-complete takes its own sound and
+    thread whatever its severity, as on Android. FCM copies the ``data`` map
+    into the Apple payload's root, where the app's tap handler reads
+    ``install_id`` and ``click_url``; on iOS its title and body are capped
+    like the alert's."""
+    data = {
+        "title": str(payload.get("title", "")),
+        "body": str(payload.get("body", "")),
+        "delivery_id": str(payload.get("delivery_id", "")),
+        "severity": str(payload.get("severity", "info")),
+        "ephemeral": str(payload.get("ephemeral", False)).lower(),
+        "click_url": str(payload.get("click_url", "/")),
+        "install_id": str(payload.get("install_id", "")),
+    }
+    message: dict = {"token": token, "data": data, "android": {"priority": "high"}}
+    if platform == "ios":
+        data["title"] = _cap_utf8(data["title"], _IOS_TITLE_MAX_BYTES)
+        data["body"] = _cap_utf8(data["body"], _IOS_BODY_MAX_BYTES)
+        severity = data["severity"]
+        if data["ephemeral"] == "true":
+            sound, level = _IOS_SOUND_TURN_DONE, "active"
+            thread = "otodock-turn-complete"
+        else:
+            sound = _IOS_SOUNDS.get(severity, _IOS_SOUND_DEFAULT)
+            level = "time-sensitive" if notification_severity.is_alarm(severity) else "active"
+            thread = f"otodock-{severity}"
+        message["apns"] = {
+            "headers": {"apns-priority": "10", "apns-push-type": "alert"},
+            "payload": {"aps": {
+                "alert": {"title": data["title"], "body": data["body"]},
+                "sound": sound,
+                "interruption-level": level,
+                "thread-id": thread,
+            }},
+        }
+    return {"message": message}
 
 
 def _endpoint_is_public(endpoint: str) -> bool:
@@ -217,13 +286,14 @@ async def _fcm_http_client():
     return state.client
 
 
-async def _send_fcm_direct(token: str, payload: dict) -> bool:
+async def _send_fcm_direct(token: str, payload: dict, platform: str = "android") -> bool:
     """BYO-Firebase **direct** FCM send — the escape hatch.
 
     Used only when a self-hoster supplied their own ``FCM_SERVICE_ACCOUNT_PATH``
-    (and rebuilt the app against their own Firebase project so device tokens live
-    in it). The **default** path is the relay (:func:`_send_fcm_relay`), which
-    holds OtoDock's service account for the project the shipped app registers to.
+    (and rebuilt the apps against their own Firebase project so device tokens
+    live in it). The **default** path is the relay (:func:`_send_fcm_relay`),
+    which holds OtoDock's service account for the project the shipped apps
+    register to. The message is :func:`fcm_message`, the relay's shape.
 
     token is the FCM registration token from the device.
     Returns True if sent successfully.
@@ -233,32 +303,10 @@ async def _send_fcm_direct(token: str, payload: dict) -> bool:
 
     try:
         access_token = await _fcm_access_token()
-
-        # Use data-only message (no "notification" key) so our custom
-        # FirebaseMessagingService always handles it — even in background.
-        # This lets us control TTS, alarm loops, and custom notification display.
-        message = {
-            "message": {
-                "token": token,
-                "data": {
-                    "title": payload.get("title", ""),
-                    "body": payload.get("body", ""),
-                    "delivery_id": payload.get("delivery_id", ""),
-                    "severity": payload.get("severity", "info"),
-                    "ephemeral": str(payload.get("ephemeral", False)).lower(),
-                    "click_url": payload.get("click_url", "/"),
-                    "install_id": payload.get("install_id", ""),
-                },
-                "android": {
-                    "priority": "high",
-                },
-            }
-        }
-
         client = await _fcm_http_client()
         resp = await client.post(
             f"{_FCM_ORIGIN}/v1/projects/{_fcm_project_id}/messages:send",
-            json=message,
+            json=fcm_message(platform, token, payload),
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10,
         )
@@ -339,7 +387,7 @@ async def send_fcm(token: str, payload: dict, platform: str = "android") -> bool
     default for the shipped app); if neither is available it's a no-op. Web Push
     is handled separately (:func:`send_web_push`) and is always local."""
     if _fcm_available:
-        return await _send_fcm_direct(token, payload)
+        return await _send_fcm_direct(token, payload, platform)
     if await _relay_available():
         return await _send_fcm_relay(platform, token, payload)
     return False

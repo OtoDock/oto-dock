@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent, within } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 
 // ─── The chat top bar: every control on one 36 px height and one glass
 //     recipe, the status dot inside the agent pill (after the name, before
@@ -12,6 +12,12 @@ import NotificationBell from '@/components/chat/notifications/NotificationBell'
 import { GLASS } from '@/components/ui/glass'
 
 const user = { sub: 'u1', name: 'dev-admin', display_name: 'Dev Admin', email: 'a@x', role: 'admin' } as never
+
+/** The agents page probe: the agent the pill handed over as route state. */
+function AgentsProbe() {
+  const state = useLocation().state as { fromAgent?: string } | null
+  return <p>Agents page<span data-testid="from-agent">{state?.fromAgent ?? ''}</span></p>
+}
 
 function renderBar(over: { name?: string; bell?: boolean } = {}) {
   render(
@@ -33,7 +39,7 @@ function renderBar(over: { name?: string; bell?: boolean } = {}) {
             />
           )}
         />
-        <Route path="/agents" element={<p>Agents page</p>} />
+        <Route path="/agents" element={<AgentsProbe />} />
       </Routes>
     </MemoryRouter>,
   )
@@ -103,5 +109,11 @@ describe('TopBar', () => {
     fireEvent.click(avatar)
     expect(avatar).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('User Settings')).toBeInTheDocument()
+  })
+
+  it('hands the agent to the agents page, so the map opens on its department', () => {
+    renderBar()
+    fireEvent.click(within(pill()).getByRole('link', { name: 'Alpha Prime' }))
+    expect(screen.getByTestId('from-agent').textContent).toBe('alpha')
   })
 })

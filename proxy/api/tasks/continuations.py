@@ -113,6 +113,7 @@ async def create_continuation(
     created_by = (u.acting_sub or u.agent or chat["agent"]) if synthetic else owner
     user_tz = get_user_tz(created_by) if scope == "user" else None
 
+    from api.tasks.tasks import task_audience
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
     task = scheduler.TaskDefinition(
         id=task_id,
@@ -131,6 +132,8 @@ async def create_continuation(
         scope=scope,
         notification_mode="none",
         user_tz=user_tz,
+        # A run's wake keeps telling who the run tells.
+        notify_audience=await task_audience(u, None),
     )
     if recurring and req.until is not None:
         # The end of a recurring wake is read in the row's zone at every

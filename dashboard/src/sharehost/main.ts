@@ -5,7 +5,7 @@
 // frame's messages through `host.ts`. Nothing here reads a dashboard
 // cookie; the only requests are the link's own routes, same-origin.
 
-import { batchUrl, classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
+import { attachmentsLine, batchUrl, classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settingsPlaceholder, cardPlaceholder, listPlaceholder, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
 import { WIRE } from '../api/wireEvents'
 import { fitViewportToDevice } from '../lib/device/viewport'
 
@@ -300,6 +300,11 @@ function block(m: SnapshotMessage, c: ShareConfig): HTMLElement | null {
       style: `max-width:85%;padding:.5rem .75rem;border-radius:1rem;font-size:.9rem;white-space:pre-wrap;overflow-wrap:anywhere;${
         mine ? 'background:var(--p-action);color:var(--p-action-fg)' : 'background:var(--p-card);box-shadow:var(--p-elevation-1)'}`,
     }, m.content || '')
+    // A person's photos and files are counted, never copied.
+    const attached = mine ? attachmentsLine(m.attachments) : ''
+    if (attached) {
+      bubble.prepend(el('div', { style: m.content ? 'font-size:.75rem;opacity:.8;margin-bottom:.25rem' : 'font-size:.75rem;opacity:.8' }, attached))
+    }
     row.appendChild(bubble)
     return row
   }
@@ -335,6 +340,15 @@ function block(m: SnapshotMessage, c: ShareConfig): HTMLElement | null {
       const a = el('a', { href: snapshotMediaUrl(c, String(d.token || '')), download: String(d.filename || ''), style: 'display:inline-block;padding:.5rem .75rem;background:var(--p-card);box-shadow:var(--p-elevation-1);border-radius:var(--p-radius);font-size:.85rem;color:inherit;text-decoration:none' }, String(d.filename || 'file'))
       return a
     }
+    case WIRE.SETTINGS_CARD:
+      return el('p', { style: 'margin:0;padding:.5rem .75rem;border:1px dashed var(--p-border);border-radius:var(--p-radius);font-size:.85rem;color:var(--p-text-secondary)' },
+        settingsPlaceholder(d.label))
+    case WIRE.ACTION_CARD:
+      return el('p', { style: 'margin:0;padding:.5rem .75rem;border:1px dashed var(--p-border);border-radius:var(--p-radius);font-size:.85rem;color:var(--p-text-secondary)' },
+        cardPlaceholder(d.title))
+    case WIRE.LIST_CARD:
+      return el('p', { style: 'margin:0;padding:.5rem .75rem;border:1px dashed var(--p-border);border-radius:var(--p-radius);font-size:.85rem;color:var(--p-text-secondary)' },
+        listPlaceholder(d.title))
     case WIRE.URL: {
       const href = webUrl(d.url)
       if (!href) return el('p', { style: 'margin:0;font-size:.85rem' }, String(d.title || d.url || ''))

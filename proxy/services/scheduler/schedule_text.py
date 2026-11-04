@@ -56,13 +56,15 @@ def cron_words(cron: str) -> str:
 
     if cron.strip() == "* * * * *":
         return "Every minute"
+    # A step on every day, or on weekdays only ("1-5").
+    step_days = "" if dow == every else " on weekdays" if dow == "1-5" else None
     m = re.fullmatch(r"\*/(\d+)", minute)
-    if m and hour == every and dom == every and dow == every:
-        return f"Every {m.group(1)} minutes"
+    if m and hour == every and dom == every and step_days is not None:
+        return f"Every {m.group(1)} minutes{step_days}"
     h = re.fullmatch(r"\*/(\d+)", hour)
-    if minute.isdigit() and h and dom == every and dow == every:
-        return (f"Every {h.group(1)} hours" if int(minute) == 0
-                else f"Every {h.group(1)} hours at :{int(minute):02d}")
+    if minute.isdigit() and h and dom == every and step_days is not None:
+        return (f"Every {h.group(1)} hours{step_days}" if int(minute) == 0
+                else f"Every {h.group(1)} hours at :{int(minute):02d}{step_days}")
     if time and dom == every and dow == every:
         return f"Daily at {time}"
     if time and dom == every and dow.isdigit():

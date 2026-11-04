@@ -4,6 +4,7 @@ import { act, screen, fireEvent, waitFor } from '@testing-library/react'
 const modeMutate = vi.fn()
 const tokenMutate = vi.fn()
 const unattendedMutate = vi.fn()
+const profileMutate = vi.fn()
 // The instant controls save through mutateAsync: it records the call, and
 // the mock's return decides the answer.
 const asAsync = (fn: (v: unknown) => unknown) => (v: unknown) => Promise.resolve(fn(v))
@@ -11,6 +12,7 @@ vi.mock('@/api/remoteMachines', () => ({
   useSetBrowserMode: () => ({ mutate: modeMutate, mutateAsync: asAsync(modeMutate), isPending: false, error: null }),
   useSetBrowserToken: () => ({ mutate: tokenMutate, isPending: false, error: null }),
   useSetBrowserUnattended: () => ({ mutate: unattendedMutate, mutateAsync: asAsync(unattendedMutate), isPending: false, error: null }),
+  useSetBrowserProfile: () => ({ mutateAsync: asAsync(profileMutate), isPending: false, error: null }),
 }))
 const toast = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/appToasts', () => ({ emitAppToast: toast, onAppToast: () => () => {} }))
@@ -31,6 +33,7 @@ beforeEach(() => {
   modeMutate.mockReset()
   tokenMutate.mockReset()
   unattendedMutate.mockReset()
+  profileMutate.mockReset()
   toast.mockReset()
 })
 
@@ -141,5 +144,34 @@ describe('unattended use of the saved token (F47)', () => {
     fireEvent.click(screen.getByRole('checkbox'))
     await waitFor(() => expect(unattendedMutate).toHaveBeenLastCalledWith({ machineId: 'm1', enabled: false }))
     expect(screen.queryByRole('alertdialog')).toBeNull()
+  })
+})
+
+describe('Browser profile', () => {
+  it('shows in own mode, saves the trimmed name on Enter and on leaving, and nothing unchanged', async () => {
+    render(<BrowserTokenField machine={machine({ browser_mode: 'own', browser_profile: 'Work' })} scope="me" />)
+    const field = screen.getByRole('textbox', { name: 'Browser profile' })
+    expect(field).toHaveValue('Work')
+    fireEvent.blur(field)
+    expect(profileMutate).not.toHaveBeenCalled()
+    fireEvent.change(field, { target: { value: '  Home ' } })
+    await act(async () => { fireEvent.keyDown(field, { key: 'Enter' }) })
+    expect(profileMutate).toHaveBeenCalledWith({ machineId: 'm1', profile: 'Home' })
+    fireEvent.change(field, { target: { value: '' } })
+    await act(async () => { fireEvent.blur(field) })
+    expect(profileMutate).toHaveBeenLastCalledWith({ machineId: 'm1', profile: '' })
+    expect(screen.getByRole('button', { name: 'About Browser profile' })).toBeInTheDocument()
+  })
+
+  it('is absent with the dedicated profile and shows on an admin machine too', async () => {
+    const { unmount } = render(<BrowserTokenField machine={machine()} scope="me" />)
+    expect(screen.queryByRole('textbox', { name: 'Browser profile' })).toBeNull()
+    unmount()
+    render(<BrowserTokenField machine={machine({ browser_mode: 'own' })} scope="admin" />)
+    const field = screen.getByRole('textbox', { name: 'Browser profile' })
+    expect(field).toHaveValue('')
+    fireEvent.change(field, { target: { value: 'Profile 1' } })
+    await act(async () => { fireEvent.blur(field) })
+    await waitFor(() => expect(profileMutate).toHaveBeenCalledWith({ machineId: 'm1', profile: 'Profile 1' }))
   })
 })

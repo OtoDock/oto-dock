@@ -140,10 +140,12 @@ def test_folders_default_workspace_user_default(temp_db):
         assigned_mcp_names=(),
         execution_path="claude-code-cli",
     )
-    assert "Default writes for this session go to `/users/alice/workspace/`" in text
-    # Mentions the shared workspace's purpose without prescribing a workflow.
-    assert "/workspace/`" in text
-    assert "shared workspace" in text
+    assert "Default writes for this session go to `/users/alice/workspace/`, the person's drafts" in text
+    assert "Finals and what the team shares go to `/workspace/`, by the rule in Execution Scope." in text
+    # Without settings-mcp the hand-over is a question, never a card.
+    assert "ask whether to move the files to the shared workspace, and wait for the answer." in text
+    assert "`hand_files` card" not in text
+    assert "Say where you saved every document you create." in text
 
 
 def test_folders_default_workspace_agent_default(temp_db):
@@ -154,8 +156,9 @@ def test_folders_default_workspace_agent_default(temp_db):
         assigned_mcp_names=(),
         execution_path="claude-code-cli",
     )
-    assert "Default writes for this session go to `/workspace/`" in text
-    assert "operational agent" in text.lower()
+    assert "Default writes for this session go to `/workspace/`, where every user of this agent reads them." in text
+    assert "Drafts, private notes and a person's own work go to `/users/alice/workspace/`." in text
+    assert "operational agent" not in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +286,10 @@ def test_building_agents_skipped_for_agent_scope(temp_db):
     assert "# Building Agents" not in text
 
 
-def test_folders_ro_library_row_mentions_bulletin(temp_db):
-    """2026-09-01: the RO library row tells the agent its bulletin is
-    auto-loaded (the RW row already mentioned bulletins; RO said nothing)."""
+def test_folders_ro_library_row_claims_no_bulletin(temp_db):
+    """The RO library row names the library and its source; since 1.9.1 no
+    bulletin loads into the context, so the row promises none (the
+    Notebook replaced it)."""
     agent_store.create_agent("pa", "PA", default_scope="user")
     ctx = SecurityContext(
         role="manager", username="alice", agent="pa", is_admin_agent=False,
@@ -299,13 +303,13 @@ def test_folders_ro_library_row_mentions_bulletin(temp_db):
     row = [ln for ln in folders.splitlines()
            if "/knowledge/shared/srcagent/marketing/" in ln][0]
     assert "(RO)" in row
-    assert "auto-loaded into your context" in row
+    assert "bulletin" not in row and "auto-loaded" not in row
 
 
-def test_building_agents_mentions_shared_libraries_and_bulletin(temp_db):
-    """2026-09-01: manager sessions get the standing hint that shared
-    knowledge libraries + bulletins are the multi-agent collaboration
-    mechanism (so agents can recommend the setup)."""
+def test_building_agents_mentions_shared_libraries(temp_db):
+    """Manager sessions get the standing hint that shared knowledge
+    libraries are how agents share material (so agents can recommend the
+    setup); no bulletin is promised since 1.9.1."""
     agent_store.create_agent("pa", "PA", default_scope="user")
     text = build_permission_context(
         _ctx(role="manager", username="alice"),
@@ -314,7 +318,8 @@ def test_building_agents_mentions_shared_libraries_and_bulletin(temp_db):
     )
     bs = text.split("# Building Agents")[1]
     assert "shared knowledge libraries" in bs
-    assert "`bulletin/` file is auto-loaded" in bs
+    assert "bulletin" not in bs
+    assert "share dated notes in the Notebook" in bs
     assert "Agent Settings → Shared Knowledge" in bs
 
 
@@ -327,7 +332,8 @@ def test_building_agents_default_scope_close(temp_db):
         execution_path="claude-code-cli",
     )
     bs = text.split("# Building Agents")[1]
-    assert "`default_scope` is **agent**" in bs
+    assert ("This agent's `default_scope` is **agent**: the team's shared desk. Change it via "
+            "`agent-config-mcp.update_default_scope(...)`") in bs
 
 
 # ---------------------------------------------------------------------------
@@ -599,3 +605,94 @@ def test_building_agents_personal_only_drops_shared_bullets(temp_db):
     assert "Per-user files" in building         # personal-only HAS user dirs
     assert "Shared collaborative output" not in building
     assert "on-demand reference library" not in building
+
+
+# ---------------------------------------------------------------------------
+# The closer per role: the hand-over cues, the contributor, the viewer
+# ---------------------------------------------------------------------------
+
+def _closer(text: str) -> str:
+    return "Default writes" + text.split("\n# Folders\n")[1].split("\n# ")[0].rsplit("\nDefault writes", 1)[-1]
+
+
+def test_the_hand_over_names_the_card_when_settings_mcp_is_in_the_session(temp_db):
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    text = build_permission_context(
+        _ctx(role="editor", username="alice"),
+        assigned_mcp_names=("settings-mcp", "schedules-mcp"),
+        execution_path="claude-code-cli",
+    )
+    closer = _closer(text)
+    assert "When the conversation says a piece of work is final (final, done, send it to the team" in closer
+    assert "Never move or copy a person's files to the shared workspace on your own." in closer
+    assert "draw the `hand_files` card with `show_card` and let the person press it: a move, or a copy" in closer
+    assert closer.split("\n---")[0].rstrip().endswith("Say where you saved every document you create.")
+
+
+def test_a_contributor_is_told_the_teams_work_belongs_in_the_shared_workspace(temp_db):
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    text = build_permission_context(
+        _ctx(role="contributor", username="cara"),
+        assigned_mcp_names=("settings-mcp",),
+        execution_path="claude-code-cli",
+    )
+    closer = _closer(text)
+    assert "Default writes for this session go to `/users/cara/workspace/`." in closer
+    # Field work goes as it arrives, and only their other files wait for the card.
+    assert ("A contributor's photos and reports for the team go to `/workspace/` as they "
+            "arrive: save them there. Never move or copy their other files to the shared "
+            "workspace on your own.") in closer
+    assert "a person's files" not in closer and "put it there" not in closer
+    assert "`hand_files` card" in closer
+    # On a shared-first agent the contributor's default is the shared workspace already.
+    agent_store.create_agent("ops", "Ops", default_scope="agent")
+    text = build_permission_context(
+        _ctx(role="contributor", username="cara", agent="ops"),
+        assigned_mcp_names=(), execution_path="claude-code-cli",
+    )
+    closer = _closer(text)
+    assert "Default writes for this session go to `/workspace/`, where every user" in closer
+    assert "A contributor's photos and reports for the team go to `/workspace/` as they arrive" in closer
+    assert "Never move or copy their other files" in closer
+    assert "ask whether to move the files to the shared workspace, and wait for the answer." in closer
+
+
+def test_a_shared_default_editor_is_told_the_hand_over_too(temp_db):
+    agent_store.create_agent("ops", "Ops", default_scope="agent")
+    text = build_permission_context(
+        _ctx(role="editor", username="alice", agent="ops"),
+        assigned_mcp_names=("settings-mcp",), execution_path="claude-code-cli",
+    )
+    closer = _closer(text)
+    assert "Drafts, private notes and a person's own work go to `/users/alice/workspace/`." in closer
+    assert "Never move or copy a person's files to the shared workspace on your own." in closer
+    assert "draw the `hand_files` card with `show_card`" in closer
+    assert "photos and reports" not in closer
+    assert closer.split("\n---")[0].rstrip().endswith("Say where you saved every document you create.")
+
+
+def test_a_viewer_is_never_told_to_hand_files_over(temp_db):
+    agent_store.create_agent("ops", "Ops", default_scope="agent")
+    text = build_permission_context(
+        _ctx(role="viewer", username="bob", agent="ops"),
+        assigned_mcp_names=("settings-mcp",),
+        execution_path="claude-code-cli",
+    )
+    closer = _closer(text)
+    assert "Default writes for this session go to `/users/bob/workspace/`. Your role reads the shared workspace" in closer
+    assert "hand_files" not in closer and "Finals" not in closer
+
+
+def test_every_human_closer_says_to_name_where_a_document_went(temp_db):
+    agent_store.create_agent("po", "PO", collaborative=False, default_scope="user")
+    agent_store.create_agent("so", "SO", collaborative=False, default_scope="agent")
+    po = build_permission_context(
+        SecurityContext(role="manager", username="alice", agent="po", is_admin_agent=False,
+                        session_scope="user", available_scopes=("user",), config_visible=True),
+        assigned_mcp_names=(), execution_path="claude-code-cli")
+    so = build_permission_context(
+        SecurityContext(role="manager", username="alice", agent="so", is_admin_agent=False,
+                        session_scope="agent", available_scopes=("agent",), config_visible=True),
+        assigned_mcp_names=(), execution_path="claude-code-cli")
+    for text in (po, so):
+        assert "Say where you saved every document you create." in _closer(text)

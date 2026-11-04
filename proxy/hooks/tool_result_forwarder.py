@@ -61,6 +61,7 @@ TOOL_ROLES = {
     "ExitPlanMode": "plan_exit",
     "AskUserQuestion": "question",
     "request_user_input": "question",
+    "request_user_input_async": "question",
     "CodexEscalation": "escalation",
     "CodexTerminalInput": "escalation",
     "view_image": "read",
@@ -382,6 +383,9 @@ def main():
         # content would ride along).
         "tool_paths": _tool_paths(tool_input),
         "tool_command": _tool_command(tool_name, tool_input),
+        # Set by the CLI for a sub-agent's call only: the proxy records it
+        # and draws no card for it in the main chat.
+        "agent_id": inp.get("agent_id", "") or "",
     }).encode()
 
     started = time.monotonic()
@@ -444,4 +448,11 @@ def _post(proxy_url: str, api_key: str, payload: bytes, *, timeout: float) -> di
 
 
 if __name__ == "__main__":
+    # PROXY_URL is a loopback address (the platform's own listener, or a
+    # satellite's tunnel): no proxy may stand between. urllib's default
+    # opener takes the environment's proxy and, on Windows, Internet
+    # Options' (whose <local> exemption skips only dotless hosts, never
+    # 127.0.0.1). Installed here, never at import: a test that loads the
+    # script keeps its own opener.
+    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
     main()

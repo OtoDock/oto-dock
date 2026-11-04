@@ -37,6 +37,7 @@ from services.infra.path_confinement import (
     normalize_rel_path,
     resolve_under,
 )
+from services.mcp import mcp_manifest_types
 
 logger = logging.getLogger("otodock.community-agents-catalog")
 
@@ -183,6 +184,36 @@ async def fetch_readme(template_slug: str) -> str:
         return body or ""
 
 
+_PICTURE_CACHE_TTL_SECONDS = 3600
+_PICTURE_MAX_BYTES = 512 * 1024
+_picture_cache: dict[str, _CacheEntry] = {}
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+async def fetch_picture(template_slug: str, app_slug: str) -> bytes | None:
+    """An app's picture of a template (``<slug>/pictures/<app>.png`` in the
+    catalog), a PNG of at most 512 KB, cached an hour; None when the
+    catalog has none."""
+    if not _is_safe_name(template_slug) or not _is_safe_name(app_slug) or "/" in app_slug:
+        return None
+    key = f"{template_slug}/{app_slug}"
+    now = time.monotonic()
+    cached = _picture_cache.get(key)
+    if cached and now - cached.fetched_at < _PICTURE_CACHE_TTL_SECONDS:
+        return cached.value or None
+    url = f"{TEMPLATE_RAW_BASE}/{template_slug}/pictures/{app_slug}.png"
+    body: bytes | None = None
+    try:
+        async with community_catalog.http_client(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url)
+        if resp.status_code == 200 and resp.content.startswith(_PNG_MAGIC) and len(resp.content) <= _PICTURE_MAX_BYTES:
+            body = resp.content
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        logger.debug("picture fetch failed for %s: %s", key, exc)
+    _picture_cache[key] = _CacheEntry(value=body, fetched_at=now, etag=None)
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Tarball fetch + extract
 # ---------------------------------------------------------------------------
@@ -275,6 +306,58 @@ def _extract_template_subfolder(tarball: bytes, template_slug: str) -> Path:
             f"Template '{template_slug}' not found in community-agents tarball",
         )
     return template_dir
+
+
+# ---------------------------------------------------------------------------
+# What an install needs (the dialogs' preview)
+# ---------------------------------------------------------------------------
+
+async def mcp_plan(entry: dict[str, Any], proposed_slug: str, is_admin: bool) -> list[dict[str, Any]]:
+    """Every MCP a template requires, classified for the install dialog:
+    ready, to be requested, or blocked (installed nowhere, in no catalog,
+    or explicit with no instance)."""
+    from services.mcp import mcp_registry
+    from storage.mcp import mcp_store
+    out: list[dict[str, Any]] = []
+    for raw in entry.get("required_mcps") or []:
+        name = raw.get("name") if isinstance(raw, dict) else None
+        if not name:
+            continue
+        local_manifest = await asyncio.to_thread(mcp_registry.get_manifest, name)
+        catalog_name = None
+        try:
+            from services.community import community_catalog
+            mcps_registry = await community_catalog.fetch_registry()
+            catalog_name = next(
+                (m["name"] for m in mcps_registry.get("mcps", []) if m.get("name") == name), None)
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
+            logger.debug("Community registry lookup for MCP %s failed: %s", name, exc)
+        if local_manifest is None:
+            out.append({
+                "name": name, "installed": False,
+                "request_type": "install" if catalog_name else None,
+                "blocked": catalog_name is None, "needs_request": True,
+                "reason": "Not installed" + ("; in community catalog" if catalog_name else "; NOT in any catalog"),
+            })
+            continue
+        assignment = getattr(local_manifest, "assignment_mode", mcp_manifest_types.ASSIGNMENT_AUTO)
+        if assignment != mcp_manifest_types.ASSIGNMENT_EXPLICIT:
+            out.append({"name": name, "installed": True, "request_type": None, "blocked": False,
+                        "needs_request": False, "reason": "Auto-mode — ready"})
+            continue
+        instances = await asyncio.to_thread(mcp_store.get_mcp_instances, name)
+        if any(i.get("assigned_to_all") for i in instances) or any(
+                proposed_slug in (i.get("agents") or []) for i in instances):
+            out.append({"name": name, "installed": True, "request_type": None, "blocked": False,
+                        "needs_request": False, "reason": "Explicit-mode — instance authorizes this agent"})
+        elif instances:
+            out.append({"name": name, "installed": True, "request_type": "access", "blocked": False,
+                        "needs_request": not is_admin, "reason": "Explicit-mode — agent will be attached to an instance"})
+        else:
+            out.append({"name": name, "installed": True, "request_type": "access", "blocked": True,
+                        "needs_request": True,
+                        "reason": "Explicit-mode — no instances configured (admin must create one first)"})
+    return out
 
 
 # ---------------------------------------------------------------------------

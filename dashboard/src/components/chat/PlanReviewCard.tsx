@@ -80,7 +80,8 @@ export default function PlanReviewCard({
 
   const handleImplement = (action: string) => {
     onRespond?.(requestId, action)
-    // Backend auto-queues "Please implement the plan now." on implement actions
+    // The proxy starts the implementation: the approved call's turn goes on,
+    // or, when nothing waited on the card (a Codex plan), an implement message.
   }
 
   const handleSubmitFeedback = () => {

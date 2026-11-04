@@ -13,6 +13,7 @@
 import type { MessageBlock } from '../components/chat/types'
 import { PERSISTED, WIRE } from '../api/wireEvents'
 import { ARTIFACT_KINDS, isArtifactKind } from './kinds/artifact'
+import { BG_COMMAND_BLOCK } from './kinds/block'
 import { getToolDetail } from './tools/detail'
 import { ROLE, toolRole } from './tools/roles'
 
@@ -45,7 +46,7 @@ export interface RunOptions {
 /** What decides how a bubble's notes are drawn. */
 export interface BubbleContext {
   meeting?: boolean     // a meeting participant's bubble
-  finished?: boolean    // the turn is over (`finishedBubble`)
+  finished?: boolean    // the turn is over (`finishedBubble`, or the bubble is outside the open turn)
 }
 
 /** The longest note still drawn as an aside: a preamble is a sentence or two. */
@@ -57,7 +58,7 @@ const ASIDE_MAX_CHARS = 280
 export const WORKING_GRACE_MS = 4000
 
 const COLLAPSIBLE_TYPES = new Set<MessageBlock['type']>([
-  'tool', 'thinking', 'subagent', 'bgcommand',
+  'tool', 'thinking', 'subagent', BG_COMMAND_BLOCK,
 ])
 
 /** A progress note: the agent's words between its steps, drawn faint. */
@@ -205,7 +206,7 @@ export function deriveActivityRuns(
           current.currentLabel = b.description
         }
         break
-      case 'bgcommand':
+      case BG_COMMAND_BLOCK:
         current.toolCount++
         if (b.failed) current.failedCount++
         if (options.turnOpen && b.isActive) {
@@ -241,7 +242,7 @@ export function turnBusy(blocks: MessageBlock[]): boolean {
         if (!b.done) return true
         break
       case 'subagent':
-      case 'bgcommand':
+      case BG_COMMAND_BLOCK:
         if (trailing && b.isActive) return true
         break
     }

@@ -58,6 +58,21 @@ describe('AudioPrefsSection', () => {
     expect(screen.queryByText(/turned off by the administrator/)).toBeNull()
   })
 
+  it('under Platform only the sentences show, no row, and the policy line', async () => {
+    mockApi(() => ({
+      ok: true,
+      json: async () => ({
+        ...CAP_OK, tts: 'platform', stt: 'platform',
+        reason: "The platform's speech provider is used for voice and dictation.",
+      }),
+    } as Response))
+    render(<AudioPrefsSection />, { wrapper })
+    await waitFor(() => expect(screen.getByText(/speech provider is used for voice and dictation/)).toBeInTheDocument())
+    expect(screen.getByText('The platform policy sets this.')).toBeInTheDocument()
+    expect(screen.queryByRole('group')).toBeNull()
+    expect(screen.getByLabelText('Dictation language')).toBeInTheDocument()
+  })
+
   it('each mode row is a named segmented control with the chosen mode pressed', async () => {
     mockApi(() => ({ ok: true, json: async () => CAP_OK } as Response))
     render(<AudioPrefsSection />, { wrapper })

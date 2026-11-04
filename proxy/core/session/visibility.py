@@ -357,10 +357,12 @@ def can_access_chat(u: UserContext, chat: dict) -> bool:
     dashboard's resume and every frame naming a chat share.
 
     Owner-equality (per-user chats) OR admin OR — for a Shared-only agent's
-    synthetic-owner chat — any user assigned to the agent OR — for a task-run
-    chat (synthetic ``task::`` owner) — the task listing's run rule:
-    agent-scoped runs for anyone with agent access, user-scoped runs only for
-    their creator. Without that branch the REST surface denies rows the
+    synthetic-owner chat — any user assigned to the agent (a delegated worker
+    there, with an agent-scope run, only from the editor tier) OR — for a
+    task-run chat (synthetic ``task::`` owner) — the task listing's run rule:
+    agent-scoped runs from the editor tier (``sees_agent_automations``: what
+    the agent does on its own behalf), user-scoped runs only for their
+    creator. Without that branch the REST surface denies rows the
     ``kind=tasks`` listing itself shows. A phone call's conversation opens
     for the agent's managers, which is who the conversations list serves, on
     a person's dashboard only: a manager's session token or API key reads no
@@ -375,14 +377,22 @@ def can_access_chat(u: UserContext, chat: dict) -> bool:
         return not u.is_api_key and u.can_manage_agent(chat.get("agent", ""))
     if owner == u.sub:
         return True
+    agent = chat.get("agent", "")
     if is_shared_chat_owner(owner):
-        return u.can_access_agent(chat.get("agent", ""))
+        if not u.can_access_agent(agent):
+            return False
+        # The pool's human chats stay readable to its members; a delegated
+        # worker in it (an agent-scope run) is the agent's own work.
+        if u.sees_agent_automations(agent):
+            return True
+        run = _run_for_chat(chat)
+        return run is None or (run.get("scope") or SCOPE_AGENT) == SCOPE_USER
     if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
         run = _run_for_chat(chat)
         if run is not None:
             if (run.get("scope") or SCOPE_AGENT) == SCOPE_USER:
                 return run.get("created_by") == (u.acting_sub or "")
-            return u.can_access_agent(chat.get("agent", ""))
+            return u.can_access_agent(agent) and u.sees_agent_automations(agent)
     return False
 
 

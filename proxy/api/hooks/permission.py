@@ -13,7 +13,7 @@ import functools
 import hmac
 import json
 import logging
-import re as _re
+import posixpath
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 import config
 from api.hooks import routing
 from api.sessions.sessions import _session_payload, verify_session_match_async
+from auth import git_reads
 from auth.path_policy import (
     TIER_ADMIN,
     TIER_EDIT,
@@ -46,7 +47,7 @@ from core.execution_layer import (
     UNATTENDED_MODE,
     current_mode,
 )
-from core.session import session_events, session_kind
+from core.session import engine_prompts, session_events, session_kind
 from core.session.session_state import (
     PROMPT_WAIT_S,
     get_permission_queue,
@@ -63,7 +64,6 @@ from core.session.session_state import (
     set_session_mode,
     took_no_answer,
     wait_for_permission,
-    wait_for_question,
     watch_prompt,
 )
 from ws import wire_events as wire
@@ -104,6 +104,10 @@ class HookPermissionRequest(BaseModel):
     # (a satellite's own): a terminal parked on a dialog compares the
     # transcript lines' times against it. None from the Codex bridge.
     hook_sent_at: float | None = None
+    # The call's id from the hook's stdin (Claude Code): a call the gate
+    # recorded is kept under it, for the CLI's own ask that follows
+    # (engine_prompts.note_gate_allow). Empty from an older gate script.
+    tool_use_id: str = ""
 
 
 # The ``hook_sent_at`` of the gate call being decided, for the park below
@@ -139,27 +143,44 @@ def _prompt_wait_s(authorization: str | None, session_id: str) -> float:
     return max(1.0, min(PROMPT_WAIT_S, exp - time.time() - _TOKEN_MARGIN_S))
 
 
-async def _wait_on_person(queue: asyncio.Queue, request_id: str, wait):
-    """Await a prompt's answer (``wait``: its ``wait_for_permission`` or
-    ``wait_for_question``). A wait that ends with no answer retires the
-    prompt's card: an item on the queue the prompt was raised on, which the
-    pump frees its slot for and forwards as ``prompt_retired``. The caller
-    gone (the hook's stream dropped, the decision cancelled) is the case a
-    retried call raises its own card for; a wait that ran out or that an
-    abort or a session close released is the other."""
+async def _card_chat_of(session_id: str) -> str:
+    """The chat a hook card shows on; none when the chat row cannot be read
+    now, so the card goes onto the queue as before."""
+    try:
+        return await routing.resolve_hook_chat_id(session_id)
+    except Exception:
+        logger.exception("Hook permission: the card's chat was not read for session %s",
+                         session_id[:8])
+        return ""
+
+
+async def _wait_on_person(queue: asyncio.Queue, request_id: str, wait, *, chat_id: str = ""):
+    """Await a prompt's answer (``wait``: its ``wait_for_permission``). A
+    wait that ends with no answer retires the prompt's card: through the
+    queue it was raised on while a pump reads it (the pump frees its slot
+    and forwards ``prompt_retired``), else on the chat's viewers; a card
+    shown between turns also writes its row as it ends
+    (``engine_prompts.end_hook_card``). The caller gone (the hook's stream
+    dropped, the decision cancelled) is the case a retried call raises its
+    own card for; a wait that ran out or that an abort or a session close
+    released is the other."""
     watch_prompt(request_id)
     gone = False
+    approved = False
     try:
-        return await wait
+        approved = await wait
+        return approved
     except asyncio.CancelledError:
         gone = True
         raise
     finally:
-        if took_no_answer(request_id) or gone:
-            item: dict[str, object] = {"event_type": wire.ITEM_PROMPT_RETIRED, "request_id": request_id}
-            if gone:
-                item["caller_gone"] = True
-            queue.put_nowait(item)
+        # The answer stands whatever ending the card meets.
+        try:
+            engine_prompts.end_hook_card(
+                queue, request_id, answered=not (took_no_answer(request_id) or gone),
+                approved=bool(approved), caller_gone=gone, chat_id=chat_id)
+        except Exception:
+            logger.exception("Hook permission: the card of %s was not ended", request_id[:8])
 
 
 async def _answer_with_keepalive(decision, deny: dict):
@@ -214,6 +235,7 @@ async def hook_permission(req: HookPermissionRequest, authorization: str | None 
             req.session_id, req.tool_name, req.tool_input,
             live_permission_mode=req.permission_mode,
             wait_s=_prompt_wait_s(authorization, req.session_id),
+            tool_use_id=req.tool_use_id,
         ),
         {"decision": "deny", "reason": "OtoDock could not decide this tool call"},
     )
@@ -230,23 +252,19 @@ async def hook_codex_question(
 ):
     """Question bridge for the satellite Codex ``request_user_input`` handler.
 
-    The remote daemon holds the turn open on ``item/tool/requestUserInput``; the
-    satellite POSTs the questions here over the loopback tunnel and blocks on the
-    proxy's ``ask_user_question`` (surface the dashboard card, wait for the human
-    answer). Returns ``{"answers": {<id>: {"answers": [...]}}}`` — the same
-    authority the local Codex layer uses in-process.
+    A satellite's daemon asks on ``item/tool/requestUserInput`` when the
+    PreToolUse hook did not see the call; the satellite POSTs the questions
+    here over the loopback tunnel and the proxy's ``ask_user_question`` draws
+    the card and answers at once. Returns
+    ``{"answers": {<id>: {"answers": [...]}}}`` — the same authority the local
+    Codex layer uses in-process.
     """
     await verify_session_match_async(authorization, req.session_id)
     from core.session.session_manager import engine_layer_for_session
     layer = engine_layer_for_session(req.session_id)
     names = layer.capabilities.behaviour.tools.get(tool_roles.QUESTION, ()) if layer else ()
-
-    async def answer() -> dict:
-        return {"answers": await ask_user_question(
-            req.session_id, req.questions, tool_name=names[0] if names else "",
-            timeout=_prompt_wait_s(authorization, req.session_id))}
-
-    return await _answer_with_keepalive(answer(), {"answers": {}})
+    return {"answers": await ask_user_question(
+        req.session_id, req.questions, tool_name=names[0] if names else "")}
 
 
 @router.post("/v1/hooks/mcp-credentials")
@@ -454,6 +472,7 @@ def _park_interactive_on_dialog(session_id: str, tool_name: str) -> None:
 async def decide_tool_permission(
     session_id: str, tool_name: str, tool_input: dict | None = None,
     live_permission_mode: str = "", *, wait_s: float = PROMPT_WAIT_S,
+    tool_use_id: str = "",
 ) -> dict:
     """The single permission-decision authority for every execution layer.
 
@@ -495,15 +514,55 @@ async def decide_tool_permission(
     No transport auth here — the caller (the endpoint / interceptor) verifies the
     session. ``AskUserQuestion`` is denied after surfacing the question; in plan
     mode non-plan tools are denied (read-only planning).
+
+    ``tool_use_id`` (the Claude hook's) records an allow for the CLI's own
+    ask that follows it (``_record_gate_allow``): a Plan stage's, any allow
+    where the hook is the only authority (Don't Ask, the unattended word),
+    and the person's Allow on the hook's card in Ask.
     """
     _pass1_out: dict = {}
     result = await _decide_tool_permission(
         session_id, tool_name, tool_input, _pass1_out, live_permission_mode,
         wait_s=wait_s,
     )
+    if result.get("decision") == "allow" and tool_use_id:
+        kind = _pass1_out.get(_GATE_RECORD) or (
+            engine_prompts.HOOK_RECORD if _pass1_out.get(_GATE_MODE) in _HOOK_ONLY_MODES else "")
+        if kind:
+            _record_gate_allow(session_id, tool_use_id, tool_name,
+                               _pass1_out.get("updated_input") or tool_input or {}, kind)
     if result.get("decision") in ("allow", "ask", "defer") and _pass1_out.get("updated_input"):
         return {**result, "updated_input": _pass1_out["updated_input"]}
     return result
+
+
+# The side-data keys: the record's kind a stage set on a call it allowed, and
+# the mode the call was judged in (never the request's own words: the agent's
+# shell holds its session's token and could post a mode word itself).
+_GATE_RECORD = "gate_record"
+_GATE_MODE = "gate_mode"
+#: The modes in which the hook is the only authority: every allow is recorded.
+_HOOK_ONLY_MODES = frozenset({DONT_ASK_MODE, UNATTENDED_MODE})
+#: ExitPlanMode's deny when the person pressed Cancel on the plan review.
+PLAN_CANCELLED_REASON = ("The person cancelled this plan. Stop here and wait for their "
+                         "next message.")
+
+
+def _record_gate_allow(session_id: str, tool_use_id: str, tool_name: str,
+                       judged_input: dict, kind: str) -> None:
+    """Claude Code asks again for some calls the hook allowed (2.1.299+ in
+    plan mode, an ``rm`` its safety check cannot clear under bypass); the
+    gate's record of the call (its id, tool, the input it judged and the
+    kind) lets ``engine_prompts`` answer that ask at once. Only for the
+    engine that raises such asks, and never for a terminal, whose ask is its
+    own dialog. Written before the decision leaves the proxy, so the ask
+    cannot outrun it."""
+    from core.session.session_manager import engine_layer_for_session
+    layer = engine_layer_for_session(session_id)
+    if layer is None or not layer.hook_can_ask() or _is_interactive_session(session_id):
+        return
+    engine_prompts.note_gate_allow(session_id, tool_use_id, tool_name,
+                                   engine_prompts.input_digest(judged_input), kind=kind)
 
 
 # The stored chat modes a meeting participant honours when its host session
@@ -624,11 +683,18 @@ async def _decide_tool_permission(
     wrapper without threading it through every mode-branch return."""
     call = await _ToolCall.resolve(session_id, tool_name, tool_input, _pass1_out,
                                    live_permission_mode, wait_s=wait_s)
+    _pass1_out[_GATE_MODE] = call.mode
     for stage in _STAGES:
         decision = await stage(call)
         if decision is not None:
             return decision
     return call.unattended()
+
+
+# What the model reads when Plan refuses a call (the gate script would word a
+# bare deny "Denied by user", which no person said).
+_PLAN_REFUSAL = ("Plan mode only reads. This call would change something or run a command "
+                 "that is not read-only. It can run once the plan is approved.")
 
 
 @dataclass
@@ -796,41 +862,34 @@ class _ToolCall:
         #  * an interactive TUI with a HUMAN present: let the tool RUN — the
         #    native terminal renders the question cards / picker and the human
         #    answers inline (don't deny + show a dashboard card, which is the
-        #    headless surrogate); park the turn the moment the dialog opens,
-        #    since the hook call precedes it deterministically;
-        #  * an engine whose question tool holds the turn open for the
-        #    platform's answers (Codex's request_user_input →
-        #    ask_user_question, which declines unattended callers): allow;
-        #  * otherwise — Claude headless, and an autonomous interactive TASK on
-        #    either engine (no viewer; a picker would block on an answer nobody
-        #    gives) — emit the question event for the chat and DENY the tool so
-        #    the model doesn't auto-select answers and retry; the reason says
-        #    the questions reached the user.
+        #    headless surrogate); park the turn the moment a dialog that holds
+        #    it opens, since the hook call precedes it deterministically (not
+        #    for a tool the engine names non-blocking: its picker holds no
+        #    turn);
+        #  * otherwise — headless on either engine, and an autonomous
+        #    interactive TASK (no viewer; a picker would block on an answer
+        #    nobody gives) — emit the question event for the chat and DENY the
+        #    tool so the turn ends and the model doesn't auto-select answers
+        #    and retry; the reason says the questions reached the user, whose
+        #    next message is the answer.
         if self.role == tool_roles.QUESTION:
             interactive = _is_interactive_session(self.session_id)
+            blocking = not self._question_is_nonblocking()
             if interactive and session_kind.attended(self.client_type):
-                _park_interactive_on_dialog(self.session_id, self.tool_name)
+                if blocking:
+                    _park_interactive_on_dialog(self.session_id, self.tool_name)
                 return {"decision": "allow"}
-            holds_turn = (self.layer is not None
-                          and self.layer.capabilities_for(self.session_id)
-                          .behaviour.question_tool_holds_turn)
-            if holds_turn and not interactive:
-                return {"decision": "allow"}
-            queue = get_permission_queue(self.route.queue_session_id)
-            await queue.put({
-                "event_type": wire.ITEM_QUESTION,
-                "tool_name": self.tool_name,
-                "tool_input": self.tool_input,
-            })
-            return {
-                "decision": "deny",
-                "reason": (
-                    "Questions have been displayed to the user in the chat interface. "
-                    "The user will reply in their next message. "
-                    f"Do NOT re-ask these questions or call {self.tool_name} again this turn."
-                ),
-            }
+            await show_question_card(self.route, self.session_id, self.tool_name, self.tool_input,
+                                     journaled=interactive and blocking)
+            return {"decision": "deny", "reason": question_shown_reason(self.tool_name)}
         return None
+
+    def _question_is_nonblocking(self) -> bool:
+        if self.layer is None:
+            return False
+        names = self.layer.capabilities_for(self.session_id).behaviour.nonblocking_question_tools
+        return any(self.layer.canonical_tool_name(self.session_id, n) == self.tool_name
+                   for n in names)
 
     async def plan_exit(self) -> dict | None:
         """Leaving plan mode."""
@@ -867,34 +926,39 @@ class _ToolCall:
                     current = get_session_mode(self.session_id)
                     if current == PLAN_MODE:
                         set_session_mode(self.session_id, ASK_MODE)
-                    return {"decision": "allow"}
+                    return self._plan_allow()
 
                 plan_content = (self.tool_input or {}).get("plan", "")
                 logger.info("Hook permission: ExitPlanMode tool_input keys=%s, has_plan=%s, plan_len=%s", list((self.tool_input or {}).keys()), bool(plan_content), len(plan_content))
                 request_id = str(uuid.uuid4())
                 queue = get_permission_queue(self.route.queue_session_id)
-                await queue.put({
+                chat_id = await self._card_chat()
+                engine_prompts.offer_hook_card(queue, {
                     "event_type": wire.ITEM_PLAN_REVIEW,
                     "request_id": request_id,
                     "plan": plan_content,
                     "tool_input": self.tool_input or {},
-                })
+                }, session_id=self.session_id, chat_id=chat_id)
                 logger.info("Hook permission: dashboard plan_review, request_id=%s", request_id)
                 approved = await _wait_on_person(
                     queue, request_id,
-                    wait_for_permission(request_id, self.session_id, timeout=self.wait_s))
+                    wait_for_permission(request_id, self.session_id, timeout=self.wait_s),
+                    chat_id=chat_id)
                 logger.info("Hook permission: plan_review resolved, approved=%s", approved)
                 if approved:
                     current = get_session_mode(self.session_id)
                     if current == PLAN_MODE:
                         set_session_mode(self.session_id, ASK_MODE)
-                        queue2 = get_permission_queue(self.route.queue_session_id)
-                        await queue2.put({
-                            "event_type": wire.ITEM_MODE_RESTORED,
-                            "mode": ASK_MODE,
-                        })
+                        engine_prompts.offer_hook_card(
+                            get_permission_queue(self.route.queue_session_id),
+                            {"event_type": wire.ITEM_MODE_RESTORED, "mode": ASK_MODE},
+                            session_id=self.session_id, chat_id=chat_id)
                         logger.info("Hook permission: plan_review fallback -- mode was still plan, restored to Ask")
-                    return {"decision": "allow"}
+                    return self._plan_allow()
+                if get_session_mode(self.session_id) != PLAN_MODE:
+                    # Cancel moved the mode back before the answer (Edit
+                    # leaves it in Plan).
+                    return {"decision": "deny", "reason": PLAN_CANCELLED_REASON}
                 return {
                     "decision": "deny",
                     "reason": (
@@ -904,8 +968,19 @@ class _ToolCall:
                     ),
                 }
             # Non-plan mode or non-dashboard: always auto-approve
-            return {"decision": "allow"}
+            return self._plan_allow()
         return None
+
+    async def _card_chat(self) -> str:
+        """The chat a card of this call shows on (the meeting's parent chat for
+        a participant)."""
+        return await _card_chat_of(self.session_id)
+
+    def _plan_allow(self) -> dict:
+        """An allow the Plan stages give: marked for the record of the call
+        (``_record_gate_allow``), so the CLI's own ask for it is answered."""
+        self._pass1_out[_GATE_RECORD] = engine_prompts.PLAN_RECORD
+        return {"decision": "allow"}
 
     async def path_gate(self) -> dict | None:
         """Pass 1: the external callers' shell floor, a revoked target, the
@@ -1041,42 +1116,43 @@ class _ToolCall:
         # (ExitPlanMode/EnterPlanMode already handled above)
         if self.mode == PLAN_MODE:
             if self.auto_approved:
-                return {"decision": "allow"}
+                return self._plan_allow()
 
             # Open-tier MCP tools (pure reads, dashboard display, recoverable
             # memory writes) support planning — the one tier plan mode admits.
             if self.mcp_tier == "open":
-                return {"decision": "allow"}
+                return self._plan_allow()
 
             # Shell read-tier in plan mode: safe read-only commands (every shell
-            # dialect is classified by _check_bash / _check_powershell).
+            # dialect is classified by _check_bash / _check_powershell). Of git,
+            # an edit-tier family, only its version: the CLI's ask after this
+            # allow is answered from the record, so this stage is the only
+            # authority, and git's reading subcommands can run a program
+            # through a repository's config.
             if (self.role == tool_roles.SHELL and self.path_decision
-                    and self.path_decision.permission_tier == "read"):
-                return {"decision": "allow"}
+                    and (self.path_decision.permission_tier == "read"
+                         or (self.path_decision.allowed and git_reads.is_git_version(
+                             tool_roles.payload_value(self.tool_name, self.tool_input))))):
+                return self._plan_allow()
 
             # Allow writing/editing plan files in ~/.claude/plans/. Normalize
             # separators: a Windows-satellite session sends the host-absolute
             # path with backslashes (C:\Users\...\.claude\plans\x.md) — without
-            # this the plan write is denied as a generic plan-mode write.
+            # this the plan write is denied as a generic plan-mode write. The
+            # path is normalized first, so one that climbs out of the plans
+            # folder with ``..`` is a plain write. Never recorded: the CLI
+            # admits its own plan files by itself.
             if self.file_edit:
-                file_path = tool_roles.payload_value(
-                    self.tool_name, self.tool_input).replace("\\", "/")
+                file_path = posixpath.normpath(tool_roles.payload_value(
+                    self.tool_name, self.tool_input).replace("\\", "/"))
                 if "/.claude/plans/" in file_path:
                     return {"decision": "allow"}
 
-            return {"decision": "deny"}
+            return {"decision": "deny", "reason": _PLAN_REFUSAL}
         return None
 
     async def judge_mode(self) -> dict | None:
         """The judge profile: a judge reads, it does not write."""
-        # The judge profile (CHECKS.md): ``git`` is edit tier in the shell
-        # classifier as a family, but a judge needs its read subcommands
-        # (status, diff, log, …) — one plain command, no pipe or redirect.
-        _JUDGE_READ_GIT_RE = _re.compile(
-            r"^\s*git\s+(?:(?:-C|--git-dir|--work-tree)\s+\S+\s+|--no-pager\s+)*"
-            r"(?:status|diff|log|show|blame|rev-parse|ls-files|ls-tree|branch|remote|describe|"
-            r"shortlog|grep|cat-file|stash\s+list|tag\s+-l|tag\s+--list|worktree\s+list)\b"
-            r"[^|;&<>`$]*$")
         # The judge profile (CHECKS.md): a check's judge session reads and
         # never writes — the read tools and the read tier of the shell run, the
         # MCP tools the check listed run below the critical tier (the session
@@ -1092,8 +1168,7 @@ class _ToolCall:
                 return {"decision": "allow"}
             if (self.role == tool_roles.SHELL and self.path_decision and self.path_decision.allowed
                     and not getattr(self.path_decision, "destructive", False)
-                    and _JUDGE_READ_GIT_RE.match(
-                        tool_roles.payload_value(self.tool_name, self.tool_input))):
+                    and git_reads.read_only_git(tool_roles.payload_value(self.tool_name, self.tool_input))):
                 return {"decision": "allow"}
             if (self.tool_name.startswith("mcp__")
                     and self.mcp_tier in ("open", "standard", "sensitive")):
@@ -1278,11 +1353,14 @@ class _ToolCall:
             }
             if self.route.meeting_agent:
                 prompt_data["meeting_agent"] = self.route.meeting_agent
-            await queue.put(prompt_data)
+            chat_id = await self._card_chat()
+            engine_prompts.offer_hook_card(queue, prompt_data, session_id=self.session_id,
+                                           chat_id=chat_id)
             logger.info("Hook permission: %sdashboard blocking for %s, request_id=%s", 'meeting ' + self.route.meeting_agent + ' ' if self.route.meeting_agent else '', self.tool_name, request_id)
             approved = await _wait_on_person(
                 queue, request_id,
-                wait_for_permission(request_id, self.session_id, timeout=self.wait_s))
+                wait_for_permission(request_id, self.session_id, timeout=self.wait_s),
+                chat_id=chat_id)
             logger.info("Hook permission: dashboard resolved %s, approved=%s",
                         self.tool_name, approved)
             if approved and self.tool_name.startswith("mcp__"):
@@ -1295,6 +1373,10 @@ class _ToolCall:
                 key = _call_key(self.role, self.tool_name, self.tool_input)
                 if key:
                     _remember_allowed_call(self.session_id, key)
+            if approved and self.mode == ASK_MODE:
+                # The person allowed this call: the CLI's own ask for it
+                # (its safety check under bypass) is answered from the record.
+                self._pass1_out[_GATE_RECORD] = engine_prompts.HOOK_RECORD
             return {"decision": "allow" if approved else "deny"}
         return None
 
@@ -1350,41 +1432,50 @@ _STAGES = (
 )
 
 
-async def ask_user_question(
-    session_id: str, questions: list, timeout: float = PROMPT_WAIT_S, *,
-    tool_name: str = "",
-) -> dict:
-    """Surface a Codex ``request_user_input`` question set to the dashboard and
-    block for the human answer. The single question authority, reused in-process
-    by the local Codex layer and over the tunnel by ``/v1/hooks/codex-question``.
+def question_shown_reason(tool_name: str) -> str:
+    """What the engine is told when its question went to the chat as a card:
+    the hook's deny reason, and every answer of a Codex question the hook did
+    not see. The person's next message is the answer."""
+    return ("Questions have been displayed to the user in the chat interface. "
+            "The user will reply in their next message. "
+            f"Do NOT re-ask these questions or call {tool_name} again this turn.")
 
-    Mirrors the permission block-and-wait: enqueue a ``question_prompt`` on the
-    session's permission queue (the pump surfaces the card + the "needs your
-    input" ephemeral), then wait for the answer keyed by the VERBATIM question id.
-    Returns the answers MAP ``{<id>: {"answers": [...]}}`` (``{}`` on timeout /
-    abort, so the held turn unwinds cleanly). ``tool_name`` is the engine's
-    question tool as the card records it (the caller's descriptor says).
-    """
-    # Belt-and-braces: only interactive dashboard chats have a human to answer.
-    # The config flag already keeps request_user_input off for autonomous runs;
-    # decline empty here too so a task/phone/meeting session never hangs a turn.
+
+async def show_question_card(route: routing.HookRoute, session_id: str, tool_name: str,
+                             tool_input: dict, *, journaled: bool = False) -> None:
+    """The question card, a block of the turn like Claude's (or shown
+    between turns when no pump runs): no answer is awaited, the person's
+    next message is it. A ``journaled`` one (a terminal's blocking question,
+    which its tailer writes as the question's row) goes onto the queue,
+    whose drainer forwards it to a viewer; a terminal's non-blocking one is
+    no question row there, so it is shown here like any other."""
+    queue = get_permission_queue(route.queue_session_id)
+    item = {"event_type": wire.ITEM_QUESTION, "tool_name": tool_name, "tool_input": tool_input}
+    if journaled:
+        queue.put_nowait(item)
+        return
+    engine_prompts.offer_hook_card(queue, item, session_id=session_id,
+                                   chat_id=await _card_chat_of(session_id))
+
+
+async def ask_user_question(session_id: str, questions: list, *, tool_name: str = "") -> dict:
+    """A Codex ``request_user_input`` question set the PreToolUse hook did not
+    see (a satellite whose gate skips the turn): the same card the hook draws,
+    and the server request answered at once, every question with
+    ``question_shown_reason``, so the turn ends as the hook's deny ends it.
+    Reused in-process by the local Codex layer and over the tunnel by
+    ``/v1/hooks/codex-question``. Returns the answers MAP
+    ``{<id>: {"answers": [...]}}``; ``{}`` for an unattended session (no card:
+    nobody answers, the model goes on). ``tool_name`` is the engine's question
+    tool as the card records it (the caller's descriptor says)."""
     if not session_kind.attended(get_session_client_type(session_id)):
         return {}
     route = routing.resolve_hook_route(session_id)
-    request_id = str(uuid.uuid4())
-    queue = get_permission_queue(route.queue_session_id)
-    await queue.put({
-        "event_type": wire.ITEM_QUESTION_PROMPT,
-        "request_id": request_id,
-        "tool_name": tool_name,
-        "tool_input": {"questions": questions},
-    })
-    logger.info("Codex question: dashboard blocking, request_id=%s", request_id)
-    answers = await _wait_on_person(
-        queue, request_id, wait_for_question(request_id, session_id, timeout=timeout))
-    logger.info("Codex question: resolved request_id=%s "
-                "(%s answered)", request_id, len(answers))
-    return answers
+    await show_question_card(route, session_id, tool_name, {"questions": questions})
+    reason = question_shown_reason(tool_name)
+    logger.info("Codex question: shown as a card, answered at once (%s)", len(questions))
+    return {str(q["id"]): {"answers": [reason]}
+            for q in questions if isinstance(q, dict) and q.get("id")}
 
 
 async def _decide(*args, **kwargs) -> dict:

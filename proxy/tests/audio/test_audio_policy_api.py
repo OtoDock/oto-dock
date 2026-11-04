@@ -54,6 +54,31 @@ def test_policy_rejects_invalid(client):
     assert r.status_code == 400
 
 
+def test_platform_only_needs_a_usable_provider_and_a_refusal_writes_nothing(client):
+    r = client.put("/v1/admin/audio/policy", json={"chat_user_policy": "platform_only", "chat_enabled": False})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Add a speech provider under Setup, Audio before choosing Platform only."
+    p = client.get("/v1/admin/audio/policy").json()
+    assert p["chat_user_policy"] == "native_preferred" and p["chat_enabled"] is True
+    # A usable chat default for one modality is enough.
+    from storage.identity import credential_store
+    from storage.prefs import audio_provider_store
+    row = audio_provider_store.create_provider({
+        "provider_type": "tts", "provider_name": "cartesia", "credential_key": "audio-cartesia",
+    })
+    credential_store.set_infra_credentials("audio-cartesia", {"API_KEY": "sk-x"})
+    audio_provider_store.set_default(row["id"], "chat")
+    r = client.put("/v1/admin/audio/policy", json={"chat_user_policy": "platform_only"})
+    assert r.status_code == 200
+    assert client.get("/v1/admin/audio/policy").json()["chat_user_policy"] == "platform_only"
+    # The released values stay accepted without a provider (a provider taken
+    # off chat loses its default).
+    audio_provider_store.update_provider(row["id"], {"enabled_for_chat": False})
+    assert audio_provider_store.get_default_provider("tts", "chat") is None
+    for value in ("native_only", "native_preferred", "user_choice"):
+        assert client.put("/v1/admin/audio/policy", json={"chat_user_policy": value}).status_code == 200
+
+
 # --- turn classifier ------------------------------------------------------
 
 def test_turn_classifier_active_from_direct_llm(client):

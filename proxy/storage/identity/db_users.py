@@ -127,6 +127,14 @@ def _upsert_user_once(sub: str, email: str, name: str, role: str,
     return existing["role"] if existing else None
 
 
+def record_login(sub: str) -> None:
+    """Stamp a completed sign-in on the account (Admin, Users "Last login")."""
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET last_login = %s WHERE sub = %s",
+                     (datetime.now(timezone.utc).isoformat(), sub))
+        conn.commit()
+
+
 def update_user_display_name(sub: str, display_name: str) -> None:
     with get_conn() as conn:
         conn.execute(
@@ -662,7 +670,9 @@ def _insert_local_user(conn, email: str, name: str, display_name: str, role: str
             username, display_name, password_hash, auth_provider,
             is_owner, must_change_password, password_changed_at)
            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (sub, email, name or display_name, role, now, now, "",
+        # The first admin is signed in by the setup that creates it; an
+        # account an admin adds has never signed in ("").
+        (sub, email, name or display_name, role, now, now if is_owner else "", "",
          username, display_name, password_hash, "local",
          is_owner, must_change_password, now),
     )

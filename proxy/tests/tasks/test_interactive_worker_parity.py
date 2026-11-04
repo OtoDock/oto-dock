@@ -30,10 +30,12 @@ class _FakeInteractiveSession:
         self.had_viewer = False              # real sessions track viewer attach
         self.events: list[str] = []          # call-order recorder
         self.submitted: list[str] = []
+        self.refuse = False                  # a write that goes nowhere
 
-    def submit_prompt(self, text: str) -> None:
+    def submit_prompt(self, text: str) -> bool:
         self.events.append("submit")
         self.submitted.append(text)
+        return not self.refuse
 
     def set_callback_marker(self):
         # queried via property below; kept simple
@@ -86,6 +88,35 @@ def test_argv_prompt_is_not_reinjected(fake_isess):
         ))
         await asyncio.sleep(0.05)
         assert fake_isess.submitted == []
+        fake_isess.on_turn_complete("done")
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(_run())
+
+
+def test_the_prompt_is_noted_before_the_submit_and_dropped_when_refused(fake_isess):
+    # The run wrote the prompt's row: the typed text is noted so the tailer
+    # skips the journaled copy, once; a write the PTY refused takes the note
+    # back, so a person's identical line keeps its row.
+    from core.session import transcript_tool_events as TE
+    TE._sent_prompts.clear()
+
+    async def _run():
+        task = asyncio.create_task(scheduler._run_interactive_task(
+            "sid-worker", "chat-w", "analyze the repo", False,
+        ))
+        await asyncio.sleep(0.05)
+        assert TE.consume_sent_prompt("chat-w", "analyze the repo") is True
+        assert TE.consume_sent_prompt("chat-w", "analyze the repo") is False
+        fake_isess.on_turn_complete("done")
+        await asyncio.wait_for(task, timeout=5)
+
+        fake_isess.refuse = True
+        task = asyncio.create_task(scheduler._run_interactive_task(
+            "sid-worker", "chat-w", "once more", False,
+        ))
+        await asyncio.sleep(0.05)
+        assert TE.consume_sent_prompt("chat-w", "once more") is False
         fake_isess.on_turn_complete("done")
         await asyncio.wait_for(task, timeout=5)
 
@@ -199,6 +230,31 @@ class TestBorrowedTerminalTurn:
             term.end_turn("the follow-up's answer")
             await asyncio.wait_for(task, timeout=5)
             assert term.waiters == [] and term.cancelled == []
+
+        asyncio.run(_run())
+
+    def test_the_prompts_row_is_written_from_the_injection(self):
+        # The queued item is noted for the tailer; the run's row job runs
+        # from the hook, after what the terminal produced before the paste,
+        # and the round reads its id back.
+        async def _run():
+            term = _BorrowedTerminal(inject_now=False)
+            written: list[str] = []
+
+            async def _row() -> int:
+                written.append("row")
+                return 42
+
+            task = asyncio.create_task(interactive._run_borrowed_terminal_turn(
+                term, "follow up", persist_row=lambda: asyncio.ensure_future(_row())))
+            await asyncio.sleep(0.05)
+            [item] = term.queued
+            assert item["note"] is True and written == []
+            item["on_injected"]()
+            await asyncio.sleep(0)
+            assert written == ["row"]
+            term.end_turn("the answer")
+            assert await asyncio.wait_for(task, timeout=5) == 42
 
         asyncio.run(_run())
 
@@ -316,9 +372,12 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
                 break
             await asyncio.sleep(0.05)
         assert term.queued and term.queued[0]["text"] == "also this"
+        assert term.queued[0]["note"] is True
         assert interactive._terminal_locks[chat_id].locked()
-        # The tailer persists the terminal's turn, then the turn ends.
-        task_store.add_chat_message(chat_id, "user", "also this")
+        # The round wrote the prompt's row from the injection; the tailer
+        # skips the journaled copy and persists the answer, then the turn
+        # ends.
+        await asyncio.sleep(0.3)
         task_store.add_chat_message(chat_id, "assistant", "terminal answer")
         term.end_turn("terminal answer")
         await asyncio.wait_for(t, timeout=20)
@@ -334,6 +393,10 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
     assert run["output_text"] == "terminal answer"
     assert run["session_id"] == sid
     assert closed == []                                   # the person's terminal stays
+    import json
+    [card] = [m for m in task_store.get_chat_messages(chat_id) if m["role"] == "user"]
+    assert card["content"] == "also this"
+    assert json.loads(card["event_data"])["badge"] == "task prompt"
     # The dashboard's session-index entry survives the round, un-stamped.
     assert entry_after == {"client_type": "dashboard"}
 

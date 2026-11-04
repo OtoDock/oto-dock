@@ -283,6 +283,7 @@ def test_edit_pdf_resolves_input_as_write(monkeypatch):
     # missing file before touching it, so a stub module satisfies the import.
     monkeypatch.setitem(sys.modules, "fitz", types.ModuleType("fitz"))
     calls = _capture_resolve(monkeypatch, pdf)
+    monkeypatch.setattr(shared, "_resolve_path", pdf._resolve_path)
     out = asyncio.run(pdf.handle_edit_pdf({"path": "/knowledge/doc.pdf"}))
     assert "File not found" in out
     assert calls == [("/knowledge/doc.pdf", True)]

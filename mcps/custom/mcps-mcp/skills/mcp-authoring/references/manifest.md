@@ -35,7 +35,7 @@ floor the fields imply.
 | `costs` | no | Per-tool prices (`currency`, `provider`, ordered `rules`). |
 | `permissions` | no | Per-tool permission tiers (`open`, `standard`, `sensitive`; `critical` is kept for the platform's own tools and runs as `sensitive` in any other MCP). A tool no rule names takes its tier from its own MCP annotations. `readOnlyHint: true` makes it `open`. `destructiveHint: false` together with `openWorldHint: false` makes it `standard`. Any other annotation makes it `sensitive`. A tool that sends no annotations, or whose list the platform has not read yet, takes `default_tier`. Set the annotations truthfully on every tool, and keep `permissions` for the tools whose tier should differ. |
 | `assignment_mode` | no | `auto` (managers enable it per agent) or `explicit` (an admin must configure an instance first). |
-| `exclude_from` | no | Session kinds that never load it: `phone`, `task`, `terminal`, `meeting`, `external`. |
+| `exclude_from` | no | Session kinds that never load it: `phone`, `task`, `terminal`, `meeting`, `external`, and `shared_chat` (a session that is not the person's own chat: a Shared-only agent's chat, a task chat reopened in the dashboard, a delegated worker's chat, a chat another person drives, an unattended wake, nobody driving). |
 | `audience` | no | The tier of the agent this whole MCP is for: `owner`, `editor` or `workspace` (empty = everyone, the default). In a session for a person below that tier the MCP is left out — of the session, its tools and its sandbox network opening; a session the agent runs as itself is always in, except a phone caller's (a caller who is not a platform user counts as a viewer). The whole-MCP version of `skills[].audience`. |
 | `network_targets` | no | The internal hosts a homelab MCP dials, read from a config key, an instance field or a credential; the admin's toggle opens the sandbox to exactly those. |
 | `system_requirements` | no | OS packages and a `node_min` the installer checks before installing. |
@@ -85,15 +85,20 @@ Fields a community package never sets: `requires_capability`, `hosted`,
   `credentials.fields` entry with `input_type: "password"` under
   `credentials.type` `per_user` or `infra`, or an env-delivered
   `instances.fields` key; `proposed_hosts` are the hosts you
-  propose, which an admin approves under the MCP's `name`. Rules:
+  propose: installed from the community catalog, the MCP's own literal
+  https server host applies by itself, and any other host (a plain http one
+  included), like every host of a ZIP, waits for an admin's Allow under the
+  MCP's `name`, on the install card, in the MCP's row on MCP Servers or in
+  Admin Setup → Security. Rules:
   `server.transport` is streamable HTTP (`streamable_http`,
   `streamable-http` or `http`); `server.url_template` is a literal URL (no
   `${…}` anywhere in it), `http` or `https`, whose host matches one of
   `proposed_hosts` (an entry there may use `*`). The validator does not
-  judge the host itself: the allowlist row an admin approves and the
-  credential gateway's egress guard (which refuses a host that resolves
-  onto the platform's own loopback or link-local range) do; `name` is a plain header
-  name and not one the platform owns or strips (`authorization`, `cookie`,
+  judge the host itself: the allowlist row (the catalog's, or an admin's
+  Allow) and the credential gateway's egress guard (which refuses a host
+  that resolves onto the platform's own loopback or link-local range) do;
+  `name` is a plain header name and not one the platform owns or strips
+  (`authorization`, `cookie`,
   `host`, `content-*`, `accept*`, `mcp-*`, `forwarded`, `x-forwarded-*`, and
   the transport headers); and it is never declared beside
   `oauth.bearer_required`. Like a bearer, the value is added to each request

@@ -5,7 +5,9 @@
  * reason (an optional note), names the reply by its first stored row (a
  * streamed reply is found among the chat's newest rows by its text and its
  * place among equal replies, never guessed), then thanks the person in place.
- * Cancel and Escape send nothing, and the focus comes back to the flag.
+ * Cancel and Escape send nothing, and the focus comes back to the flag. The
+ * flag stays filled across a reload (the person's reported replies in the
+ * chat), and a stored reply with no text has one too.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -19,13 +21,17 @@ import { findStoredReply, storedRowId } from '@/lib/messageBlocks'
 
 type Page = { messages: Array<Record<string, unknown>>; has_more: boolean }
 const api = vi.hoisted(() => ({
-  reportReply: vi.fn(async (_chatId: string, _body: unknown) => {}),
+  reportReply: vi.fn(async (_chatId: string, body: { message_id: number }) => body.message_id),
   fetchRowsPage: vi.fn(async (_chatId: string, _before?: number): Promise<Page> => ({ messages: [], has_more: false })),
+  mine: [] as number[],
+  addMine: vi.fn(),
 }))
 vi.mock('@/api/replyReports', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/replyReports')>()),
   reportReply: api.reportReply,
   fetchRowsPage: api.fetchRowsPage,
+  useMyReportedReplies: () => ({ data: api.mine }),
+  useAddMyReportedReply: () => api.addMine,
 }))
 
 class ObserverStub {
@@ -81,7 +87,9 @@ const row = (id: number, role: string, content: string, extra: Record<string, un
 
 beforeEach(() => {
   api.reportReply.mockReset()
-  api.reportReply.mockImplementation(async () => {})
+  api.reportReply.mockImplementation(async (_chatId: string, body: { message_id: number }) => body.message_id)
+  api.mine = []
+  api.addMine.mockReset()
   api.fetchRowsPage.mockReset()
   api.fetchRowsPage.mockImplementation(async () => ({ messages: [], has_more: false }))
 })
@@ -260,5 +268,49 @@ describe('naming the reply', () => {
       row(3, 'assistant', 'Looking it up.', { event_data: '{"note": true}' }), row(4, 'assistant', 'Done.'),
     ]
     expect(findStoredReply([streamed], 0, rows)).toBe(3)
+  })
+})
+
+describe('Reported across a reload', () => {
+  it('fills the flag of a reply this person reported, from its first row up to the next bubble', () => {
+    api.mine = [43]
+    renderChat([
+      { id: 'db-40', role: 'user', createdAt: 't', blocks: [{ type: 'text', content: 'q' }] },
+      reply('db-41', 'The first answer.'),
+      { id: 'db-50', role: 'user', createdAt: 't', blocks: [{ type: 'text', content: 'q2' }] },
+      reply('db-51', 'The second answer.'),
+    ])
+    expect(screen.getAllByRole('button', { name: 'Reported' })).toHaveLength(1)
+    expect(flags()).toHaveLength(1)
+  })
+
+  it('adds the first row the server answers to the chat\'s set', async () => {
+    api.reportReply.mockImplementation(async () => 39)
+    renderChat([reply('db-41', 'Stored answer.')])
+    await openAndSend('Something else')
+    expect(api.addMine).toHaveBeenCalledWith('chat-1', 39)
+  })
+})
+
+describe('a reply with no text', () => {
+  const toolOnly = (id: string): DisplayMessage => ({
+    id, role: 'assistant', createdAt: 't',
+    blocks: [{ type: 'tool', name: 'Bash', toolId: 't1', summary: 'ls', status: 'done' }, META],
+  })
+
+  it('has a flag once it is stored, and no copy or read-aloud', async () => {
+    renderChat([toolOnly('db-90')])
+    expect(flags()).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: /copy/i })).toBeNull()
+    await openAndSend('Harmful or offensive')
+    expect(api.reportReply).toHaveBeenCalledWith('chat-1', { message_id: 90, reason: 'harmful', note: '' })
+  })
+
+  it('has none while it is only streamed, nor when it shows nothing to report', () => {
+    renderChat([toolOnly('stream-1'), {
+      id: 'db-91', role: 'assistant', createdAt: 't',
+      blocks: [{ type: 'thinking', content: 'x', collapsed: true }, META],
+    }])
+    expect(flags()).toHaveLength(0)
   })
 })

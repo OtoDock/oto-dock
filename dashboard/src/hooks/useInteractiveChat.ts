@@ -118,25 +118,26 @@ export interface RouteSendCtx {
   warmingUp: boolean
   warmupParams: InteractiveWarmupParams
   /** Page-specific UI prep before a cold start (add the user bubble + set the
-   * warming flag). The stashed prompt is flushed to the PTY on warmup_ready. */
+   * warming flag). The prompt rides the warmup; the server delivers it. */
   onColdStart: () => void
-  /** Chat-attached photos (base64) + already-uploaded files. When present
-   * the live send goes through `sendPtyAttachments` (the backend saves the
-   * photos + types the Read-tool paths into the PTY) instead of plain text. */
+  /** Chat-attached photos (base64 or a saved path) + already-uploaded files.
+   * A live terminal takes them through `sendPtyAttachments`, a cold start
+   * with the warmup (the backend saves the photos and types the Read-tool
+   * paths either way). */
   images?: WireImage[]
   files?: Array<{ path: string; name: string }>
 }
 
 /** 'pty' — written to the live terminal; 'cold' — cold-started an interactive
- * warmup (text stashed for flush on ready); null — not interactive, the caller
- * should run its normal send path. */
+ * warmup carrying the prompt; null — not interactive, the caller should run
+ * its normal send path. */
 export type RouteSendResult = 'pty' | 'cold' | null
 
-/** 'interactive' — a live PTY exists, stashed text flushed; 'declined' — we
- * requested interactive but the backend ran headless, the stashed prompt was
- * handed to onDecline; 'none' — not an interactive warmup, the caller handles
- * the rest of warmup_ready (e.g. server-kick adoption). */
-export type WarmupReadyResult = 'interactive' | 'declined' | 'none'
+/** 'interactive' — a live PTY exists; 'none' — not an interactive warmup, the
+ * caller handles the rest of warmup_ready (e.g. server-kick adoption, which
+ * also covers a start the backend declined to headless: it kicks the prompt
+ * the warmup carried). */
+export type WarmupReadyResult = 'interactive' | 'none'
 
 export function useInteractiveChat(
   ws: InteractiveWs,
@@ -174,18 +175,6 @@ export function useInteractiveChat(
   // sessionInteractive; reset whenever a (re)warm lands so a fresh terminal
   // always opens on the terminal, not a stale snapshot.
   const [showRichView, setShowRichView] = useState(false)
-  // ATTACHMENTS-ONLY stash: a cold send with photos/files keeps its text here
-  // and flushes on warmup_ready (or replays as a normal turn if the backend
-  // declines). Text-only cold sends do NOT stash — their prompt rides the
-  // warmup and the backend delivers it server-side, surviving a chat switch
-  // or reload mid-warmup (this ref dies with resetSession on switch).
-  const pendingPtyTextRef = useRef<string | null>(null)
-  // Photos/files attached on a cold-start send; flushed via
-  // sendPtyAttachments on warmup_ready (the backend saves + types the paths).
-  const pendingPtyAttachmentsRef = useRef<{
-    images?: WireImage[]
-    files?: Array<{ path: string; name: string }>
-  } | null>(null)
   // A live switch (kill+rewarm) is in flight — locks the toggle until
   // the re-warm's warmup_ready lands, so it can't be double-fired.
   const [switching, setSwitching] = useState(false)
@@ -310,15 +299,13 @@ export function useInteractiveChat(
     setShowRichView(false)
     endSwitch()
     setChatExecMode('')
-    pendingPtyTextRef.current = null
-    pendingPtyAttachmentsRef.current = null
     deferredSwitchRef.current = null
   }, [endSwitch])
 
   // Route a send. A live terminal → write the line straight to the PTY (no pump
   // turn, no bubble). Toggle on with nothing live yet → cold-start an
-  // interactive warmup and stash the text. Otherwise return null so the caller
-  // runs its normal (headless `-p`) send path.
+  // interactive warmup that carries the prompt. Otherwise return null so the
+  // caller runs its normal (headless `-p`) send path.
   const routeSend = useCallback((text: string, ctx: RouteSendCtx): RouteSendResult => {
     const hasAttachments = !!(ctx.images?.length || ctx.files?.length)
     if (sessionInteractive && ctx.chatId) {
@@ -334,27 +321,19 @@ export function useInteractiveChat(
     if (interactiveMode && !ctx.sessionId && !ctx.warmingUp) {
       ctx.onColdStart()
       const p = ctx.warmupParams
-      if (!hasAttachments) {
-        // Text-only cold start, every engine: the RAW prompt rides the warmup
-        // and the BACKEND delivers it — as the TUI's launch argument or via
-        // submit_prompt at spawn completion, whichever the engine's descriptor
-        // says, stamped there with the time and the viewer-focus line; a
-        // declined-to-headless spawn runs it as the server kick (that path
-        // injects the time itself, which is why the text must go up
-        // un-stamped). Server-owned delivery survives switching chats /
-        // reloading mid-warmup; the client-held stash below does not
-        // (resetSession nulls it on switch, and warmup_ready for a non-viewed
-        // chat is dropped by the staleness guard).
-        ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, { text }, 'interactive', currentDashboardTheme())
-        return 'cold'
-      }
-      // Attachments keep the stash + warmup_ready flush (the base64 photos
-      // ride a separate pty_attachments message the backend saves + types as
-      // Read paths — the Read-tool path pipeline). Known residual: switching
-      // away mid-warmup still drops an attachments send.
-      pendingPtyTextRef.current = text
-      pendingPtyAttachmentsRef.current = { images: ctx.images, files: ctx.files }
-      ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, undefined, 'interactive', currentDashboardTheme())
+      // Cold start, every engine: the RAW prompt rides the warmup with its
+      // photos and files, and the BACKEND delivers it — as the TUI's launch
+      // argument or via submit_prompt at spawn completion, whichever the
+      // engine's descriptor says (a prompt with attachments always through
+      // the terminal: their Read paths are lines), stamped there with the
+      // time and the viewer-focus line; a declined-to-headless spawn runs it
+      // as the server kick (that path injects the time itself, which is why
+      // the text must go up un-stamped). The backend saves the photos when it
+      // writes the message's row, so the history keeps them. Server-owned
+      // delivery survives switching chats / reloading mid-warmup.
+      ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer,
+        { text, ...(ctx.images?.length ? { images: ctx.images } : {}), ...(ctx.files?.length ? { files: ctx.files } : {}) },
+        'interactive', currentDashboardTheme())
       return 'cold'
     }
     return null
@@ -364,36 +343,13 @@ export function useInteractiveChat(
   // then does its own page-specific work only when the result is 'none'.
   const onWarmupReady = useCallback((
     data: { interactive?: boolean; chat_id?: string },
-    hooks: { onDecline: (text: string, chatId: string) => void },
   ): WarmupReadyResult => {
     const isInteractive = !!data.interactive
     setSessionInteractive(isInteractive)
     setShowRichView(false)  // a (re)warm landed → open on the terminal, not a stale rich snapshot
     endSwitch()  // a re-warm landed → any in-flight live switch is done
-    if (isInteractive) {
-      if (pendingPtyTextRef.current != null && data.chat_id) {
-        const att = pendingPtyAttachmentsRef.current
-        // Interactive landed → stamp browser time/zone at delivery (parity with
-        // -p inject_time); bracketed paste because the prefix is multi-line.
-        if (att) ws.sendPtyAttachments(data.chat_id, withInteractiveTime(pendingPtyTextRef.current), att.images, att.files)
-        else ws.sendPtyInput(data.chat_id, ptyPasteB64(withInteractiveTime(pendingPtyTextRef.current)), true)
-      }
-      pendingPtyTextRef.current = null
-      pendingPtyAttachmentsRef.current = null
-      return 'interactive'
-    }
-    if (pendingPtyTextRef.current && data.chat_id) {
-      // Requested interactive but the backend ran HEADLESS (kill-switch off, or
-      // a non-Claude / remote target). Don't drop the message — run the stashed
-      // prompt as a normal turn (the caller already added the bubble).
-      const t = pendingPtyTextRef.current
-      pendingPtyTextRef.current = null
-      pendingPtyAttachmentsRef.current = null  // headless fallback drops attachments (rare)
-      hooks.onDecline(t, data.chat_id)
-      return 'declined'
-    }
-    return 'none'
-  }, [ws, endSwitch])
+    return isInteractive ? 'interactive' : 'none'
+  }, [endSwitch])
 
   return {
     interactiveMode,
@@ -410,7 +366,6 @@ export function useInteractiveChat(
     switchStarted,
     switchErrored,
     switchFailed,
-    pendingPtyTextRef,
     toggle,
     performSwitch,
     flushDeferredSwitch,

@@ -1,6 +1,6 @@
 """OAuth subscription grant-health warnings (login-expiry + expired alerts).
 
-Run as one pass of the ~60s registry sweep (``app.py::_registry_sweep_loop``),
+Run as one pass of the ~60s registry sweep (``startup.py::_registry_sweep_loop``),
 self-throttled to 15 min — each pass decrypts every OAuth row's credential
 blob, and grant lifetimes are measured in days, not minutes.
 
@@ -13,6 +13,12 @@ For every OAuth subscription row with an owner:
     stored) stay silent — absence never means "expiring".
   * ``status=expired``: fire once — the refresh path already logged the
     terminal ``invalid_grant``; this is the owner-visible half.
+
+Both notices name the account by its label WITH its email (one person's
+logins on one plan all carry the plan's label) and open the AI Engines
+settings (``href``), where the row offers Reconnect. The grant's end is read
+by ``login_expiry_ms``, the one reading the AI Engines lists share
+(``login_expires_at``), so the row's chip and the notice never disagree.
 
 Dedup stamps live INSIDE the encrypted credential blob
 (``oauth_token.healthAlerts = {"72h": {"expiry": <ms>, "at": <ms>},
@@ -34,6 +40,7 @@ read can clobber anything.
 
 import asyncio
 import logging
+import math
 import time
 
 from storage.billing import subscription_status, subscription_store
@@ -43,11 +50,19 @@ logger = logging.getLogger(__name__)
 _MIN_INTERVAL_S = 15 * 60
 _last_run: float = 0.0
 
+_HOUR_MS = 3600 * 1000
+# The window a login that ends soon is told in: the first notice, and the
+# AI Engines row's chip (the dashboard's LOGIN_ENDING_WINDOW_HOURS, bound to
+# this one by a test).
+LOGIN_ENDING_WINDOW_MS = 72 * _HOUR_MS
+# The page a notice opens.
+AI_ENGINES_PATH = "/user-settings/ai-engines"
+
 # Most urgent first — one notification per pass per row, the tighter window wins.
 # (An account first seen at remaining≈25h gets the 72h warn, then the 24h warn
 # ~1h later — still ≤2 per cycle; the floor below never blocks the normal
 # 72h→24h pair, which is ~48h apart.)
-_WARN_THRESHOLDS = (("24h", 24 * 3600 * 1000), ("72h", 72 * 3600 * 1000))
+_WARN_THRESHOLDS = (("24h", 24 * _HOUR_MS), ("72h", LOGIN_ENDING_WINDOW_MS))
 
 # Re-arm a fired threshold only when the grant expiry moved forward at least
 # this much (rotation jitter is not a new grant)...
@@ -78,17 +93,59 @@ async def check_subscription_health() -> None:
             logger.exception("subscription_health: row %s failed", sub.get("id", "")[:8])
 
 
+def login_expiry_ms(cred) -> int:
+    """The login grant's end (epoch ms) from a decrypted credential blob, 0
+    when unknown: no ``refreshTokenExpiresAt`` (grants connected before it
+    was stored), or a blob or token of another shape. Never raises."""
+    oauth = cred.get("oauth_token") if isinstance(cred, dict) else None
+    if not isinstance(oauth, dict):
+        return 0
+    try:
+        return max(int(oauth.get("refreshTokenExpiresAt") or 0), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def account_name(sub: dict, product: str) -> str:
+    """How a notice names the account: "Claude Max (name@example.com)" when
+    the label and the email both exist and differ, else whichever exists, else
+    the engine's account word. An identity without an @ is the account's
+    UUID and is never shown. The dashboard's ``accountName`` keeps the same
+    rule."""
+    label = str(sub.get("label") or "").strip()
+    identity = str(sub.get("oauth_email") or "").strip()
+    email = identity if "@" in identity else ""
+    if label and email and email.lower() != label.lower():
+        return f"{label} ({email})"
+    return label or email or product
+
+
+def ends_in(remaining_ms: int) -> str:
+    """When a login ends, in words: days from 48 rounded hours, then hours,
+    then "within the hour". Rounded half up, as the dashboard's
+    ``loginEndsIn``."""
+    hours = max(remaining_ms, 0) / _HOUR_MS
+    rounded = math.floor(hours + 0.5)
+    if rounded >= 48:
+        return f"in about {math.floor(hours / 24 + 0.5)} days"
+    if rounded >= 1:
+        return f"in about {rounded} hour{'' if rounded == 1 else 's'}"
+    return "within the hour"
+
+
 async def _check_row(sub: dict) -> None:
     status = sub.get("status")
     if status not in (subscription_status.ACTIVE, subscription_status.EXPIRED):
         return
     sub_id = sub["id"]
     cred = await asyncio.to_thread(subscription_store.get_credential_data, sub_id)
-    oauth = cred.get("oauth_token") or {}
-    alerts = dict(oauth.get("healthAlerts") or {})
+    token = cred.get("oauth_token") if isinstance(cred, dict) else None
+    oauth = token if isinstance(token, dict) else {}
+    stamps = oauth.get("healthAlerts")
+    alerts = dict(stamps) if isinstance(stamps, dict) else {}
     from core.session.session_manager import account_label_for
     product = account_label_for(sub.get("layer", ""), "AI engine")
-    label = sub.get("label") or sub.get("oauth_email") or product
+    name = account_name(sub, product)
 
     if status == subscription_status.EXPIRED:
         if alerts.get("expired"):
@@ -97,15 +154,14 @@ async def _check_row(sub: dict) -> None:
             sub,
             title=f"{product} login expired",
             body=(
-                f"“{label}” can no longer refresh — its login grant expired. "
-                f"Reconnect the same account from your AI Engines settings to "
-                f"revive it in place."
+                f"The login for “{name}” has ended. Press Reconnect on its row "
+                f"in User Settings, AI Engines to sign in again."
             ),
         )
         await asyncio.to_thread(_stamp, sub_id, "expired", int(time.time() * 1000))
         return
 
-    grant_expiry = int(oauth.get("refreshTokenExpiresAt") or 0)
+    grant_expiry = login_expiry_ms(cred)
     if not grant_expiry:
         return
     now_ms = int(time.time() * 1000)
@@ -119,19 +175,12 @@ async def _check_row(sub: dict) -> None:
             or now_ms - stamped_at < _MIN_RENOTIFY_MS
         ):
             return  # already warned for this grant generation
-        hours = max(remaining_ms, 0) / 3_600_000
-        when = (
-            f"in about {hours / 24:.0f} day(s)" if hours >= 48
-            else f"in about {hours:.0f} hour(s)" if hours >= 1
-            else "imminently"
-        )
         await _notify(
             sub,
             title=f"{product} login expires soon",
             body=(
-                f"The login for “{label}” expires {when}. Reconnect the same "
-                f"account from your AI Engines settings before then to avoid "
-                f"an interruption."
+                f"The login for “{name}” ends {ends_in(remaining_ms)}. Press "
+                f"Reconnect on its row in User Settings, AI Engines to renew it."
             ),
         )
         await asyncio.to_thread(
@@ -150,6 +199,7 @@ async def _notify(sub: dict, *, title: str, body: str) -> None:
         target=sub["owner_sub"],
         source="subscription_health",
         source_id=f"{sub['id']}:{title}",
+        href=AI_ENGINES_PATH,
     )
 
 
@@ -172,9 +222,10 @@ def _stamp(sub_id: str, key: str, value) -> None:
     with subscription_pool._refresh_lock(sub_id):
         cred = subscription_store.get_credential_data(sub_id)
         oauth = cred.get("oauth_token")
-        if not oauth:
+        if not isinstance(oauth, dict):
             return
-        alerts = dict(oauth.get("healthAlerts") or {})
+        stamps = oauth.get("healthAlerts")
+        alerts = dict(stamps) if isinstance(stamps, dict) else {}
         alerts[key] = value
         oauth["healthAlerts"] = alerts
         subscription_store.update_credential_data(sub_id, cred)

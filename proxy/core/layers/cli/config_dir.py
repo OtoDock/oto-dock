@@ -90,7 +90,7 @@ DISALLOWED_BUILTIN_TOOLS = [
 # ``cc-plugin-diff`` (/diff), ``cc-plugin-telemetry`` and the managed-only
 # ``cc-plugin-sec-default`` (the deny-first guard) — and every other built-in
 # the binary names is off by name, so no flag can add a skill, an agent, a
-# command or a reply-mod. ``agents-md`` and ``telemetry`` load on 2.1.281
+# tool, an MCP server, a command or a reply-mod. ``agents-md`` and ``telemetry`` load on 2.1.281
 # too; older CLIs ignore an id they do not know. Satellite twin:
 # ``satellite/sessions/cli_session.py``, held equal by test_sandbox.
 DISABLED_BUILTIN_PLUGINS = (
@@ -101,6 +101,11 @@ DISABLED_BUILTIN_PLUGINS = (
     "cc-plugin-mermaid@builtin",
     "cc-plugin-responsive-mode@builtin",
     "cc-plugin-tips@builtin",
+    # 2.1.306: charts drawn in the transcript, a chart tool and charts under
+    # MCP results. 2.1.312: the developer docs of platform.claude.com as an
+    # HTTP MCP server, with a claude-api skill. Both dark behind remote flags.
+    "cc-plugin-easel@builtin",
+    "cc-plugin-claude-platform@builtin",
 )
 
 
@@ -182,6 +187,15 @@ def build_settings(sandbox_claude_dir: str) -> dict:
         # frame listed the account's Claude Docs connector as connected); off
         # for the same reason. The platform's own MCPs ride --mcp-config.
         "disableClaudeAiConnectors": True,
+        # Plan keeps Claude Code's plain plan semantics: with auto mode
+        # available (a claude.ai login) the CLI otherwise sends a call it does
+        # not read as read-only to its own reviewer, a model call the platform
+        # neither shows nor counts, which can refuse what the gate allowed in
+        # Plan. Off, such a call becomes the CLI's ask, which a headless Plan
+        # spawn answers from the gate's record (engine_prompts) and a terminal
+        # shows as its own question. 2.1.296 knows the key. Satellite twin:
+        # satellite/sessions/cli_session.py::_write_cli_hooks.
+        "useAutoModeDuringPlan": False,
         "permissions": {
             "deny": list(DISALLOWED_BUILTIN_TOOLS),
         },

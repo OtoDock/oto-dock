@@ -12,6 +12,7 @@ this package without the platform.
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
@@ -20,6 +21,7 @@ from typing import cast
 
 import config
 from storage import database as task_store
+from storage.agents import agent_store
 from storage.automation import run_status
 
 logger = logging.getLogger("otodock.scheduler")
@@ -100,6 +102,7 @@ def _cut_short_phrases() -> dict[str, str]:
         te.EXITED: "the program stopped",
         te.SILENT: "it went silent and was ended",
         te.LOST: "the machine's connection was lost",
+        te.RESTARTED: "the platform restarted",
     }
 
 
@@ -133,8 +136,41 @@ def report_missing(cut_short: str, status: str, output: str,
     return _BLOCKED_ON_RE.search(own) is None
 
 
+# The badges the platform stamps on the user rows it writes into a lane (the
+# dashboard draws them as cards): a delegated task or steer names the agent
+# it came from, a task run with no delegating agent names its own.
+DELEGATED_BY_BADGE = "delegated by"
+TASK_PROMPT_BADGE = "task prompt"
+
+
+def prompt_row_meta(delegating_slug: str | None, executing_slug: str) -> dict:
+    """The ``event_data`` of a prompt row the platform writes: the agent it
+    came from (the delegating one, else the executing one) with its name
+    and colour as the dashboard's header draws them, and the badge."""
+    slug = delegating_slug or executing_slug
+    data = agent_store.get_agent(slug) or {}
+    return {
+        "agent_slug": slug,
+        "agent_display_name": data.get("display_name") or slug,
+        "agent_color": data.get("color", ""),
+        "badge": DELEGATED_BY_BADGE if delegating_slug else TASK_PROMPT_BADGE,
+    }
+
+
+def _platform_prompt(m: dict) -> bool:
+    """A user row the platform wrote (a delegated task or steer, a task run's
+    prompt, a meeting prompt): its meta names the agent it came from."""
+    data = m.get("event_data")
+    if not data:
+        return False
+    try:
+        return bool(json.loads(data).get("agent_slug"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def _by_person(m: dict) -> bool:
-    return m["role"] == "user"
+    return m["role"] == "user" and not _platform_prompt(m)
 
 
 def user_rows_after(chat_id: str, cursor: int) -> bool:
@@ -158,31 +194,20 @@ def missing_report_note(cut_short: str, worker_chat_id: str) -> str:
             f"the report.")
 
 
-_PASTED_CONTENT_TAG_RE = re.compile(r"</?pasted_content\b[^>]*>")
-
-
-def _prompt_key(text: str) -> str:
-    """A user row and the prompt that produced it, made comparable: the
-    Claude TUI journals a multi-line paste wrapped in ``<pasted_content>``
-    tags, an interactive run's first prompt carries the time and
-    parallel-activity lines ahead of the run's own text (the transcript
-    keeps them; the caller holds the raw prompt), and every terminal
-    re-flows whitespace."""
-    from core.session.codex_rollout_tailer import _user_row_key
-    return _user_row_key(_PASTED_CONTENT_TAG_RE.sub("", text or "").strip())
-
-
 def _collect_lane_output_since(chat_id: str, after_id: int = 0,
                                skip_row_id: int = 0, own_prompt: str = "") -> str:
     """Batched delegate-lane collection: everything the lane produced after
-    the pre-run cursor — assistant turns verbatim, USER rows labelled
+    the pre-run cursor — assistant turns verbatim, a PERSON's rows labelled
     ``[User interjected]`` so the delegating agent sees redirects/steering in
-    order. The run's own driven prompt is excluded: by row id when the caller
-    persisted it (headless), by first-content-match otherwise (interactive
-    runs, where the transcript tailer backfills it as a user row, possibly
-    wrapped as pasted content — see ``_prompt_key``)."""
-    own_key = _prompt_key(own_prompt)
-    own_prompt_pending = bool(own_key)
+    order (the platform's own rows, a delegated steer's included, are not a
+    person's). The run's own driven prompt is excluded: by row id when the
+    run wrote it, by first-content-match otherwise (a lane from before the
+    runs wrote their rows, where the transcript tailer backfilled it as a
+    plain user row, possibly wrapped as pasted content and stamped — see
+    ``transcript_tool_events.prompt_key``)."""
+    from core.session.transcript_tool_events import prompt_key
+    own_key = prompt_key(own_prompt)
+    own_prompt_pending = bool(own_key) and not skip_row_id
     messages = task_store.get_chat_messages(chat_id)
     parts = []
     for m in messages:
@@ -195,7 +220,7 @@ def _collect_lane_output_since(chat_id: str, after_id: int = 0,
         if m["role"] == "assistant" and content:
             parts.append(content)
         elif _by_person(m) and content:
-            if own_prompt_pending and _prompt_key(content) == own_key:
+            if own_prompt_pending and prompt_key(content) == own_key:
                 own_prompt_pending = False
                 continue
             parts.append(f"[User interjected]: {content}")

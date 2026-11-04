@@ -171,6 +171,21 @@ def _looks_like_oom(exc: BaseException) -> bool:
     )
 
 
+# numpy's OpenBLAS (which openpyxl, matplotlib and PIL import) reserves a
+# buffer per CPU thread when it loads: about 360 MB more address space on a
+# 10-CPU host, which RLIMIT_AS counts against the job. A spawn child takes
+# the parent's environment as it starts, before its target's module is
+# imported, so the limit is set in the parent; an operator's value wins.
+# OMP_NUM_THREADS stays as it is: onnxruntime reads it, and one thread makes
+# a background removal four times slower.
+SINGLE_THREAD_ENV = ("OPENBLAS_NUM_THREADS",)
+
+
+def _single_threaded_math() -> None:
+    for name in SINGLE_THREAD_ENV:
+        os.environ.setdefault(name, "1")
+
+
 def _child_main(conn, budget_bytes: int, target, args: tuple, kwargs: dict,
                 advice: str | None) -> None:
     """Runs in the spawn child: cap the address space, run the job, ship a
@@ -248,18 +263,54 @@ def _get_sem() -> asyncio.Semaphore:
     return sem
 
 
+class _Permit:
+    """The worker semaphore held for one run; with an absolute ``deadline_at``
+    (``time.monotonic()``) the wait for a free permit counts against it."""
+
+    def __init__(self, deadline_at: float | None, advice: str | None) -> None:
+        self.deadline_at = deadline_at
+        self.advice = advice
+        self.sem = _get_sem()
+
+    async def __aenter__(self) -> "_Permit":
+        if self.deadline_at is None:
+            await self.sem.acquire()
+            return self
+        left = self.deadline_at - time.monotonic()
+        try:
+            if left <= 0:
+                raise TimeoutError
+            await asyncio.wait_for(self.sem.acquire(), left)
+        except TimeoutError:
+            raise RuntimeError(
+                f"no worker came free in time: the server is busy. {self.advice or _DEFAULT_TIMEOUT_ADVICE}"
+            ) from None
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.sem.release()
+
+    def timeout(self, deadline: float) -> float:
+        """The run's own deadline, cut to what is left of ``deadline_at``."""
+        if self.deadline_at is None:
+            return deadline
+        return max(0.0, min(deadline, self.deadline_at - time.monotonic()))
+
+
 async def run_parse(target, /, *args, _timeout_s: float | None = None,
-                    _advice: str | None = None, **kwargs):
+                    _deadline_at: float | None = None, _advice: str | None = None, **kwargs):
     """Run ``target(*args, **kwargs)`` in a bounded, deadline-limited child.
 
     Returns the child's result (any picklable value; strings truncate at
     512KB); raises RuntimeError with a self-contained, user-facing message on
     over-budget, timeout, abnormal child death, or any in-child exception.
 
-    ``_timeout_s`` and ``_advice`` are reserved control parameters (never
-    forwarded to ``target``): a per-call deadline override, and the
-    "what to do instead" tail used in over-budget/timeout/truncation
-    messages (defaults keep the parse-flavoured wording).
+    ``_timeout_s``, ``_deadline_at`` and ``_advice`` are reserved control
+    parameters (never forwarded to ``target``): a per-call deadline override,
+    an absolute end (``time.monotonic()``) that the wait for a worker counts
+    against too, and the "what to do instead" tail used in
+    over-budget/timeout/truncation messages (defaults keep the
+    parse-flavoured wording).
     """
     budget = worker_rss_budget_bytes()
     deadline = _timeout_s if _timeout_s is not None else _default_timeout_s()
@@ -271,7 +322,7 @@ async def run_parse(target, /, *args, _timeout_s: float | None = None,
         # the executor so a long job never blocks the event loop. Only
         # Exception is mapped: BaseException (CancelledError,
         # KeyboardInterrupt) must propagate in-process.
-        async with _get_sem():
+        async with _Permit(_deadline_at, _advice):
             try:
                 out = await loop.run_in_executor(
                     None, functools.partial(target, *args, **kwargs)
@@ -282,8 +333,10 @@ async def run_parse(target, /, *args, _timeout_s: float | None = None,
                 raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
         return _cap_str_result(out, _advice)
 
+    _single_threaded_math()
     ctx = multiprocessing.get_context("spawn")
-    async with _get_sem():
+    async with _Permit(_deadline_at, _advice) as permit:
+        deadline = permit.timeout(deadline)
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         # daemon: the interpreter terminates surviving children at exit, so a
         # SIGTERM'd server never leaves an orphan mid-job.

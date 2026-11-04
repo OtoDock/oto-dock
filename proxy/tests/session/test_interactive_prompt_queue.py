@@ -798,3 +798,103 @@ class TestHeldComposerSend:
         assert writes[-1] == b"\r" and len(writes) == 2      # their own Enter only
         s._apply_turn_signal("tool_use")
         assert writes[-1] == b"\r" and len(writes) == 3      # the held Enter, pressed
+
+
+@pytest.mark.asyncio
+class TestNotedPrompts:
+    """A queued item whose row exists (``note=True``) is noted for the
+    transcript tailer once its bytes are in the terminal, and only then: a
+    refused write keeps the item at the head with the turn closed and no
+    note; the satellite's ACK notes too, a cancelled item's included; a
+    close drops what this session noted and keeps the dashboard's."""
+
+    async def test_the_note_is_made_after_the_paste(self):
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        s = await _register("sid-note", chat_id="chat-note")
+        _make_idle(s)
+        s.queue_prompt("go on", "delegate_result", chat_id="chat-note", note=True)
+        assert TE.consume_sent_prompt("chat-note", "go on") is False   # queued, not typed
+        await _drain_and_settle(s)
+        assert not s._prompt_queue
+        assert TE.consume_sent_prompt("chat-note", "go on") is True
+        assert TE.consume_sent_prompt("chat-note", "go on") is False   # once
+
+    async def test_an_item_without_the_flag_is_never_noted(self):
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        s = await _register("sid-plain", chat_id="chat-plain")
+        _make_idle(s)
+        s.queue_prompt("spoken", "duplex", chat_id="chat-plain")
+        await _drain_and_settle(s)
+        assert not s._prompt_queue
+        assert TE.consume_sent_prompt("chat-plain", "spoken") is False
+
+    async def test_a_refused_write_keeps_the_item_and_the_turn_closed(self, monkeypatch):
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        s = await _register("sid-refuse", chat_id="chat-refuse")
+        _make_idle(s)
+        monkeypatch.setattr(s, "submit_prompt", lambda *a, **k: False)
+        fired: list[int] = []
+        item = s.queue_prompt("later", "delegate_result", chat_id="chat-refuse", note=True,
+                              on_injected=lambda: fired.append(1))
+        await _drain_and_settle(s)
+        assert s._prompt_queue[0] is item
+        assert s._turn_open is False and fired == []
+        assert TE.consume_sent_prompt("chat-refuse", "later") is False
+
+    async def test_a_satellite_ack_leaves_a_cancelled_items_row_to_the_tailer(self, monkeypatch):
+        # The item's row is its hook's (a borrowed turn): the round that was
+        # cancelled never writes it, so the typed copy the tailer journals
+        # must stay the one record. No note, no hook.
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        mgr = _FakeConnMgr()
+        import core.remote.satellite_connection as sc
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: mgr)
+        s = await _register("sid-ack-note", chat_id="chat-ack-note")
+        _make_idle(s)
+        s.target = "machine-1"
+        s.otodock_attached = True
+        fired: list[int] = []
+        item = s.queue_prompt("remote go", "delegate_continue", chat_id="chat-ack-note",
+                              note=True, on_injected=lambda: fired.append(1))
+        await asyncio.sleep(0.05)
+        frame = mgr.sent[0]
+        assert TE.consume_sent_prompt("chat-ack-note", "remote go") is False   # sent, not typed
+        assert s.cancel_prompt(item) is False                                 # in flight
+        s.handle_inject_result(frame["inject_id"], True)
+        assert fired == []                                                    # its round is gone
+        assert TE.consume_sent_prompt("chat-ack-note", "remote go") is False  # the tailer's row
+
+    async def test_a_satellite_ack_notes_a_cancelled_item_whose_row_exists(self, monkeypatch):
+        # No hook: the row was the queuer's (a result, a wake), so the typed
+        # copy is a duplicate and the note skips it.
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        mgr = _FakeConnMgr()
+        import core.remote.satellite_connection as sc
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: mgr)
+        s = await _register("sid-ack-row", chat_id="chat-ack-row")
+        _make_idle(s)
+        s.target = "machine-1"
+        s.otodock_attached = True
+        item = s.queue_prompt("the report", "delegate_result", chat_id="chat-ack-row", note=True)
+        await asyncio.sleep(0.05)
+        frame = mgr.sent[0]
+        assert s.cancel_prompt(item) is False
+        s.handle_inject_result(frame["inject_id"], True)
+        assert TE.consume_sent_prompt("chat-ack-row", "the report") is True
+
+    async def test_a_close_drops_the_sessions_notes_and_keeps_the_dashboards(self):
+        from core.session import transcript_tool_events as TE
+        TE._sent_prompts.clear()
+        s = await _register("sid-close-note", chat_id="chat-close-note")
+        _make_idle(s)
+        TE.note_sent_prompt("chat-close-note", "the person's send")
+        s.queue_prompt("typed", "delegate_result", chat_id="chat-close-note", note=True)
+        await _drain_and_settle(s)
+        await s.close(reason="test")
+        assert TE.consume_sent_prompt("chat-close-note", "typed") is False
+        assert TE.consume_sent_prompt("chat-close-note", "the person's send") is True

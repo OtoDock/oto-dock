@@ -200,3 +200,46 @@ def test_budget_derivation_from_cgroup(monkeypatch, tmp_path):
     assert isolation.parse_permits() == 1
     expected = 2 * 1024 ** 3 - isolation._HEADROOM_BYTES
     assert isolation.worker_rss_budget_bytes() == expected
+
+
+def test_the_wait_for_a_worker_counts_against_an_absolute_deadline(monkeypatch):
+    monkeypatch.setenv("FILETOOLS_ISOLATION_INLINE", "1")
+
+    async def scenario():
+        sem = isolation._get_sem()
+        for _ in range(isolation.parse_permits()):
+            await sem.acquire()
+        try:
+            began = time.monotonic()
+            with pytest.raises(RuntimeError, match="no worker came free in time"):
+                await isolation.run_parse(targets.ok_target, "x", _deadline_at=time.monotonic() + 0.2)
+            assert 0.15 <= time.monotonic() - began < 2
+        finally:
+            for _ in range(isolation.parse_permits()):
+                sem.release()
+        with pytest.raises(RuntimeError, match="no worker came free in time"):
+            await isolation.run_parse(targets.ok_target, "x", _deadline_at=time.monotonic() - 1)
+        assert await isolation.run_parse(targets.ok_target, "x", _deadline_at=time.monotonic() + 30) == "parsed:x"
+
+    asyncio.run(scenario())
+
+
+def test_an_absolute_deadline_cuts_a_spawned_run(monkeypatch):
+    monkeypatch.delenv("FILETOOLS_ISOLATION_INLINE", raising=False)
+    began = time.monotonic()
+    with pytest.raises(RuntimeError, match="took longer than"):
+        asyncio.run(isolation.run_parse(targets.sleep_target, 30, _deadline_at=time.monotonic() + 1.5))
+    assert time.monotonic() - began < 15
+
+
+def test_a_worker_starts_with_single_threaded_math(monkeypatch):
+    """numpy's per-thread buffers would take hundreds of MB of the worker's
+    address space; the variables reach the child before it imports anything."""
+    import os
+
+    for name in isolation.SINGLE_THREAD_ENV:
+        monkeypatch.delenv(name, raising=False)
+    seen = [asyncio.run(isolation.run_parse(os.getenv, name)) for name in isolation.SINGLE_THREAD_ENV]
+    assert seen == ["1"]
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "4")
+    assert asyncio.run(isolation.run_parse(os.getenv, "OPENBLAS_NUM_THREADS")) == "4"

@@ -36,6 +36,12 @@ from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.permission_modes import AUTO_REVIEW_MODE, PLAN_MODE, cli_mode, terminal_mode
 from core.sandbox import pty_relay
 from core.session import engine_prompts
+from core.session.background_frames import (
+    log_between_turns_census,
+    read_stale_line,
+    resolve_background_frame,
+    resolve_background_work,
+)
 from core.session.session_state import (
     _aborted_sessions,
     _active_processes,
@@ -45,14 +51,13 @@ from core.session.session_state import (
     get_session_user_tz,
     has_pending_prompt,
     mark_closing,
-    reconcile_background_snapshot,
     reset_subagent_registry,
-    resolve_bg_command_frame,
     resolve_session_permissions,
     session_exists,
 )
 
 logger = logging.getLogger("otodock")
+
 
 
 def _record_rate_limit(session_id: str, info: dict) -> None:
@@ -337,7 +342,17 @@ class PersistentSession:
             # mode-based gating (terminal_mode).
             cmd.extend(["--permission-mode", terminal_mode(self.permission_mode)])
         elif self.permission_mode == PLAN_MODE:
-            cmd.extend(["--permission-mode", "plan"])
+            # Claude Code 2.1.299+ no longer runs a call the PreToolUse hook
+            # allowed when it does not read the call as read-only in plan
+            # mode: it asks, and a headless spawn with no prompt tool reads
+            # that ask as a refusal (an open-tier MCP call, a read-tier
+            # command). The prompt tool carries the ask here, and
+            # core/session/engine_prompts answers it from the gate's record
+            # of what it allowed in Plan. Bypass beside plan mode cannot
+            # replace it: the CLI honours that pair in a terminal only. The
+            # tool's presence also exposes ExitPlanMode and AskUserQuestion,
+            # which a Plan spawn without it never offers.
+            cmd.extend(["--permission-mode", "plan", "--permission-prompt-tool", "stdio"])
         else:
             # Headless -p: the PreToolUse hook gates. In Auto the CLI runs its
             # own auto mode (a call the hook leaves undecided goes to its
@@ -713,7 +728,6 @@ class PersistentSession:
                     with contextlib.suppress(json.JSONDecodeError):
                         data = json.loads(line)
                         drained["?"] -= 1
-                        drained[data.get("type", "?")] += 1
                         if wake_capture.is_wake_init(data):
                             # Between-turns init = a self-wake turn. Record
                             # it, then keep draining (another bracket may
@@ -723,34 +737,24 @@ class PersistentSession:
                                 data, source="stale_drain")
                             timeout = 0.05
                             continue
-                        # A backgrounded command may have completed while the
-                        # session was idle between turns — resolve it (badge clear
-                        # + registry) instead of discarding the frame, else its
-                        # badge sticks forever and the agent never gets nudged.
-                        resolve_bg_command_frame(self.session_id, data)
-                        reconcile_background_snapshot(self.session_id, data)
-                        engine_prompts.note_frame(self.session_id, data)
+                        # Background work went on while the session was idle
+                        # between turns: a command or a sub-agent may have ended
+                        # (badge clear + registry) and a sub-agent's own lines
+                        # are its work, not a lost answer.
+                        drained[read_stale_line(self.session_id, data)] += 1
                         if data.get("type") == "result":
                             break  # Previous response fully drained
             except asyncio.TimeoutError:
                 break  # No more stale data — pipe is clean
 
-        if drained:
-            # Type census only, never payloads — a swallowed late answer from
-            # an orphaned prior turn is otherwise invisible.
-            logger.warning(
-                "Persistent session %s: drained "
-                "%s stale lines from interrupted "
-                "response (types=%s, "
-                "results=%s)",
-                self.session_id, sum(drained.values()), dict(drained), drained.get('result', 0)
-            )
+        log_between_turns_census(f"Persistent session {self.session_id}", drained)
 
     async def drain_bg_commands(self, budget: float = 2.0) -> bool:
         """Between turns, read whatever stdout the IDLE session has buffered:
-        resolve background-command completion frames (badge clear + registry),
-        apply ``background_tasks_changed`` snapshots, and CAPTURE any self-wake
-        turn (2.1.243) as a real chat turn. Returns True on any progress.
+        the background work's lines (``resolve_background_frame``: a command's
+        or a sub-agent's completion, a snapshot, a sub-agent's own lines as a
+        sign of life), and CAPTURE any self-wake turn (2.1.243) as a real chat
+        turn. Returns True on any progress.
 
         Background bash has NO completion hook (unlike subagents' SubagentStop),
         so this active read is the only post-turn completion signal — the
@@ -786,9 +790,8 @@ class PersistentSession:
                     await self._capture_wake_bracket(data, source="idle_drain")
                     progressed = True
                     continue
-                if resolve_bg_command_frame(self.session_id, data):
+                if resolve_background_work(self.session_id, data):
                     progressed = True
-                reconcile_background_snapshot(self.session_id, data)
                 engine_prompts.note_frame(self.session_id, data)
         finally:
             self.lock.release()
@@ -1358,8 +1361,7 @@ class PersistentSession:
                             )
                             continue
                         if nxt is not None:
-                            resolve_bg_command_frame(self.session_id, nxt)
-                            reconcile_background_snapshot(self.session_id, nxt)
+                            resolve_background_frame(self.session_id, nxt)
                             engine_prompts.note_frame(self.session_id, nxt)
                     yield ClaudeStreamChunk(
                         is_done=True,

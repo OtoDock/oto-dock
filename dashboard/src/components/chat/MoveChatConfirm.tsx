@@ -13,6 +13,8 @@ interface Props {
   fromTarget: string
   fromLabel: string
   fromOffline: boolean
+  /** A shared chat going to a person's computer (accountsStayFor). */
+  accountsStay?: boolean
   onConfirm: () => void
   onCancel: () => void
 }
@@ -22,9 +24,10 @@ interface Props {
  * rendered only while the move is still possible (it goes when its
  * condition clears). It names where the chat goes, and says when the chat
  * continues from a summary: because the place it leaves is offline, or
- * because a place's satellite is too old to move the files. */
+ * because a place's satellite is too old to move the files. A shared chat
+ * going to a person's computer also says the agent's accounts stay behind. */
 export default function MoveChatConfirm({
-  target, label, memory, fromTarget, fromLabel, fromOffline, onConfirm, onCancel,
+  target, label, memory, fromTarget, fromLabel, fromOffline, accountsStay = false, onConfirm, onCancel,
 }: Props) {
   const to = placePhrase(target, label)
   let words = `The chat continues on ${to}.`
@@ -33,6 +36,7 @@ export default function MoveChatConfirm({
       ? `${placePhrase(fromTarget, fromLabel, true)} is offline, so the chat continues on ${to} from a summary of the conversation.`
       : `The chat continues on ${to} from a summary of the conversation.`
   }
+  if (accountsStay) words += " The agent's accounts stay on the server, except the ones you connected."
   return (
     <AlertDialog title={`Move this chat to ${to}?`} confirmLabel="Move chat" onConfirm={onConfirm} onCancel={onCancel}>
       {words}

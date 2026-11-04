@@ -16,7 +16,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import TypeGuard, cast
+from typing import Protocol, TypeGuard, cast
 
 import psycopg
 
@@ -111,18 +111,14 @@ def _create_task_chat_row(chat_id: str, run_id: str, task: shared.TaskDefinition
     carry ``source_type='task'`` — the row's kind (``session_kind.of_chat``);
     rows minted before that write carry ``chat`` with the same ``task-`` id.
 
-    The row is stamped with the lane this run will ACTUALLY use — the task's
-    override when it has one, else the agent default. Billing reads the model
-    off the chat row (``services/execution/stream_pump.py`` →
-    ``usage_records``), so stamping the default here would mis-attribute every
-    overridden run's tokens to the wrong model, and the chat header would lie
-    about what answered."""
-    task_path = task.override_execution_path or ""
-    # Layer-aware (mirrors task_config_builder's wire resolution): with a
-    # layer override, the agent-default model may be foreign to the run's
-    # engine — stamping it would 400 the provider AND mis-attribute usage.
-    task_model = config.resolve_run_model(task.agent, task.override_model,
-                                          layer=task_path or None)
+    The row is stamped with the engine and model this run will ACTUALLY
+    use (``_task_engine_and_model``: the pins, else the creator's own engine
+    for a user-scope run, else the agent's default), resolved ONCE here:
+    the builder reads the row back, so the row, the session and billing
+    (``services/execution/stream_pump.py`` → ``usage_records``, which reads
+    the model off the chat row) never name different engines, and a re-warm
+    of the run's chat follows the engine the run used."""
+    task_path, task_model = _task_engine_and_model(task)
     kind = task_kinds.of(task)
     if kind.worker:
         worker_sub = (cast("str", task.created_by) if task.scope == "user"
@@ -154,12 +150,73 @@ def _create_task_chat_row(chat_id: str, run_id: str, task: shared.TaskDefinition
         pass
 
 
+class _EngineInputs(Protocol):
+    """What ``_task_engine_and_model`` reads of a run: a task definition,
+    or the delegation spawn's view of its worker (``api/tasks/delegation``)."""
+    agent: str
+    scope: str
+    created_by: str | None
+    override_execution_path: str | None
+    override_model: str | None
+
+
+def _task_engine(task: _EngineInputs, *, run_person: str | None = None) -> tuple[str, str]:
+    """The engine and model this run spawns on. An engine pin as given. A
+    model pin without one runs where the model is offered
+    (``engine_resolution.engine_for_model``, the rule
+    ``spawn_authz.validate_spawn_overrides`` judged it by): the engine the
+    roster marked default for the person first, else the agent's default
+    engine, else the first allowed engine that offers it. Without a pin, a
+    run that spends a person's accounts takes that person's own engine among
+    the agent's (``engine_resolution``, the rule their new chat follows):
+    ``run_person`` when the caller names one (a chat worker on its
+    delegator's own computer), else the creator of a user-scope run not on a
+    Shared-only agent (whose runs draw on the platform pool whatever the row
+    says). Else the agent's default engine. The model is the person's
+    resolution's, else ``""`` (``_task_engine_and_model`` finishes it)."""
+    from core.session.visibility import SCOPE_USER, is_shared_only
+    from services.engines import engine_resolution
+    agent = agent_store.get_agent(task.agent) or {}
+    path = task.override_execution_path or ""
+    model = ""
+    person = run_person or ""
+    if not person and task.scope == SCOPE_USER and task.created_by and not is_shared_only(task.agent):
+        person = task.created_by
+    pinned = config.live_model_id(task.override_model or "")
+    if not path and person:
+        resolved = engine_resolution.resolve_session_engine(task.agent, person)
+        path, model = resolved.execution_path, resolved.model
+    if not path:
+        path = agent.get("execution_path") or DEFAULT_EXECUTION_PATH
+    if pinned and not task.override_execution_path:
+        try:
+            path = engine_resolution.engine_for_model(agent, pinned, first=path) or path
+        except psycopg.Error:
+            logger.warning("Task %s: the engine of the pinned model %s could not be read; "
+                           "running on %s", getattr(task, "id", "?"), pinned, path)
+        model = ""
+    return path, model
+
+
+def _task_engine_and_model(task: _EngineInputs, *, run_person: str | None = None) -> tuple[str, str]:
+    """``_task_engine``'s engine with the model this run takes: the pin,
+    else the person's, else the engine's for this agent
+    (``config.resolve_run_model``, layer-aware, which raises when the
+    engine has no enabled model)."""
+    path, model = _task_engine(task, run_person=run_person)
+    pinned = config.live_model_id(task.override_model or "")
+    if pinned:
+        model = pinned
+    elif not model:
+        model = config.resolve_run_model(task.agent, None, layer=path)
+    return path, model
+
+
 def _task_layer(task: shared.TaskDefinition) -> str:
-    """The engine this run will use: the task's override, else the agent's
-    (the rule task_config_builder applies at spawn)."""
-    return (task.override_execution_path
-            or (agent_store.get_agent(task.agent) or {}).get("execution_path")
-            or DEFAULT_EXECUTION_PATH)
+    """The engine this run will use (``_task_engine``): the limit checks
+    read the engine alone, so an engine with no enabled model still names
+    itself here and fails at the spawn, as it always did."""
+    return _task_engine(task)[0]
 
 
 async def _pool_cap_block(task: shared.TaskDefinition) -> str:
@@ -238,6 +295,17 @@ async def _execute_task(task: shared.TaskDefinition, trigger_type: str = "schedu
             if not limit_status["allowed"]:
                 logger.warning("Task %s blocked by agent limit: %s", task.id, task.agent)
                 blocked_by = "Agent usage limit exceeded"
+            # A chat worker on its delegator's own computer spends their
+            # own account: their own limit holds too.
+            from core.config.task_config_builder import owners_computer_person
+            owner = None if blocked_by else await run_db(owners_computer_person, task)
+            if owner:
+                owner_row = await run_db(task_store.get_user, owner)
+                limit_status = await asyncio.to_thread(
+                    usage_service.check_user_limit, owner, (owner_row or {}).get("role", "member"))
+                if not limit_status["allowed"]:
+                    logger.warning("Task %s blocked by its delegator's limit: %s", task.id, owner)
+                    blocked_by = "User usage limit exceeded"
         if not blocked_by:
             blocked_by = await _pool_cap_block(task)
         if blocked_by:

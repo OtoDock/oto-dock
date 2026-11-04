@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import {
-  useSetBrowserMode, useSetBrowserToken, useSetBrowserUnattended,
+  useSetBrowserMode, useSetBrowserProfile, useSetBrowserToken, useSetBrowserUnattended,
   type MachineScope, type RemoteMachine,
 } from '../api/remoteMachines'
 import { BROWSER_MODE, type BrowserMode, browserModeOf } from '../lib/remote/browserMode'
@@ -132,6 +132,7 @@ export function BrowserTokenField({
           </Button>
         )}
       </div>
+      <BrowserProfileField machine={machine} scope={scope} />
       {tokenSet && (
         <div className="flex items-start">
         <label className="flex items-start gap-1.5 text-3xs leading-relaxed text-tertiary">
@@ -163,6 +164,48 @@ export function BrowserTokenField({
       {setToken.error && (
         <p className="text-3xs text-status-danger-fg">{setToken.error.message}</p>
       )}
+    </div>
+  )
+}
+
+// "Browser profile": the profile of the person's browser that has the
+// extension (the connect page opens there). Saved on Enter or when the field
+// is left; empty means the one profile that has it.
+function BrowserProfileField({ machine, scope }: { machine: RemoteMachine; scope: MachineScope }) {
+  const setProfile = useSetBrowserProfile(scope)
+  const saved = machine.browser_profile ?? ''
+  const [draft, setDraft] = useState(saved)
+  const [shownSaved, setShownSaved] = useState(saved)
+  if (saved !== shownSaved) {
+    setShownSaved(saved)
+    setDraft(saved)
+  }
+  const { stateOf, run } = useSaveState()
+  const save = () => {
+    const next = draft.trim()
+    if (next === saved) return
+    void run('profile', () => setProfile.mutateAsync({ machineId: machine.id, profile: next }),
+      { failTitle: 'The browser profile was not saved', revert: () => setDraft(saved) })
+  }
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className="inline-flex items-center gap-1 text-3xs text-tertiary">
+        Browser profile
+        <InfoTip label="Browser profile">
+          The profile that has the extension, as Chrome names it. Leave empty when one profile has it.
+        </InfoTip>
+      </span>
+      <Input compact
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={save}
+        onKeyDown={e => { if (e.key === 'Enter') save() }}
+        maxLength={100}
+        autoComplete="off"
+        aria-label="Browser profile"
+        className="flex-1 min-w-[10rem]"
+      />
+      <SaveState state={stateOf('profile')} />
     </div>
   )
 }

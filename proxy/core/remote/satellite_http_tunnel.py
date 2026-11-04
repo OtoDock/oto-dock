@@ -112,6 +112,18 @@ _ALLOWLIST_REGEXES = [
     # request routes ride the /v1/agents wildcard above).
     re.compile(r"^/v1/community/skills$"),
     re.compile(r"^/v1/execution-layers$"),
+    # The settings tool (settings-mcp; 0.5.159): the catalog a
+    # person's own session reads and the card it asks for.
+    re.compile(r"^/v1/settings/(catalog|card)$"),
+    # The agent-creator tool's proposal cards (agent-creator-mcp; 0.5.162):
+    # the draw and the read of a card's state, exact shapes. Never the
+    # person's click (`/v1/cards/<id>/act` takes a sign-in, never a session).
+    re.compile(r"^/v1/cards(/[A-Za-z0-9-]{1,64})?$"),
+    # The same tool's reads (0.5.163): the community catalog's templates and
+    # department sets, and the departments the person may see. Exact paths;
+    # the routes judge the session's role proxy-side.
+    re.compile(r"^/v1/community/(agents|departments)$"),
+    re.compile(r"^/v1/departments$"),
     re.compile(r"^/mcp/[a-z0-9_-]+/.*$"),
 ]
 

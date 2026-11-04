@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { rollbackNoticeText, useApps, useHideAppForMe, usePurgeApp, useReorderApps, useRollbackApp, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
+import { rollbackNoticeText, useApps, useHideAppForMe, usePurgeApp, useReorderApps, useRollbackApp, useSendToSource, useStopFollowing, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
 import { GRANTEE_KIND, useHideShare, usePatchShare, useUnhideShare } from '../../api/shares'
 import { toastError } from '../../lib/http/apiJson'
 import { roleLabel } from '../../lib/permissions'
@@ -28,6 +28,8 @@ function placedCallsNote(a: PinnedApp): string {
 import SharePopover from '../sharing/SharePopover'
 import AppApprovalCard from './AppApprovalCard'
 import AppDeployCard from './AppDeployCard'
+import AppFollowCard, { FollowConfirm, FollowNotice } from './AppFollowCard'
+import { FOLLOW_CONFIRM, dismissedRelease, showsFollowCard, type FollowConfirmKind, type FollowNoticeState } from './AppFollowCard.helpers'
 import AppLogsPanel from './AppLogsPanel'
 import AppSettingsPanel from './AppSettingsPanel'
 import { appNeedsApproval } from './AppApprovalCard.helpers'
@@ -162,6 +164,8 @@ export default function AppsOverlay({
   const rollback = useRollbackApp(agent)
   const purge = usePurgeApp(agent)
   const reorder = useReorderApps(agent)
+  const sendToSource = useSendToSource(agent)
+  const stopFollowing = useStopFollowing(agent)
   const hideShare = useHideShare()
   const unhideShare = useUnhideShare()
   const patchShare = usePatchShare()
@@ -195,6 +199,11 @@ export default function AppsOverlay({
   // app, its data. The result stays on the card slot until dismissed.
   const [confirmRollbackId, setConfirmRollbackId] = useState<string | null>(null)
   const [rollbackNotice, setRollbackNotice] = useState<{ appId: string; text: string; error: boolean } | null>(null)
+  // An app that follows its source (services/apps/app_follow.py): the result of a press on its
+  // card or its menu rows, and the Send and Stop following confirms, on the
+  // active tab only.
+  const [followNotice, setFollowNotice] = useState<{ appId: string } & FollowNoticeState | null>(null)
+  const [confirmFollow, setConfirmFollow] = useState<{ appId: string; kind: FollowConfirmKind } | null>(null)
   const [shareId, setShareId] = useState<string | null>(null)
   const [showHidden, setShowHidden] = useState(false)
   // Folder apps (APPS.md): the logs panel and the working-copy preview are
@@ -241,6 +250,21 @@ export default function AppsOverlay({
     setConfirmRollbackId(null)
     setConfirmRemove(null)
     setWhereFromId(null)
+    setConfirmFollow(null)
+  }
+  const runSend = (a: PinnedApp) => {
+    setConfirmFollow(null)
+    sendToSource.mutate(a.id, {
+      onSuccess: (r) => setFollowNotice({ appId: a.id, text: r.text, error: false }),
+      onError: (e) => setFollowNotice({ appId: a.id, text: (e as Error).message, error: true }),
+    })
+  }
+  const runStop = (a: PinnedApp) => {
+    setConfirmFollow(null)
+    stopFollowing.mutate(a.id, {
+      onSuccess: () => setFollowNotice({ appId: a.id, text: `“${a.title || a.slug}” no longer follows ${a.follows?.agent_name ?? 'its source'}’s app.`, error: false }),
+      onError: (e) => setFollowNotice({ appId: a.id, text: (e as Error).message, error: true }),
+    })
   }
   const runRollback = (a: PinnedApp) => {
     setConfirmRollbackId(null)
@@ -377,6 +401,8 @@ export default function AppsOverlay({
       onUnpin={a.can_manage ? () => setConfirmUnpinId(a.id) : undefined}
       onShare={a.can_manage ? () => setShareId(a.id) : undefined}
       onRollback={a.can_manage ? () => { setConfirmUnpinId(null); setConfirmRollbackId(a.id) } : undefined}
+      onSendToSource={a.can_manage && a.follows?.exists && a.follows.can_take ? () => setConfirmFollow({ appId: a.id, kind: FOLLOW_CONFIRM.SEND }) : undefined}
+      onStopFollowing={a.can_manage && a.follows ? () => setConfirmFollow({ appId: a.id, kind: FOLLOW_CONFIRM.STOP }) : undefined}
       onLogs={appKind(a).mayServe && a.can_manage ? () => setLogsId(a.id) : undefined}
       onSettings={appKind(a).hasSettings && a.can_manage ? () => setSettingsId(a.id) : undefined}
       onTogglePreview={appKind(a).hasPreviewBuild && a.can_manage ? () => togglePreview(a.id) : undefined}
@@ -622,6 +648,19 @@ export default function AppsOverlay({
       {active && rollbackNotice?.appId === active.id && (
         <RollbackNotice notice={rollbackNotice} onClose={() => setRollbackNotice(null)} />
       )}
+      {active && confirmFollow?.appId === active.id && (
+        <FollowConfirm
+          app={active}
+          kind={confirmFollow.kind}
+          busy={confirmFollow.kind === FOLLOW_CONFIRM.SEND ? sendToSource.isPending : stopFollowing.isPending}
+          onConfirm={() => (confirmFollow.kind === FOLLOW_CONFIRM.SEND ? runSend(active) : runStop(active))}
+          onCancel={() => setConfirmFollow(null)}
+        />
+      )}
+      {active && followNotice?.appId === active.id && (
+        <FollowNotice key={`${followNotice.release ?? 0}-${followNotice.text}`} notice={followNotice} app={active}
+          onClose={() => setFollowNotice(null)} />
+      )}
 
       {active && confirmDeleteId === active.id && (
         <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-card border border-status-danger-border bg-status-danger-bg px-3 py-2.5 text-xs" data-testid="app-delete-confirm">
@@ -660,6 +699,10 @@ export default function AppsOverlay({
       )}
       {needsApproval && active && (
         <AppApprovalCard key={active.id} app={active} agent={active.agent ?? agent} />
+      )}
+      {active && active.deploy_state !== DEPLOY_STATE.PENDING && showsFollowCard(active, dismissedRelease(active.id)) && (
+        <AppFollowCard key={`follow-${active.id}-${active.follows?.update?.release ?? 0}`} app={active} agent={active.agent ?? agent}
+          onResult={(n) => setFollowNotice({ appId: active.id, ...n })} />
       )}
       {active && logsId === active.id && (
         <AppLogsPanel key={`logs-${active.id}`} app={active} onClose={() => setLogsId(null)} />

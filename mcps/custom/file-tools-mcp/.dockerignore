@@ -1,0 +1,13 @@
+# The image takes the server's modules, their subfolders and data, and the
+# notices: never tests, skills, venvs, compose files or local settings. A new
+# subfolder the code reads gets its own line here.
+*
+!*.py
+!formats
+!requirements.txt
+!ooxml
+!data
+!THIRD-PARTY-NOTICES.md
+!licenses
+**/__pycache__
+**/*.pyc

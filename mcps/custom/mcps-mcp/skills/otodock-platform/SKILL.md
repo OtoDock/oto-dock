@@ -1,6 +1,6 @@
 ---
 name: otodock-platform
-description: "How the OtoDock platform itself works and where every setting lives: installing and first-run setup, agents, AI engines, permission modes, sessions and where a chat runs, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks, triggers and notifications, remote machines, the Android app, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock."
+description: "How the OtoDock platform itself works and where every setting lives: installing and first-run setup, agents, AI engines, permission modes, sessions and where a chat runs, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks, triggers and notifications, remote machines, the Android and iOS apps, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock."
 ---
 
 # OtoDock Platform Guide
@@ -24,8 +24,9 @@ deeper than this file, read the matching reference in `references/`.
   agent works reaches a Claude Code or Codex turn at its next step, otherwise it waits
   as a "queued" bubble with a dashed edge at the end of the conversation (every tab of the chat sees
   it) and goes out with the next turn. A turn that cannot finish ends with a card that says why. Where
-  the turn had started, **Resume** asks the agent to carry on from where it stopped. Where nothing
-  ran, **Send again** sends the message again.
+  the turn had started, **Resume** asks the agent to carry on from where it stopped, without sending
+  its photos and files again. Where nothing ran, **Send again** sends the message again, with its
+  photos and files.
 - **Apps** are pages an agent builds and keeps running (buttons that put it to work,
   live data, a server and database when needed): **shared** with the agent's team or
   **personal**, shareable with a person, another agent or a department, or by
@@ -37,8 +38,8 @@ deeper than this file, read the matching reference in `references/`.
   paired **remote machine** the user owns. The machine's agent software updates itself
   at reconnect; an update ends the turns running there and the chat continues from the
   next message. Each chat shows where it runs, and a person can move it (references/agents.md).
-- The **Android app** opens the same dashboard and adds push notifications, the alarm for
-  urgent ones and the phone's location for agents that ask (references/setup.md).
+- The **Android and iOS apps** open the same dashboard and add push notifications, the
+  alarm for urgent ones and the phone's location for agents that ask (references/setup.md).
 
 ## The two role systems — always state the required role
 
@@ -66,9 +67,12 @@ Common surprises worth pre-empting: department assignment and shared-knowledge w
 need platform **admin/creator** (agent managers alone can't); agent-scope schedules and
 triggers, and pinning, approving or sharing a shared app, need per-agent **editor+**;
 installing tools and skills is **admin**, installing an agent from the community catalog
-**admin/creator** — managers and agents file requests admins approve.
+**admin/creator** — managers and agents file requests admins approve. A contributor or a
+viewer sees only their own tasks, triggers and notifications on an agent. What the agent
+runs on its own shows for editors and managers, and the Scheduled Tasks and Triggers
+pages say so.
 
-## Where things live (summary — full map in references/settings-map.md)
+## Where things live (summary — every setting is in references/settings-map.md)
 
 - **User Settings** (avatar menu): General (profile, security/2FA, appearance, wake
   word, memory) · Integrations (connected accounts, API keys) · Remote Machines · AI
@@ -111,6 +115,61 @@ platform settings, or connect engines/accounts (a hosted MCP server's own sign-i
 the person's too, under User Settings → Integrations) — for those, give the user the
 exact page, tab, and role from `references/settings-map.md`.
 
+In a chat with a person present you may also have the **Settings tool**
+(`find_settings`, `get_setting`, `show_card`, `show_list`, `check_card`). It
+finds a setting by words and says where it lives and what it does. For a setting
+the chat can show, it draws a **card** to change it in. You never see the value,
+and no tool of yours writes a setting. Every change is a person's click in the
+card. In a chat several people see (a Shared only agent's chat), each of them
+sees the card: a setting their role changes shows them their own value to
+change, and an admin's setting shows anyone below admin only who changes it. The tool is absent in a task, a meeting, a call and a session
+started with the `otodock` command. An older agent has it once a manager turns it
+on under Agent Settings → MCPs. Where you do not have it, answer from the map.
+
+**Cards with buttons** (`show_card`). When the conversation reaches a decision
+the person makes with their own permissions, draw a card instead of asking in
+prose: a title, one or two sentences, up to three buttons. Anyone in the chat may
+press, and the card acts for whoever does. A **say** button sends its message to
+you as the presser's own words (a yes, a no, a choice). On a chat that runs on a
+platform machine, only a manager's press goes out, unless that machine lets every
+role run there; an editor writes the answer instead. A **do** button runs one
+action of the platform when someone presses it, with the presser's own role,
+checked again at the click. Each action takes exactly its
+own parameters: hand files to the team (`hand_files`: `paths` from their space
+to the team's workspace, `dest_dir`, `copy` when they keep theirs), share a
+memory topic with the team (`promote_memory`: `topic`, `new_name`), copy an
+app to another agent (`share_app`: `app_slug`, `target_agent`), bring a copied
+app up to its source's newer release or unpack that release for a merge
+(`update_followed_app`: `app_slug`, `mode` `update` or `merge`, `visibility`
+`user` for the person's own app), send a copied app's release back to the app
+it follows (`send_release_to_source`: `app_slug`, `visibility`), attach a
+shared knowledge library to an agent (`attach_library`: `source_agent`,
+`target_agent`, `subdir` for a library that is one folder, `writable`; admins
+and creators), create a department (`create_department`: `name`, `levels`,
+`mode`, `reach`), set its delegation mode and reach (`set_department`:
+`department_id`, `mode`, `reach`), and move an agent into a department
+(`move_agent`: `agent`, `department_id`, `level_id`). The platform writes a
+do button's title and text from its parameters; your own words go in the
+note. A refusal names the parameter that did not fit: fix it and draw again.
+A card about a person's own files, memory or personal app is theirs alone to
+press, so draw it in their turn, for them.
+Nothing happens by the call, the card may be ignored, one press answers it,
+and `check_card` tells you who pressed it and what happened. Offer a
+hand to the team when the conversation says a person's work is final (a report
+done, photos to share), never on a guess. In a chat with a platform creator or
+admin, the Agent Creator tool (`search_community_agents`, `propose_install`,
+`propose_department_install`, `propose_move`) proposes a community agent, a
+department set or a move into a department the same way.
+
+**Live lists** (`show_list`). When the person asks what their scheduled tasks,
+triggers, notifications, remote machines or MCP servers are, draw the list
+instead of a paragraph: the dashboard fetches it with each viewer's own sign-in
+when the card renders, so it is current, everyone in the chat sees their own
+rows, and you copy nothing into text; the row
+actions (pause, run now, open the page) are the page's own. Filters: `scope`
+(mine, agent, all) and `status` (active, paused) for tasks, triggers and
+notifications. The MCP servers list is a manager's.
+
 ## Routing — read the reference that matches
 
 | Question is about | Read |
@@ -118,9 +177,9 @@ exact page, tab, and role from `references/settings-map.md`.
 | Installing, first run, connecting Claude/ChatGPT/keys, voice & phone add-on, pairing remote machines | `references/setup.md` |
 | What an agent is, folders/workspaces, visibility modes, engines & models per agent, tools, skills, creating agents | `references/agents.md` |
 | Apps (shared, personal, the agent's home), the approval card, releases and rollback, secrets, templates and `.otoapp`, sharing apps and chats (people, agents, departments, "Shared with you", links) | `references/apps.md` |
-| Departments, delegation modes and targets, the company map, meetings, shared knowledge libraries, bulletins, memory — running a company on OtoDock | `references/company-management.md` |
+| Departments, delegation modes and targets, the company map, meetings, shared knowledge libraries, the Notebook, memory — running a company on OtoDock | `references/company-management.md` |
 | Schedules, one-time and trigger-fired tasks, model pinning, webhooks, event subscriptions, checks, notifications | `references/automation.md` |
-| "Where is the setting for X?" / "who can do X?" | `references/settings-map.md` |
+| "Where is the setting for X?" / "who can do X?" | `references/settings-map.md` (every setting, one table per page) and `references/settings-notes.md` (the roles, the areas' shape, the apps and chats surfaces, the quick answers) |
 
 ## House rules for platform help
 

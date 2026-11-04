@@ -1,6 +1,8 @@
 // Platform STT — capture the mic, downsample to 16 kHz PCM, and stream it over
-// /ws/audio/stt to the server STT provider. Used when the browser has no native
-// Web Speech STT (Firefox/Safari) or the policy forces platform.
+// /ws/audio/stt to the server STT provider. Used where the capability and the
+// resolver send a dictation to the platform (`audio/resolver.ts`): no device
+// recognizer (Firefox), the admin's policy, the person's pick, the Automatic
+// language with a provider, and Apple's WebKit by default.
 //
 // The token is minted via POST /v1/audio/stt/session (cookie-authed) and sent in
 // the first WS frame — never in the URL. Mic capture uses a

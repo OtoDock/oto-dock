@@ -1,0 +1,50 @@
+{
+ "source": "A permission refusal on a restarted recognizer (no gesture behind it) is a plain stop.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "a."
+    }
+   ]
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 150
+  },
+  {
+   "event": "start"
+  },
+  {
+   "event": "error",
+   "error": "not-allowed"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "a."
+  ],
+  "replaces": [],
+  "interims": [],
+  "errors": [
+   "STOPPED"
+  ],
+  "ended": [
+   "error"
+  ],
+  "recognizers": 2
+ }
+}

@@ -9,6 +9,7 @@ of the phase; the six contexts below are the same ones spelled through
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -20,7 +21,11 @@ from auth import path_prompt
 from core import placement
 from tests._paths import PROXY_DIR
 
-_GOLDEN = json.loads((PROXY_DIR / "tests" / "fixtures" / "permission_context_golden.json").read_text())
+_PATH = PROXY_DIR / "tests" / "fixtures" / "permission_context_golden.json"
+_GOLDEN = json.loads(_PATH.read_text())
+# A deliberate change to the prompt's texts rewrites the fixture once, in the
+# commit that explains the sentences that moved (the golden master's pattern).
+WRITE = os.environ.get("PERMISSION_CONTEXT_WRITE") == "1"
 P = placement.PlacementCapabilities
 
 CASES = {
@@ -57,3 +62,14 @@ def test_the_permission_context_is_byte_identical(key):
     text = path_prompt.build_permission_context(CASES[name], assigned_mcp_names=("memory-mcp",),
                                                 execution_path=engine)
     assert text == _GOLDEN[key]
+
+
+@pytest.mark.skipif(not WRITE, reason="PERMISSION_CONTEXT_WRITE=1 rewrites the fixture")
+def test_rewrite_the_golden():
+    out = {}
+    for key in sorted(_GOLDEN):
+        name, engine = key.split("/")
+        out[key] = path_prompt.build_permission_context(CASES[name], assigned_mcp_names=("memory-mcp",),
+                                                        execution_path=engine)
+    _PATH.write_text(json.dumps(out, indent=1) + "\n")
+    pytest.fail("golden written; run again without PERMISSION_CONTEXT_WRITE")

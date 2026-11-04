@@ -364,18 +364,17 @@ def test_focus_line_only_for_a_visible_app_and_honours_the_setting(people):
 def test_prelude_matchers_strip_the_focus_line_for_titles():
     import ws.dashboard  # noqa: F401 — module import order
     from core.session.transcript_tailer import _title_from_prompt
-    from storage.chat.chat_titles import deterministic_title
-    from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
+    from storage.chat.chat_titles import PRELUDE_RE as ws_re, title_from_prompt
     text = (
         "[Current time: Monday, June 1, 2026 10:00 (10:00 AM) Europe/Athens (UTC+03:00)]\n\n"
         '[The user is looking at the app "Ops" (ops) right now.]\n\n'
         "move lane three to done"
     )
     assert _title_from_prompt(text) == "move lane three to done"
-    assert deterministic_title(text) == "move lane three to done"
+    assert title_from_prompt(text) == "move lane three to done"
     assert ws_re.sub("", ws_re.sub("", text, count=1), count=1) == "move lane three to done"
     # A user quoting the shape mid-message is never touched.
-    assert deterministic_title('say [The user is looking at the app "x" (x) right now.]').startswith("say")
+    assert title_from_prompt('say [The user is looking at the app "x" (x) right now.]').startswith("say")
 
 
 def test_prelude_matchers_strip_a_task_runs_parallel_activity_line():
@@ -387,8 +386,7 @@ def test_prelude_matchers_strip_a_task_runs_parallel_activity_line():
         _user_row_key,
     )
     from core.session.transcript_tailer import _title_from_prompt
-    from storage.chat.chat_titles import deterministic_title
-    from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
+    from storage.chat.chat_titles import PRELUDE_RE as ws_re, title_from_prompt
     stamp = "[Current time: Friday, October 9, 2026 06:00 (6:00 AM) UTC (UTC+00:00)]"
     parallel = ("[Parallel activity — for awareness only, no action needed: sibling "
                 "sessions: 'Fix [bug]' (generating). Check one only if your work depends "
@@ -397,7 +395,7 @@ def test_prelude_matchers_strip_a_task_runs_parallel_activity_line():
                  f"{stamp} {parallel} summarise the inbox"):
         assert _title_from_prompt(text) == "summarise the inbox"
         assert codex_title(text) == "summarise the inbox"
-        assert deterministic_title(text) == "summarise the inbox"
+        assert title_from_prompt(text) == "summarise the inbox"
         assert _user_row_key(text) == "summarise the inbox"
         out = text
         for _ in range(3):

@@ -39,6 +39,7 @@ from core.session.session_state import (
     set_session_user_tz,
     set_user_tz,
 )
+from services.cards.status import CARD_ANSWER_STAYS
 from services.notifications import notification_manager
 from services.remote import chat_move
 from storage import database as task_store
@@ -359,6 +360,11 @@ class ClientMessageDispatcher(_Host):
         qi = q.find(qid) if qid else (
             q.items[idx] if isinstance(idx, int) and 0 <= idx < len(q.items) else None)
         if qi is None:
+            return None
+        if qi.item.card:
+            # A card's answer was the person's press, recorded on the card:
+            # it goes out, for the author and an admin alike.
+            await self._send_error(CARD_ANSWER_STAYS)
             return None
         if qi.author_sub != (self.user_sub or "") and not roles.is_admin(self.user_role):
             await self._send_error("Only its author or an admin can cancel a queued message.")
@@ -888,15 +894,12 @@ class ClientMessageDispatcher(_Host):
         return None
 
     async def _question_answer_fallback(self, msg: dict) -> None:
-        """Deliver a structured question answer that reached NO live waiter.
+        """Deliver a structured question answer as the person's message.
 
-        ``resolve_question`` returning False means the held
-        ``item/tool/requestUserInput`` server-request is gone — its session was
-        reaped (or released) while the human was deciding — so the parked turn
-        can never resume and the answer would be silently lost (the app-server
-        write would hit a closed transport; live on T1, 2026-08-06). The answer
-        is a HUMAN's input, so re-send it as an ordinary composer message on the
-        chat: that takes ``_handle_chat``'s dead-session branch, which does the
+        The card is a held Codex question stored by 1.9.0: nothing waits on
+        it any more, so the answer (a HUMAN's input) is sent as an ordinary
+        composer message on the chat: that takes ``_handle_chat``'s
+        dead-session branch where the session is gone, which does the
         registry-aware single-flight revival, persists the text as a user
         message and runs the turn.
         """
@@ -904,15 +907,13 @@ class ClientMessageDispatcher(_Host):
         chat_id = msg.get("chat_id") or self.chat_id or ""
         if not text or not chat_id:
             logger.warning(
-                "WS dashboard question_response: no live waiter for request %s "
-                "and nothing to replay (chat=%s)", str(msg.get("request_id"))[:8], chat_id,
+                "WS dashboard question_response: request %s carries nothing to "
+                "send (chat=%s)", str(msg.get("request_id"))[:8], chat_id,
             )
             return
-        logger.warning(
-            "WS dashboard question_response: no live waiter for request %s — "
-            "replaying the answer as a chat message on chat=%s (session reaped "
-            "while the question was parked)",
-            str(msg.get("request_id"))[:8], chat_id,
+        logger.info(
+            "WS dashboard question_response: request %s sent as the person's "
+            "message on chat=%s", str(msg.get("request_id"))[:8], chat_id,
         )
         if self.streaming:
             # Queued in its chat as a typed message is (``_on_chat``): the
@@ -1086,6 +1087,12 @@ class ClientMessageDispatcher(_Host):
         ):
             await _deny("That model isn't available on the selected engine.")
             return
+        from services.engines import engine_resolution
+        if not await asyncio.to_thread(
+                lambda: engine_resolution.model_allowed_on(
+                    agent_rec, new_path, new_model, engine_resolution.engine_catalog([new_path]))):
+            await _deny("This agent allows only local models on that engine.")
+            return
 
         # Teardown of any still-REGISTERED dead session: registry-membership
         # close (the stored path may be stale relative to where the session
@@ -1244,4 +1251,8 @@ class ClientMessageDispatcher(_Host):
                                         event_data=_json.dumps(evt))
             if post_tokens is not None:
                 task_store.update_chat(self.chat_id, context_used=post_tokens)
+        # As after a compaction the pump sees: the engine just forgot what it
+        # had not saved, so the next message carries the memory reminder once.
+        from services.memory import memory_nudge
+        memory_nudge.arm(self.session_id)
         await self._send({**evt, "chat_id": self.chat_id or ""})

@@ -1,6 +1,7 @@
-// A stand-in for the Android app's origin-scoped `OtoDockNative` object: it
-// records every post (header fields plus the optional body after the first
-// newline) and answers the replying methods from `answers`.
+// A stand-in for the apps' origin-scoped `OtoDockNative` object (the Android
+// object and the iOS shim share its shape): it records every post (header
+// fields plus the optional body after the first newline) and answers the
+// replying methods from `answers`.
 
 export interface NativePost {
   m: string

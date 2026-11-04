@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { Capacitor } from '@capacitor/core'
 import { askNative, callNative, inAppShell, openPrivacyPolicy } from '../../lib/nativeBridge'
 import Dialog from '../ui/Dialog'
 import Button from '../ui/Button'
@@ -23,6 +24,14 @@ async function readInstallations(): Promise<Install[] | undefined> {
   return Array.isArray(list) ? list : undefined
 }
 
+/** Whether the phone's battery setting would help the alarms: the Android
+ *  app's answer, the question its one-time offer asks. No answer (an app
+ *  older than the question) keeps the row away; iOS never asks. */
+async function readBatteryAdvice(): Promise<boolean> {
+  if (Capacitor.getPlatform() !== 'android') return false
+  return (await askNative<boolean>('getBatteryAdvice')) === true
+}
+
 function hostOf(url: string): string {
   try {
     return new URL(url).host
@@ -35,6 +44,7 @@ export default function AppSettingsModal({ open, onClose }: Props) {
   const [installs, setInstalls] = useState<Install[]>([])
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [batteryHelps, setBatteryHelps] = useState(false)
 
   // The app runs channel calls in order, so a refresh posted after a change
   // reads the changed list.
@@ -50,6 +60,20 @@ export default function AppSettingsModal({ open, onClose }: Props) {
   }
   useEffect(() => {
     if (open) void readInstallations().then((list) => { if (list) setInstalls(list) })
+  }, [open])
+  // Asked again when the person comes back from the phone's settings, so
+  // the row leaves once the setting is right.
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    const read = () => { void readBatteryAdvice().then((helps) => { if (alive) setBatteryHelps(helps) }) }
+    const onVisible = () => { if (!document.hidden) read() }
+    read()
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      alive = false
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [open])
 
   if (!open) return null
@@ -199,6 +223,20 @@ export default function AppSettingsModal({ open, onClose }: Props) {
             </svg>
             Add installation
           </Button>
+
+          {batteryHelps && (
+            <section aria-labelledby="app-battery-title" className="mt-4 rounded-card border border-subtle px-3 py-3"
+              data-testid="app-battery-row">
+              <h3 id="app-battery-title" className="text-sm font-medium text-primary">Alarms on this phone</h3>
+              <p className="mt-1 text-xs text-secondary">
+                To keep alarms on time, set Battery to Unrestricted, or on some phones Battery optimization to
+                Don&apos;t optimize.
+              </p>
+              <Button className="mt-2" onClick={() => callNative('openBatterySettings')}>
+                Open battery settings
+              </Button>
+            </section>
+          )}
 
           {/* Close */}
           <button

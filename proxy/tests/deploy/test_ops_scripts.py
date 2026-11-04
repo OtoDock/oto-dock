@@ -12,14 +12,17 @@ is active (otodock-phone too with --phone).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -443,10 +446,12 @@ esac
     "make": r'''#!/bin/sh
 echo "make $*" >> "$FAKE_CALLS"
 [ -n "${FAKE_MAKE_FAIL:-}" ] && exit 2
-prev=""; for a; do [ "$prev" = -C ] && touch "$a/passt"; prev="$a"; done
+dir=""; prev=""
+for a; do [ "$prev" = -C ] && dir="$a"; prev="$a"; done
+for a; do case "$a" in passt|passt.avx2) touch "$dir/$a" ;; esac; done
 ''',
     "curl": '#!/bin/sh\necho "curl $*" >> "$FAKE_CALLS"\nexit 7\n',
-    "uname": "#!/bin/sh\necho x86_64\n",
+    "uname": '#!/bin/sh\necho "${FAKE_ARCH:-x86_64}"\n',
 }
 
 
@@ -458,7 +463,8 @@ def _baseline_function(name: str) -> str:
     return m.group(0)
 
 
-def _netns(tmp_path, mode, *, pasta=None, candidate=_DEBIAN_12, head=_PASST_COMMIT, **fail):
+def _netns(tmp_path, mode, *, pasta=None, candidate=_DEBIAN_12, head=_PASST_COMMIT,
+           arch="x86_64", **fail):
     """install_netns_tools from the real installer, with fakes for every tool
     it runs and a PATH holding nothing else: the host's own pasta, apt and git
     are never reached. ``pasta`` is the version an existing pasta prints;
@@ -486,7 +492,7 @@ def _netns(tmp_path, mode, *, pasta=None, candidate=_DEBIAN_12, head=_PASST_COMM
               + "install_netns_tools\n")
     env = {"PATH": f"{fakes}:{tools}", "FAKE_CALLS": str(calls), "FAKEBIN": str(fakes),
            "FAKE_CANDIDATE": candidate, "FAKE_HEAD": head, "FAKE_BUILT": _PASST_PIN,
-           "TMPDIR": str(tmp_path)}
+           "FAKE_ARCH": arch, "TMPDIR": str(tmp_path)}
     env.update({f"FAKE_{k.upper()}_FAIL": "1" for k, v in fail.items() if v})
     r = subprocess.run([str(tools / "bash"), "-c", script], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=60)
@@ -516,10 +522,21 @@ def test_passt_builds_the_pin_and_keeps_its_source(tmp_path):
     assert any(" archive " in c and f"passt-{_PASST_PIN}.tar.gz" in c for c in calls)
     assert any(c.startswith("sudo install -m 0644") and f"passt-{_PASST_PIN}.tar.gz" in c
                and c.endswith("/usr/local/share/doc/passt/") for c in calls), calls
-    # Copied beside first, then the old layout replaced, then the link.
+    # Both builds made; the AVX2 binary lands first, then passt is copied
+    # beside, the old layout replaced, then the link.
+    assert any(c.startswith("make -s -C") and c.endswith(" passt passt.avx2") for c in calls), calls
     swap = [c for c in calls if "/usr/local/bin/" in c]
-    assert [c.split()[1] for c in swap] == ["install", "rm", "mv", "ln"], swap
+    assert [c.split()[1] for c in swap] == ["install", "mv", "install", "rm", "mv", "ln"], swap
+    assert swap[1].endswith("/usr/local/bin/passt.avx2")
     assert _APT_PASST not in calls
+
+
+def test_passt_on_arm_builds_no_avx2_binary_and_drops_a_stale_one(tmp_path):
+    r, calls = _netns(tmp_path, "required", arch="aarch64")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(c.startswith("make -s -C") and c.endswith(" passt") for c in calls), calls
+    assert "sudo rm -f /usr/local/bin/passt.avx2" in calls
+    assert not [c for c in calls if "passt.avx2.new" in c]
 
 
 @pytest.mark.parametrize("head", [
@@ -586,6 +603,409 @@ def test_passt_required_never_takes_the_distro_candidate(tmp_path):
     r, calls = _netns(tmp_path, "required", candidate="0.0~git20240220.1e6f92b-1")
     assert r.returncode == 0, r.stdout + r.stderr
     assert _APT_PASST not in calls and any(" clone " in c for c in calls)
+
+
+# ── install-baseline-tools.sh on macOS ─────────────────────────────────
+
+# A fake Homebrew: `shellenv` puts its own bin on PATH, every other call is
+# logged. Homebrew's installer (what the fake curl downloads) logs how it ran
+# and what it read on stdin, then lays the fake brew down at FAKE_BREW_AT.
+_FAKE_BREW = r"""#!/bin/sh
+if [ "$1" = shellenv ]; then echo "export PATH=\"${0%/*}:\$PATH\""; exit 0; fi
+echo "brew $*" >> "$FAKE_CALLS"
+"""
+_MACOS_FAKES = {
+    "sudo": r"""#!/bin/sh
+echo "sudo $*" >> "$FAKE_CALLS"
+[ -n "${FAKE_SUDO_FAIL:-}" ] && exit 1
+case "$1" in -n|-v) exit 0 ;; esac
+exec "$@"
+""",
+    "curl": r"""#!/bin/sh
+echo "curl $*" >> "$FAKE_CALLS"
+[ -n "${FAKE_CURL_FAIL:-}" ] && exit 22
+prev=""; for a; do [ "$prev" = -o ] && out="$a"; prev="$a"; done
+cat > "$out" <<'EOF'
+echo "installer NONINTERACTIVE=${NONINTERACTIVE:-} stdin=$(cat | wc -c | tr -d ' ')" >> "$FAKE_CALLS"
+[ -n "${FAKE_INSTALLER_FAIL:-}" ] && exit 1
+[ -n "${FAKE_INSTALLER_WAIT:-}" ] && { echo "installer waiting" >> "$FAKE_CALLS"; exec "$REAL_SLEEP" 30; }
+mkdir -p "${FAKE_BREW_AT%/*}" && cp "$FAKEBIN/brew.fake" "$FAKE_BREW_AT" && chmod +x "$FAKE_BREW_AT"
+EOF
+""",
+    "xcode-select": '#!/bin/sh\n[ -n "${FAKE_NO_CLT:-}" ] && exit 2\necho /Library/Developer/CommandLineTools\n',
+    "id": '#!/bin/sh\necho "${FAKE_UID:-501}"\n',
+}
+
+
+def _macos_setup(tmp_path, *, brew_on_path=False, brew_at_candidate=False, fast_sleep=False, **env_extra):
+    """install_macos_all from the real installer on a fake Mac: PATH holds
+    the fakes and the system tools it runs, never the host's own brew or
+    curl. The standard prefixes are two folders under ``tmp_path``;
+    ``fast_sleep`` turns every ``sleep`` into a twentieth of a second.
+    Returns the command, its environment, the calls log and the candidate
+    the installer fills."""
+    fakes, tools = tmp_path / "macbin", tmp_path / "mactools"
+    for d in (fakes, tools):
+        d.mkdir()
+    for name, body in _MACOS_FAKES.items():
+        (fakes / name).write_text(body)
+        (fakes / name).chmod(0o755)
+    (fakes / "brew.fake").write_text(_FAKE_BREW)
+    if fast_sleep:
+        (fakes / "sleep").write_text('#!/bin/sh\nexec "$REAL_SLEEP" 0.05\n')
+        (fakes / "sleep").chmod(0o755)
+    for name in ("bash", "cat", "chmod", "cp", "mkdir", "mktemp", "rm", "sleep", "tr", "wc"):
+        (tools / name).symlink_to(shutil.which(name))
+    first, second = tmp_path / "opt" / "bin" / "brew", tmp_path / "usrlocal" / "bin" / "brew"
+    path = f"{fakes}:{tools}"
+    if brew_on_path:
+        onpath = tmp_path / "onpath"
+        onpath.mkdir()
+        (onpath / "brew").write_text(_FAKE_BREW)
+        (onpath / "brew").chmod(0o755)
+        path = f"{onpath}:{path}"
+    if brew_at_candidate:
+        second.parent.mkdir(parents=True)
+        second.write_text(_FAKE_BREW)
+        second.chmod(0o755)
+    calls = tmp_path / "macos.log"
+    calls.touch()
+    script = ('set -euo pipefail\n'
+              'info() { echo "[INFO] $*"; }; ok() { echo "[OK] $*"; }\n'
+              'warn() { echo "[WARN] $*"; }; err() { echo "[ERROR] $*" >&2; }\n'
+              'SUDO=sudo\nSKIP_TIER_2=false\nOTODOCK_PYTHON_MINOR=3.13\n'
+              f'BREW_CANDIDATES="{first} {second}"\nHOMEBREW_INSTALL_URL=https://brew.example/install.sh\n'
+              + "".join(_baseline_function(n) for n in ("install_macos_all", "_find_brew", "_install_homebrew", "_brew_failed"))
+              + 'install_macos_all\necho "PATH-AFTER=$PATH"\n')
+    env = {"PATH": path, "FAKE_CALLS": str(calls), "FAKEBIN": str(fakes), "REAL_SLEEP": shutil.which("sleep"),
+           "FAKE_BREW_AT": str(first), "TMPDIR": str(tmp_path), **env_extra}
+    return [str(tools / "bash"), "-c", script], env, calls, first
+
+
+def _macos(tmp_path, *, stdin="", **kw):
+    """``_macos_setup``'s run to its end: the run, the calls logged and the
+    candidate the installer fills."""
+    argv, env, calls, first = _macos_setup(tmp_path, **kw)
+    r = subprocess.run(argv, env=env, cwd=tmp_path, input=stdin, capture_output=True, text=True, timeout=60)
+    return r, calls.read_text().splitlines(), first
+
+
+def test_macos_installs_homebrew_when_missing_unattended_and_off_stdin(tmp_path):
+    # `curl … | bash`: the pipe carries the rest of the installer, which
+    # Homebrew's own installer must never read.
+    r, calls, brew = _macos(tmp_path, stdin="the rest of the piped installer\n")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "sudo -n true" in calls
+    assert any(c.startswith("curl -fsSL -o ") and c.endswith(" https://brew.example/install.sh") for c in calls), calls
+    assert "installer NONINTERACTIVE=1 stdin=0" in calls
+    assert brew.is_file()
+    assert f"PATH-AFTER={brew.parent}:" in r.stdout
+    installs = [c for c in calls if c.startswith("brew install ")]
+    assert installs and "python@3.13" in installs[0].split() and "python" in installs[0].split()
+
+
+def test_macos_finds_homebrew_off_path_at_a_standard_prefix(tmp_path):
+    # An SSH command runs no login shell: brew exists but is on no PATH.
+    r, calls, _ = _macos(tmp_path, brew_at_candidate=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c.startswith(("curl", "installer", "sudo"))], calls
+    assert any(c.startswith("brew install ") for c in calls)
+    assert "/usrlocal/bin:" in r.stdout.split("PATH-AFTER=")[1]
+
+
+def test_macos_with_homebrew_on_path_needs_no_sudo(tmp_path):
+    r, calls, _ = _macos(tmp_path, brew_on_path=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c.startswith(("curl", "installer", "sudo"))], calls
+
+
+@pytest.mark.parametrize("fail, said", [
+    ({"FAKE_SUDO_FAIL": "1"}, "Installing Homebrew needs an administrator account and its password"),
+    ({"FAKE_CURL_FAIL": "1"}, "Could not download Homebrew's installer"),
+    ({"FAKE_INSTALLER_FAIL": "1"}, "Homebrew did not install"),
+])
+def test_macos_stops_when_homebrew_cannot_install(tmp_path, fail, said):
+    r, calls, _ = _macos(tmp_path, **fail)
+    assert r.returncode == 1
+    assert said in r.stderr
+    assert not [c for c in calls if c.startswith("brew ")], calls
+
+
+def test_macos_sudo_refresh_ends_with_an_interrupted_run(tmp_path):
+    """Ctrl-C or a kill during Homebrew's installer: the loop that keeps sudo
+    fresh must not outlive the run, or the person's terminal keeps a sudo
+    ticket for good."""
+    argv, env, calls, _ = _macos_setup(tmp_path, fast_sleep=True, FAKE_INSTALLER_WAIT="1")
+    proc = subprocess.Popen(argv, env=env, cwd=tmp_path, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def refreshes():
+        return calls.read_text().count("sudo -n true")
+
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not ("installer waiting" in calls.read_text() and refreshes() > 3):
+            time.sleep(0.05)
+        assert refreshes() > 3, calls.read_text()  # sudo kept fresh while the installer runs
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        deadline, last, stable = time.monotonic() + 10, refreshes(), 0
+        while time.monotonic() < deadline and stable < 3:
+            time.sleep(0.3)
+            now = refreshes()
+            stable, last = (stable + 1 if now == last else 0), now
+        assert stable >= 3, "the sudo refresh outlived the run"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
+def test_macos_refuses_root_and_missing_command_line_tools(tmp_path):
+    r, _, _ = _macos(tmp_path, brew_on_path=True, FAKE_UID="0")
+    assert r.returncode == 1 and "not as root" in r.stderr
+    (tmp_path / "clt").mkdir()
+    r, calls, _ = _macos(tmp_path / "clt", brew_on_path=True, FAKE_NO_CLT="1")
+    assert r.returncode == 1 and "xcode-select --install" in r.stderr
+    assert not [c for c in calls if c.startswith("brew install")], calls
+
+
+def _helper(tmp_path, os_type, *, root_owned_gitconfig=False, dst="/usr/local/bin/oto-git-credential-helper"):
+    """install_credential_helper from the real installer: sudo and git are
+    logging fakes, brew answers a prefix under ``tmp_path``; ``install`` is
+    the real one with sudo's copy logged and never run. Returns the run, the
+    calls and the prefix."""
+    fakes, tools, prefix = tmp_path / "helperbin", tmp_path / "helpertools", tmp_path / "brew"
+    for d in (fakes, tools, prefix / "bin", prefix / "etc"):
+        d.mkdir(parents=True, exist_ok=True)
+    bodies = {
+        "sudo": '#!/bin/sh\necho "sudo $*" >> "$FAKE_CALLS"\n',
+        "git": '#!/bin/sh\necho "git $*" >> "$FAKE_CALLS"\n',
+        "brew": f'#!/bin/sh\n[ "$1" = --prefix ] && echo "{prefix}"\n',
+        "id": '#!/bin/sh\ncase "$1" in -un) echo person ;; -g) echo 20 ;; *) echo 501 ;; esac\n',
+    }
+    for name, body in bodies.items():
+        (fakes / name).write_text(body)
+        (fakes / name).chmod(0o755)
+    for name in ("bash", "install"):
+        (tools / name).symlink_to(shutil.which(name))
+    src = tmp_path / "oto-git-credential-helper"
+    src.write_text("#!/bin/sh\n")
+    if root_owned_gitconfig:
+        conf = prefix / "etc" / "gitconfig"
+        conf.write_text("")
+        conf.chmod(0o444)
+    calls = tmp_path / "helper.log"
+    calls.touch()
+    script = ('set -euo pipefail\n'
+              'info() { echo "[INFO] $*"; }; ok() { echo "[OK] $*"; }\n'
+              'warn() { echo "[WARN] $*"; }; err() { echo "[ERROR] $*" >&2; }\n'
+              f'SUDO=sudo\nOS_TYPE={os_type}\nSKIP_CREDENTIAL_HELPER=false\n'
+              f'CREDENTIAL_HELPER_SRC="{src}"\n'
+              f'CREDENTIAL_HELPER_DST="{dst}"\n'
+              + _baseline_function("install_credential_helper") + "install_credential_helper\n")
+    r = subprocess.run([str(tools / "bash"), "-c", script], env={"PATH": f"{fakes}:{tools}", "FAKE_CALLS": str(calls)},
+                       cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    return r, calls.read_text().splitlines(), prefix
+
+
+def test_linux_helper_creates_a_missing_folder_before_the_copy(tmp_path):
+    folder = tmp_path / "usrlocal" / "bin"
+    r, calls, _ = _helper(tmp_path, "linux", dst=f"{folder}/oto-git-credential-helper")
+    assert r.returncode == 0, r.stdout + r.stderr
+    made = calls.index(f"sudo install -d -m 0755 {folder}")
+    copied = next(i for i, c in enumerate(calls) if c.endswith(f" {folder}/oto-git-credential-helper")
+                  and c.startswith("sudo install -m 0755 "))
+    assert made < copied
+    assert ("sudo git config --system credential.https://github.com.helper "
+            f"{folder}/oto-git-credential-helper") in calls
+
+
+def test_linux_helper_leaves_an_existing_folders_mode_alone(tmp_path):
+    # GNU `install -d -m 0755` resets the mode of a folder that exists: a
+    # group-writable /usr/local/bin (Debian's staff layout) would lose it.
+    folder = tmp_path / "usrlocal" / "bin"
+    folder.mkdir(parents=True)
+    r, calls, _ = _helper(tmp_path, "linux", dst=f"{folder}/oto-git-credential-helper")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if " install -d " in c], calls
+
+
+def test_macos_helper_goes_to_homebrew_with_no_sudo(tmp_path):
+    r, calls, prefix = _helper(tmp_path, "macos")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (prefix / "bin" / "oto-git-credential-helper").is_file()
+    assert not [c for c in calls if c.startswith("sudo")], calls
+    assert f"git config --system credential.https://github.com.helper {prefix}/bin/oto-git-credential-helper" in calls
+
+
+def test_macos_helper_in_another_accounts_homebrew_warns_and_goes_on(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root writes a read-only folder")
+    prefix = tmp_path / "brew"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "bin").chmod(0o555)
+    try:
+        r, calls, _ = _helper(tmp_path, "macos")
+    finally:
+        (prefix / "bin").chmod(0o755)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[WARN] Could not install the git credential helper" in r.stdout
+    assert not [c for c in calls if c.startswith("git config")], calls
+
+
+def test_macos_helper_gives_back_a_gitconfig_an_older_installer_left_to_root(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root writes a read-only file")
+    r, calls, prefix = _helper(tmp_path, "macos", root_owned_gitconfig=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"sudo chown 501:20 {prefix}/etc/gitconfig" in calls
+
+
+@pytest.mark.parametrize("os_type", ["macos", "linux"])
+def test_sympy_goes_to_the_users_site_on_macos_only(tmp_path, os_type):
+    fakes, tools = tmp_path / "sympybin", tmp_path / "sympytools"
+    for d in (fakes, tools):
+        d.mkdir()
+    bodies = {
+        "python3": '#!/bin/sh\necho "python3 $*" >> "$FAKE_CALLS"\n[ "$1" = -c ] && exit 1\nexit 0\n',
+        "sudo": '#!/bin/sh\necho "sudo $*" >> "$FAKE_CALLS"\nexit 0\n',
+        "brew": '#!/bin/sh\necho "brew $*" >> "$FAKE_CALLS"\n',
+    }
+    for name, body in bodies.items():
+        (fakes / name).write_text(body)
+        (fakes / name).chmod(0o755)
+    (tools / "bash").symlink_to(shutil.which("bash"))
+    calls = tmp_path / "sympy.log"
+    calls.touch()
+    script = ('set -euo pipefail\n'
+              'info() { echo "[INFO] $*"; }; ok() { echo "[OK] $*"; }\n'
+              'warn() { echo "[WARN] $*"; }; err() { echo "[ERROR] $*" >&2; }\n'
+              f'SUDO=sudo\nOS_TYPE={os_type}\n'
+              + _baseline_function("install_sympy") + "install_sympy\n")
+    r = subprocess.run([str(tools / "bash"), "-c", script], env={"PATH": f"{fakes}:{tools}", "FAKE_CALLS": str(calls)},
+                       cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    logged = calls.read_text().splitlines()
+    pins = re.findall(r'local sympy_ver="\$\{SYMPY_VERSION:-([^}]+)\}"', _BASELINE)
+    if os_type == "macos":
+        assert f"python3 -m pip install --quiet --user --break-system-packages sympy=={pins[0]}" in logged
+        assert not [c for c in logged if c.startswith(("sudo", "brew"))], logged
+    else:
+        assert f"sudo python3 -m pip install --quiet sympy=={pins[0]}" in logged
+
+
+def _npm_fn(tmp_path, fn, *, sudo="sudo", prefix=None, uid=501):
+    """One npm helper of the real installer (with ``_npm_sudo``, which the
+    repair asks) and the real ``find``, with fakes for npm (answering
+    ``prefix``, failing without one), id and sudo. The files under
+    ``tmp_path`` are this test's own: an ``id -u`` of 501 makes every one of
+    them another account's, the test's own uid none. Returns the run and the
+    calls logged."""
+    fakes, tools, home = tmp_path / "npmbin", tmp_path / "npmtools", tmp_path / "home"
+    for d in (fakes, tools, home / ".npm" / "_cacache"):
+        d.mkdir(parents=True)
+    (home / ".npm" / "_cacache" / "index").write_text("")
+    bodies = {
+        "npm": (f'#!/bin/sh\necho "{prefix}"\n' if prefix else "#!/bin/sh\nexit 1\n"),
+        "id": '#!/bin/sh\ncase "$1" in -un) echo person ;; -g) echo 20 ;; *) echo "$FAKE_UID" ;; esac\n',
+        "sudo": '#!/bin/sh\necho "sudo $*" >> "$FAKE_CALLS"\n',
+    }
+    for name, body in bodies.items():
+        (fakes / name).write_text(body)
+        (fakes / name).chmod(0o755)
+    for name in ("bash", "find"):
+        (tools / name).symlink_to(shutil.which(name))
+    calls = tmp_path / "npm.log"
+    calls.touch()
+    script = ('set -euo pipefail\n'
+              'info() { echo "[INFO] $*"; }; ok() { echo "[OK] $*"; }\n'
+              'warn() { echo "[WARN] $*"; }; err() { echo "[ERROR] $*" >&2; }\n'
+              f'SUDO="{sudo}"\n' + "".join(_baseline_function(n) for n in dict.fromkeys(("_npm_sudo", fn)))
+              + f'echo "answer=[$({fn})]"\n')
+    r = subprocess.run([str(tools / "bash"), "-c", script],
+                       env={"PATH": f"{fakes}:{tools}", "FAKE_CALLS": str(calls), "HOME": str(home),
+                            "FAKE_UID": str(uid)},
+                       cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    return r, calls.read_text().splitlines()
+
+
+def test_npm_needs_no_sudo_where_the_person_owns_the_prefix(tmp_path):
+    # Homebrew's prefix on a Mac, nvm's on Linux; a lib/node_modules not made
+    # yet is judged by the folder above it.
+    prefix = tmp_path / "brew"
+    (prefix / "bin").mkdir(parents=True)
+    r, _ = _npm_fn(tmp_path, "_npm_sudo", prefix=prefix)
+    assert "answer=[]" in r.stdout, r.stdout + r.stderr
+
+
+def test_npm_takes_sudo_for_a_system_prefix_or_an_unknown_one(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root writes everywhere")
+    prefix = tmp_path / "usr"
+    (prefix / "lib" / "node_modules").mkdir(parents=True)
+    (prefix / "bin").mkdir()
+    (prefix / "lib" / "node_modules").chmod(0o555)
+    try:
+        (tmp_path / "a").mkdir()
+        r, _ = _npm_fn(tmp_path / "a", "_npm_sudo", prefix=prefix)
+        assert "answer=[sudo]" in r.stdout, r.stdout + r.stderr
+    finally:
+        (prefix / "lib" / "node_modules").chmod(0o755)
+    (tmp_path / "b").mkdir()
+    r, _ = _npm_fn(tmp_path / "b", "_npm_sudo")
+    assert "answer=[sudo]" in r.stdout
+    (tmp_path / "c").mkdir()
+    r, _ = _npm_fn(tmp_path / "c", "_npm_sudo", sudo="")
+    assert "answer=[]" in r.stdout
+
+
+@pytest.mark.parametrize("foreign", [True, False])
+def test_npm_cache_left_to_root_is_given_back(tmp_path, foreign):
+    r, calls = _npm_fn(tmp_path, "_repair_npm_files", uid=501 if foreign else os.getuid())
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert calls == ([f"sudo chown -R -h 501:20 {tmp_path / 'home' / '.npm'}"] if foreign else [])
+
+
+def _prefix_with_root_leftovers(prefix: Path) -> None:
+    """A Homebrew prefix after the 1.9.0 installer's `sudo npm install -g`:
+    two packages and their links, beside a link and a file that are not npm's."""
+    for pkg in ("@openai/codex", "npm"):
+        (prefix / "lib" / "node_modules" / pkg).mkdir(parents=True)
+    (prefix / "bin").mkdir()
+    (prefix / "bin" / "codex").symlink_to(Path("..", "lib", "node_modules", "@openai", "codex", "bin", "codex.js"))
+    (prefix / "bin" / "docker").symlink_to("/Applications/Docker.app/Contents/Resources/bin/docker")
+    (prefix / "bin" / "oto-git-credential-helper").write_text("#!/bin/sh\n")
+
+
+def test_npm_packages_left_to_root_in_the_persons_prefix_are_given_back(tmp_path):
+    """Else the next CLI pin bump fails the re-pair: npm runs without sudo
+    and cannot replace a package folder root owns."""
+    prefix = tmp_path / "brew"
+    _prefix_with_root_leftovers(prefix)
+    r, calls = _npm_fn(tmp_path, "_repair_npm_files", prefix=prefix)
+    assert r.returncode == 0, r.stdout + r.stderr
+    given = {c.removeprefix("sudo chown -R -h 501:20 ") for c in calls}
+    assert given == {str(tmp_path / "home" / ".npm"), str(prefix / "lib" / "node_modules" / "@openai"),
+                     str(prefix / "lib" / "node_modules" / "npm"), str(prefix / "bin" / "codex")}
+    assert "An older installer left" in r.stdout
+
+
+def test_npm_files_already_the_persons_and_a_system_prefix_are_left_alone(tmp_path):
+    prefix = tmp_path / "brew"
+    _prefix_with_root_leftovers(prefix)
+    (tmp_path / "own").mkdir()
+    r, calls = _npm_fn(tmp_path / "own", "_repair_npm_files", prefix=prefix, uid=os.getuid())
+    assert r.returncode == 0 and calls == []
+    if os.geteuid() == 0:
+        return
+    # NodeSource's /usr is root's by design: only the cache is looked at.
+    (prefix / "lib" / "node_modules").chmod(0o555)
+    try:
+        (tmp_path / "system").mkdir()
+        r, calls = _npm_fn(tmp_path / "system", "_repair_npm_files", prefix=prefix)
+    finally:
+        (prefix / "lib" / "node_modules").chmod(0o755)
+    assert r.returncode == 0 and calls == [f"sudo chown -R -h 501:20 {tmp_path / 'system' / 'home' / '.npm'}"]
 
 
 # ── dev-setup.sh stops while the platform's units run ──────────────────
@@ -1383,3 +1803,19 @@ def test_install_writes_the_editors_scheme_line(tmp_path, env_text, want):
     assert stat.S_IMODE(env.stat().st_mode) == 0o600 and not (tmp_path / ".env.scheme").exists()
     r = _install_steps(tmp_path, env.read_text())
     assert r.returncode == 0 and "setting COLLABORA_SSL_TERMINATION" not in r.stdout
+
+
+def test_the_image_boot_check_reads_pastas_first_line():
+    """With the AVX2 build in the image, pasta's version is its first line on
+    every runner; a warning ahead of it (no AVX2 binary on an AVX2 host) is
+    what the check must refuse, so it never searches past the first line."""
+    boot = (SCRIPTS / "image-boot-check.sh").read_text()
+    cut = next(line for line in boot.splitlines() if line.startswith('got="${got%%'))
+    for output, first in (
+        ("pasta 2026_10_02.cba3570\nCopyright Red Hat\n", "pasta 2026_10_02.cba3570"),
+        ("Can't run AVX2 build, using non-AVX2 version: No such file or directory\n"
+         "pasta 2026_10_02.cba3570\n", "Can't run AVX2 build, using non-AVX2 version: No such file or directory"),
+    ):
+        r = subprocess.run(["bash", "-c", f'set -euo pipefail\ngot="$1"\n{cut}\nprintf %s "$got"', "_", output],
+                           capture_output=True, text=True, timeout=30)
+        assert r.stdout == first, r.stderr

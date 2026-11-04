@@ -5,11 +5,11 @@ green tests, and explains where different kinds of contributions live.
 
 ## Where things go
 
-- **Platform code** (proxy, dashboard, Android app, satellite, phone
-  service, first-party MCPs, audio): this repo. [ARCHITECTURE.md](ARCHITECTURE.md)
+- **Platform code** (proxy, dashboard, the Android and iOS apps, satellite,
+  phone service, first-party MCPs, audio): this repo. [ARCHITECTURE.md](ARCHITECTURE.md)
   maps it, and [AGENTS.md](AGENTS.md) holds the instructions for coding agents
   (`CLAUDE.md` loads it).
-- **New agents for the catalog**: [OtoDock/community-agents](https://github.com/OtoDock/community-agents).
+- **New agents and department sets for the catalog**: [OtoDock/community-agents](https://github.com/OtoDock/community-agents).
 - **New MCP tool servers for the catalog**: [OtoDock/community-mcps](https://github.com/OtoDock/community-mcps).
 - **New Agent Skills for the catalog**: [OtoDock/community-skills](https://github.com/OtoDock/community-skills).
 - **Bugs and ideas**: GitHub issues here. The issue forms ask for what a
@@ -120,8 +120,19 @@ without push notifications, and only release packaging is signed):
 cd dashboard && npm run build && npx cap sync android && cd android && ./gradlew assembleDebug testDebugUnitTest
 ```
 
-**Lint and types** (CI runs all three, and the required `proxy` check runs
-only ruff's import and dead-code rules):
+**iOS app** (the Capacitor shell in `dashboard/ios/`, around the built
+dashboard). It needs a Mac with Xcode 16 or later. It needs no Firebase
+file and no signing values (a Debug build runs without push notifications,
+and only an archive for TestFlight is signed):
+
+```bash
+cd dashboard && npm run build && npx cap sync ios
+cd dashboard/ios/OtoDockShell && swift test                             # the shell's rules
+cd dashboard/ios/App && xcodebuild -project App.xcodeproj -scheme App -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+```
+
+**Lint and types** (CI runs all three, and the `proxy` job also runs ruff's
+import and dead-code rules):
 
 ```bash
 proxy/venv/bin/python -m pip install "ruff==0.15.22" "mypy==2.4.0"   # once, into the proxy's environment
@@ -205,11 +216,9 @@ cd dashboard && npm run lint  # ESLint
 ## Pull requests
 
 - Keep PRs focused: one concern per PR reviews quickly.
-- CI runs automatically on every PR. The `proxy` (with the audio suite),
-  `dashboard`, `satellite` and `phone` checks must be green: merging is
-  blocked until they are. Lint and types, the Android build and the
-  security scans report on the PR without blocking it, and a maintainer
-  reads them too.
+- CI runs automatically on every PR, and every check must be green before a
+  merge: the test suites, lint and types, the Android build and the security
+  scans.
 - If you're planning something large, open an issue first so we can agree on
   the shape before you invest the time.
 - **Dependency bumps**: please don't send them. Pins are managed internally

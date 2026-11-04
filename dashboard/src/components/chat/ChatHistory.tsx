@@ -1,18 +1,18 @@
 import { useState, useMemo, useEffect, useRef, useCallback, type JSX, useLayoutEffect } from 'react'
 import {
-  Chat, TaskChat, useDeleteChat, useRenameChat, useRenameTask,
-  useSearchChats, useTaskChats,
+  Chat, TaskChat, useDeleteChat, useRenameChat,
+  useSearchChats, type ListPaging, SNIPPET_MARK_START, SNIPPET_MARK_END,
 } from '../../api/chats'
 import { useChatSlice } from '../../store/chatStore'
 import { useActiveChats } from '../../hooks/useActiveChats'
 import { pushEscHandler } from '../../lib/escStack'
 import Button from '../ui/Button'
 import Tooltip from '../ui/Tooltip'
-import { POPOVER } from '../ui/classes'
+import { POPOVER, ROW_TRAIL_HOVER_REVEAL } from '../ui/classes'
 import { rowAccentClass } from './projectAccents'
 import ActiveChatsPanel from './ActiveChatsPanel'
 import MoveChatConfirm from './MoveChatConfirm'
-import { leavesOffline, MOVE_MEMORY, moveMemoryOf, useChatTargets } from '../../api/remoteMachines'
+import { accountsStayFor, leavesOffline, MOVE_MEMORY, moveMemoryOf, useChatTargets } from '../../api/remoteMachines'
 import SharePopover, { type ShareTarget } from '../sharing/SharePopover'
 import { SOURCE_TYPE } from '../../lib/session/kind'
 import { isSharedChatOwner } from '../../lib/visibility'
@@ -49,9 +49,17 @@ function ChatStatusDot({ chatId }: { chatId: string }) {
 
 interface Props {
   chats: Chat[]
+  /** The chat list's older pages (the page's `useChats`). */
+  chatPaging?: ListPaging
+  /** The task view's rows and paging: the page owns the one task-list query
+      (its poll pauses with the rename and the duplex session). */
+  taskChats?: TaskChat[]
+  taskPaging?: ListPaging
   activeChatId: string | null
   agentName?: string
-  onSelect: (chatId: string, searchQuery?: string) => void
+  /** `searchQuery` and `messageId`: picked from search results, the chat
+      opens with the find bar on the query, at the matching message. */
+  onSelect: (chatId: string, searchQuery?: string, messageId?: number) => void
   onNew: () => void
   onNavigate?: () => void
   /** Task mode: the list shows the agent's task-run chats instead of the chat
@@ -224,6 +232,36 @@ function highlightTitle(title: string, query: string): JSX.Element {
   )
 }
 
+/** A search row's words around its match: the server marks the words it
+ * matched (stems included), and those are highlighted like the title. */
+function SnippetLine({ text, tone, onFill }: { text: string; tone: string; onFill: boolean }) {
+  const parts: JSX.Element[] = []
+  let rest = text
+  for (let i = 0; rest; i++) {
+    const at = rest.indexOf(SNIPPET_MARK_START)
+    if (at < 0) {
+      parts.push(<span key={i}>{rest}</span>)
+      break
+    }
+    if (at > 0) parts.push(<span key={`${i}t`}>{rest.slice(0, at)}</span>)
+    const end = rest.indexOf(SNIPPET_MARK_END, at + 1)
+    const word = rest.slice(at + 1, end < 0 ? undefined : end)
+    // On the open row's solid fill the subtle tint would sit under light
+    // text: a veil of the text's own colour instead.
+    parts.push(
+      <mark key={`${i}m`} className={`${onFill ? 'bg-action-fg/25' : 'bg-action-subtle-hover'} text-inherit rounded-sm px-0.5`}>
+        {word}
+      </mark>,
+    )
+    rest = end < 0 ? '' : rest.slice(end + 1)
+  }
+  return (
+    <p data-testid="search-snippet" className={`text-3xs mt-[2px] truncate ${tone}`}>
+      {parts}
+    </p>
+  )
+}
+
 /** Three-dot menu for chat items with dropdown and delete confirmation. */
 // One sidebar row. Split out of the group map so the per-chat store slice
 // (live and unread state) can drive the row's styling with a hook.
@@ -238,11 +276,13 @@ function highlightTitle(title: string, query: string): JSX.Element {
 // alone blend into the sidebar (especially age-faded unread), and the ring
 // stays constant while the background pulses/fades so the row keeps a crisp
 // edge. A ring, not a border: the left border is the delegation edge.
-function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveChat,
+function ChatRow({ chat, active, title, plainTitle, snippet, onClick, onDelete, onMoveChat,
                    onRename, onShare, canDelete, edit }: {
   chat: Chat
   active: boolean
   title: string | JSX.Element
+  /** A search row's words around its match. */
+  snippet?: string
   /** The row's full label as plain text — the hover/long-press tooltip body
       (the `title` prop can be a search-highlight JSX element). */
   plainTitle: string
@@ -306,6 +346,7 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
               )}
               <Tooltip text={plainTitle} onlyWhenClipped className="truncate">{title}</Tooltip>
             </p>
+            {snippet && <SnippetLine text={snippet} onFill={active} tone={active ? 'text-action-fg' : 'text-secondary'} />}
             <p className={`text-3xs mt-[2px] ${active ? 'text-action-fg' : 'text-tertiary'}`}>{timeAgo(chat.updated_at)}</p>
           </>
         )}
@@ -321,6 +362,18 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
   )
 }
 
+// A task row's two lines. The run chat's title leads once a model wrote it
+// or a person renamed it (`title_generated`); before that the task's name
+// does, since the stamped title is only the prompt's first words. The other
+// of the two is the subtitle when they differ.
+function taskRowLabels(chat: TaskChat): { label: string; subtitle: string } {
+  const name = chat.task_name || ''
+  const title = chat.title || ''
+  const label = (chat.title_generated && title) || name || title
+  const other = label === title ? name : title
+  return { label, subtitle: other !== label ? other : '' }
+}
+
 // One TASK-mode row: a task-run chat with its latest run joined. Purple is
 // the task LIVE identity (matches the Active-now strip): purple pulse while
 // generating, solid purple inversion when active. The left accent rail is
@@ -329,12 +382,14 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
 // for an orchestrator — plain scheduled tasks get none. No unread dot/tint (notifications cover completion). The kebab
 // renders Rename/Delete from the server-computed can_* flags — the task
 // role matrix lives backend-side; a row with neither right shows no kebab.
-function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
+function TaskRow({ chat, active, title, plainTitle, subtitle, snippet, onClick, onDelete,
                    onRename, canDelete, edit }: {
   chat: TaskChat
   active: boolean
   title: string | JSX.Element
   plainTitle: string
+  subtitle: string
+  snippet?: string
   onClick: () => void
   onDelete: (id: string) => void
   onRename?: () => void
@@ -368,23 +423,20 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
       } ${stateClass}`}
     >
       <div className="min-w-0 flex-1">
-        {/* Rows are titled by the task's NAME; the chat title (prompt first
-            line / LLM upgrade) drops to the subtitle as per-run context, and
-            stays the title for runs whose task row is gone (one-time tasks
-            hard-delete after firing → task_name is null). Rename follows the
-            label ("rename what you see"): name-labeled rows rename the task
-            definition, title-labeled rows rename this run's chat. */}
+        {/* The run's own title (taskRowLabels) leads; the task's name drops
+            to the subtitle when it differs. Rename edits this run's chat. */}
         {edit ? (
           <RenameInput initial={edit.initial} onCommit={edit.onCommit} onCancel={edit.onCancel} />
         ) : (
           <>
             <p className="text-xs font-medium">
               <Tooltip text={plainTitle} onlyWhenClipped className="block truncate">
-                {chat.task_name || title}
+                {title}
               </Tooltip>
             </p>
+            {snippet && <SnippetLine text={snippet} onFill={active} tone={active ? 'text-on-solid' : 'text-secondary'} />}
             <p className={`text-3xs mt-[2px] truncate ${active ? 'text-on-solid' : 'text-tertiary'}`}>
-              {chat.task_name && chat.title ? `${chat.title} · ` : ''}{timeAgo(chat.updated_at)}
+              {subtitle ? `${subtitle} · ` : ''}{timeAgo(chat.updated_at)}
             </p>
           </>
         )}
@@ -401,7 +453,8 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
 }
 
 // `onBrand`: the row behind the trigger is the open row on the action fill:
-// the trigger takes the fill's foreground so the dots stay visible.
+// the trigger takes the fill's foreground so the dots stay visible, and it
+// never collapses, so the open chat's actions are always one tap away.
 // `isOpen`: this row is the OPEN chat — the move_chat op acts on the
 // connection's open chat, so only then is the target-mismatch row actionable.
 function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
@@ -490,22 +543,16 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
 
   return (
     <>
-      {/* Width-based reveal: on desktop a zero-width, clipped wrapper gives
+      {/* Where the device can hover, a zero-width, clipped wrapper gives
           the title the FULL row width until the row is hovered or focused,
           and the button stays in the Tab order (display: none would drop it,
-          an opacity reveal would reserve its width). Shown, the wrapper stops
-          clipping so the focus ring is whole. Mobile (no hover) keeps it
-          always visible; an open dropdown pins the wrapper so it can't
-          vanish mid-interaction. */}
+          an opacity reveal would reserve its width). A touch device keeps it
+          in sight at every width; the open row, an open dropdown and a held
+          focus pin it so it can't vanish mid-interaction. */}
       <div
         ref={menuRef}
         data-testid="chat-row-menu"
-        className={`relative ${
-          menuOpen || holding
-            ? ''
-            : 'md:w-0 md:overflow-hidden md:group-hover:w-auto md:group-hover:overflow-visible '
-              + 'md:group-focus-within:w-auto md:group-focus-within:overflow-visible'
-        }`}
+        className={`relative ${menuOpen || holding || onBrand ? '' : ROW_TRAIL_HOVER_REVEAL}`}
       >
         <button
           ref={kebabRef}
@@ -528,10 +575,11 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
         {/* Dropdown menu */}
         {menuOpen && (
           <div className={`absolute right-0 top-full mt-1 z-30 ${POPOVER} py-1 min-w-[120px] max-w-[240px]`}>
-            {/* Mobile full-title header — no hover on touch, so the menu is
-                where a clipped title is guaranteed readable. */}
+            {/* The full-title header where the device cannot hover (a
+                phone, a tablet): no hover tooltip there, so the menu is where
+                a clipped title is guaranteed readable. */}
             {fullTitle && (
-              <div className="md:hidden px-3 py-1.5 text-xs font-medium text-primary break-words border-b border-subtle mb-1">
+              <div className="[@media(hover:hover)]:hidden px-3 py-1.5 text-xs font-medium text-primary break-words border-b border-subtle mb-1">
                 {fullTitle}
               </div>
             )}
@@ -614,6 +662,7 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
           fromTarget={targets?.current.target ?? mismatch.pinnedTarget}
           fromLabel={targets?.current.label || mismatch.pinnedLabel}
           fromOffline={targets ? leavesOffline(targets) : false}
+          accountsStay={accountsStayFor(targets, mismatch.resolvedTarget)}
           onConfirm={handleConfirmMove}
           onCancel={() => setConfirmMove(false)}
         />
@@ -622,23 +671,24 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
   )
 }
 
+// How near the list's bottom the next page is asked for: a page usually
+// lands before the person reaches the end.
+const OLDER_MARGIN_PX = 400
+
 export default function ChatHistory({
-  chats, activeChatId, agentName, onSelect, onNew, onNavigate,
+  chats, chatPaging, taskChats, taskPaging, activeChatId, agentName, onSelect, onNew, onNavigate,
   tasksMode = false, onTasksModeChange, onMoveChat, onRenameEditingChange,
 }: Props) {
   const deleteChat = useDeleteChat()
   const renameChat = useRenameChat()
-  const renameTask = useRenameTask()
   const [searchInput, setSearchInput] = useState('')
   const debouncedQuery = useDebounce(searchInput, 300)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // The row being inline-renamed. taskId set = the rename targets the task
-  // DEFINITION (name-labeled task rows — "rename what you see"); null = the
-  // chat/run title. Keyed here (not row-local) so a row remount — e.g.
-  // crossing a day-group boundary on refetch — can't drop the edit.
-  const [editing, setEditing] = useState<
-    { id: string; taskId: string | null; initial: string } | null>(null)
+  // The row being inline-renamed (a chat, or a task run's chat). Keyed here
+  // (not row-local) so a row remount — e.g. crossing a day-group boundary
+  // on refetch — can't drop the edit.
+  const [editing, setEditing] = useState<{ id: string; initial: string } | null>(null)
   useEffect(() => {
     onRenameEditingChange?.(editing !== null)
   }, [editing, onRenameEditingChange])
@@ -650,7 +700,6 @@ export default function ChatHistory({
   // task search over the agent's task-run chats (run-permission gated).
   const { data: searchResults, isFetching: isSearching } =
     useSearchChats(agentName, debouncedQuery, tasksMode ? 'tasks' : 'chats')
-  const { data: taskChats } = useTaskChats(agentName, tasksMode, editing !== null)
 
   // The tasks toggle pulses purple while this agent has a task generating and
   // the toggle is off — the task rows aren't visible to carry the pulse.
@@ -666,6 +715,27 @@ export default function ChatHistory({
   const modeChats: Chat[] = tasksMode ? (taskChats ?? []) : chats
   const displayChats = isSearchActive && searchResults ? searchResults : modeChats
   const groups = useMemo(() => groupChats(displayChats), [displayChats])
+
+  // Older rows load as the last row comes near: a sentinel after the groups,
+  // watched in the list's own scroll box. The observer is made again when the
+  // rows change and when a load ends, and observe() reports at once, so a
+  // page that leaves the sentinel in view asks for the next. After a failure
+  // it waits for the press (no loop of failing requests).
+  const listRef = useRef<HTMLDivElement>(null)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const paging = tasksMode ? taskPaging : chatPaging
+  const pageable = !isSearchActive && !!paging?.hasMore
+  const observable = typeof IntersectionObserver !== 'undefined'
+  const rowCount = modeChats.length
+  useEffect(() => {
+    const el = sentinelRef.current
+    if (!pageable || !paging || paging.loadingOlder || paging.failed || !el || !observable) return
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) paging.loadOlder()
+    }, { root: listRef.current, rootMargin: `0px 0px ${OLDER_MARGIN_PX}px 0px` })
+    io.observe(el)
+    return () => io.disconnect()
+  }, [pageable, paging, observable, rowCount])
 
   // A failed DELETE/RENAME otherwise vanishes (the confirm popover / inline
   // input already closed and the list never refetches) — surface it inline
@@ -697,29 +767,21 @@ export default function ChatHistory({
   }, [deleteChat, surfaceError, activeChatId, onNew, onSelect])
 
   const startRename = useCallback((chat: Chat | TaskChat) => {
-    const tc = chat as TaskChat
-    const nameLabeled = tasksMode && !!tc.task_name && !!tc.task_id
-    setEditing({
-      id: chat.id,
-      taskId: nameLabeled ? (tc.task_id as string) : null,
-      // Prefill from DATA, never the rendered title prop (search mode passes
-      // a JSX highlight element) and never the 'New Chat' placeholder.
-      initial: nameLabeled ? (tc.task_name as string) : (chat.title || ''),
-    })
+    // Prefill from DATA, never the rendered title prop (search mode passes
+    // a JSX highlight element) and never the 'New Chat' placeholder. A task
+    // row edits its run's chat too, starting from the label it shows.
+    const initial = tasksMode ? taskRowLabels(chat as TaskChat).label : (chat.title || '')
+    setEditing({ id: chat.id, initial })
   }, [tasksMode])
 
   const cancelRename = useCallback(() => setEditing(null), [])
   const commitRename = useCallback((value: string) => {
     if (!editing) return
-    const onError = (e: unknown) =>
-      surfaceError((e as Error)?.message || 'Failed to rename')
-    if (editing.taskId) {
-      renameTask.mutate({ taskId: editing.taskId, name: value }, { onError })
-    } else {
-      renameChat.mutate({ chatId: editing.id, title: value }, { onError })
-    }
+    renameChat.mutate({ chatId: editing.id, title: value }, {
+      onError: (e: unknown) => surfaceError((e as Error)?.message || 'Failed to rename'),
+    })
     setEditing(null)
-  }, [editing, renameChat, renameTask, surfaceError])
+  }, [editing, renameChat, surfaceError])
 
   return (
     <div className="w-full border-r border-subtle bg-surface-card flex flex-col h-full">
@@ -831,7 +893,7 @@ export default function ChatHistory({
       </div>
 
       {/* Chat list */}
-      <div className="flex-1 overflow-y-auto p-2">
+      <div ref={listRef} className="flex-1 overflow-y-auto p-2">
         {/* Search loading indicator */}
         {isSearchActive && isSearching && (
           <div className="flex items-center justify-center py-3">
@@ -851,13 +913,15 @@ export default function ChatHistory({
               {group.label}
             </p>
             {group.chats.map((chat) => {
-              const title = isSearchActive
-                ? highlightTitle(chat.title || 'New Chat', debouncedQuery)
-                : (chat.title || 'New Chat')
+              const rowLabels = tasksMode ? taskRowLabels(chat as TaskChat) : null
+              const label = rowLabels?.label || chat.title || 'New Chat'
+              const title = isSearchActive ? highlightTitle(label, debouncedQuery) : label
               const open = () => {
-                onSelect(chat.id, isSearchActive ? debouncedQuery : undefined)
+                onSelect(chat.id, isSearchActive ? debouncedQuery : undefined,
+                  isSearchActive ? chat.match_message_id ?? undefined : undefined)
                 closeMobileDrawer(onNavigate)
               }
+              const snippet = isSearchActive ? chat.match_snippet || undefined : undefined
               // Server-computed flags; absent (older-proxy cache) → chats keep
               // their historical owner rights, task rows stay menu-less.
               const canRename = chat.can_rename ?? !tasksMode
@@ -872,7 +936,9 @@ export default function ChatHistory({
                   chat={chat as TaskChat}
                   active={chat.id === activeChatId}
                   title={title}
-                  plainTitle={(chat as TaskChat).task_name || chat.title || 'New Chat'}
+                  plainTitle={label}
+                  subtitle={rowLabels?.subtitle ?? ''}
+                  snippet={snippet}
                   onClick={open}
                   onDelete={handleDelete}
                   onRename={canRename ? () => startRename(chat) : undefined}
@@ -886,6 +952,7 @@ export default function ChatHistory({
                   active={chat.id === activeChatId}
                   title={title}
                   plainTitle={chat.title || 'New Chat'}
+                  snippet={snippet}
                   onClick={open}
                   onDelete={handleDelete}
                   onMoveChat={onMoveChat}
@@ -901,6 +968,20 @@ export default function ChatHistory({
             })}
           </div>
         ))}
+        {pageable && paging && (
+          <div ref={sentinelRef} data-testid="history-older" className="py-2 text-center text-3xs text-tertiary">
+            {paging.loadingOlder ? (
+              tasksMode ? 'Loading older task runs…' : 'Loading older chats…'
+            ) : (paging.failed || !observable) ? (
+              <button
+                onClick={paging.loadOlder}
+                className="px-2 py-1 rounded-control text-secondary hover:text-primary hover:bg-surface-hover transition-colors"
+              >
+                {tasksMode ? 'Load older task runs' : 'Load older chats'}
+              </button>
+            ) : null}
+          </div>
+        )}
         {shareTarget && <SharePopover target={shareTarget} onClose={() => setShareTarget(null)} />}
 
         {/* Empty state */}

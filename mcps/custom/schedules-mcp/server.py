@@ -65,9 +65,13 @@ _MODEL_ARG_SCHEMA = {
         "model enabled on the task's execution layer — read the valid ids "
         "off this agent's `layers:` line in the prompt, and pick by the "
         "capability tier tagged there ([t1] frontier … [t4] fast; the Model "
-        "tiers list explains each), never by how an id sounds. Omit to "
-        "inherit the agent's default (recommended). On `edit_task`, pass "
-        "\"\" to clear an existing pin."
+        "tiers list explains each), never by how an id sounds. Omit it "
+        "(recommended) and the run takes the model of its engine. Without "
+        "`layer` it runs on the engine the task would take unpinned when that "
+        "engine offers it, else on the first engine of the agent's own order "
+        "that does, which is not always the `layers:` line's order: name "
+        "`layer` for a model listed on two lines. On "
+        "`edit_task`, pass \"\" to clear an existing pin."
     ),
 }
 
@@ -75,9 +79,11 @@ _LAYER_ARG_SCHEMA = {
     "type": "string",
     "description": (
         "OPTIONAL execution-layer override for THIS task's runs (e.g. "
-        "'claude-code-cli', 'codex-cli', 'direct-llm') — must be enabled for "
-        f"{AGENT}. Omit to inherit the agent's default layer. On `edit_task`, "
-        "pass \"\" to clear an existing pin."
+        "'claude-code-cli', 'codex-cli', 'direct-llm') — must be allowed on "
+        f"{AGENT}. Omit it and a user-scope task runs on the engine its "
+        "creator's own new chat on this agent takes, an agent-scope task or "
+        "a task on a Shared-only agent on the agent's default. On "
+        "`edit_task`, pass \"\" to clear an existing pin."
     ),
 }
 
@@ -90,6 +96,20 @@ _PERMISSION_MODE_ARG_SCHEMA = {
         "every tool runs. autoReview (Auto): reads, file edits and safe tools run, "
         "anything else is checked by the engine's own reviewer first and refused "
         "when it cannot be checked. Auto needs Claude Code or Codex."
+    ),
+}
+
+# Who is told, for an agent-scope task: the lowest per-agent role its
+# notifications reach. Offered only where the agent offers the agent scope.
+_AUDIENCE_ARG_SCHEMA = {
+    "type": "string",
+    "enum": ["manager", "editor", "contributor", "viewer"],
+    "description": (
+        "Who is told, for an agent-scope task only: the lowest role on this agent that "
+        "receives the task's notifications (platform admins always do). editor: editors "
+        "and managers. contributor: also contributors. viewer: everyone who uses the "
+        "agent. manager: managers only. Omit for editors and managers, or, when this "
+        "session is itself a task run, for the people that run tells."
     ),
 }
 
@@ -156,8 +176,9 @@ def _fires_info(t: dict) -> str:
 def _runs_on(t: dict) -> str:
     """What the task's runs execute on, as a ', runs on: …' suffix. The
     backend resolves effective_model / effective_execution_path (the task's
-    pin, else the agent's CURRENT default resolved with the effective
-    layer) and tags the source; the model's capability tier rides along.
+    pin, else for a person's unpinned task the engine their own chats take,
+    else the agent's CURRENT default resolved with the effective layer) and
+    tags the source; the model's capability tier rides along.
     An unresolved default comes back "" — render nothing rather than a
     wrong claim (matches the dashboard). An app handler row runs no LLM
     turn at all, so it never claims a model."""
@@ -256,6 +277,13 @@ AVAILABLE_SCOPES = [
 # `agent`, so a handler defaulting to a literal "user" made every
 # scope-omitted create 400 ("does not support 'user'-scoped tasks").
 SCOPE_DEFAULT = DEFAULT_SCOPE if DEFAULT_SCOPE in AVAILABLE_SCOPES else AVAILABLE_SCOPES[0]
+_SCOPE_AGENT = "agent"
+_AUDIENCE_ARGS = {"audience": _AUDIENCE_ARG_SCHEMA} if _SCOPE_AGENT in AVAILABLE_SCOPES else {}
+# On edit, omitting the argument leaves the task's value as it is.
+_AUDIENCE_EDIT_ARGS = ({"audience": {**_AUDIENCE_ARG_SCHEMA, "description": (
+    "Who is told, for an agent-scope task only: the new lowest role on this agent that receives "
+    "the task's notifications (platform admins always do). Omit to leave it as it is. A task run "
+    "may not name a wider audience than its own.")}} if _SCOPE_AGENT in AVAILABLE_SCOPES else {})
 
 
 server = Server("schedules-mcp")
@@ -398,6 +426,7 @@ async def list_tools() -> list[Tool]:
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
                     "permission_mode": _PERMISSION_MODE_ARG_SCHEMA,
+                    **_AUDIENCE_ARGS,
                     "machine": _MACHINE_ARG_SCHEMA,
                     "checks": _CHECKS_ARG_SCHEMA,
                     "timezone": _TIMEZONE_ARG_SCHEMA,
@@ -491,6 +520,7 @@ async def list_tools() -> list[Tool]:
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
                     "permission_mode": _PERMISSION_MODE_ARG_SCHEMA,
+                    **_AUDIENCE_ARGS,
                     "machine": _MACHINE_ARG_SCHEMA,
                     "checks": _CHECKS_ARG_SCHEMA,
                     "timezone": _TIMEZONE_ARG_SCHEMA,
@@ -631,10 +661,12 @@ async def list_tools() -> list[Tool]:
                 "List all tasks (static + agent-created) for this agent, including "
                 "pending session continuations. Shows each task's schedule, next run "
                 "time, status (active or paused), and what its runs execute on: "
-                "`runs on: <model> [pinned|agent default|layer default, tier N "
-                "<label>]`, plus `via <layer> [pinned layer]` when the engine is "
-                "pinned (`layer default` = only the engine is pinned and its own "
-                "first choice runs); an `[app]` handler row runs no LLM turn and "
+                "`runs on: <model> [pinned|your engine|agent default|layer default, "
+                "tier N <label>]`, plus `via <layer> [pinned layer]` when the "
+                "engine is pinned (`your engine` = an unpinned user-scope task, "
+                "on the engine its creator's own chats take, and `layer default` = "
+                "only the engine is pinned and its own first choice runs); an "
+                "`[app]` handler row runs no LLM turn and "
                 "shows no model; `, machine: <name>` when the task runs on its "
                 "own machine instead of the agent's default. This is the "
                 "authoritative read for "
@@ -807,6 +839,7 @@ async def list_tools() -> list[Tool]:
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
                     "permission_mode": _PERMISSION_MODE_ARG_SCHEMA,
+                    **_AUDIENCE_EDIT_ARGS,
                     "machine": _MACHINE_ARG_SCHEMA,
                     "checks": _CHECKS_ARG_SCHEMA,
                     "timezone": _TIMEZONE_ARG_SCHEMA,
@@ -906,6 +939,8 @@ async def _tool_create_scheduled_task(arguments: dict) -> list[TextContent]:
             body[k] = arguments[k]
     if arguments.get("permission_mode"):
         body["permission_mode"] = arguments["permission_mode"]
+    if arguments.get("audience"):
+        body["notify_audience"] = arguments["audience"]
     if arguments.get("checks"):
         body["checks"] = list(arguments["checks"])
     if arguments.get("timezone"):
@@ -971,6 +1006,8 @@ async def _tool_create_one_time_task(arguments: dict) -> list[TextContent]:
             body[k] = arguments[k]
     if arguments.get("permission_mode"):
         body["permission_mode"] = arguments["permission_mode"]
+    if arguments.get("audience"):
+        body["notify_audience"] = arguments["audience"]
     if arguments.get("checks"):
         body["checks"] = list(arguments["checks"])
     if arguments.get("timezone"):
@@ -1192,7 +1229,9 @@ async def _tool_get_task(arguments: dict) -> list[TextContent]:
         f"Notification: {t.get('notification_mode', '—')}"
         + (f" ({t['notify_severity']})" if t.get("notify_severity") else "")
         + (f"   Target chat: {t['target_chat_id']}" if t.get("target_chat_id") else "")
-        + f"   Mode: {mode}",
+        + f"   Mode: {mode}"
+        + (f"   Who is told: {t['notify_audience']} and above"
+           if t.get("scope") == _SCOPE_AGENT and t.get("notify_audience") else ""),
     ]
     runs_on = _runs_on(t)
     if runs_on:
@@ -1271,6 +1310,8 @@ async def _tool_edit_task(arguments: dict) -> list[TextContent]:
         "model", "layer", "machine", "permission_mode", "checks",
     )
     body = {k: arguments[k] for k in edit_keys if k in arguments}
+    if arguments.get("audience"):
+        body["notify_audience"] = arguments["audience"]
     # The zone travels as user_tz on the wire; a zone edit alone is
     # a valid edit (the proxy re-registers on it).
     if arguments.get("timezone"):

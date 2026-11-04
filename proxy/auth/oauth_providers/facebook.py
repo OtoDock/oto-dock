@@ -66,6 +66,7 @@ class FacebookOAuthProvider(OAuthProvider):
     provider_id = "facebook"
     flow = "authorization_code"
     supports_incremental_auth = False
+    grants_accumulate = True
     authorization_url = f"https://www.facebook.com/{GRAPH_VERSION}/dialog/oauth"
     token_url = f"https://graph.facebook.com/{GRAPH_VERSION}/oauth/access_token"
     revoke_url = f"https://graph.facebook.com/{GRAPH_VERSION}/me/permissions"

@@ -272,6 +272,30 @@ def list_user_accounts(user_sub: str, mcp_name: str) -> list[dict]:
         return [_account_row(r) for r in rows]
 
 
+def mcps_naming_label(user_sub: str, account_label: str) -> list[str]:
+    """Every MCP with an account row of this person under ``account_label``
+    (the MCPs of one provider share that label's token file)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT mcp_name FROM user_credential_accounts "
+            "WHERE user_sub=%s AND account_label=%s",
+            (user_sub, account_label),
+        ).fetchall()
+        return sorted(r["mcp_name"] for r in rows)
+
+
+def list_all_user_accounts(user_sub: str) -> list[dict]:
+    """Every account a user has connected, across MCPs:
+    ``[{mcp_name, account_label, meta}, ...]``."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT mcp_name, account_label, meta FROM user_credential_accounts "
+            "WHERE user_sub=%s ORDER BY mcp_name, created_at ASC",
+            (user_sub,),
+        ).fetchall()
+        return [_account_row(r) for r in rows]
+
+
 def get_account_meta(user_sub: str, mcp_name: str, account_label: str) -> dict:
     """The vendor meta of one account (``{}`` when none or no such row)."""
     with get_conn() as conn:
@@ -358,14 +382,20 @@ def accounts_by_github_user(mcp_names: list[str], user_id: int) -> list[dict]:
     ]
 
 
-def any_hosted_app_account(mcp_names: list[str]) -> bool:
-    """Whether any account of these MCPs is a GitHub-App account signed in
-    through OtoDock's hosted relay (its meta says ``hosted``): the relay's
-    forwarding of the app's events must stay on for it."""
-    return any(
-        oauth_app_kinds.is_github_app_meta(a["meta"]) and a["meta"].get("hosted")
-        for a in _accounts_with_meta(mcp_names)
-    )
+def hosted_app_account_mcps(exclude_user_sub: str = "") -> set[str]:
+    """The MCPs of every GitHub-App account signed in through OtoDock's
+    hosted relay, whichever MCP manifests are loaded right now; a person
+    being deleted (``exclude_user_sub``) left out."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT user_sub, mcp_name, account_label, display_email, meta "
+            "FROM user_credential_accounts WHERE meta <> '' AND user_sub <> %s",
+            (exclude_user_sub,),
+        ).fetchall()
+    return {
+        a["mcp_name"] for a in (_account_row(r) for r in rows)
+        if oauth_app_kinds.is_github_app_meta(a["meta"]) and a["meta"].get("hosted")
+    }
 
 
 def get_default_account(user_sub: str, mcp_name: str) -> str | None:

@@ -247,15 +247,6 @@ class PumpEventHandlers(_Host):
             spawn(title_generator.request_chat_title(
                 self.chat_id, assistant_excerpt="".join(self._pending_text),
             ), name="request_chat_title", owner="stream_pump")
-        # A memory tool call resets this session's capture-nudge counter
-        # (services/memory_nudge). Name shapes: mcp__memory-mcp__memory
-        # (CLI/Codex) or bare "memory" (Direct LLM).
-        if tool_name == "memory" or tool_name.startswith("mcp__memory-mcp__"):
-            try:
-                from services.memory import memory_nudge
-                memory_nudge.record_memory_call(self.session_id)
-            except ImportError:
-                pass
         # Record tool-start time for any MCP with `outputs` declared so
         # mcp_output_relocation can diff source dir by mtime on
         # TOOL_RESULT and move just the newly-written files.

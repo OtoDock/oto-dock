@@ -46,13 +46,16 @@
         }
        ],
        "default_model": "claude-char-1",
+       "is_agent_default": true,
        "is_default": true,
-       "local_only": false,
        "models": [
         "claude-char-1"
        ],
        "more": 0,
+       "no_machines": false,
        "path": "claude-code-cli",
+       "person": false,
+       "platform": false,
        "tiers": {
         "claude-char-1": 2
        }
@@ -133,6 +136,7 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
      "updated_at": "<stamp>"

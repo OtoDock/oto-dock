@@ -100,7 +100,7 @@ create_trigger(
 )
 ```
 
-An agent trigger's notify goes to all of this agent's users when it names no target (`target_scope="agent"` is the default), or to one of them (`target_scope="user"`, `target=<username>`). Every user on the platform (`target_scope="global"`), another agent, or someone outside this agent needs a platform admin; the create or edit is refused otherwise.
+An agent trigger's notify goes to this agent's users at or above its `audience` when it names no target (`target_scope="agent"` is the default), or to one of them (`target_scope="user"`, `target=<username>`). `notify.audience` is `editor` when omitted (editors and managers), `contributor`, `viewer` (everyone who uses the agent) or `manager`. Platform admins are always told. Every user on the platform (`target_scope="global"`), another agent, or someone outside this agent needs a platform admin; the create or edit is refused otherwise.
 
 You can combine both: a trigger with `task_id` AND `notify` enabled fires both on every webhook call.
 
@@ -120,6 +120,8 @@ For vendors connected via OAuth you do NOT configure a raw webhook URL + API key
 - Other keys: `actor.{id,name,email}`, `subject.{id,title,url}`, `target.{id,type}`, `vendor_event_id`.
 
 **Testing:** vendor webhook delivery is **async** — after the test action (e.g. posting a comment) wait ~10–15s, then check `fired_count` via `get_trigger`. Do NOT rapid-fire several test actions while flipping the filter: deliveries are deduped and delayed, so you'll misattribute which filter fired. Change the filter once, post one action, wait, check.
+
+If nothing fires at all, check the MCP itself. A subscription receives nothing while an admin has its MCP turned off, or after the MCP was removed. `list_subscriptions` then shows `status=mcp_off` or `status=mcp_removed`, and the dashboard marks such a subscription "Its MCP is turned off" or "Its MCP was removed".
 
 ## Webhook payload → placeholder substitution
 

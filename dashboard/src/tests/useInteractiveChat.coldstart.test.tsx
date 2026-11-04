@@ -3,10 +3,10 @@ import { renderHook, act } from '@testing-library/react'
 
 import { useInteractiveChat } from '@/hooks/useInteractiveChat'
 
-// ─── Interactive cold-start routing: the text must ride the WARMUP (server-
-// owned delivery — survives a chat switch / reload mid-warmup), never the
-// volatile client stash that dies with resetSession. Attachments keep the
-// stash+flush path (their photos ride a separate pty_attachments message).
+// ─── Interactive cold-start routing: the prompt, its photos and files with
+// it, must ride the WARMUP (server-owned delivery — survives a chat switch /
+// reload mid-warmup, and the backend saves the photos with the message's
+// row), never a client stash.
 
 function makeWs() {
   return {
@@ -44,8 +44,6 @@ describe('useInteractiveChat cold start', () => {
     // double-stamped by the declined-to-headless kick's own time injection).
     expect(prompt).toEqual({ text: 'hello there' })
     expect(execMode).toBe('interactive')
-    // No stash — a later warmup_ready must not paste a duplicate into the PTY.
-    expect(result.current.pendingPtyTextRef.current).toBeNull()
   })
 
   it('warmup_ready{interactive} after a text-only cold send flushes nothing', () => {
@@ -54,10 +52,7 @@ describe('useInteractiveChat cold start', () => {
 
     let status = ''
     act(() => {
-      status = result.current.onWarmupReady(
-        { interactive: true, chat_id: 'chat-1' },
-        { onDecline: vi.fn() },
-      )
+      status = result.current.onWarmupReady({ interactive: true, chat_id: 'chat-1' })
     })
 
     expect(status).toBe('interactive')
@@ -65,46 +60,42 @@ describe('useInteractiveChat cold start', () => {
     expect(ws.sendPtyAttachments).not.toHaveBeenCalled()
   })
 
-  it('cold send WITH attachments keeps the stash + flush path', () => {
+  it('a cold send WITH attachments rides the warmup too, and nothing is typed on ready', () => {
+    const { result } = renderHook(() => useInteractiveChat(ws, 'interactive'))
+    const images = [{ base64: 'aGk=', name: 'photo.png' }, { path: 'users/u/workspace/uploads/photos/a.jpg', name: 'a.jpg' }]
+    const files = [{ path: 'users/u/workspace/uploads/files/plan.pdf', name: 'plan.pdf' }]
+
+    act(() => { result.current.routeSend('see photo', { ...CTX, onColdStart: vi.fn(), images, files }) })
+
+    const [, , , , , prompt, execMode] = ws.warmup.mock.calls[0]
+    expect(prompt).toEqual({ text: 'see photo', images, files })
+    expect(execMode).toBe('interactive')
+
+    act(() => { result.current.onWarmupReady({ interactive: true, chat_id: 'chat-1' }) })
+    expect(ws.sendPtyAttachments).not.toHaveBeenCalled()
+    expect(ws.sendPtyInput).not.toHaveBeenCalled()
+  })
+
+  it('a cold send of photos alone rides the warmup', () => {
     const { result } = renderHook(() => useInteractiveChat(ws, 'interactive'))
     const images = [{ base64: 'aGk=', name: 'photo.png' }]
-
-    act(() => { result.current.routeSend('see photo', { ...CTX, onColdStart: vi.fn(), images }) })
-
-    // The warmup carries NO text (delivery happens via the flush below).
+    act(() => { result.current.routeSend('', { ...CTX, onColdStart: vi.fn(), images }) })
     const [, , , , , prompt] = ws.warmup.mock.calls[0]
-    expect(prompt).toBeUndefined()
-    expect(result.current.pendingPtyTextRef.current).toBe('see photo')
-
-    act(() => {
-      result.current.onWarmupReady(
-        { interactive: true, chat_id: 'chat-1' },
-        { onDecline: vi.fn() },
-      )
-    })
-    expect(ws.sendPtyAttachments).toHaveBeenCalledOnce()
-    const [cid, typed] = ws.sendPtyAttachments.mock.calls[0]
-    expect(cid).toBe('chat-1')
-    expect(typed).toContain('see photo')  // stamped at delivery
-    expect(result.current.pendingPtyTextRef.current).toBeNull()
+    expect(prompt).toEqual({ text: '', images })
   })
 
   it('decline after a text-only cold send does NOT replay client-side (server kicks it)', () => {
     const { result } = renderHook(() => useInteractiveChat(ws, 'interactive'))
     act(() => { result.current.routeSend('hello there', { ...CTX, onColdStart: vi.fn() }) })
 
-    const onDecline = vi.fn()
     let status = ''
     act(() => {
-      status = result.current.onWarmupReady(
-        { interactive: false, chat_id: 'chat-1' },
-        { onDecline },
-      )
+      status = result.current.onWarmupReady({ interactive: false, chat_id: 'chat-1' })
     })
 
-    // No stash → 'none': the caller's server-kick adoption handles the turn
-    // the backend already runs from the warmup text.
+    // 'none': the caller's server-kick adoption handles the turn the backend
+    // already runs from the warmup's prompt.
     expect(status).toBe('none')
-    expect(onDecline).not.toHaveBeenCalled()
+    expect(ws.sendPtyAttachments).not.toHaveBeenCalled()
   })
 })

@@ -12,3 +12,5 @@ mss>=9.0
 Pillow>=13.0
 pyautogui>=0.9.54
 pyperclip>=1.8
+# macOS: reads and asks for the Accessibility grant (AXIsProcessTrustedWithOptions).
+pyobjc-framework-ApplicationServices ; sys_platform == 'darwin'

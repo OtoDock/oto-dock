@@ -8,7 +8,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import type { EngineDescriptor } from './engineDescriptor'
-import type { EngineSubscriptionStatus } from '../lib/status/engineSubscription'
+import { ENGINE_SUBSCRIPTION_STATUS, type EngineSubscriptionStatus } from '../lib/status/engineSubscription'
 import { apiJson, withMessage } from '../lib/http/apiJson'
 
 // ---------------------------------------------------------------------------
@@ -52,6 +52,64 @@ export interface Subscription {
   updated_at: string
   // Absent on non-OAuth rows and while the platform setting is off.
   windows?: SubscriptionWindows | null
+  // The login grant's end (ISO 8601 UTC) on an OAuth row; null when the
+  // platform does not know it (absence never means "ending"). Absent on
+  // every other row.
+  login_expires_at?: string | null
+}
+
+// ---------------------------------------------------------------------------
+// A login that ends soon
+// ---------------------------------------------------------------------------
+
+/** The window a login that ends soon is shown in: the first notice's, the
+ *  proxy's `LOGIN_ENDING_WINDOW_MS` (a proxy test binds the two). Outside it
+ *  the row shows nothing. */
+export const LOGIN_ENDING_WINDOW_HOURS = 72
+
+const HOUR_MS = 3_600_000
+
+/** When an active OAuth row's login ends, in words, inside the window only:
+ *  'in 3 days', 'in 5 hours', 'in 1 hour', 'within the hour', or 'now' once
+ *  the instant passed while the row is still active. Null for a row that is
+ *  not active, an unknown end (only OAuth rows carry one), or an end further
+ *  away. Rounded half up, as the proxy's notice
+ *  (`subscription_health.ends_in`). Timed by this device's clock. */
+export function loginEndsIn(sub: Subscription, now: number = Date.now()): string | null {
+  if (sub.status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE || !sub.login_expires_at) return null
+  const end = Date.parse(sub.login_expires_at)
+  if (Number.isNaN(end)) return null
+  const remaining = end - now
+  if (remaining > LOGIN_ENDING_WINDOW_HOURS * HOUR_MS) return null
+  if (remaining <= 0) return 'now'
+  const hours = remaining / HOUR_MS
+  const rounded = Math.floor(hours + 0.5)
+  if (rounded >= 48) return `in ${Math.floor(hours / 24 + 0.5)} days`
+  if (rounded >= 1) return `in ${rounded} ${rounded === 1 ? 'hour' : 'hours'}`
+  return 'within the hour'
+}
+
+/** The row's chip for a `loginEndsIn` answer. */
+export function loginEndingChip(when: string): string {
+  return when === 'now' ? 'Login ending' : `Login ends ${when}`
+}
+
+/** A row's identity when it is an email, else '': a Claude identity without
+ *  an email is the account's UUID, which is never shown. */
+export function accountEmail(identity: string | null | undefined): string {
+  const value = (identity || '').trim()
+  return value.includes('@') ? value : ''
+}
+
+/** An account's name as the notices give it: "Claude Max (name@example.com)"
+ *  when the label and the email both exist and differ, else whichever exists.
+ *  An identity without an @ is the account's UUID and is never shown. The
+ *  proxy's `subscription_health.account_name` keeps the same rule. */
+export function accountName(sub: Pick<Subscription, 'label' | 'oauth_email'>, fallback = ''): string {
+  const label = (sub.label || '').trim()
+  const email = accountEmail(sub.oauth_email)
+  if (label && email && email.toLowerCase() !== label.toLowerCase()) return `${label} (${email})`
+  return label || email || fallback
 }
 
 export interface LayerModel {
@@ -557,12 +615,26 @@ export const CLAUDE_SECOND_ACCOUNT_HINT =
   'The popup signs you in on platform.claude.com. To add a second account, sign out of your Claude account there first. ' +
   'You can also use a private window.'
 
+/** How to add a second account: the popup's platform.claude.com session
+ *  decides which account a login connects. */
+const SECOND_ACCOUNT_ADVICE =
+  'To add a different account, sign out of platform.claude.com in this browser first. ' +
+  'You can also use a private window. Then start again.'
+
 /** The message when a paste matched an account that is already connected. */
 export function alreadyConnectedMessage(email: string): string {
   return (
     `That is the account you already connected: ${email || 'the same account'}. ` +
-    'Its login was refreshed and no new account was added. To add a different account, ' +
-    'sign out of platform.claude.com in this browser first. You can also use a private window. Then start again.'
+    `Its login was refreshed and no new account was added. ${SECOND_ACCOUNT_ADVICE}`
+  )
+}
+
+/** The admin Setup form's answer when a paste matched an active account: the
+ *  form is also how an admin renews a login that ends soon. */
+export function renewedMessage(email: string): string {
+  return (
+    `Renewed ${email || 'the account'}: its login is fresh again. ` +
+    `No new account was added. ${SECOND_ACCOUNT_ADVICE}`
   )
 }
 

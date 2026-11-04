@@ -51,6 +51,8 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
 })
 
 import ExecutionLayersTab from '@/pages/admin/ExecutionLayersTab'
+import { SubscriptionRow } from '@/pages/admin/ExecutionLayersTab.rows'
+import type { Subscription } from '@/api/executionLayers'
 
 const follows = (a: Node, b: Node) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
 
@@ -83,5 +85,46 @@ describe('Admin AI Engines: forms open where they are invoked', () => {
     expect(within(dialog).getByRole('button', { name: 'Connect Claude Account' })).toBeInTheDocument()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     expect(screen.queryByRole('dialog')).toBeNull()
+  })
+})
+
+describe('Admin AI Engines: a login that ends soon', () => {
+  const inHours = (hours: number) => new Date(Date.now() + hours * 3_600_000).toISOString()
+  const oauthRow = (over: object) => ({
+    id: 'o1', label: 'Claude Max', provider: 'anthropic', auth_type: 'oauth', status: 'active',
+    oauth_email: 'a@example.com', active_sessions: 0, use_personal: true, contribute_platform: true,
+    is_mine: true, owner_sub: 'local:admin', layer: 'claude-code-cli', created_at: '', updated_at: '',
+    login_expires_at: inHours(50), ...over,
+  }) as unknown as Subscription
+  const renderRow = (over: object = {}) =>
+    render(<SubscriptionRow sub={oauthRow(over)} layer="claude-code-cli" vendorId="anthropic" />)
+  const hint = () => {
+    fireEvent.click(screen.getByRole('button', { name: 'About Login ends in 2 days' }))
+    return screen.getByRole('tooltip')
+  }
+
+  it("the admin's own row: the chip, and Connect Account renews it", () => {
+    renderRow()
+    expect(screen.getByText('Login ends in 2 days')).toBeInTheDocument()
+    expect(hint()).toHaveTextContent('To renew it, press Connect Account above and sign in as the same account.')
+  })
+
+  it("another admin's row: its owner renews it", () => {
+    renderRow({ is_mine: false, owner_sub: 'local:other' })
+    expect(hint()).toHaveTextContent('Its owner renews it by signing in to the same account again.')
+  })
+
+  it('an owner-less row: it cannot be renewed in place', () => {
+    renderRow({ is_mine: false, owner_sub: '' })
+    expect(hint()).toHaveTextContent('Nobody owns this account, so it cannot be renewed in place.')
+  })
+
+  it('at four days, and on an expired row, nothing new shows', () => {
+    const { unmount } = renderRow({ login_expires_at: inHours(96) })
+    expect(screen.queryByText(/Login end/)).toBeNull()
+    unmount()
+    renderRow({ status: 'expired', login_expires_at: inHours(10) })
+    expect(screen.queryByText(/Login end/)).toBeNull()
+    expect(screen.getByText('expired')).toBeInTheDocument()
   })
 })

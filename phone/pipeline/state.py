@@ -201,6 +201,10 @@ class CallState:
     _transfer_label: str = ""
     _transfer_previous_outcome: str = ""
     _transfer_settled: bool = False
+    # The person's side is gone (a hangup frame, or the media leg closed:
+    # ``_note_remote_hangup``). An AudioSocket read EOF leaves the
+    # connection's own closed flag unset.
+    _line_closed: bool = False
 
     # The caller's language (pipeline/language.py): locked at construction
     # unless the surface detects it (final after a few seconds of speech);

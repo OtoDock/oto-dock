@@ -7,6 +7,7 @@
    ],
    "call": "build_session_mcp_config",
    "kwargs": {
+    "chat_worker": false,
     "delegation_targets": [
      "char-agent",
      "char-peer"
@@ -15,6 +16,7 @@
     "only_mcps": null,
     "placement": {},
     "session_id": "s-task",
+    "shared_chat": false,
     "target_browser": {},
     "task_mode": true,
     "task_owner": "",
@@ -67,13 +69,16 @@
         }
        ],
        "default_model": "claude-char-1",
+       "is_agent_default": true,
        "is_default": true,
-       "local_only": false,
        "models": [
         "claude-char-1"
        ],
        "more": 0,
+       "no_machines": false,
        "path": "claude-code-cli",
+       "person": false,
+       "platform": false,
        "tiers": {
         "claude-char-1": 2
        }
@@ -90,13 +95,16 @@
         }
        ],
        "default_model": "claude-char-1",
+       "is_agent_default": true,
        "is_default": true,
-       "local_only": false,
        "models": [
         "claude-char-1"
        ],
        "more": 0,
+       "no_machines": false,
        "path": "claude-code-cli",
+       "person": false,
+       "platform": false,
        "tiers": {
         "claude-char-1": 2
        }
@@ -127,8 +135,10 @@
     "execution_path": "claude-code-cli",
     "mount_shared": true,
     "placement": {},
+    "read_only": false,
     "role": "manager",
     "sandboxed": true,
+    "shared_chat": false,
     "username": ""
    }
   },
@@ -193,6 +203,7 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
      "updated_at": "<stamp>"
@@ -221,6 +232,7 @@
    "OTO_STUB_ROOTS": ":"
   },
   "permission_mode": "auto",
+  "placement_sub": "",
   "sandbox_host_claude_dir": "/char/.claude",
   "security_context": {
    "agent": "char-agent",

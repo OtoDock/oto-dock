@@ -1,6 +1,6 @@
 """Shared utilities for the file-tools MCP server.
 
-Config, path mapping, LibreOffice runs, preview push helpers.
+Config, path mapping, preview push helpers.
 """
 
 import asyncio
@@ -8,15 +8,11 @@ import base64
 import contextlib
 import contextvars
 import hashlib
-import json
 import logging
 import os
 import re
-import signal
 import tempfile
-import time
 import unicodedata
-import weakref
 from pathlib import Path
 
 import httpx
@@ -282,111 +278,6 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     )
 
 
-def _op_type(op: dict) -> str:
-    """Extract operation type — LLMs may use 'op', 'operation', 'action' or
-    'type'. An explicit op key wins: next to one, 'type' is a parameter of
-    that operation (add_chart's chart type), not the dispatch key."""
-    return op.get("op") or op.get("operation") or op.get("action") or op.get("type") or ""
-
-
-def _normalize_operations(ops) -> tuple[list[dict], int]:
-    """Normalize an operations argument to a list of dicts.
-
-    Some LLMs double-encode array parameters as JSON strings. Accept any of:
-    - list of dicts (correct shape)
-    - list of JSON-encoded strings: ["{\"type\":\"resize\"}", ...]
-    - JSON-encoded string of a list: "[{\"type\":\"resize\"}, ...]"
-    - JSON-encoded string of a single op: "{\"type\":\"resize\"}"
-    - single dict (wrap in list)
-
-    Returns (operations, dropped): malformed items are dropped so other
-    operations still run, but the count is reported — a caller that silently
-    swallows them leaves the model believing everything was applied.
-    """
-    if ops is None:
-        return [], 0
-    if isinstance(ops, str):
-        try:
-            ops = json.loads(ops)
-        except (json.JSONDecodeError, ValueError):
-            return [], 1  # the whole blob was unparseable
-    if isinstance(ops, dict):
-        ops = [ops]
-    if not isinstance(ops, list):
-        return [], 1
-    normalized: list[dict] = []
-    dropped = 0
-    for op in ops:
-        if isinstance(op, str):
-            try:
-                op = json.loads(op)
-            except (json.JSONDecodeError, ValueError):
-                dropped += 1
-                continue
-        if isinstance(op, dict):
-            normalized.append(op)
-        else:
-            dropped += 1
-    return normalized, dropped
-
-
-def _dropped_note(dropped: int) -> str:
-    """Result-message suffix reporting operations lost in normalization."""
-    if not dropped:
-        return ""
-    return (
-        f"\nWARNING: {dropped} malformed operation item(s) could not be parsed "
-        "and were NOT applied (expected objects like {\"type\": \"...\", ...})."
-    )
-
-
-# ---------------------------------------------------------------------------
-# The `help` op of write_docx and write_pptx (write_xlsx has its own, built
-# from its key catalogue): the tool descriptions stay under the CLI's
-# 2048-character cap and name every op; the parameters live here.
-# ---------------------------------------------------------------------------
-
-_HELP_OPS = frozenset({"help", "describe", "describe_ops", "catalog", "catalogue",
-                       "list_ops", "?"})
-_HELP_NAME_KEYS = ("name", "op_name", "operation_name", "topic")
-HELP_POINTER = ' ({"op": "help"} lists every operation and its keys)'
-
-
-def split_help_ops(ops: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(the help ops, every other op)."""
-    def is_help(op: dict) -> bool:
-        return str(_op_type(op)).strip().lower() in _HELP_OPS
-    return [op for op in ops if is_help(op)], [op for op in ops if not is_help(op)]
-
-
-def help_text(tool: str, groups: tuple, notes: str, help_ops: list[dict],
-              aliases: dict[str, str] | None = None) -> str:
-    """The answer to the help ops of one call: the whole catalogue, or one
-    operation's keys when the op names it (an alias the dispatcher accepts
-    answers for its operation). ``groups`` is
-    ``((group, ((op, keys), ...)), ...)``."""
-    entries = {name: keys for _, ops in groups for name, keys in ops}
-    aliases = aliases or {}
-    answers = []
-    for op in help_ops:
-        name = next((str(op[k]).strip() for k in _HELP_NAME_KEYS if op.get(k)), "")
-        name = aliases.get(name, name)
-        if not name:
-            lines = [f'{tool} operations: each is {{"op": "<name>", ...keys}}; ? marks '
-                     'an optional key. {"op": "help", "name": "<op>"} shows one.']
-            for group, ops in groups:
-                lines.append(f"\n{group}")
-                lines.extend(f"  {op_name}: {keys}" for op_name, keys in ops)
-            if notes:
-                lines.append("\n" + notes)
-            answers.append("\n".join(lines))
-        elif name in entries:
-            answers.append(f"{name}: {entries[name]}")
-        else:
-            answers.append(f"No operation named '{name}'. Valid operations: {', '.join(entries)}")
-    return "\n\n".join(answers)
-
-
 # ---------------------------------------------------------------------------
 # Writing an output: beneath the mount, no link followed
 # ---------------------------------------------------------------------------
@@ -475,209 +366,9 @@ def cleanup_partials(container_path: str) -> None:
 # Worker-core plumbing (see isolation.py)
 # ---------------------------------------------------------------------------
 
-# Parent-side path pre-resolution failures travel into sync worker cores as
-# marker strings, so the cores' per-op error containment (errors.append +
-# continue with the remaining ops) behaves exactly as the old inline awaits
-# did — a bad path in one op must never fail the whole call.
-_RESOLVE_ERR_PREFIX = "__RESOLVE_ERROR__:"
-
-
-async def _resolve_or_mark(path_value: str, *, writing: bool = False) -> str:
-    try:
-        return await _resolve_path(path_value, writing=writing)
-    except Exception as exc:  # noqa: BLE001  # a path that cannot be resolved becomes a marked error for the batch
-        return _RESOLVE_ERR_PREFIX + (str(exc) or exc.__class__.__name__)
-
-
-def _checked_resolved(value):
-    """In-core: re-raise the parent's resolve failure at the op's use site."""
-    if isinstance(value, str) and value.startswith(_RESOLVE_ERR_PREFIX):
-        raise ValueError(value[len(_RESOLVE_ERR_PREFIX):])
-    return value
-
-
-async def _preresolve_image_ops(ops: list) -> None:
-    """Canonicalize add_image's `image_path|path|image` aliases (all three
-    write modules accept all three) to one pre-resolved `image_path`."""
-    for op in ops:
-        if _op_type(op) == "add_image":
-            src = op.get("image_path") or op.get("path") or op.get("image", "")
-            op.pop("path", None)
-            op.pop("image", None)
-            op["image_path"] = await _resolve_or_mark(src)
-
-
 _WRITE_OP_ADVICE = (
     "Split the operation list into smaller calls or work on a smaller file"
 )
-
-
-# ---------------------------------------------------------------------------
-# LibreOffice runs: one profile per slot, the slots by memory
-# ---------------------------------------------------------------------------
-#
-# Two LibreOffice processes on one user profile cannot run at once (the
-# second exits with no output), so each conversion slot has a profile of its
-# own and a conversion waits for a free slot. The slots follow the parse
-# workers' permits: two on a container of 3 GiB or more or with no memory
-# limit, one on a smaller one, where a second soffice beside the warm
-# background model and a parse worker would pass the container's memory. A
-# conversion writes only into the output directory its caller made for it,
-# so two conversions of one file run side by side.
-
-_LO_TIMEOUT_S = 120
-# How long a conversion waits for a free slot: past two whole runs, a slot
-# that never comes back is an error the caller sees, never a hang.
-_LO_SLOT_WAIT_S = 300
-
-# The profile the headless conversions run under: formulas are never
-# recalculated on load, links are never updated, macros never run, and a
-# linked graphic is never loaded (an HTML image reference, an ODF or OOXML
-# linked picture: LibreOffice 7.4 loads them from any path it can read
-# unless BlockUntrustedRefererLinks is set; an embedded picture still
-# renders). The document under conversion is untrusted input; LibreOffice
-# 7.4 is inert on the first three by default and the profile pins them.
-_LO_PROFILE_DIR = os.environ.get("FILETOOLS_LO_PROFILE", "/tmp/file-tools-lo-profile")
-_LO_REGISTRY = """<?xml version="1.0" encoding="UTF-8"?>
-<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-<item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="ODFRecalcMode" oor:op="fuse"><value>1</value></prop></item>
-<item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="OOXMLRecalcMode" oor:op="fuse"><value>1</value></prop></item>
-<item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1</value></prop></item>
-<item oor:path="/org.openoffice.Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value></prop></item>
-<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
-<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
-<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop></item>
-</oor:items>
-"""
-
-
-def _lo_slot_count() -> int:
-    from isolation import parse_permits
-
-    return parse_permits()
-
-
-_lo_free: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Queue]" = weakref.WeakKeyDictionary()
-# The runs in flight: a run outlives a caller that stopped waiting.
-_lo_runs: set[asyncio.Task] = set()
-
-
-def _lo_free_slots() -> asyncio.Queue:
-    """This loop's free slot numbers (one queue per event loop)."""
-    loop = asyncio.get_running_loop()
-    free = _lo_free.get(loop)
-    if free is None:
-        free = _lo_free[loop] = asyncio.Queue()
-        for slot in range(_lo_slot_count()):
-            free.put_nowait(slot)
-    return free
-
-
-def _libreoffice_profile(slot: int) -> str:
-    """The user-installation directory of one slot's conversions, its
-    registry seeded with the pins above (written once, rewritten on drift)."""
-    profile = os.path.join(_LO_PROFILE_DIR, f"slot-{slot}")
-    user = os.path.join(profile, "user")
-    os.makedirs(user, exist_ok=True)
-    xcu = os.path.join(user, "registrymodifications.xcu")
-    try:
-        current = open(xcu, encoding="utf-8").read()
-    except OSError:
-        current = ""
-    if current != _LO_REGISTRY:
-        with open(xcu, "w", encoding="utf-8") as fh:
-            fh.write(_LO_REGISTRY)
-    return profile
-
-
-async def _libreoffice_convert(input_path: str, output_format: str, output_dir: str) -> str:
-    """Convert a file with LibreOffice headless. Returns output path. The
-    caller passes an ``output_dir`` outside the agent tree (a temp directory)
-    and lands the result through ``safe_open_write``: LibreOffice writes by
-    name and must never write into the tree itself.
-
-    The run is a task of its own: a caller that stops waiting (the client
-    went away) ends it, and the run still ends its processes and waits for
-    them before it frees its slot."""
-    run = asyncio.ensure_future(_libreoffice_run(input_path, output_format, output_dir))
-    _lo_runs.add(run)
-    run.add_done_callback(_lo_runs.discard)
-    try:
-        await asyncio.shield(run)
-    except asyncio.CancelledError:
-        run.cancel()
-        raise
-    stem = Path(input_path).stem
-    out = Path(output_dir) / f"{stem}.{output_format}"
-    if not out.exists():
-        raise RuntimeError(f"Conversion produced no output file at {out}")
-    return str(out)
-
-
-async def _libreoffice_run(input_path: str, output_format: str, output_dir: str) -> None:
-    free = _lo_free_slots()
-    try:
-        slot = await asyncio.wait_for(free.get(), _LO_SLOT_WAIT_S)
-    except asyncio.TimeoutError as exc:
-        raise RuntimeError(
-            f"LibreOffice is busy: no conversion slot came free within {_LO_SLOT_WAIT_S}s"
-        ) from exc
-    proc = None
-    try:
-        # The slot is held: a drift rewrite never lands while a run reads it.
-        profile = await asyncio.to_thread(_libreoffice_profile, slot)
-        # Its own process group: the wrapper starts oosplash and soffice.bin,
-        # and ending the run ends all three.
-        proc = await asyncio.create_subprocess_exec(
-            "libreoffice", f"-env:UserInstallation=file://{profile}",
-            "--headless", "--norestore", "--convert-to",
-            output_format, "--outdir", output_dir, input_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            _stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_LO_TIMEOUT_S
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(f"LibreOffice conversion timed out ({_LO_TIMEOUT_S}s)") from exc
-        if proc.returncode != 0:
-            raise RuntimeError(f"LibreOffice error: {stderr.decode()[:500]}")
-    finally:
-        # Ending the group and freeing the slot is one task of its own: a
-        # cancel that arrives while a lingering group is ended (the person
-        # stops a conversion that just timed out) leaves it running, and the
-        # slot still comes back once the group is gone.
-        cleanup = asyncio.ensure_future(_end_and_free(proc, free, slot))
-        _lo_runs.add(cleanup)
-        cleanup.add_done_callback(_lo_runs.discard)
-        await asyncio.shield(cleanup)
-
-
-async def _end_and_free(proc, free: asyncio.Queue, slot: int) -> None:
-    try:
-        if proc is not None and proc.returncode is None:
-            await _end_process_group(proc)
-    finally:
-        free.put_nowait(slot)
-
-
-async def _end_process_group(proc) -> None:
-    """End a run's whole process group and wait, five seconds at most, until
-    none of it is left, so the next run on the slot's profile never meets a
-    dying instance. The grandchildren are reaped by the image's init."""
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, signal.SIGKILL)
-    await proc.wait()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(proc.pid, 0)
-        except (ProcessLookupError, PermissionError):
-            return
-        await asyncio.sleep(0.05)
-    logger.warning("LibreOffice run %s: its processes outlived the 5 s wait", proc.pid)
 
 
 # ---------------------------------------------------------------------------

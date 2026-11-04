@@ -608,9 +608,9 @@ class _PhoneCall:
             if phone_route_id else None
         )
         # The prompt lists the route's targets only on a line that
-        # can hand the caller over (the daemon's warmup says; an
-        # outbound AMI call's media leg names no channel to move).
-        # An older daemon never says: today's shape.
+        # can hand the caller over (the daemon's warmup says: Twilio
+        # always, an AMI line once its event listener covers the
+        # server). An older daemon never says: today's shape.
         can_transfer = bool(msg.get("transfer", True))
         self.transfer_targets = [
             t for t in ((route or {}).get("transfer_targets") or [])

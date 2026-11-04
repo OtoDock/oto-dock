@@ -8,7 +8,7 @@ import android.app.NotificationManager;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.ActivityInfo;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.media.AudioAttributes;
@@ -26,7 +26,6 @@ import android.provider.Settings;
 import android.util.Base64;
 import android.graphics.Color;
 import android.view.MotionEvent;
-import android.view.OrientationEventListener;
 import android.view.View;
 import android.view.Window;
 import android.animation.ArgbEvaluator;
@@ -40,7 +39,9 @@ import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 import android.widget.Toast;
+import androidx.activity.EdgeToEdge;
 import androidx.activity.OnBackPressedCallback;
+import androidx.activity.SystemBarStyle;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
@@ -59,6 +60,10 @@ import com.getcapacitor.BridgeActivity;
 import com.getcapacitor.BridgeWebViewClient;
 import com.getcapacitor.CapConfig;
 import com.getcapacitor.WebViewListener;
+import com.google.android.play.core.review.ReviewException;
+import com.google.android.play.core.review.ReviewManager;
+import com.google.android.play.core.review.ReviewManagerFactory;
+import com.google.android.play.core.review.testing.FakeReviewManager;
 import com.google.firebase.FirebaseApp;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -152,13 +157,11 @@ public class MainActivity extends BridgeActivity {
     private boolean splashRemoved = false;
     private volatile boolean splashGone = false;
     private boolean startupQuestionsWaiting = false;
-    // The container's two gradient stops and the bars as last painted, so the
-    // state survives the splash's removal and a configuration change (both
-    // re-apply the theme's own).
+    // The container's two gradient stops and the bars' icons as last set, so
+    // the state survives the splash's removal and a configuration change
+    // (both re-apply the theme's own).
     private final int[] containerColors = new int[2];
     private ValueAnimator containerFade;
-    private int barStatusColor;
-    private int barNavigationColor;
     private boolean barLight;
     // The bar insets last pushed to the page, in physical px (-1: none yet).
     private int barTopPx = -1;
@@ -168,8 +171,10 @@ public class MainActivity extends BridgeActivity {
     // survives the browser round-trip (onNewIntent), cleared on delivery/timeout.
     private volatile boolean authInProgress = false;
     private long authInProgressUntil = 0L;
-    // Set by the dashboard when live work (voice/meeting/upload/dirty form) would be
-    // lost on a switch. Combined with isStreaming for the switch busy-guard.
+    // Set by the dashboard when live work on this page (a live meeting or voice
+    // conversation in the chat) would be lost on a switch. A generating chat is
+    // not that: its turn runs on the server and the chat picks it up again, so
+    // streaming never blocks a switch.
     private volatile boolean switchBusyFlag = false;
     // 3-finger horizontal swipe tracking (install switcher).
     private boolean swipeArmed = false;
@@ -468,6 +473,8 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(NativeChannelPlugin.class);
         installBootSplash(savedInstanceState);
         super.onCreate(savedInstanceState);
+        // After the plugins' load(), which set the window's bar flags.
+        edgeToEdge();
         if (getBridge() == null) {
             // BridgeActivity fell back to its no-WebView layout: nothing below has
             // a WebView to work on.
@@ -680,14 +687,16 @@ public class MainActivity extends BridgeActivity {
         containerColors[1] = getColor(R.color.bootFieldDeep);
         container.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, containerColors.clone()));
         getBridge().getWebView().setBackgroundColor(getColor(R.color.bootField));
-        paintBars(getColor(R.color.bootField), getColor(R.color.bootFieldDeep), false);
+        paintBarIcons(false);
 
         ViewCompat.setOnApplyWindowInsetsListener(container, (view, insets) -> {
-            // Video fullscreen: go edge-to-edge — no system-bar padding so the
-            // web <video> fullscreen fills the whole screen (system bars are
-            // also hidden via the insets controller in enterVideoFullscreen).
+            // Video fullscreen: no system-bar padding, so the web <video>
+            // fullscreen fills the screen (enterVideoFullscreen hides the bars
+            // too); a camera cutout keeps its band, so the player's controls
+            // stay clear of it.
             if (videoFullscreen) {
-                view.setPadding(0, 0, 0, 0);
+                Insets cut = insets.getInsets(WindowInsetsCompat.Type.displayCutout());
+                view.setPadding(cut.left, cut.top, cut.right, cut.bottom);
                 return WindowInsetsCompat.CONSUMED;
             }
             Insets bars = insets.getInsets(
@@ -700,10 +709,11 @@ public class MainActivity extends BridgeActivity {
             // the dashboard CSS (.pb-composer-safe) so every client gets the gap.
             int bottomPadding = Math.max(ime.bottom, bars.bottom);
 
-            view.setPadding(0, bars.top, 0, bottomPadding);
-            // The screen's bars, for the page's boot screen: below Android 15
-            // the window fits the navigation bar, so this view's own bottom
-            // inset reads 0 there.
+            // Every side: a side navigation bar or cutout in landscape, and a
+            // window on a large screen, cover the page otherwise.
+            view.setPadding(bars.left, bars.top, bars.right, bottomPadding);
+            // The screen's bars, for the page's boot screen, from the root's
+            // insets (this view's own are what the parents left it).
             WindowInsetsCompat root = ViewCompat.getRootWindowInsets(view);
             Insets screenBars = (root != null ? root : insets).getInsets(
                 WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout()
@@ -741,6 +751,9 @@ public class MainActivity extends BridgeActivity {
             return bootHeld;
         });
         splash.setOnExitAnimationListener(provider -> {
+            // The library has just painted the theme's bar colours (Android 12
+            // and later): transparent again, before the fade shows them.
+            reapplyBars();
             splashLeaving = true;
             View view = provider.getView();
             Runnable gone = () -> {
@@ -845,19 +858,19 @@ public class MainActivity extends BridgeActivity {
         return activeOrigin != null && url != null && NativeBridgePolicy.sameOrigin(activeOrigin, url);
     }
 
-    /** The window's bar colours below Android 15 (later versions show what
-     *  is drawn beneath, the container) and the icon appearance of both
-     *  bars, recorded for reapplyBars. */
-    @SuppressWarnings("deprecation")
-    private void paintBars(int statusColor, int navigationColor, boolean lightBackground) {
-        barStatusColor = statusColor;
-        barNavigationColor = navigationColor;
+    /** Both bars transparent with no contrast scrim, on every Android
+     *  version: what shows beneath them is the container's background (the
+     *  boot field, then the page colour), which the insets listener pads. */
+    private void edgeToEdge() {
+        SystemBarStyle clear = SystemBarStyle.dark(Color.TRANSPARENT);
+        EdgeToEdge.enable(this, clear, clear);
+    }
+
+    /** The icons of both bars, dark on a light page, recorded for
+     *  reapplyBars. */
+    private void paintBarIcons(boolean lightBackground) {
         barLight = lightBackground;
         Window window = getWindow();
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-            window.setStatusBarColor(statusColor);
-            window.setNavigationBarColor(navigationColor);
-        }
         WindowInsetsControllerCompat ctl = WindowCompat.getInsetsController(window, window.getDecorView());
         if (ctl != null) {
             ctl.setAppearanceLightStatusBars(lightBackground);
@@ -865,10 +878,12 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
-    /** The bars as the page last set them: after the splash's removal and a
-     *  configuration change, both of which re-apply the theme's own. */
+    /** The bars as the page last set them: at the splash's hand-over and
+     *  removal and after a configuration change, all of which re-apply the
+     *  theme's own. */
     private void reapplyBars() {
-        paintBars(barStatusColor, barNavigationColor, barLight);
+        edgeToEdge();
+        paintBarIcons(barLight);
     }
 
     /** The bundled setup page follows the phone's theme. */
@@ -913,8 +928,9 @@ public class MainActivity extends BridgeActivity {
         if (nm == null || nm.canUseFullScreenIntent()) return false;
         if (!offerOnce(FULL_SCREEN_OFFERED)) return false;
         return showSettingsOffer("Alarms on the lock screen",
-                "To show a critical alarm over the lock screen, OtoDock needs the "
-                        + "full-screen alarm access. Turn it on in the setting that opens.",
+                "To show a critical alarm over the lock screen, OtoDock needs "
+                        + "full-screen notifications. Turn on Allow full-screen "
+                        + "notifications on the page that opens.",
                 "Open the setting",
                 new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
                         Uri.parse("package:" + getPackageName())));
@@ -927,32 +943,162 @@ public class MainActivity extends BridgeActivity {
      * opened, or restricted), and then the alarm shows as a full-screen
      * notification that starts the sound once opened (NotificationService).
      * The direct exemption request needs a permission Play grants only when
-     * the core function fails without it, so the person is pointed once to the
-     * app's battery setting instead.
+     * the core function fails without it, so this offer points the person
+     * once to the app's battery setting instead. App Settings keeps a row
+     * that opens the same page while the setting would help.
      */
     private boolean offerBatterySettingsOnce() {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-        ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
-        boolean restricted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                && am != null && am.isBackgroundRestricted();
-        if (pm == null || (pm.isIgnoringBatteryOptimizations(getPackageName()) && !restricted)) return false;
+        if (pm == null || !OneTimeOffers.batteryHelps(
+                pm.isIgnoringBatteryOptimizations(getPackageName()), backgroundRestricted())) return false;
         if (!offerOnce(BATTERY_SETTINGS_OFFERED)) return false;
         return showSettingsOffer("Alarms on this phone",
                 "Android can hold back alarms from an app you rarely open. To have "
                         + "OtoDock's alarms ring on time, open Battery in its settings and "
                         + "choose Unrestricted (on some phones: Battery optimization, then "
                         + "Don't optimize).",
-                "Open OtoDock's settings",
-                new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.parse("package:" + getPackageName())));
+                "Open OtoDock's settings", appDetailsSettings());
+    }
+
+    private boolean backgroundRestricted() {
+        ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                && am != null && am.isBackgroundRestricted();
+    }
+
+    /** This app's own page in the phone's settings, where Battery is. */
+    private Intent appDetailsSettings() {
+        return new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + getPackageName()));
+    }
+
+    /** App Settings asks whether to show its battery row: the offer's own
+     *  question, answered again on every opening, false when it cannot be
+     *  read (the row then stays away). */
+    private boolean batteryAdvice() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            return pm != null && OneTimeOffers.batteryHelps(
+                    pm.isIgnoringBatteryOptimizations(getPackageName()), backgroundRestricted());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private long batterySettingsOpenedAt = 0L;
+
+    /** App Settings' battery row: this app's settings page, never another
+     *  address. Any thread. At most once in two seconds, as the privacy link. */
+    private void openBatterySettings() {
+        runOnUiThread(() -> {
+            long now = SystemClock.elapsedRealtime();
+            if (batterySettingsOpenedAt != 0L && now - batterySettingsOpenedAt < 2000L) return;
+            batterySettingsOpenedAt = now;
+            try {
+                startActivity(appDetailsSettings());
+            } catch (Exception e) {
+                // Some OEMs leave a settings page out.
+                try {
+                    startActivity(new Intent(Settings.ACTION_SETTINGS));
+                } catch (Exception ignored) {}
+            }
+        });
+    }
+
+    private static final String STORE_REVIEW_ASKED_AT = "store_review_asked_at";
+    /** The store gets this long to answer; the page waits ten seconds. */
+    private static final long STORE_REVIEW_WAIT_MS = 8000L;
+
+    /**
+     * The store's own review sheet (Play's in-app review). The dashboard
+     * decides when; Play decides whether the sheet shows and never says.
+     * Answers true only when the request went to a Play that can show it:
+     * this build was installed by Play and is not debuggable. A debuggable
+     * build runs the flow against Play's test manager, which shows nothing,
+     * logs it and answers false, so the page records no ask. At most one
+     * hand-over a day for the whole app (OneTimeOffers.reviewDue); a store
+     * that does not answer in time gets no late launch.
+     */
+    private void requestStoreReview(JavaScriptReplyProxy reply, int id) {
+        runOnUiThread(() -> {
+            final AtomicBoolean answered = new AtomicBoolean(false);
+            final java.util.function.Consumer<Boolean> answer = handed -> {
+                if (answered.compareAndSet(false, true)) replyNative(reply, id, handed);
+            };
+            if (isPaused || isFinishing() || isDestroyed()) {
+                answer.accept(false);
+                return;
+            }
+            final SharedPreferences prefs = getSharedPreferences(AUX_PREFS, MODE_PRIVATE);
+            final long now = System.currentTimeMillis();
+            if (!OneTimeOffers.reviewDue(prefs.getLong(STORE_REVIEW_ASKED_AT, 0L), now)) {
+                Log.i(TAG, "store review not handed over: one a day");
+                answer.accept(false);
+                return;
+            }
+            final boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            if (!debuggable && !installedByPlay()) {
+                Log.i(TAG, "store review not handed over: not installed from Play");
+                answer.accept(false);
+                return;
+            }
+            final ReviewManager manager = debuggable
+                    ? new FakeReviewManager(this) : ReviewManagerFactory.create(this);
+            getWindow().getDecorView().postDelayed(() -> {
+                if (!answered.get()) Log.i(TAG, "store review not handed over: no answer from Play");
+                answer.accept(false);
+            }, STORE_REVIEW_WAIT_MS);
+            manager.requestReviewFlow().addOnCompleteListener(this, request -> {
+                if (answered.get()) return;
+                if (!request.isSuccessful()) {
+                    Exception err = request.getException();
+                    Log.i(TAG, "store review not available: " + (err instanceof ReviewException
+                            ? "error " + ((ReviewException) err).getErrorCode() : "no answer"));
+                    answer.accept(false);
+                    return;
+                }
+                if (isPaused || isFinishing() || isDestroyed()) {
+                    answer.accept(false);
+                    return;
+                }
+                prefs.edit().putLong(STORE_REVIEW_ASKED_AT, now).apply();
+                manager.launchReviewFlow(this, request.getResult()).addOnCompleteListener(this, done ->
+                        Log.i(TAG, debuggable
+                                ? "store review handed over (test build, no sheet)"
+                                : "store review handed over"));
+                answer.accept(!debuggable);
+            });
+        });
+    }
+
+    /** Whether Play installed this build (its internal testing and app
+     *  sharing included); a sideloaded or self-built APK is unknown to it. */
+    @SuppressWarnings("deprecation")
+    private boolean installedByPlay() {
+        try {
+            String installer = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? getPackageManager().getInstallSourceInfo(getPackageName()).getInstallingPackageName()
+                    : getPackageManager().getInstallerPackageName(getPackageName());
+            return "com.android.vending".equals(installer);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** True the first time for this key, recording it. */
     private boolean offerOnce(String key) {
         SharedPreferences prefs = getSharedPreferences(AUX_PREFS, MODE_PRIVATE);
-        if (prefs.getBoolean(key, false)) return false;
-        prefs.edit().putBoolean(key, true).apply();
-        return true;
+        return OneTimeOffers.take(new OneTimeOffers.Flags() {
+            @Override
+            public boolean get(String k) {
+                return prefs.getBoolean(k, false);
+            }
+
+            @Override
+            public void set(String k) {
+                prefs.edit().putBoolean(k, true).apply();
+            }
+        }, key);
     }
 
     private boolean showSettingsOffer(String title, String message, String open, Intent settings) {
@@ -1276,43 +1422,8 @@ public class MainActivity extends BridgeActivity {
     private volatile boolean isStreaming = false;
     private boolean isPaused = false;
     // True while a web <video> is in fullscreen (set via the JS bridge) — the
-    // inset listener then drops system-bar padding for true edge-to-edge.
+    // inset listener then pads the display cutout only.
     private volatile boolean videoFullscreen = false;
-    private OrientationEventListener videoOrientationRelease;
-
-    /**
-     * The SENSOR_LANDSCAPE set on video-fullscreen entry is a CUE, not a pin:
-     * once the user physically holds the phone in landscape (they accepted
-     * the rotation), switch to FULL_SENSOR so turning the phone upright
-     * rotates the video back to portrait fullscreen — with or without the
-     * system auto-rotate toggle (YouTube-style). If they never rotate the
-     * phone, the landscape cue stays.
-     */
-    private void armVideoOrientationRelease() {
-        disarmVideoOrientationRelease();
-        videoOrientationRelease = new OrientationEventListener(this) {
-            @Override
-            public void onOrientationChanged(int deg) {
-                if (deg == ORIENTATION_UNKNOWN || !videoFullscreen) return;
-                boolean physicallyLandscape =
-                    (deg >= 60 && deg <= 120) || (deg >= 240 && deg <= 300);
-                if (physicallyLandscape) {
-                    setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR);
-                    disarmVideoOrientationRelease();
-                }
-            }
-        };
-        if (videoOrientationRelease.canDetectOrientation()) {
-            videoOrientationRelease.enable();
-        }
-    }
-
-    private void disarmVideoOrientationRelease() {
-        if (videoOrientationRelease != null) {
-            videoOrientationRelease.disable();
-            videoOrientationRelease = null;
-        }
-    }
 
     // --- The dashboard channel ---
 
@@ -1414,6 +1525,9 @@ public class MainActivity extends BridgeActivity {
                     break;
                 case "openAddInstallation": loadSetupPage("mode=add"); break;
                 case "openPrivacyPolicy": openPrivacyPolicyInBrowser(); break;
+                case "getBatteryAdvice": replyNative(reply, id, batteryAdvice()); break;
+                case "openBatterySettings": openBatterySettings(); break;
+                case "requestStoreReview": requestStoreReview(reply, id); break;
                 case "removeInstallation": removeInstallation(arg(args, 0)); break;
                 case "disconnectServer": disconnectServer(); break;
                 case "foldNote": {
@@ -1479,7 +1593,7 @@ public class MainActivity extends BridgeActivity {
                 WebView wv = getBridge().getWebView();
                 View container = (View) wv.getParent();
                 wv.setBackgroundColor(to);
-                paintBars(to, to, ColorUtils.calculateLuminance(to) > 0.5);
+                paintBarIcons(ColorUtils.calculateLuminance(to) > 0.5);
                 if (containerFade != null) containerFade.cancel();
                 final int fromTop = containerColors[0];
                 final int fromBottom = containerColors[1];
@@ -1502,15 +1616,21 @@ public class MainActivity extends BridgeActivity {
 
     /**
      * Enter edge-to-edge video fullscreen: drop the WebView's system-bar
-     * padding (so a web &lt;video&gt; fullscreen fills the screen), hide
-     * the status/nav bars (immersive), and lock landscape for wide
-     * videos. Called by VideoPlayer.tsx on fullscreen enter.
+     * padding (so a web &lt;video&gt; fullscreen fills the screen) and hide
+     * the status/nav bars (immersive). Called by VideoPlayer.tsx on
+     * fullscreen enter. The screen turns with the phone: the app requests no
+     * orientation (Android 16 ignores one on a large screen, and Play counts
+     * it against large-screen support), so the page's wide-video hint
+     * {@code landscape} is accepted and unused.
      */
     private void enterVideoFullscreen(boolean landscape) {
         runOnUiThread(() -> {
             videoFullscreen = true;
             try {
                 View container = (View) getBridge().getWebView().getParent();
+                // The cutout's band beside the player is black, as a player's.
+                if (containerFade != null) containerFade.end();
+                container.setBackgroundColor(Color.BLACK);
                 ViewCompat.requestApplyInsets(container);
                 WindowInsetsControllerCompat ctl = WindowCompat.getInsetsController(
                     getWindow(), getWindow().getDecorView());
@@ -1519,28 +1639,24 @@ public class MainActivity extends BridgeActivity {
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
                     ctl.hide(WindowInsetsCompat.Type.systemBars());
                 }
-                if (landscape) {
-                    setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
-                    armVideoOrientationRelease();
-                }
             } catch (Exception ignored) {}
         });
     }
 
-    /** Exit video fullscreen: restore padding, system bars, orientation. */
+    /** Exit video fullscreen: restore the padding, the container and the bars. */
     private void exitVideoFullscreen() {
         runOnUiThread(() -> {
             videoFullscreen = false;
-            disarmVideoOrientationRelease();
             try {
                 View container = (View) getBridge().getWebView().getParent();
+                container.setBackground(new GradientDrawable(
+                        GradientDrawable.Orientation.TOP_BOTTOM, containerColors.clone()));
                 ViewCompat.requestApplyInsets(container);
                 WindowInsetsControllerCompat ctl = WindowCompat.getInsetsController(
                     getWindow(), getWindow().getDecorView());
                 if (ctl != null) {
                     ctl.show(WindowInsetsCompat.Type.systemBars());
                 }
-                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
             } catch (Exception ignored) {}
         });
     }
@@ -1947,9 +2063,9 @@ public class MainActivity extends BridgeActivity {
         });
     }
 
-    /** A switch would lose live work (an LLM stream or a dashboard-reported session). */
+    /** A switch would lose live work on this page (the dashboard's own report). */
     private boolean switchIsBusy() {
-        return isStreaming || switchBusyFlag;
+        return switchBusyFlag;
     }
 
     /** Capture the current install's in-app route (so it reopens there) and switch. */
@@ -2282,15 +2398,11 @@ public class MainActivity extends BridgeActivity {
     /**
      * Fold/unfold (and any other in-process config change — the manifest's
      * configChanges swallows recreation, so this is the only hook that runs).
-     * Two belt-and-braces recoveries for the foldable stuck-in-landscape
-     * family, both no-ops on a healthy pass:
-     * 1. Clear a stale video-fullscreen orientation lock — SENSOR_LANDSCAPE
-     *    is the only orientation this app ever requests, and outside video
-     *    fullscreen nothing should hold it.
-     * 2. Re-drive the WebView's layout: fold display switches can leave the
-     *    WebView surface sized for the previous display (known
-     *    WebView-on-foldable stuck-surface family); requestLayout now and
-     *    once more after the transition settles.
+     * A belt-and-braces recovery for the foldable stuck-surface family, a
+     * no-op on a healthy pass: re-drive the WebView's layout, since fold
+     * display switches can leave the WebView surface sized for the previous
+     * display (known WebView-on-foldable stuck-surface family);
+     * requestLayout now and once more after the transition settles.
      * The fold log records the change first, then the frames that follow.
      */
     @Override
@@ -2299,12 +2411,6 @@ public class MainActivity extends BridgeActivity {
         super.onConfigurationChanged(newConfig);
         // Capacitor's plugins re-applied their own bar styles just now.
         reapplyBars();
-        try {
-            if (!videoFullscreen
-                    && getRequestedOrientation() == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
-                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-            }
-        } catch (Exception ignored) {}
         try {
             final WebView wv = (getBridge() != null) ? getBridge().getWebView() : null;
             if (wv != null) {

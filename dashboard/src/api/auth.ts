@@ -40,6 +40,10 @@ export interface User {
     // clients fall back to the shipped defaults when absent.
     upload_max_bytes?: number
     recover_bin_max_bytes?: number
+    // The apps' store review ask (hooks/storeReview): the admin's switch and
+    // the days before the second ask.
+    store_review_enabled?: boolean
+    store_review_days?: number
   }
 }
 

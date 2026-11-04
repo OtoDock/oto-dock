@@ -55,3 +55,60 @@ def test_build_user_response_always_includes_flags():
     row = {"sub": "u-flags-unit", "email": "u@t.com", "name": "U", "role": "member"}
     payload = _build_user_response(row, agents=[], agent_roles={})
     assert _FLAG_KEYS <= set(payload["feature_flags"])
+
+
+# --- the apps' store review ask (two admin settings, read through the flags) ---
+
+_REVIEW_KEYS = ("store_review_enabled", "store_review_days")
+
+
+@pytest.fixture
+def _review_settings():
+    from auth.providers import UserContext, get_current_user
+
+    async def _admin():
+        return UserContext(sub="review-admin", email="ra@t.com", name="A", role="admin")
+    app.dependency_overrides[get_current_user] = _admin
+    for key in _REVIEW_KEYS:
+        db.set_platform_setting(key, "")
+    yield
+    for key in _REVIEW_KEYS:
+        db.set_platform_setting(key, "")
+    app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_the_store_review_flags_default_on_and_ninety_days(_review_settings):
+    flags = build_feature_flags()
+    assert flags["store_review_enabled"] is True
+    assert flags["store_review_days"] == 90
+
+
+@pytest.mark.parametrize(("stored", "read"), [
+    ("45", 45), ("30", 30), ("730", 730), ("5", 30), ("9999", 730), ("soon", 90), ("", 90),
+])
+def test_the_store_review_days_read_inside_the_range(_review_settings, stored, read):
+    db.set_platform_setting("store_review_days", stored)
+    assert build_feature_flags()["store_review_days"] == read
+
+
+def test_an_admin_turns_the_store_review_off_and_spaces_it(_review_settings):
+    r = client.put("/v1/admin/platform-settings",
+                   json={"store_review_enabled": False, "store_review_days": "120"})
+    assert r.status_code == 200, r.text
+    got = client.get("/v1/admin/platform-settings").json()
+    assert got["store_review_enabled"] is False and got["store_review_days"] == 120
+    flags = build_feature_flags()
+    assert flags["store_review_enabled"] is False and flags["store_review_days"] == 120
+    assert client.put("/v1/admin/platform-settings", json={"store_review_days": 30}).status_code == 200
+    assert client.put("/v1/admin/platform-settings", json={"store_review_days": "730"}).status_code == 200
+    assert build_feature_flags()["store_review_days"] == 730
+
+
+@pytest.mark.parametrize("bad", ["29", "731", "soon", "", "45.5", 45.5, "\u00b2", "4\u00b2", -1, 0])
+def test_a_store_review_days_value_out_of_range_is_refused_before_any_write(_review_settings, bad):
+    r = client.put("/v1/admin/platform-settings",
+                   json={"store_review_enabled": False, "store_review_days": bad})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "The days before the second ask are a whole number from 30 to 730."
+    assert db.get_platform_setting("store_review_enabled") == ""
+    assert db.get_platform_setting("store_review_days") == ""

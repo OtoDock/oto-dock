@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { CHAT_PHASE, LANE_STATUS, isLiveChatPhase, laneStatusOf } from '@/lib/status/chat'
 import { RUN_STATUS, isLiveRunStatus } from '@/lib/status/run'
 import { MACHINE_STATE, isReachableMachine } from '@/lib/status/machine'
+import { NOTIFICATION_SEVERITIES, NOTIFICATION_SEVERITY, isAlarm } from '@/lib/status/notificationSeverity'
 
 // The mirrors' predicates (core-seams phase 8). The sets themselves are
 // bound to the proxy by tests/storage/test_status_vocabularies.py.
@@ -53,5 +54,13 @@ describe('the liveness predicates', () => {
     for (const s of [MACHINE_STATE.PAUSED, MACHINE_STATE.DISCONNECTED, MACHINE_STATE.NEVER_CONNECTED, 'offline', null]) {
       expect(isReachableMachine(s)).toBe(false)
     }
+  })
+})
+
+describe('isAlarm', () => {
+  it('only danger is the alarm', () => {
+    expect(NOTIFICATION_SEVERITIES.filter(s => isAlarm(s))).toEqual([NOTIFICATION_SEVERITY.DANGER])
+    expect(isAlarm(undefined)).toBe(false)
+    expect(isAlarm('error')).toBe(false)
   })
 })

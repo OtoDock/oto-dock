@@ -14,6 +14,8 @@ describe('feature flags', () => {
       interactive_terminal_enabled: true,
       upload_max_bytes: 1024 * 1024 * 1024,
       recover_bin_max_bytes: 100 * 1024 * 1024,
+      store_review_enabled: true,
+      store_review_days: 90,
     })
     for (const u of [null, undefined, user(), user({})]) {
       expect(flagValue(u, 'remote_machines_available')).toBe(true)

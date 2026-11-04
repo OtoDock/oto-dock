@@ -61,8 +61,11 @@ class _Store:
             self.rows.append({"role": "event", "event_type": event_type,
                               "event_data": json.loads(event_data)})
         else:
-            self.rows.append({"role": role, "content": content, "author_sub": author_sub,
-                              "sync_search": kw.get("sync_search", True)})
+            row = {"role": role, "content": content, "author_sub": author_sub,
+                   "sync_search": kw.get("sync_search", True)}
+            if event_data:  # a progress note's {"note": true}
+                row["event_data"] = json.loads(event_data)
+            self.rows.append(row)
 
     def get_chat(self, chat_id):
         return self.row if chat_id == CHAT else None
@@ -71,20 +74,30 @@ class _Store:
         self.updates.append(kw)
         self.row.update(kw)
 
+    def set_chat_title_if_unset(self, chat_id, title):
+        """The real write's condition: only an untitled row takes it."""
+        if (self.row.get("title") or "").strip():
+            return False
+        self.update_chat(chat_id, title=title)
+        return True
+
     def get_chat_messages(self, chat_id, limit=500, **kw):
         return list(self.prefix_rows)
 
     def persisted_as_prefix(self) -> list[dict]:
-        """The rows as ``get_chat_messages`` would hand them back (newest
-        first) for a later first tail's prefix merge."""
+        """The rows as ``get_chat_messages`` would hand them back (in
+        chronological order) for a later first tail's prefix merge."""
         out = []
         for r in self.rows:
             if r["role"] == "event":
                 out.append({"role": "event", "content": "", "event_type": r["event_type"],
                             "event_data": json.dumps(r["event_data"])})
             else:
-                out.append({"role": r["role"], "content": r["content"]})
-        return list(reversed(out))
+                row = {"role": r["role"], "content": r["content"]}
+                if "event_data" in r:
+                    row["event_data"] = json.dumps(r["event_data"])
+                out.append(row)
+        return out
 
     def snapshot(self) -> dict:
         return copy.deepcopy({
@@ -114,6 +127,7 @@ def store(monkeypatch):
     monkeypatch.setattr(db, "rebuild_chat_search", st.rebuilds.append)
     monkeypatch.setattr(db, "get_chat", st.get_chat)
     monkeypatch.setattr(db, "update_chat", st.update_chat)
+    monkeypatch.setattr(db, "set_chat_title_if_unset", st.set_chat_title_if_unset)
     monkeypatch.setattr(db, "get_chat_messages", st.get_chat_messages)
     monkeypatch.setattr(usage_service, "record_turn_usage", st.usage.extend)
     monkeypatch.setattr(subscription_pool, "get_session_subscription", lambda sid: None)
@@ -327,3 +341,14 @@ def test_codex_sent_prompt_consumed(codex_store):
     _TE.note_sent_prompt(CHAT, text.replace("\n\n", "\n"))
     results = [C.tail_lines(sid, CHAT, lines)]
     check_golden("tailer-codex-sent-prompt", _result(sid, C, codex_store, results))
+
+
+def test_the_prefix_reads_the_store_in_chronological_order(temp_db):
+    # The real store, not a mock: the merge walks the rows oldest first.
+    note = json.dumps({"note": True})
+    temp_db.create_chat("c-order", "user-admin", "a1")
+    for role, text, data in [("user", "q1", ""), ("assistant", "I'll look.", note),
+                             ("assistant", "a1", ""), ("user", "q2", "")]:
+        temp_db.add_chat_message("c-order", role, text, event_data=data)
+    prefix, _ = C._persisted_prefix("c-order")
+    assert prefix == [("user", "q1"), ("assistant", "I'll look."), ("assistant", "a1"), ("user", "q2")]

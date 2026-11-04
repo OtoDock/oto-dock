@@ -51,13 +51,17 @@ export function AccountsManager({ integration, ops }: Props) {
         </div>
         {/* A rotated chevron stacks above the stretched toggle: no pointer here. */}
         <div className="pointer-events-none flex items-center gap-2 shrink-0">
-          {accounts.length > 0 ? (
-            <Badge variant="success">
-              {accounts.length} account{accounts.length === 1 ? '' : 's'}
-            </Badge>
-          ) : (
+          {accounts.length === 0 ? (
             <Badge variant="warning">
               Not Connected
+            </Badge>
+          ) : accounts.some((a) => a.needs_reconnect) ? (
+            <Badge variant="warning">
+              Reconnect needed
+            </Badge>
+          ) : (
+            <Badge variant="success">
+              {accounts.length} account{accounts.length === 1 ? '' : 's'}
             </Badge>
           )}
           <svg

@@ -503,6 +503,70 @@ class TestEngineCatalog:
         assert "✅" in out
         assert ("PATCH", "/v1/agents/demo", {"default_execution_mode": "interactive"}) in calls
 
+    def test_the_toggle_rides_the_patch_only_when_given(self):
+        mod, calls = self._load()
+        # Without the toggle the body is the allowlist alone (a tool that
+        # names nothing about local models leaves the setting as it is).
+        out = asyncio.run(mod._tool_update_execution_layers(["acme-cli", "zephyr-api"]))
+        assert "✅" in out and "local" not in out.lower()
+        assert ("PATCH", "/v1/agents/demo", {"execution_paths": ["acme-cli", "zephyr-api"]}) in calls
+        # The catalog declares no local provider: the toggle is refused
+        # before any PATCH.
+        out = asyncio.run(mod._tool_update_execution_layers(["acme-cli"], ["acme-cli"]))
+        assert "❌" in out and "cannot be limited to local models" in out
+        # An empty toggle clears it and rides the body.
+        out = asyncio.run(mod._tool_update_execution_layers(["acme-cli"], []))
+        assert "✅" in out and "No engine is limited to local models" in out
+        assert ("PATCH", "/v1/agents/demo",
+                {"execution_paths": ["acme-cli"], "local_only_engines": []}) in calls
+
+    def test_a_local_provider_fills_the_toggles_enum_and_text(self):
+        mod, calls = self._load()
+        catalog = json.loads(json.dumps(self.CATALOG))
+        catalog["acme-cli"]["providers"] = [{"id": "acme", "kind": "vendor"}, {"id": "ollama", "kind": "local"}]
+        real = mod._request
+
+        async def fake_request(method, path, **kwargs):
+            if path == "/v1/execution-layers":
+                return catalog
+            return await real(method, path, **kwargs)
+        mod._request = fake_request
+        tools = self._tools(mod)
+        schema = tools["update_execution_layers"].inputSchema["properties"]["local_only_layers"]
+        assert schema["items"]["enum"] == ["acme-cli"]
+        assert "possible on acme-cli" in tools["update_execution_layers"].description
+        assert "{local_engines}" not in tools["update_execution_layers"].description
+        out = asyncio.run(mod._tool_update_execution_layers(["acme-cli"], ["acme-cli"]))
+        assert "✅" in out and "Local models only on ['acme-cli']" in out
+        assert ("PATCH", "/v1/agents/demo",
+                {"execution_paths": ["acme-cli"], "local_only_engines": ["acme-cli"]}) in calls
+
+    def test_without_a_local_provider_the_description_says_so(self):
+        mod, _ = self._load()
+        tools = self._tools(mod)
+        desc = tools["update_execution_layers"].description
+        assert "possible on no engine of this platform" in desc
+        assert "resolve per person" in desc
+        assert "resolve per person" in tools["list_available_models"].description
+        assert "stays a preference" in tools["update_default_layer"].description
+
+    def test_list_available_models_flags_what_the_person_can_run(self):
+        mod, _ = self._load()
+        real = mod._request
+
+        async def fake_request(method, path, **kwargs):
+            if path.endswith("/info"):
+                return {"execution_path": "acme-cli", "execution_paths": ["acme-cli", "zephyr-api"],
+                        "default_model": "z-1", "engine_for_me": "zephyr-api",
+                        "engines_for_me": {"acme-cli": False, "zephyr-api": True},
+                        "local_only_engines": ["zephyr-api"]}
+            return await real(method, path, **kwargs)
+        mod._request = fake_request
+        out = asyncio.run(mod._tool_list_available_models())
+        assert "## Acme Coder (`acme-cli`) — **the agent's default engine** — you cannot run it here" in out
+        assert "## Zephyr API (`zephyr-api`) — **allowed on this agent** — your new chats take it — local models only" in out
+        assert "Engines resolve per person" in out
+
     def test_list_available_models_names_what_auto_runs(self):
         mod, _ = self._load()
         out = asyncio.run(mod._tool_list_available_models())

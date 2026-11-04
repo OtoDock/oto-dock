@@ -31,7 +31,7 @@ SERVERS = {
     "file-tools-mcp": "server.py", "image-gen-mcp": "server.py", "image-search-mcp": "server.py",
     "location-mcp": "server.py", "mcps-mcp": "server.py", "meetings-mcp": "server.py",
     "music-gen-mcp": "server.py", "notifications-mcp": "server.py", "schedules-mcp": "server.py",
-    "ssh-hosts": "server.py", "transcribe-mcp": "server.py", "triggers-mcp": "server.py",
+    "settings-mcp": "server.py", "ssh-hosts": "server.py", "transcribe-mcp": "server.py", "triggers-mcp": "server.py",
     "tts-mcp": "server.py", "video-gen-mcp": "server.py",
 }
 

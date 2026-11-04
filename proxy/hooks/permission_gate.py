@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Transport failures fail CLOSED. The alternative — silently allowing the
@@ -44,12 +45,53 @@ _SOCKET_TIMEOUT_S = 150
 # policy with OTO_HOOK_BRIDGED set: every command reaches its bridge, so
 # the gate stands aside on such a turn. Nothing else sets the switch.
 _BRIDGE_ASKS = frozenset({"default", "acceptEdits", "plan"})
+# What the hold met last and for how long, for the deny reason: the class of
+# the failure and its address, so a refused call says which link failed
+# (``_failure_of``). ``_where`` is PROXY_URL's host and port (``main``).
+_where = ""
+_last_failure = ""
+_held_s = 0.0
+
+
+def _error_word(e):
+    """The ``error`` word of a synthetic tunnel answer, "" for any other body."""
+    try:
+        return str(json.loads(e.read().decode("utf-8", "replace") or "{}").get("error") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _failure_of(exc):
+    """One failure of the hold in words: its class and address, never a
+    traceback (the reason reaches the model and the chat)."""
+    where = _where or "the platform"
+    if isinstance(exc, urllib.error.HTTPError):
+        word = _error_word(exc)
+        if exc.code == 503 and word == "tunnel-not-connected":
+            return "this machine's link to OtoDock was down: 503"
+        if exc.code == 502 and word == "tunnel-disconnected":
+            return "this machine's link to OtoDock dropped: 502"
+        return f"{exc.code} from the platform"
+    if isinstance(exc, urllib.error.URLError):
+        exc = exc.reason if isinstance(exc.reason, BaseException) else exc
+    if isinstance(exc, ConnectionRefusedError):
+        return f"no answer at {where}: connection refused"
+    if isinstance(exc, ConnectionResetError):
+        return f"no answer at {where}: connection reset"
+    if isinstance(exc, TimeoutError):
+        return f"no answer at {where}: timed out"
+    if isinstance(exc, (http.client.HTTPException, ValueError)):
+        return "the platform's answer was cut off"
+    if isinstance(exc, OSError):
+        return f"no answer at {where}: {exc.strerror or type(exc).__name__}"
+    return f"no answer at {where}"
 
 
 def _request_decision(req):
     """POST to the proxy. The decision dict; a deny for a definitive refusal;
     None when the platform stayed unreachable for the whole hold, counted
     from the first failure (a prompt may wait days before its stream drops)."""
+    global _last_failure, _held_s
     deadline = None
     unreachable = auth = 0
     while True:
@@ -59,6 +101,7 @@ def _request_decision(req):
             if text:
                 return json.loads(text)
             # A 2xx whose body ended before its JSON: the stream dropped.
+            _last_failure = "the platform's answer was cut off"
         except urllib.error.HTTPError as e:
             if e.code == 401 and auth < len(_AUTH_LADDER):
                 time.sleep(_AUTH_LADDER[auth])
@@ -67,12 +110,15 @@ def _request_decision(req):
             if e.code not in (502, 503, 504):
                 return {"decision": "deny",
                         "reason": f"OtoDock refused this tool call (HTTP {e.code})"}
-        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
-            pass  # unreachable, or a streamed answer cut before its JSON
+            _last_failure = _failure_of(e)
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
+            # Unreachable, or a streamed answer cut before its JSON.
+            _last_failure = _failure_of(e)
         wait = _BACKOFF[min(unreachable, len(_BACKOFF) - 1)]
         if deadline is None:
             deadline = time.monotonic() + _HOLD_S
         if time.monotonic() + wait > deadline:
+            _held_s = time.monotonic() - (deadline - _HOLD_S)
             return None
         time.sleep(wait)
         unreachable += 1
@@ -133,6 +179,8 @@ def main():
     session_id = os.environ.get("OTO_SESSION_ID", "")
     proxy_url = os.environ.get("PROXY_URL", "")
     api_key = os.environ.get("PROXY_API_KEY", "")
+    global _where
+    _where = urllib.parse.urlsplit(proxy_url).netloc
 
     # If env vars aren't set (e.g. subagent call), allow by default
     if not proxy_url or not api_key:
@@ -151,6 +199,9 @@ def main():
         # This host's clock, the one the CLI's transcript lines carry: a
         # terminal's turn parked on a dialog ignores lines journaled before.
         "hook_sent_at": time.time(),
+        # The call's id: a call allowed in Plan is recorded under it for the
+        # CLI's own ask that follows (Claude Code 2.1.299+).
+        "tool_use_id": inp.get("tool_use_id", ""),
     }).encode()
 
     req = urllib.request.Request(
@@ -165,7 +216,8 @@ def main():
     result = _request_decision(req)
     if result is None:
         decision = "deny"
-        reason = "OtoDock platform unreachable — tool call denied (fail closed)"
+        reason = (f"OtoDock platform unreachable ({_last_failure or 'no answer'} for "
+                  f"{_held_s:.0f} s). Tool call denied (fail closed).")
         updated_input = None
     else:
         decision = result.get("decision", "allow")
@@ -226,6 +278,14 @@ def main():
 
 if __name__ == "__main__":
     try:
+        # PROXY_URL is a loopback address (the platform's own listener, or a
+        # satellite's tunnel): no proxy may stand between. urllib's default
+        # opener takes the environment's proxy and, on Windows, Internet
+        # Options' (whose <local> exemption skips only dotless hosts, never
+        # 127.0.0.1). Installed here, never at import: a test that loads the
+        # script keeps its own opener.
+        urllib.request.install_opener(
+            urllib.request.build_opener(urllib.request.ProxyHandler({})))
         main()
     except Exception:  # noqa: BLE001  # the gate answers deny on any crash, a traceback lets the tool run
         # A hook crash enforces nothing on its own: both CLIs read a non-zero

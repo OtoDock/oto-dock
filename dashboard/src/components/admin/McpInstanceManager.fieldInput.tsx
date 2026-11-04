@@ -48,7 +48,9 @@ export function InstanceFieldInput({
               // Dropdown sourced from enabled outbound phone
               // routes. Value = route.id (UUID), label = human-readable
               // name (falls back to "<direction> <id-prefix>" if route
-              // has no name).
+              // has no name). The route's agent speaks on the call, so a
+              // route of another agent is a valid pick.
+              <>
               <Select
                 id={id}
                 className="mt-1"
@@ -62,6 +64,10 @@ export function InstanceFieldInput({
                   </option>
                 ))}
               </Select>
+              <p className="mt-1 text-xs text-tertiary">
+                The route's agent speaks on the call. Every agent this instance is assigned to can place calls through it.
+              </p>
+              </>
             ) : f.input_type === 'stt_provider_select' ? (
               // transcribe-mcp: bind an STT provider to this instance. Value =
               // provider id (string); blank = the platform's default STT.

@@ -6,18 +6,26 @@ plus one server-GENERATED ``MEMORY.md`` index per scope:
 - agent scope: ``agents/{agent}/knowledge/memory/``        (shared across users)
 - user scope:  ``agents/{agent}/users/{u}/context/memory/`` (per user, per agent)
 
-Agents read memory from their system prompt (the proxy injects either the
-full topic files or, past a byte budget, just the index) and write it ONLY
+Agents read memory from their system prompt (the proxy injects the topic
+files whole under a byte budget; past it the newest that fit load whole and
+the rest are listed with their index entries) and write it ONLY
 through the ``memory`` MCP tool → ``POST /v1/internal/memory/op``, which
 calls into this module. The command set mirrors Anthropic's
 ``memory_20250818`` contract (view / create / str_replace / insert / delete /
 rename) including its success/error strings — models are trained on them.
 
-``MEMORY.md`` is deterministic server output (one line per topic file, taken
-from the file's first heading/line) — no LLM is involved anywhere. It is
-regenerated synchronously after every mutation and lazily healed at
+``MEMORY.md`` is deterministic server output (``memory_index``: per topic
+the heading, a summary line, the size, the entry count, the newest date and
+the ``##`` sections with their line numbers) — no LLM is involved anywhere.
+It is regenerated synchronously after every mutation and lazily healed at
 injection time when a human hand-edited topic files directly (dashboard /
-satellite), so it can never drift.
+satellite) or when an older builder wrote it, so it drifts only while its
+folder cannot be written (the prompt build logs the failed rewrite).
+
+The caps: a write that leaves a topic SMALLER always passes, so every
+oversized topic on a released install stays editable; a write that grows
+one meets the hard cap, the growth cap and (for an edit) the entry cap,
+the two admin-set caps arriving as ``Caps``.
 
 Humans edit topic files freely via the dashboard Files UI / satellites under
 the normal folder roles; agents are denied direct Write/Edit on these paths
@@ -34,12 +42,14 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import logging
 import os
 import re
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import config
 from core import layout
@@ -49,34 +59,44 @@ from services.infra.path_confinement import (
     join_under,
     normalize_rel_path,
 )
+from services.memory.memory_index import (  # the callers read these through this module
+    ALLOWED_EXTENSIONS,
+    INDEX_FILENAME,
+    INDEX_HEADER,
+    build_index_content,
+    has_date,
+    iter_topic_files,
+    scope_total_bytes,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-INDEX_FILENAME = "MEMORY.md"
 LOCK_FILENAME = ".memlock"  # hidden: excluded from listings, never committed
 
-ALLOWED_EXTENSIONS = {".md", ".txt"}
-
 # Caps — curation pressure replaces any offline consolidator.
-TOPIC_SOFT_WARN_BYTES = 16 * 1024     # tool result appends a "tighten" warning
-TOPIC_HARD_CAP_BYTES = 64 * 1024      # write rejected
-SCOPE_TOTAL_CAP_BYTES = 512 * 1024    # write rejected
+TOPIC_SOFT_WARN_BYTES = 16 * 1024     # tool result appends an imperative warning
+TOPIC_HARD_CAP_BYTES = 64 * 1024      # a growing write rejected
+SCOPE_TOTAL_CAP_BYTES = 512 * 1024    # a growing write rejected
 MAX_TOPICS_PER_SCOPE = 100            # create rejected
 
-INDEX_MAX_LINES = 200                 # Claude Code parity
-INDEX_MAX_BYTES = 25 * 1024
-INDEX_SUMMARY_MAX_CHARS = 200
-
-INDEX_HEADER = (
-    "# Memory index (auto-generated — edit topic files, not this file)\n"
-)
+# The two admin-set caps (memory_settings): a topic over the growth cap no
+# longer grows, an edit adds at most the entry cap. The ranges bound the
+# setting on both sides.
+DEFAULT_TOPIC_GROW_CAP_BYTES = 32 * 1024
+DEFAULT_ENTRY_CAP_BYTES = 2 * 1024
+GROW_CAP_RANGE = (TOPIC_SOFT_WARN_BYTES, TOPIC_HARD_CAP_BYTES)
+ENTRY_CAP_RANGE = (256, TOPIC_HARD_CAP_BYTES)
 
 _VIEW_DIR_DEPTH = 2                   # `view` lists up to 2 levels deep
 
+logger = logging.getLogger("otodock.memory")
+
 # Control characters never legal in memory content (newline + tab excluded).
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+DATE_REMINDER = "Date this entry (YYYY-MM-DD) so its age stays visible."
 
 
 class MemoryOpError(Exception):
@@ -86,16 +106,52 @@ class MemoryOpError(Exception):
     layer instead."""
 
 
+class MemoryCapError(MemoryOpError):
+    """A write refused by a size or count cap (logged apart from a bad path)."""
+
+
+def _in_range(value: Any, bounds: tuple[int, int], default: int) -> int:
+    lo, hi = bounds
+    if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+        return default
+    return value
+
+
+@dataclass(frozen=True)
+class Caps:
+    """The admin-set caps a write is judged by. ``from_settings`` takes the
+    ``memory_settings`` row and falls back per value to the default when
+    the row lacks it or holds something out of range."""
+    grow_cap: int = DEFAULT_TOPIC_GROW_CAP_BYTES
+    entry_cap: int = DEFAULT_ENTRY_CAP_BYTES
+
+    @classmethod
+    def from_settings(cls, settings: Mapping[str, Any]) -> Caps:
+        return cls(
+            grow_cap=_in_range(
+                settings.get("topic_grow_cap_bytes"), GROW_CAP_RANGE,
+                DEFAULT_TOPIC_GROW_CAP_BYTES,
+            ),
+            entry_cap=_in_range(
+                settings.get("entry_cap_bytes"), ENTRY_CAP_RANGE,
+                DEFAULT_ENTRY_CAP_BYTES,
+            ),
+        )
+
+
 @dataclass
 class OpResult:
     """Successful command outcome. ``output`` is returned verbatim as the
     tool result text; ``warnings`` are appended as extra lines; ``changed``
     lists scope-relative paths that were written/created (for git + fan-out)
-    and ``deleted`` those that were removed (for tombstones + fan-out)."""
+    and ``deleted`` those that were removed (for tombstones + fan-out);
+    ``over_target`` is the topic's size when it was left over the soft
+    target (the API logs it), 0 otherwise."""
     output: str
     warnings: list[str] = field(default_factory=list)
     changed: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    over_target: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -305,72 +361,8 @@ def _sanitize(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Topic-file scanning + the generated index
+# The generated index (its content is memory_index's)
 # ---------------------------------------------------------------------------
-
-def iter_topic_files(root: Path) -> list[Path]:
-    """All topic files in a scope (recursive), excluding the index, hidden
-    files/dirs, and non-text extensions. Sorted by relpath for stability."""
-    if not root.is_dir():
-        return []
-    out: list[Path] = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or p.is_symlink():
-            continue
-        rel = p.relative_to(root)
-        if any(seg.startswith(".") for seg in rel.parts):
-            continue
-        if p.name == INDEX_FILENAME and len(rel.parts) == 1:
-            continue
-        if p.suffix.lower() not in ALLOWED_EXTENSIONS:
-            continue
-        out.append(p)
-    return out
-
-
-def scope_total_bytes(root: Path) -> int:
-    return sum(p.stat().st_size for p in iter_topic_files(root))
-
-
-def _topic_summary(path: Path) -> str:
-    """First non-empty line, stripped of markdown heading markers, truncated
-    to INDEX_SUMMARY_MAX_CHARS — the topic's one-line index entry."""
-    with contextlib.suppress(OSError):
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip().lstrip("#").strip()
-                if s:
-                    return (
-                        s[: INDEX_SUMMARY_MAX_CHARS - 1] + "…"
-                        if len(s) > INDEX_SUMMARY_MAX_CHARS else s
-                    )
-    return "(empty)"
-
-
-def build_index_content(root: Path) -> str:
-    """Deterministic index body for a scope — pure code, no LLM, ever."""
-    lines = [INDEX_HEADER.rstrip("\n")]
-    for p in iter_topic_files(root):
-        rel = p.relative_to(root).as_posix()
-        updated = datetime.fromtimestamp(
-            p.stat().st_mtime, tz=timezone.utc
-        ).strftime("%Y-%m-%d")
-        lines.append(f"- {rel} — {_topic_summary(p)} (updated {updated})")
-    body = ""
-    count = 0
-    for i, line in enumerate(lines):
-        candidate = body + line + "\n"
-        count += 1
-        if count > INDEX_MAX_LINES or len(candidate.encode("utf-8")) > INDEX_MAX_BYTES:
-            omitted = len(lines) - i
-            body += (
-                f"… ({omitted} more topics not indexed — index over budget; "
-                "consolidate topic files)\n"
-            )
-            break
-        body = candidate
-    return body
-
 
 def regenerate_index(root: Path) -> Path | None:
     """Write the generated index (only when content changed, to keep git
@@ -401,7 +393,9 @@ def regenerate_index(root: Path) -> Path | None:
 
 def index_is_stale(root: Path) -> bool:
     """True when a topic file is newer than the index (or index missing) —
-    i.e. a human hand-edited files directly. Cheap: stat calls only."""
+    i.e. a human hand-edited files directly — or when an older builder
+    wrote the index (its header carries the version). Cheap: stat calls
+    and one line."""
     if not root.is_dir():
         return False
     topics = iter_topic_files(root)
@@ -409,6 +403,12 @@ def index_is_stale(root: Path) -> bool:
         return False
     index_path = root / INDEX_FILENAME
     if not index_path.exists():
+        return True
+    try:
+        with open(index_path, encoding="utf-8", errors="replace") as f:
+            if f.readline() != INDEX_HEADER:
+                return True
+    except OSError:
         return True
     index_mtime = index_path.stat().st_mtime
     return any(p.stat().st_mtime > index_mtime for p in topics)
@@ -510,48 +510,82 @@ def op_view(root: Path, rel: str, view_range: list[int] | None = None) -> OpResu
 
 def _check_caps_for_write(
     root: Path, rel: str, new_bytes: int, *, creating: bool,
-) -> list[str]:
-    """Hard caps raise; soft warnings are returned. Caller holds the lock."""
-    if new_bytes > TOPIC_HARD_CAP_BYTES:
-        raise MemoryOpError(
-            f"Error: {rel} would be {new_bytes} bytes — over the "
-            f"{TOPIC_HARD_CAP_BYTES}-byte per-file cap. Split it into "
+    caps: Caps, current: int = 0,
+) -> tuple[list[str], int]:
+    """The caps raise (``MemoryCapError``); the soft warning is returned
+    with the size that earned it. Every size rule judges a GROWING write
+    only: a write that leaves the topic smaller always passes, so an
+    oversized topic (a hand edit, an older cap) can be brought down.
+    ``current`` is the topic's size before the write, measured as
+    ``new_bytes`` is (the sanitised text). Caller holds the lock."""
+    growing = new_bytes > current
+    if growing and new_bytes > TOPIC_HARD_CAP_BYTES:
+        raise MemoryCapError(
+            f"Error: {rel} would be {new_bytes:,} bytes, over the "
+            f"{TOPIC_HARD_CAP_BYTES:,} byte per-file cap. Split it into "
             "smaller topic files or prune stale content."
+        )
+    if growing and new_bytes > caps.grow_cap:
+        raise MemoryCapError(
+            f"Error: {rel} would be {new_bytes:,} bytes, over the "
+            f"{caps.grow_cap:,} byte growth cap. Bring it under "
+            f"{TOPIC_SOFT_WARN_BYTES:,} bytes first: drop entries that no "
+            "longer govern, fold duplicates, move a log to a file outside "
+            "memory and keep one pointer line. Or split it into a second "
+            "topic. Then retry."
+        )
+    if growing and not creating and new_bytes - current > caps.entry_cap:
+        raise MemoryCapError(
+            f"Error: this edit adds {new_bytes - current:,} bytes, over the "
+            f"{caps.entry_cap:,} byte entry cap. A memory entry is a fact, a "
+            "rule or a pointer, not a log. Write the detail to a file outside "
+            "memory and keep one line here."
         )
     topics = iter_topic_files(root)
     if creating and len(topics) + 1 > MAX_TOPICS_PER_SCOPE:
-        raise MemoryOpError(
+        raise MemoryCapError(
             f"Error: this scope already has {len(topics)} topic files "
             f"(cap {MAX_TOPICS_PER_SCOPE}). Consolidate existing topics "
             "before creating new ones."
         )
-    existing = root / rel
-    current = existing.stat().st_size if existing.exists() else 0
-    total_after = scope_total_bytes(root) - current + new_bytes
-    if total_after > SCOPE_TOTAL_CAP_BYTES:
-        raise MemoryOpError(
-            f"Error: this write would put the scope at {total_after} bytes — "
-            f"over the {SCOPE_TOTAL_CAP_BYTES}-byte total cap. Prune or "
-            "consolidate topics first."
-        )
+    if growing:
+        existing = root / rel
+        on_disk = existing.stat().st_size if existing.exists() else 0
+        total_after = scope_total_bytes(root) - on_disk + new_bytes
+        if total_after > SCOPE_TOTAL_CAP_BYTES:
+            raise MemoryCapError(
+                f"Error: this write would put the scope at {total_after:,} "
+                f"bytes, over the {SCOPE_TOTAL_CAP_BYTES:,} byte total cap. "
+                "Prune or consolidate topics first."
+            )
     warnings: list[str] = []
+    over = 0
     if new_bytes > TOPIC_SOFT_WARN_BYTES:
+        over = new_bytes
         warnings.append(
-            f"WARN: {rel} is {new_bytes} bytes (soft limit "
-            f"{TOPIC_SOFT_WARN_BYTES}). Consider tightening this topic — "
-            "merge duplicates, drop stale entries."
+            f"{rel} is {new_bytes:,} bytes, over the {TOPIC_SOFT_WARN_BYTES:,} "
+            "byte target. Bring it under the target now: fold duplicates, "
+            "drop superseded trails, move logs out."
         )
-    return warnings
+    return warnings, over
 
 
-def op_create(root: Path, rel: str, file_text: str) -> OpResult:
+def _needs_date_reminder(edited_lines: list[str]) -> bool:
+    """An edit whose lines say something (not blank, not a heading) and
+    carry no date gets the reminder; a date on any edited line clears it."""
+    said = [line for line in edited_lines if line.strip() and not line.lstrip().startswith("#")]
+    return bool(said) and not any(has_date(line) for line in said)
+
+
+def op_create(root: Path, rel: str, file_text: str, *, caps: Caps | None = None) -> OpResult:
     content = _sanitize(file_text or "")
     with _scope_lock(root):
         target = _resolve_strict(root, rel)
         if target.exists():
             raise MemoryOpError(f"Error: File {rel} already exists")
-        warnings = _check_caps_for_write(
+        warnings, over = _check_caps_for_write(
             root, rel, len(content.encode("utf-8")), creating=True,
+            caps=caps or Caps(),
         )
         _atomic_write(target, content)
         changed = [rel]
@@ -559,11 +593,13 @@ def op_create(root: Path, rel: str, file_text: str) -> OpResult:
             changed.append(INDEX_FILENAME)
         return OpResult(
             output=f"File created successfully at: {rel}",
-            warnings=warnings, changed=changed,
+            warnings=warnings, changed=changed, over_target=over,
         )
 
 
-def op_str_replace(root: Path, rel: str, old_str: str, new_str: str) -> OpResult:
+def op_str_replace(
+    root: Path, rel: str, old_str: str, new_str: str, *, caps: Caps | None = None,
+) -> OpResult:
     if not old_str:
         raise MemoryOpError("Error: `old_str` must be non-empty")
     with _scope_lock(root):
@@ -588,28 +624,44 @@ def op_str_replace(root: Path, rel: str, old_str: str, new_str: str) -> OpResult
                 f"old_str `{old_str}` in lines: {line_numbers}. Please ensure "
                 "it is unique"
             )
+        pos = text.find(old_str)
         new_text = _sanitize(text.replace(old_str, new_str, 1))
-        warnings = _check_caps_for_write(
+        warnings, over = _check_caps_for_write(
             root, rel, len(new_text.encode("utf-8")), creating=False,
+            caps=caps or Caps(), current=len(_sanitize(text).encode("utf-8")),
         )
         _atomic_write(target, new_text)
         changed = [rel]
         if regenerate_index(root):
             changed.append(INDEX_FILENAME)
-        # Snippet around the edit, line-numbered (contract shape).
-        idx = new_text[: new_text.find(new_str) if new_str else 0].count("\n")
-        lines = new_text.splitlines()
-        lo, hi = max(0, idx - 2), min(len(lines), idx + new_str.count("\n") + 3)
+        # The lines the replacement spans in the result: the snippet around
+        # them (contract shape) and the date reminder read them. A newline
+        # leading or trailing the new text touches no line of its own, so
+        # the reminder reads the text between them only.
+        idx = _sanitize(text[:pos]).count("\n")
+        clean = _sanitize(new_str)
+        span = clean.count("\n")
+        lines = new_text.split("\n")
+        if new_text.endswith("\n"):
+            lines.pop()
+        core = clean.strip("\n")
+        if core.strip():
+            start = idx + (len(clean) - len(clean.lstrip("\n")))
+            if _needs_date_reminder(lines[start : start + core.count("\n") + 1]):
+                warnings.append(DATE_REMINDER)
+        lo, hi = max(0, idx - 2), min(len(lines), idx + span + 3)
         snippet = "\n".join(
             f"{i:>6}\t{line}" for i, line in enumerate(lines[lo:hi], start=lo + 1)
         )
         return OpResult(
             output=f"The memory file has been edited.\n{snippet}",
-            warnings=warnings, changed=changed,
+            warnings=warnings, changed=changed, over_target=over,
         )
 
 
-def op_insert(root: Path, rel: str, insert_line: int, insert_text: str) -> OpResult:
+def op_insert(
+    root: Path, rel: str, insert_line: int, insert_text: str, *, caps: Caps | None = None,
+) -> OpResult:
     # An empty insert would rewrite the file unchanged and answer "edited";
     # a blank line is "\n". Judged after sanitising: text of control
     # characters alone is empty too.
@@ -622,7 +674,7 @@ def op_insert(root: Path, rel: str, insert_line: int, insert_text: str) -> OpRes
             raise MemoryOpError(
                 f"The path {rel} does not exist. Please provide a valid path."
             )
-        text = target.read_text(encoding="utf-8", errors="replace")
+        text = _sanitize(target.read_text(encoding="utf-8", errors="replace"))
         lines = text.splitlines()
         if not isinstance(insert_line, int) or insert_line < 0 or insert_line > len(lines):
             raise MemoryOpError(
@@ -632,16 +684,19 @@ def op_insert(root: Path, rel: str, insert_line: int, insert_text: str) -> OpRes
             )
         new_lines = lines[:insert_line] + inserted + lines[insert_line:]
         new_text = "\n".join(new_lines) + ("\n" if text.endswith("\n") or not text else "")
-        warnings = _check_caps_for_write(
+        warnings, over = _check_caps_for_write(
             root, rel, len(new_text.encode("utf-8")), creating=False,
+            caps=caps or Caps(), current=len(text.encode("utf-8")),
         )
         _atomic_write(target, new_text)
         changed = [rel]
         if regenerate_index(root):
             changed.append(INDEX_FILENAME)
+        if _needs_date_reminder(inserted):
+            warnings.append(DATE_REMINDER)
         return OpResult(
             output=f"The file {rel} has been edited.",
-            warnings=warnings, changed=changed,
+            warnings=warnings, changed=changed, over_target=over,
         )
 
 
@@ -715,4 +770,76 @@ def op_rename(root: Path, old_rel: str, new_rel: str) -> OpResult:
         return OpResult(
             output=f"Successfully renamed {old_rel} to {new_rel}",
             changed=changed, deleted=deleted,
+        )
+
+
+def op_promote(
+    src_root: Path, dst_root: Path, rel: str, dst_rel: str, *, caps: Caps | None = None,
+) -> tuple[OpResult, OpResult]:
+    """Move one topic file from a person's scope into the shared scope:
+    a create in the destination (its caps apply, the growth cap included),
+    then the source's removal, under both scope locks (the source first;
+    no other path takes two, so no cycle). A copy then an unlink, never a
+    rename: the two folders may sit on different quota projects. When the
+    unlink fails the copy is taken back and nothing changed. Returns the
+    source's result (the deletion) and the destination's (the new file),
+    each with its own index; the caller commits and publishes both roots.
+    """
+    with _scope_lock(src_root), _scope_lock(dst_root):
+        src = _resolve_strict(src_root, rel)
+        if src.is_dir():
+            raise MemoryOpError(
+                f"Error: {rel} is a folder. Promote one topic file at a time."
+            )
+        if not src.is_file():
+            raise MemoryOpError(
+                f"The path {rel} does not exist. Please provide a valid path."
+            )
+        dst = _resolve_strict(dst_root, dst_rel)
+        if dst.exists():
+            raise MemoryOpError(f"Error: The destination {dst_rel} already exists")
+        if dst.suffix.lower() not in ALLOWED_EXTENSIONS:
+            raise MemoryOpError(
+                f"Error: {dst.name} has an unsupported extension. Memory "
+                "files must be .md or .txt"
+            )
+        content = _sanitize(src.read_text(encoding="utf-8", errors="replace"))
+        warnings, over = _check_caps_for_write(
+            dst_root, dst_rel, len(content.encode("utf-8")), creating=True,
+            caps=caps or Caps(),
+        )
+        _atomic_write(dst, content)
+        try:
+            # A source that vanished meanwhile (a hand delete) is gone
+            # either way: the copy is the move's result.
+            safe_fs.unlink_beneath(config.AGENTS_DIR, _agents_rel(src), missing_ok=True)
+        except OSError as exc:
+            try:
+                safe_fs.unlink_beneath(config.AGENTS_DIR, _agents_rel(dst))
+            except OSError:
+                logger.warning(
+                    "memory promote: %s stayed in both scopes (%s, %s)",
+                    rel, src, dst, exc_info=True,
+                )
+                raise MemoryOpError(
+                    f"Error: {rel} could not be moved out of /memories/user/ "
+                    f"and a copy stayed at /memories/agent/{dst_rel}. Delete "
+                    "one of the two."
+                ) from exc
+            raise MemoryOpError(
+                f"Error: {rel} could not be moved out of /memories/user/ and "
+                "stays there. Nothing changed in /memories/agent/."
+            ) from exc
+        src_changed: list[str] = []
+        if regenerate_index(src_root):
+            src_changed.append(INDEX_FILENAME)
+        dst_changed = [dst_rel]
+        if regenerate_index(dst_root):
+            dst_changed.append(INDEX_FILENAME)
+        return (
+            OpResult(output="", changed=src_changed, deleted=[rel]),
+            OpResult(
+                output=f"Successfully renamed /memories/user/{rel} to /memories/agent/{dst_rel}",
+                warnings=warnings, changed=dst_changed, over_target=over,
+            ),
         )

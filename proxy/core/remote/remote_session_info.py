@@ -76,3 +76,8 @@ class RemoteSessionInfo:
     # watchdog, a typed ending's kill): the session end that follows is
     # that kill, not a lost machine.
     proxy_killed: bool = False
+    # The machine's local link port the session was started with (its
+    # ``PROXY_URL`` and MCP addresses hold it): a session whose machine moved
+    # the link to another port is dead to the platform (``tunnel_state``).
+    # 0 = unknown, never judged.
+    tunnel_port: int = 0

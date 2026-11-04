@@ -23,6 +23,10 @@ export interface PlatformSettings {
   offboarded_retention_days: string
   // Automatic MCP updates (weekly; community MCPs)
   mcp_auto_update_enabled: boolean
+  // The apps' store review ask (default ON) and the days before the second
+  // ask (90, from 30 to 730).
+  store_review_enabled: boolean
+  store_review_days: number
   // Read each OAuth account's session and weekly usage from the vendor
   // (default ON): the pool routes on it, the AI Engines cards show it.
   subscription_windows_enabled: boolean
@@ -74,6 +78,8 @@ export interface PlatformSettings {
   sharing_external_enabled: boolean
   sharing_public_links_enabled: boolean
   sharing_max_expiry_days: string
+  /** The Notebook's share of every prompt in bytes (0 loads no entries). */
+  notebook_inline_bytes?: string
   user_directory_visible_to_members: boolean
   // Shares to an agent and to a department (SHARING.md); off refuses new ones.
   sharing_to_agents_enabled: boolean

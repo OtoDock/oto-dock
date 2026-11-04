@@ -64,6 +64,44 @@ def mark_release_seen(user_sub: str, version: str) -> None:
         conn.commit()
 
 
+def engine_firsts(user_sub: str) -> dict[str, str]:
+    """``engine_first``: per agent, the engine the person's model picker
+    last showed first (``services/engines/engine_resolution.py``, the
+    engine order by use); ``{}`` when none was shown."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT data -> 'engine_first' AS firsts FROM user_ui_prefs WHERE user_sub = %s",
+            (user_sub,),
+        ).fetchone()
+    firsts = _json_field(row["firsts"]) if row else {}
+    if not isinstance(firsts, dict):
+        return {}
+    return {str(k): v for k, v in firsts.items() if isinstance(v, str)}
+
+
+def remember_engine_firsts(user_sub: str, firsts: dict[str, str]) -> None:
+    """Merge ``firsts`` into ``engine_first`` key by key in one statement
+    (two tabs remembering different agents never drop each other's), outside
+    the merged-bag cap like ``last_seen_version``: one short key per agent
+    the person opens."""
+    if not firsts:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO user_ui_prefs (user_sub, data, updated_at)
+               VALUES (%s, jsonb_build_object('engine_first', %s::jsonb), %s)
+               ON CONFLICT (user_sub) DO UPDATE SET
+                   data = user_ui_prefs.data || jsonb_build_object(
+                       'engine_first',
+                       CASE WHEN jsonb_typeof(user_ui_prefs.data -> 'engine_first') = 'object'
+                            THEN user_ui_prefs.data -> 'engine_first' ELSE '{}'::jsonb END
+                       || %s::jsonb),
+                   updated_at = EXCLUDED.updated_at""",
+            (user_sub, json.dumps(firsts), _now(), json.dumps(firsts)),
+        )
+        conn.commit()
+
+
 def upsert_prefs(user_sub: str, data: dict) -> dict:
     """Insert or update the user's prefs bag. Shallow merge: the provided
     top-level keys overwrite the stored ones; every other stored key is kept.

@@ -24,7 +24,7 @@ def _stub(monkeypatch):
     pushed = []
 
     class _Q:
-        async def put(self, item):
+        def put_nowait(self, item):
             pushed.append(item)
 
     monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())

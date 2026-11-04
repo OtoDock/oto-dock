@@ -341,6 +341,7 @@ def pump_end(monkeypatch):
 
     async def fake_fire_ephemeral(user_sub, title, body, chat_id=None, **kw):
         calls["ephemeral"].append((user_sub, chat_id))
+        calls.setdefault("words", []).append((title, body))
 
     from core.events import stream_pump as sp
     monkeypatch.setattr(sp.task_store, "get_chat",
@@ -366,10 +367,14 @@ async def test_chat_status_targets_shared_owner(monkeypatch):
     # resolves to every user of the agent (same set the notification system
     # uses for scope="agent"). Read from a worker thread: a fan-out's first
     # read on the loop answers nobody while its entry fills.
+    from core.session import visibility
     from services.notifications import notification_manager as nm
-    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs",
-                        lambda agent: ["alice", "bob"] if agent == "so" else [])
+    monkeypatch.setattr(nm.notification_store, "get_agent_members",
+                        lambda agent: [("alice", "viewer"), ("bob", "editor")] if agent in ("so", "co") else [])
+    monkeypatch.setattr(visibility, "is_shared_only", lambda agent: agent == "so")
     assert await asyncio.to_thread(nm.chat_status_targets, "agent::so", "so") == ["alice", "bob"]
+    # Off a Shared-only agent the owner is a delegated worker: the editor tier.
+    assert await asyncio.to_thread(nm.chat_status_targets, "agent::co", "co") == ["bob"]
     assert nm.chat_status_targets("agent::so", "") == []
 
 
@@ -392,6 +397,78 @@ async def test_continued_task_chat_pump_keeps_ping(pump_end):
     assert pump_end["ephemeral"] == [("u", "task-42")]
 
 
+async def test_a_plain_turn_end_says_finished(pump_end):
+    _pump("chat")._fire_end_of_turn(_END_ROW, False, "researcher")
+    await asyncio.sleep(0)
+    assert pump_end["words"] == [("researcher finished", "Response ready")]
+
+
+@pytest.mark.parametrize("tool", ["AskUserQuestion", "request_user_input", "request_user_input_async"])
+async def test_a_turn_that_asked_says_an_answer_is_waited_for(pump_end, tool):
+    # The terminal's words, on either engine: the question's card ended the
+    # turn and the person's next message is the answer.
+    pump = _pump("chat")
+    await pump._handle_perm_event({"event_type": "question", "tool_name": tool,
+                                   "tool_input": {"questions": [{"title": "Which colour?"}]}})
+    pump._fire_end_of_turn(_END_ROW, False, "researcher")
+    await asyncio.sleep(0)
+    assert pump_end["words"] == [("researcher needs your input", "Waiting for your answer")]
+
+
+async def test_the_persons_next_turn_clears_the_question(pump_end, monkeypatch):
+    # The answer queued behind the turn runs in the same pump: its end is a
+    # plain one.
+    pump = _pump("chat")
+    await pump._handle_perm_event({"event_type": "question", "tool_name": "AskUserQuestion",
+                                   "tool_input": {"questions": []}})
+    monkeypatch.setattr(pump, "_save_turn_blocks", lambda *a, **k: None)
+    await pump._accept_queue_turn({"inputs": []})
+    pump._fire_end_of_turn(_END_ROW, False, "researcher")
+    await asyncio.sleep(0)
+    assert pump_end["words"] == [("researcher finished", "Response ready")]
+
+
+async def test_a_codex_plan_left_for_review_says_the_plan_waits(pump_end):
+    # A Codex plan's card comes as its turn ends, nothing waiting on it: the
+    # notice says the plan waits, not that the agent finished.
+    pump = _pump("chat")
+    await pump._handle_perm_event({
+        "event_type": "plan_review", "request_id": "r-plan", "plan": "1. a",
+        "tool_input": {"plan": "1. a", "planFilePath": "plan-x.md", "between_turns": True}})
+    pump._fire_end_of_turn(_END_ROW, False, "researcher")
+    await asyncio.sleep(0)
+    assert pump_end["words"] == [("researcher needs your input", "Review the plan")]
+
+
+async def test_an_answer_steered_into_the_turn_clears_the_question(pump_end, monkeypatch):
+    # The card's answer sent while the turn still streams goes in as a steer:
+    # the work goes on with it, and the turn's end is a plain one.
+    from core.events import input_queue
+
+    pump = _pump("chat")
+    await pump._handle_perm_event({"event_type": "question", "tool_name": "AskUserQuestion",
+                                   "tool_input": {"questions": []}})
+    monkeypatch.setattr(pump, "_save_turn_blocks", lambda *a, **k: None)
+    monkeypatch.setattr(pump, "_flush_pending_previews", _anoop)
+    monkeypatch.setattr(pump, "_forward", _anoop)
+    pump._recovery_eligible = False
+
+    class _Queue:
+        async def accept_job(self, items, extra_meta=None):
+            return [1]
+    monkeypatch.setattr(input_queue, "get", lambda chat_id: _Queue())
+    monkeypatch.setattr(input_queue, "steered_frame", lambda *a, **k: {})
+    pump.accepts_in_flight = 1
+    await pump._accept_steer({"item": object()})
+    pump._fire_end_of_turn(_END_ROW, False, "researcher")
+    await asyncio.sleep(0)
+    assert pump_end["words"] == [("researcher finished", "Response ready")]
+
+
+async def _anoop(*a, **k):
+    return None
+
+
 # --- file_updated: the catalog's file_changes delta ------------------------
 
 
@@ -406,7 +483,7 @@ async def test_a_file_change_is_one_catalog_delta_whoever_watches(monkeypatch):
     deltas: list[list[str]] = []
     monkeypatch.setattr(catalog, "file_changed",
                         lambda users, agent, rel, **kw: deltas.append(sorted(users)))
-    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target: ["u1", "u2", "u3"])
+    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target, audience=None: ["u1", "u2", "u3"])
     monkeypatch.setattr(nm, "acting_role_of", lambda sub, agent: "editor")
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: sub)
     monkeypatch.setattr(file_sync, "should_sync_to_target", lambda rel, username, role: True)

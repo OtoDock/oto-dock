@@ -7,6 +7,7 @@
    ],
    "call": "build_session_mcp_config",
    "kwargs": {
+    "chat_worker": false,
     "delegation_targets": [
      "char-shared"
     ],
@@ -14,6 +15,7 @@
     "only_mcps": null,
     "placement": {},
     "session_id": "s-task",
+    "shared_chat": false,
     "target_browser": {},
     "task_mode": true,
     "task_owner": "",

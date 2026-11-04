@@ -96,10 +96,14 @@ WORKFLOW_PROGRESS = "workflow_progress"
 WORKFLOW_END = "workflow_end"
 DELEGATE_SPAWN = "delegate_spawn"
 DELEGATE_RESULT = "delegate_result"
+SCHEDULE_WAKE = "schedule_wake"  # the platform's own prompt into a chat (the row of a scheduled wake or of the resume after a move; only the wake sends the frame)
 CHECK_VERDICT = "check_verdict"
 PERMISSION_PROMPT = "permission_prompt"
 PLAN_REVIEW = "plan_review"
 QUESTION = "question"
+SETTINGS_CARD = "settings_card"   # a setting's card for every viewer of the chat (api/settings)
+ACTION_CARD = "action_card"       # an action card: words and up to three buttons (api/cards)
+LIST_CARD = "list_card"           # a live list the dashboard fetches for each viewer (api/cards)
 PROMPT_RETIRED = "prompt_retired"   # a prompt card whose wait ended with no answer
 PERMISSION_RESOLVED = "permission_resolved"   # a card answered on another socket
 LOCATION_REQUEST = "location_request"
@@ -240,7 +244,7 @@ class Frame(NamedTuple):
 PERSISTED_TOOL = "tool"           # tool_start + tool_info + tool_end, one row
 PERSISTED_BG_NUDGE = "bg_nudge"   # the review nudge after background agents
 PERSISTED_BG_COMMAND_NUDGE = "bg_command_nudge"
-PERSISTED_SCHEDULE_WAKE = "schedule_wake"
+PERSISTED_SCHEDULE_WAKE = SCHEDULE_WAKE   # the wake's row, under the frame's own name
 
 FRAMES: dict[str, Frame] = {
     TEXT: Frame(True, None),
@@ -261,10 +265,14 @@ FRAMES: dict[str, Frame] = {
     WORKFLOW_END: Frame(True, None),
     DELEGATE_SPAWN: Frame(True, DELEGATE_SPAWN),
     DELEGATE_RESULT: Frame(True, DELEGATE_RESULT),
+    SCHEDULE_WAKE: Frame(True, PERSISTED_SCHEDULE_WAKE),
     CHECK_VERDICT: Frame(False, CHECK_VERDICT),
     PERMISSION_PROMPT: Frame(True, PERMISSION_PROMPT),
     PLAN_REVIEW: Frame(True, PLAN_REVIEW),
     QUESTION: Frame(True, QUESTION),
+    SETTINGS_CARD: Frame(True, SETTINGS_CARD),
+    ACTION_CARD: Frame(True, ACTION_CARD),
+    LIST_CARD: Frame(True, LIST_CARD),
     PROMPT_RETIRED: Frame(True, None),
     PERMISSION_RESOLVED: Frame(True, None),
     LOCATION_REQUEST: Frame(True, None),
@@ -372,10 +380,10 @@ PER_CHAT_FRAMES: frozenset[str] = frozenset(n for n, f in FRAMES.items() if f.pe
 
 # The ``event_type`` vocabulary of ``chat_messages``: every frame kind that
 # is persisted under its own name, the three renamed kinds, and the rows
-# the server writes without a frame (the two nudges, the schedule wake).
+# the server writes without a frame (the two nudges).
 PERSISTED_EVENT_TYPES: frozenset[str] = frozenset(
     {f.persisted for f in FRAMES.values() if f.persisted}
-    | {PERSISTED_BG_NUDGE, PERSISTED_BG_COMMAND_NUDGE, PERSISTED_SCHEDULE_WAKE}
+    | {PERSISTED_BG_NUDGE, PERSISTED_BG_COMMAND_NUDGE}
 )
 
 # The live-block kinds (``live_state.live_blocks[].type``): what a reconnect
@@ -448,6 +456,52 @@ LIVE_BLOCK_OF_WIRE: dict[str, str] = {
 }
 
 
+def photos_not_attached_block(count: int) -> dict:
+    """The chat's notice that ``count`` photos of the person's message did
+    not reach the agent: the ``system`` block its row stores, written right
+    after the person's row, and the live frame carries (with its
+    ``chat_id``)."""
+    return {"type": SYSTEM, "subtype": SUBTYPE_PHOTOS_NOT_ATTACHED,
+            "message": PHOTOS_NOT_ATTACHED_ONE if count == 1 else PHOTOS_NOT_ATTACHED_MANY,
+            "count": count}
+
+
+def settings_card_block(setting: str, label: str, catalog_version: int) -> dict:
+    """The block a setting's card stores and the frame carries: the id, the
+    label and the catalog's version, no value. The
+    pump appends it to the turn, the terminal's drainer persists it and
+    sends it as a window."""
+    return {"type": SETTINGS_CARD, "setting": setting, "label": label,
+            "catalog_version": catalog_version}
+
+
+def action_card_block(card_id: str, title: str, text: str, note: str,
+                      buttons: list[dict], options: list[dict]) -> dict:
+    """The block an action card stores and the frame carries (services/cards):
+    the card's id, the server's words, the agent's note, the buttons' ids,
+    labels and kinds, the options; never an action's parameters. The
+    dashboard reads the card's state by its id."""
+    return {"type": ACTION_CARD, "card_id": card_id, "title": title, "text": text,
+            "note": note, "buttons": buttons, "options": options}
+
+
+def list_card_block(kind: str, filters: dict, title: str, person: str) -> dict:
+    """The block a list card stores and the frame carries (services/cards):
+    the kind of list, the filters the agent asked for, the title and who
+    asked for it. No row of the list travels: the dashboard fetches it with
+    each viewer's own sign-in when the card renders."""
+    return {"type": LIST_CARD, "kind": kind, "filters": filters, "title": title, "person": person}
+
+
+def client_frame(msg: dict) -> dict:
+    """A client's message with the platform's own keys taken out: a key
+    starting with an underscore (``_server_kick``, ``_artifact_framed``,
+    ``_focus_line``) is set by a handler that calls another in process,
+    never by a browser, and a client that sent one would run a turn with
+    no user row."""
+    return {k: v for k, v in msg.items() if not str(k).startswith("_")}
+
+
 def persisted_of(frame: str) -> str | None:
     """The row kind a frame's block is stored under (None: live-only; TEXT:
     an assistant row) — ``FRAMES`` asked by name."""
@@ -487,6 +541,9 @@ ITEM_PERMISSION_PROMPT = PERMISSION_PROMPT
 ITEM_PLAN_REVIEW = PLAN_REVIEW
 ITEM_QUESTION = QUESTION                # Claude's fire-and-forget question card
 ITEM_QUESTION_PROMPT = "question_prompt"  # Codex's held question (a request_id)
+ITEM_SETTINGS_CARD = SETTINGS_CARD      # the settings tool's card (api/settings)
+ITEM_ACTION_CARD = ACTION_CARD          # a tool's action card (api/cards)
+ITEM_LIST_CARD = LIST_CARD              # a tool's list card (api/cards)
 ITEM_MODE_RESTORED = "mode_restored"    # the plan-mode restore after a review
 ITEM_TOOL_RESULT = TOOL_RESULT
 # A prompt's wait ended with no answer: {"request_id", "caller_gone"?}; the
@@ -494,7 +551,8 @@ ITEM_TOOL_RESULT = TOOL_RESULT
 ITEM_PROMPT_RETIRED = PROMPT_RETIRED
 ITEM_KINDS: frozenset[str] = frozenset({
     ITEM_PERMISSION_PROMPT, ITEM_PLAN_REVIEW, ITEM_QUESTION, ITEM_QUESTION_PROMPT,
-    ITEM_MODE_RESTORED, ITEM_TOOL_RESULT, ITEM_PROMPT_RETIRED,
+    ITEM_MODE_RESTORED, ITEM_TOOL_RESULT, ITEM_PROMPT_RETIRED, ITEM_SETTINGS_CARD, ITEM_ACTION_CARD,
+    ITEM_LIST_CARD,
     IMAGES, IMAGE_GENERATING, IMAGE_GEN_FAILED, URL, FILE, VIDEO, AUDIO,
     MEDIA_PROCESSING, MEDIA_FAILED, DOCUMENT_PREVIEW, UI,
 })
@@ -582,6 +640,17 @@ SUBTYPE_CHAT_MOVED = CHAT_MOVED
 # session started with tools still installing there, named; a second line
 # says how they ended. ``message`` is the sentence.
 SUBTYPE_TOOLS_INSTALLING = "tools_installing"
+# Photos of a person's message that did not reach the agent (one that did
+# not decode, one saved earlier that could not be read back): the row
+# right after the person's (``photos_not_attached_block`` below),
+# ``message`` the sentence, ``count`` how many.
+SUBTYPE_PHOTOS_NOT_ATTACHED = "photos_not_attached"
+PHOTOS_NOT_ATTACHED_ONE = "The photo did not reach the agent. Attach it again to send it."
+PHOTOS_NOT_ATTACHED_MANY = "The photos did not reach the agent. Attach them again to send them."
+# The refusal of a message whose text is empty and none of whose photos and
+# files reached the agent: nothing of it is sent, no row is written.
+NOTHING_REACHED_THE_AGENT = ("None of the photos or files reached the agent, so nothing was sent. "
+                             "Attach them again to send them.")
 # A ``chat_moved`` row's ``reason``: the move did not finish; the agent moved
 # the chat ten times in a row with no message from a person, so it does not
 # continue by itself; the agent's move could not resume the chat by itself.
@@ -611,8 +680,8 @@ SYSTEM_SUBTYPES: frozenset[str] = frozenset({
     SUBTYPE_SESSION_RESEEDED, SUBTYPE_UNDELIVERED_INPUT, SUBTYPE_TURN_ENDED, SUBTYPE_BG_WAKE,
     SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING, SUBTYPE_MACHINE_NOT_ANSWERING,
     SUBTYPE_ENGINE_PROMPT_REFUSED, SUBTYPE_CHAT_MOVED, SUBTYPE_TOOLS_INSTALLING,
-    SUBTYPE_MEETING_STARTED, SUBTYPE_MEETING_TURN_START, SUBTYPE_MEETING_TURN_END,
-    SUBTYPE_MEETING_CONCLUDED, SUBTYPE_MEETING_AGENT_FAILED,
+    SUBTYPE_PHOTOS_NOT_ATTACHED, SUBTYPE_MEETING_STARTED, SUBTYPE_MEETING_TURN_START,
+    SUBTYPE_MEETING_TURN_END, SUBTYPE_MEETING_CONCLUDED, SUBTYPE_MEETING_AGENT_FAILED,
     SUBTYPE_MEETING_AGENT_LEFT, SUBTYPE_MEETING_FAILED,
 })
 # The raw CLI subtypes the pump never persists (they drive registries).
@@ -630,6 +699,8 @@ REASON_NONE = "none"
 REASON_THROTTLED = "throttled"
 REASON_OWN_SUB_EXPIRED = "own_sub_expired"
 REASON_POOL_CAP = "pool_cap"
+# The agent allows only local models on the engine and none is connected.
+REASON_LOCAL_ONLY = "local_only"
 REASON_TARGET_UNAVAILABLE = "target_unavailable"
 REASON_SESSION_ERROR = "session_error"
 # A chat that runs as the agent, for a person below the editor tier
@@ -637,7 +708,7 @@ REASON_SESSION_ERROR = "session_error"
 REASON_BELOW_EDITOR = "below_editor"
 WARMUP_FAILED_REASONS: frozenset[str] = frozenset({
     REASON_AUTH_OFF, REASON_ADMIN_OAUTH_ONLY, REASON_NO_POOL, REASON_NONE,
-    REASON_THROTTLED, REASON_OWN_SUB_EXPIRED, REASON_POOL_CAP,
+    REASON_THROTTLED, REASON_OWN_SUB_EXPIRED, REASON_POOL_CAP, REASON_LOCAL_ONLY,
     REASON_TARGET_UNAVAILABLE, REASON_SESSION_ERROR, REASON_BELOW_EDITOR,
 })
 
@@ -780,6 +851,19 @@ class DelegateResultFrame(_PerChat, total=False):
     # ones that did not land, each with its reason (``{path, reason}``).
     files: list
     files_skipped: list
+    # The worker's own chat, for the card's link to the lane (``chat_id`` is
+    # the delegating chat this frame belongs to). Absent for a run with none.
+    worker_chat_id: str
+
+
+class ScheduleWakeFrame(_PerChat):
+    """The platform's own prompt into the chat, sent where a scheduled wake's
+    row is written (``task_id`` names the continuation). The move's resume
+    writes the same row with ``source`` and sends no frame. The dashboard
+    draws the card and opens the answer's bubble under it."""
+    prompt: str
+    task_id: NotRequired[str]
+    source: NotRequired[str]
 
 
 class CheckVerdictFrame(_PerChat, total=False):
@@ -813,6 +897,39 @@ class QuestionFrame(_PerChat, total=False):
     request_id: str       # present for a held (Codex) question only
     tool_name: str
     tool_input: Any
+
+
+class SettingsCardFrame(_PerChat):
+    """A setting's card: the settings tool asked for
+    it through ``POST /v1/settings/card``. The row and the frame carry the
+    catalog's id, its label and the catalog's version, never a value: the
+    dashboard reads the value with each viewer's own sign-in."""
+    setting: str
+    label: str
+    catalog_version: int
+
+
+class ActionCardFrame(_PerChat):
+    """An action card (services/cards): the card's id, the server's words,
+    the agent's note, the buttons (id, label, kind, a say button's message)
+    and the declared options; never an action's parameters. The dashboard
+    reads the card's state by its id."""
+    card_id: str
+    title: str
+    text: str
+    note: str
+    buttons: list
+    options: list
+
+
+class ListCardFrame(_PerChat):
+    """A list card (services/cards): the kind of list, the filters, the
+    title and who asked for it. The rows are fetched by the dashboard with
+    each viewer's own sign-in, never carried."""
+    kind: str
+    filters: dict
+    title: str
+    person: str
 
 
 class PromptRetiredFrame(_PerChat):
@@ -1055,9 +1172,12 @@ class AppActionAckFrame(TypedDict, total=False):
 class _QueueAttachments(TypedDict, total=False):
     """The attachment meta a queued or steered message carries
     (``TurnInput.frame_fields``): the photos as saved (``{name, path}``) and
-    the validated files (``{path, name}``); absent on a text-only message."""
+    the validated files (``{path, name}``); absent on a text-only message.
+    ``card`` (``{card_id, button}``) marks a message a card's say button
+    sent for the person."""
     images: list
     files: list
+    card: dict
 
 
 class _QueueWaiting(TypedDict, total=False):

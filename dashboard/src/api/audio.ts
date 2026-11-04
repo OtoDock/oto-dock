@@ -52,7 +52,7 @@ export interface TurnClassifier {
 
 export interface AudioPolicy {
   chat_enabled: boolean
-  chat_user_policy: 'native_only' | 'native_preferred' | 'user_choice'
+  chat_user_policy: 'native_only' | 'native_preferred' | 'platform_only' | 'user_choice'
   show_experimental: boolean
 }
 
@@ -61,6 +61,14 @@ export type AudioSettings = Record<string, string>
 // ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
+
+/** A chat default provider the server counts as usable: its credential set,
+ *  or none needed (the server's rule for the policy write). Undefined while
+ *  the list has not loaded. */
+export function platformProviderUsable(providers: AudioProvider[] | undefined): boolean | undefined {
+  if (!providers) return undefined
+  return providers.some(p => p.is_default_chat && (p.credential_configured || !p.credential_key))
+}
 
 export function useAudioProviders() {
   return useQuery({
@@ -195,7 +203,12 @@ export function useUpdateAudioPolicy() {
         body: JSON.stringify(data),
       }, 'Failed to update audio policy')
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['audio-policy'] }),
+    // The capability follows the policy, so the user page and the chat's
+    // microphone read the change without a reload.
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['audio-policy'] })
+      void qc.invalidateQueries({ queryKey: ['audio-capability'] })
+    },
   })
 }
 

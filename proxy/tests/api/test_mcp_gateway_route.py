@@ -408,3 +408,346 @@ def test_a_vendor_that_rebinds_to_loopback_between_the_check_and_the_dial_is_ref
     target.close()
     mcp_broker.purge_session(sid)
     mcp_gateway._clients.clear()
+
+
+# ---------------------------------------------------------------------------
+# The server's own 401 for a token file: the account says "Reconnect needed"
+# ---------------------------------------------------------------------------
+
+_INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+_MARKED_MCP = "refusing-mcp"
+
+
+@pytest.fixture
+def refusals(monkeypatch):
+    """The module's spawned work, collected and run in the test thread after
+    each request, and its clock."""
+    from types import SimpleNamespace
+
+    from services.oauth import token_refusals
+    token_refusals.forget()
+    coros: list = []
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(token_refusals, "background",
+                        SimpleNamespace(spawn=lambda coro, **k: coros.append(coro)))
+    monkeypatch.setattr(token_refusals, "_monotonic", lambda: clock["now"])
+
+    def run() -> int:
+        n = 0
+        while coros:
+            asyncio.run(coros.pop(0))
+            n += 1
+        return n
+    yield SimpleNamespace(run=run, clock=clock, coros=coros, module=token_refusals)
+    for c in coros:
+        c.close()
+    token_refusals.forget()
+
+
+def _token_file(tmp_path, *, access_token="at-1", refresh_token="", expires_at="", extra=None,
+                client_secret=""):
+    d = tmp_path / "sessions" / "refusing-tokens" / "alice"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "acct.json"
+    f.write_text(json.dumps({
+        "provider": "refusing", "account_id": "a", "access_token": access_token,
+        "refresh_token": refresh_token, "expires_at": expires_at, "client_id": "ci",
+        "client_secret": client_secret, "token_url": "https://auth.example.com/token",
+        "scopes": [], "extra": extra or {}}))
+    return f
+
+
+def _provision_file(sid, f, **cred):
+    base = dict(value="", token_ref=mcp_gateway.TokenRef(str(f.parent), "acct"), manifest=_MARKED_MCP)
+    base.update(cred)
+    return _provision(sid, **base)
+
+
+def _marks(f) -> dict:
+    return json.loads(f.read_text())["extra"].get("refused_by") or {}
+
+
+def _post(sid, msg, mcp="vendor", path="mcp"):
+    return client.post(f"/v1/mcp-gateway/{mcp}/{path}", json=msg, headers=_token(sid))
+
+
+def test_a_second_sessions_refusal_marks_the_mcp_and_one_sessions_burst_does_not(monkeypatch, tmp_path, refusals, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="otodock.mcp-gateway")
+    f = _token_file(tmp_path)
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    _provision_file(a, f)
+    _provision_file(b, f)
+    _wire(monkeypatch, _Upstream(status=401))
+    for _ in range(3):
+        r = _post(a, _tool("search"))
+        assert r.status_code == 200 and "reconnect" in r.json()["error"]["message"]
+        refusals.run()
+    assert _marks(f) == {}
+    r = _post(b, _INIT)
+    refusals.run()
+    mark = _marks(f)[_MARKED_MCP]
+    assert mark["methods"] == ["initialize", "tools/call"] and mark["at"]
+    assert "acct" not in caplog.text and "at-1" not in caplog.text
+    assert "refused the token again" in caplog.text
+    # marked: the gateway notes nothing more, and still forwards
+    up = _Upstream(status=401)
+    _wire(monkeypatch, up)
+    _post(a, _tool("search"))
+    assert len(up.requests) == 1 and refusals.coros == []
+    mcp_broker.purge_session(a)
+    mcp_broker.purge_session(b)
+
+
+def test_one_session_counts_again_ten_minutes_later(monkeypatch, tmp_path, refusals):
+    f = _token_file(tmp_path)
+    a = str(uuid.uuid4())
+    _provision_file(a, f)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+    refusals.clock["now"] += 599
+    _post(a, _tool("search"))
+    refusals.run()
+    assert _marks(f) == {}
+    refusals.clock["now"] += 2
+    _post(a, _tool("search"))
+    refusals.run()
+    assert _marks(f)[_MARKED_MCP]["methods"] == ["tools/call"]
+    mcp_broker.purge_session(a)
+
+
+def test_what_is_not_the_servers_verdict_on_the_token_never_counts(monkeypatch, tmp_path, refusals):
+    f = _token_file(tmp_path)
+    sids = [str(uuid.uuid4()) for _ in range(6)]
+    _provision_file(sids[0], f)
+    _provision_file(sids[1], f)
+    _wire(monkeypatch, _Upstream(status=401, headers={
+        "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="admin"'}))
+    _post(sids[0], _tool("a"))
+    _post(sids[1], _tool("a"))
+    # a gateway refusal: another endpoint path, an MCP the session does not hold
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(sids[0], _tool("a"), path="other")
+    _post(sids[1], _tool("a"), mcp="nobody")
+    # a GET
+    client.get("/v1/mcp-gateway/vendor/mcp", headers=_token(sids[0]))
+    # a static value and a sidecar's token file
+    _provision(sids[2], value="key-1")
+    _provision_file(sids[3], f, upstream="http://localhost:8935", proxy_local=True)
+    _post(sids[2], _tool("a"))
+    _post(sids[3], _tool("a"))
+
+    def dial_fails(request):
+        raise httpx.ConnectError("refused")
+    _wire(monkeypatch, dial_fails)
+    _post(sids[0], _tool("a"))
+    assert refusals.module._entries == {} and refusals.coros == []
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(sids[0], _tool("a"))
+    assert len(refusals.module._entries) == 1
+    for s in sids:
+        mcp_broker.purge_session(s)
+
+
+def test_an_answered_call_ends_the_count_and_clears_the_mark(monkeypatch, tmp_path, refusals):
+    f = _token_file(tmp_path)
+    a, b, c = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    for s in (a, b, c):
+        _provision_file(s, f)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+    _wire(monkeypatch, _Upstream())
+    _post(a, _tool("search"))
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(b, _tool("search"))
+    refusals.run()
+    assert _marks(f) == {}
+    _post(c, _tool("search"))
+    refusals.run()
+    assert _MARKED_MCP in _marks(f)
+    # the token works again: an answered initialize is not the refused call,
+    # an answered tool call is
+    _wire(monkeypatch, _Upstream(body=b'{"jsonrpc":"2.0","id":1,"result":{}}'))
+    _post(a, _INIT)
+    refusals.run()
+    assert _MARKED_MCP in _marks(f)
+    _post(a, _tool("search"))
+    refusals.run()
+    assert _marks(f) == {}
+    for s in (a, b, c):
+        mcp_broker.purge_session(s)
+
+
+def test_an_answered_tool_call_ends_any_count_and_clears_any_mark(monkeypatch, tmp_path, refusals):
+    """New chats are refused at ``initialize`` alone, which a running session
+    never sends again: its answered tool call still ends the count and takes
+    the mark off."""
+    f = _token_file(tmp_path)
+    a, b, c, running = (str(uuid.uuid4()) for _ in range(4))
+    for s in (a, b, c, running):
+        _provision_file(s, f)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _INIT)
+    _wire(monkeypatch, _Upstream())
+    _post(running, _tool("search"))
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(b, _INIT)
+    refusals.run()
+    assert _marks(f) == {}
+    _post(c, _INIT)
+    refusals.run()
+    assert _marks(f)[_MARKED_MCP]["methods"] == ["initialize"]
+    _wire(monkeypatch, _Upstream())
+    _post(running, _tool("search"))
+    refusals.run()
+    assert _marks(f) == {}
+    for s in (a, b, c, running):
+        mcp_broker.purge_session(s)
+
+
+def test_a_token_the_worker_can_renew_is_renewed_not_marked(monkeypatch, tmp_path, refusals):
+    from services.oauth import oauth_refresh_worker
+    f = _token_file(tmp_path, refresh_token="RT", client_secret="cs")
+    a, b, c = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    for s in (a, b, c):
+        _provision_file(s, f)
+    asked: list = []
+
+    async def renew_now(path, *, still):
+        asked.append(path)
+        raw = json.loads(path.read_text())
+        assert still(raw)
+        _token_file(tmp_path, access_token="at-2", refresh_token="RT", client_secret="cs")
+        return oauth_refresh_worker.RENEWED
+    monkeypatch.setattr(oauth_refresh_worker, "renew_now", renew_now)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+    refusals.run()
+    assert asked == [f] and _marks(f) == {}
+    # the renewed token is refused too, from another session: marked, no
+    # second renewal
+    _post(b, _tool("search"))
+    refusals.run()
+    assert asked == [f] and _MARKED_MCP in _marks(f)
+    for s in (a, b, c):
+        mcp_broker.purge_session(s)
+
+
+def test_a_token_past_its_expiry_is_marked_at_the_first_refusal(monkeypatch, tmp_path, refusals):
+    f = _token_file(tmp_path, expires_at="2026-01-01T00:00:00Z", extra={"flow": "personal_access_token"})
+    a = str(uuid.uuid4())
+    _provision_file(a, f)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+    refusals.run()
+    assert _MARKED_MCP in _marks(f)
+    mcp_broker.purge_session(a)
+
+
+def test_a_refusal_of_a_token_the_file_no_longer_holds_marks_nothing(monkeypatch, tmp_path, refusals):
+    f = _token_file(tmp_path)
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    _provision_file(a, f)
+    _provision_file(b, f)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+
+    def reconnect_then_refuse(request):
+        # a reconnect lands while the old token's request is out
+        _token_file(tmp_path, access_token="at-new")
+        return httpx.Response(401, stream=_Body(b""))
+    _wire(monkeypatch, reconnect_then_refuse)
+    _post(b, _tool("search"))
+    refusals.run()
+    assert _marks(f) == {} and json.loads(f.read_text())["access_token"] == "at-new"
+    mcp_broker.purge_session(a)
+    mcp_broker.purge_session(b)
+
+
+def test_a_refusal_of_the_renewed_token_during_the_renewal_still_carries_it(monkeypatch, tmp_path, refusals):
+    """The renewed token is refused before the renewal's answer is back: the
+    new count carries the renewal, so the next event marks instead of asking
+    for a second renewal."""
+    from services.oauth import oauth_refresh_worker
+    f = _token_file(tmp_path, refresh_token="RT", client_secret="cs")
+    a, c = str(uuid.uuid4()), str(uuid.uuid4())
+    for s in (a, c):
+        _provision_file(s, f)
+    ref = mcp_gateway.TokenRef(str(f.parent), "acct")
+    asked: list = []
+
+    async def renew_now(path, *, still):
+        asked.append(path)
+        _token_file(tmp_path, access_token="at-2", refresh_token="RT", client_secret="cs")
+        renewed = mcp_gateway.Prepared(url=None, headers={}, proxy_local=False, client=None, token_ref=ref,
+                                       manifest=_MARKED_MCP, digest=mcp_gateway._digest("at-2"))
+        refusals.module.refused(renewed, session_id="session-b", method="POST",
+                                body=json.dumps(_tool("search")).encode(), challenge="")
+        return oauth_refresh_worker.RENEWED
+    monkeypatch.setattr(oauth_refresh_worker, "renew_now", renew_now)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+    refusals.run()
+    assert asked == [f] and _marks(f) == {}
+    _post(c, _tool("search"))
+    refusals.run()
+    assert asked == [f] and _MARKED_MCP in _marks(f)
+    for s in (a, c):
+        mcp_broker.purge_session(s)
+
+
+@pytest.mark.parametrize("late", ["during the renewal", "after the renewal"])
+def test_a_late_refusal_of_the_old_token_keeps_the_renewal(monkeypatch, tmp_path, refusals, late):
+    """Another session's request resolved the file before the renewal wrote
+    it, and its refusal lands while the renewal runs or just after: the
+    renewal stands, and the renewed token's refusal marks with no second
+    renewal (a token of another length, so the gateway's file memo re-reads)."""
+    from services.oauth import oauth_refresh_worker
+    f = _token_file(tmp_path, refresh_token="RT", client_secret="cs")
+    a, c = str(uuid.uuid4()), str(uuid.uuid4())
+    for s in (a, c):
+        _provision_file(s, f)
+    ref = mcp_gateway.TokenRef(str(f.parent), "acct")
+    asked: list = []
+
+    def late_refusal():
+        old = mcp_gateway.Prepared(url=None, headers={}, proxy_local=False, client=None, token_ref=ref,
+                                   manifest=_MARKED_MCP, digest=mcp_gateway._digest("at-1"))
+        refusals.module.refused(old, session_id="session-b", method="POST",
+                                body=json.dumps(_tool("search")).encode(), challenge="")
+
+    async def renew_now(path, *, still):
+        asked.append(path)
+        _token_file(tmp_path, access_token="at-renewed", refresh_token="RT", client_secret="cs")
+        if late == "during the renewal":
+            late_refusal()
+        return oauth_refresh_worker.RENEWED
+    monkeypatch.setattr(oauth_refresh_worker, "renew_now", renew_now)
+    _wire(monkeypatch, _Upstream(status=401))
+    _post(a, _tool("search"))
+    refusals.run()
+    if late == "after the renewal":
+        late_refusal()
+        refusals.run()
+    assert asked == [f] and _marks(f) == {}
+    _post(c, _tool("search"))
+    refusals.run()
+    assert asked == [f] and _MARKED_MCP in _marks(f)
+    for s in (a, c):
+        mcp_broker.purge_session(s)
+
+
+def test_the_table_forgets_old_counts_and_old_renewals(monkeypatch, refusals):
+    m = refusals.module
+    now = 1_000_000.0
+    old, new = ("dir", "old", "mcp"), ("dir", "new", "mcp")
+    m._entries[old] = m._Entry(digest="d", first_at=now - m._WINDOW_S - 1)
+    m._entries[new] = m._Entry(digest="d", first_at=now)
+    m._renewed_at[old] = now - m._RENEWED_CARRY_S - 1
+    m._renewed_at[new] = now
+    assert not m._renewed_lately(old, now) and m._renewed_lately(new, now)
+    m._prune(now)
+    assert len(m._entries) == 2 and len(m._renewed_at) == 2
+    monkeypatch.setattr(m, "_TABLE_MAX", 4)
+    m._prune(now)
+    assert list(m._entries) == [new] and list(m._renewed_at) == [new]

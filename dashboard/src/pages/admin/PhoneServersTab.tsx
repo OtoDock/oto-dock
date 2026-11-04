@@ -482,7 +482,7 @@ function RouteModal({
           )}
 
           <div>
-            <FieldLabel label="Transfer targets">The colleagues the agent may transfer the caller to, by name. These are the only numbers it ever dials. Asterisk lines transfer inbound calls only. Twilio lines transfer both ways.</FieldLabel>
+            <FieldLabel label="Transfer targets">The colleagues the agent may transfer the caller to, by name. These are the only numbers it ever dials. Inbound and outbound calls transfer.</FieldLabel>
             <p className="text-xs text-tertiary mb-1">Use a FreePBX extension or a number your outbound routes understand.</p>
             <div className="space-y-2" data-testid="transfer-targets">
               {/* Wraps on a phone: the number takes its own row below 640 px. */}

@@ -1,9 +1,11 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import type { MutableRefObject } from 'react'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
 import { dbMessagesToDisplay, withPlanRows } from '../lib/messageBlocks'
+import { markRunningBackground, NO_RUNNING_BACKGROUND, runningFor, withRunningInView, type RunningBackground } from '../lib/chat/runningBackground'
 import { fetchOlderMessages } from '../api/chats'
 import { WIRE, type DbMessageRow, type DbPlanRow } from '../api/wireEvents'
+import { BG_COMMAND_BLOCK } from '../lib/kinds/block'
 
 /** How a request for an older page settled: rows `landed`; `nothing` came
  *  (an empty page, a failure, no history to page); or the request is
@@ -65,6 +67,37 @@ export function useChatMessages(args: {
   // A history frame's rows held for the live state that follows them
   // (useChatHistory): their paint would drop a page loaded meanwhile.
   const historyHeldRef = useRef(false)
+  // The background work the last history frame said still runs, with the
+  // chat it belongs to: every rebuild of that chat from rows marks it running
+  // again (its stored spawns read finished), its done frames take it out, the
+  // status bar shows what no loaded block carries (a spawn started turns back). Read
+  // through `runningFor`, so another chat never shows it.
+  const [runningBackground, setRunningBackgroundState] = useState<RunningBackground>(NO_RUNNING_BACKGROUND)
+  const runningBackgroundRef = useRef<RunningBackground>(NO_RUNNING_BACKGROUND)
+  const setRunningBackground = useCallback((running: RunningBackground, chatId: string | null) => {
+    const next = { ...running, chatId }
+    runningBackgroundRef.current = next
+    setRunningBackgroundState(next)
+  }, [])
+  // The committed list, for the rebuilds from REST rows: what the view shows
+  // running before the rebuild is kept.
+  const committedRef = useRef<DisplayMessage[]>([])
+  useEffect(() => { committedRef.current = messages }, [messages])
+  /** The chat's running list with what the view shows running added, saved
+   *  for the status bar (a spawn older than a refetched page keeps its badge). */
+  const runningWithView = useCallback((chatId: string | null): RunningBackground => {
+    const mine = runningFor(runningBackgroundRef.current, chatId)
+    const combined = withRunningInView(mine, committedRef.current)
+    if (combined !== mine) setRunningBackground(combined, chatId)
+    return combined
+  }, [setRunningBackground])
+  /** Background work that ended: one spawn by id, or every one of a kind. */
+  const dropRunning = useCallback((kind: 'agents' | 'commands', toolId?: string) => {
+    const cur = runningBackgroundRef.current
+    const kept = toolId ? cur[kind].filter((e) => e.id !== toolId) : []
+    if (kept.length === cur[kind].length) return
+    setRunningBackground({ ...cur, [kind]: kept }, cur.chatId ?? null)
+  }, [setRunningBackground])
 
   /** A new window of rows (a history frame, a seed): the cursor is this
    *  chat's from here, and a page still loading for the last one is void. */
@@ -99,8 +132,9 @@ export function useChatMessages(args: {
     loadingOlderRef.current = false
     setLoadingOlder(false)
     setHasMoreOlder(hasMore)
-    setMessages(withPlanRows(dbMessagesToDisplay(rows, agents), planRowsRef.current))
-  }, [agents, resetWindow])
+    const running = runningWithView(chatIdRef.current)
+    setMessages(markRunningBackground(withPlanRows(dbMessagesToDisplay(rows, agents), planRowsRef.current), running))
+  }, [agents, resetWindow, runningWithView, chatIdRef])
 
   // Lazy scroll-back: fetch the next older page and re-render the DB portion from
   // the full merged raw rows, preserving the live/optimistic tail (non-`db-` ids).
@@ -119,9 +153,11 @@ export function useChatMessages(args: {
       if (older.length) {
         rawRowsRef.current = [...older, ...rawRowsRef.current]
         oldestLoadedIdRef.current = rawRowsRef.current[0]?.id ?? beforeId
+        const running = runningWithView(cid)
         setMessages((prev) => {
           const tail = prev.filter((m) => !m.id.startsWith('db-'))
-          return [...withPlanRows(dbMessagesToDisplay(rawRowsRef.current, agents), planRowsRef.current), ...tail]
+          const rebuilt = withPlanRows(dbMessagesToDisplay(rawRowsRef.current, agents), planRowsRef.current)
+          return [...markRunningBackground(rebuilt, running), ...tail]
         })
       }
       setHasMoreOlder(has_more)
@@ -137,7 +173,7 @@ export function useChatMessages(args: {
         setLoadingOlder(false)
       }
     }
-  }, [agents, chatIdRef])
+  }, [agents, chatIdRef, runningWithView])
 
   // A document push's card: appended to the streaming bubble, or in place
   // of the card of the same file already there (a reconnect's live state
@@ -271,6 +307,7 @@ export function useChatMessages(args: {
 
   // Update subagent blocks' active state — search ALL assistant messages
   const updateSubagentActive = useCallback((toolId: string, isActive: boolean) => {
+    if (!isActive) dropRunning('agents', toolId)
     setMessages((prev) => {
       let found = false
       const updated = prev.map((msg) => {
@@ -289,22 +326,23 @@ export function useChatMessages(args: {
       })
       return found ? updated : prev
     })
-  }, [])
+  }, [dropRunning])
 
   // Update bg-command blocks' active state by tool_use_id (mirror of
   // updateSubagentActive) — the badge + inline block derive from this flag.
   const updateCommandActive = useCallback((toolId: string, isActive: boolean) => {
+    if (!isActive) dropRunning('commands', toolId)
     setMessages((prev) => {
       let found = false
       const updated = prev.map((msg) => {
         if (found || msg.role !== 'assistant') return msg
         const hasMatch = msg.blocks.some(
-          (b) => b.type === 'bgcommand' && b._toolId === toolId,
+          (b) => b.type === BG_COMMAND_BLOCK && b._toolId === toolId,
         )
         if (!hasMatch) return msg
         found = true
         const blocks = msg.blocks.map((b) =>
-          b.type === 'bgcommand' && b._toolId === toolId
+          b.type === BG_COMMAND_BLOCK && b._toolId === toolId
             ? { ...b, isActive }
             : b,
         )
@@ -312,7 +350,7 @@ export function useChatMessages(args: {
       })
       return found ? updated : prev
     })
-  }, [])
+  }, [dropRunning])
 
   function ensureAssistantMsg() {
     if (!currentMsgRef.current) {
@@ -342,6 +380,6 @@ export function useChatMessages(args: {
     appendBlock, removePlaceholders, appendToLastTextBlock,
     updateToolBlock, updateToolBlockByName, resolvePermission,
     updateSubagentActive, updateCommandActive, ensureAssistantMsg,
-    upsertPreviewBlock,
+    upsertPreviewBlock, runningBackground, setRunningBackground, dropRunning,
   }
 }

@@ -40,6 +40,9 @@ logger = logging.getLogger("otodock.oauth")
 # browser-binding cookie the start route sets lives as long.
 STATE_TTL_SECONDS = 300
 _STATE_TTL_SECONDS = STATE_TTL_SECONDS
+# How long a hosted GitHub-App connect's callback waits for the relay
+# register it starts (it goes on in the background past that).
+_HOSTED_REGISTER_WAIT_S = 8.0
 
 
 @dataclass
@@ -371,7 +374,9 @@ class ExchangeResult:
     installations_listed: int | None = None
 
 
-async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> ExchangeResult:
+async def do_oauth_exchange(
+    *, code: str, state_token: str, iss: str = "", callback_provider: str = "",
+) -> ExchangeResult:
     """Drive the full exchange + persist flow.
 
     Steps:
@@ -393,6 +398,10 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
         # at that moment: exchanging it could put another GitHub user's token
         # under the account's label. The setup page re-lists instead.
         raise RuntimeError("An install page's return is not a sign-in")
+    # A code that came back on another provider's callback was issued for
+    # another sign-in (a mix-up, RFC 9700 4.4): it is never exchanged.
+    if callback_provider and callback_provider != state.provider_id:
+        raise RuntimeError("The authorization response came back for another provider")
 
     # Provider + app credentials
     from auth.oauth_providers import get_provider
@@ -479,19 +488,17 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
                 "— cannot derive account label"
             )
 
-    # Account label resolution:
-    #   - If state carries an explicit hint (e.g. user typed "work"), use it
-    #     verbatim (rare; v1 always auto-labels by email).
-    #   - Otherwise default to userinfo.email (login-backed for GitHub privacy).
-    account_label = state.account_label_hint.strip() or userinfo.email
-
-    # Persist — writes the user_credential_accounts row, the credential
-    # rows, and the on-disk token file as one orchestrated operation, under
-    # the account lock the refresh worker holds across its own rewrite.
-    from core.credentials import credential_locks
+    # The label: the card's (a Reconnect) or the login's own, never a file
+    # another MCP's row names for another login (``signin_label``). Persist
+    # writes the account row, the credential rows and the token file as one
+    # operation under the label's lock, which the refresh worker shares.
     from services.oauth import oauth_account_store
     listed: int | None = None
-    async with credential_locks.get_lock(state.user_sub, state.provider_id, account_label):
+    async with oauth_account_store.signin_label(
+        user_sub=state.user_sub, provider_id=state.provider_id, mcp_name=state.mcp_name,
+        hint=state.account_label_hint, own_label=userinfo.email, userinfo=userinfo,
+        identity=userinfo.account_id, issued=oauth_account_store.issued_by(token_set.raw, client_id),
+    ) as account_label:
         await asyncio.to_thread(
             oauth_account_store.persist_oauth_account,
             user_sub=state.user_sub,
@@ -514,6 +521,11 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
             )
     if app_kind == oauth_app_kinds.KIND_GITHUB_APP and token_set.raw.get("via_relay"):
         await _register_hosted_app_events(state)
+    elif token_set.raw.get("via_relay"):
+        # The relay tells an install that an account was removed at the
+        # vendor only at a registered endpoint (``relay_events``).
+        from services.webhooks import relay_events
+        relay_events.sync_provider_soon(state.provider_id)
 
     return ExchangeResult(
         email=userinfo.email,
@@ -527,30 +539,24 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
 async def _register_hosted_app_events(state: OAuthState) -> None:
     """A hosted GitHub-App account: the relay forwards its installations'
     changes (a repository added, the app removed) only to an install whose
-    events endpoint is registered, so register it now (idempotent: the
-    forward secret rotates only when none is held). Best-effort: the
-    account stands either way, and its card's Refresh still reads GitHub."""
-    import httpx
-
-    from services.billing import relay_client
+    events endpoint is registered, so register it. The callback waits a few
+    seconds at most (another registration may hold the lock); the register
+    finishes in the background. Best-effort: the account stands either way,
+    and its card's Refresh still reads GitHub."""
+    import config
     from services.mcp import mcp_registry
-    from services.webhooks import subscription_manager
+    from services.webhooks import relay_events
     manifest = mcp_registry.get_manifest(state.mcp_name)
     webhooks = (manifest.credentials.webhooks or {}) if manifest and manifest.credentials else {}
     if not webhooks.get("app_webhook"):
         return
-    try:
-        await subscription_manager._relay_register_events(provider_id=state.provider_id)
-    except relay_client.RelayError as exc:
-        # The relay keeps the first address an install registers, for every
-        # provider: a refused address is the admin's to fix, not a blip.
-        level = logging.WARNING if exc.code in ("events_host_changed", "bad_events_url") else logging.INFO
-        logger.log(level, "hosted GitHub App: the events endpoint was not registered (%s): %s",
-                   exc.code, relay_client.relay_error_message(exc.code))
-    except subscription_manager.SubscriptionError as exc:
-        logger.warning("hosted GitHub App: the events endpoint was not registered: %s", exc)
-    except (relay_client.RelayNotConfigured, httpx.HTTPError, OSError) as exc:
-        logger.info("hosted GitHub App: the events endpoint was not registered (%s)", exc)
+    if not config.DASHBOARD_PUBLIC_URL:
+        logger.warning("hosted GitHub App: the events endpoint was not registered: "
+                       "DASHBOARD_PUBLIC_URL must be set for hosted event delivery")
+        return
+    task = relay_events.sync_provider_soon(state.provider_id)
+    if task is not None:
+        await asyncio.wait({task}, timeout=_HOSTED_REGISTER_WAIT_S)
 
 
 async def _exchange_registered_client(
@@ -571,7 +577,6 @@ async def _exchange_registered_client(
     from urllib.parse import urlsplit
 
     from auth.oauth_providers.base import OAuthTokenError
-    from core.credentials import credential_locks
     from services.oauth import mcp_authorization, oauth_account_store
     from storage.identity import oauth_client_registrations as regs
     from storage.pg import run_db
@@ -625,17 +630,18 @@ async def _exchange_registered_client(
         # all: a token issued for the MCP server reaches nothing else.
         if provider.userinfo_url and userinfo_parts.scheme == "https" and userinfo_host == resource_host:
             userinfo = await provider.fetch_userinfo(access_token=token_set.access_token)
+            identity = userinfo.account_id
             if not userinfo.email:
-                userinfo.email = userinfo.account_id or userinfo.name
-            account_label = state.account_label_hint.strip() or userinfo.email or state.provider_id
-            if not userinfo.email:
-                userinfo.email = account_label
+                userinfo.email = (userinfo.account_id or userinfo.name
+                                  or state.account_label_hint.strip() or state.provider_id)
+            own_label = userinfo.email
         else:
-            account_label, userinfo = mcp_authorization.identity_from_token_response(
-                token_set.raw, block, provider_id=state.provider_id,
-                label_hint=state.account_label_hint,
+            own_label, userinfo = mcp_authorization.identity_from_token_response(
+                token_set.raw, block, provider_id=state.provider_id, label_hint="",
             )
-        oauth_account_store.validate_account_label(account_label)
+            identity = mcp_authorization.identity_id(token_set.raw, block)
+        if state.account_label_hint.strip():
+            oauth_account_store.validate_account_label(state.account_label_hint.strip())
     except Exception:
         await _revoke_grant()
         raise
@@ -649,8 +655,12 @@ async def _exchange_registered_client(
         "revocation_endpoint": str(auth.get("revocation_endpoint") or ""),
         "token_endpoint_auth_method": method,
     }
-    async with credential_locks.get_lock(state.user_sub, state.provider_id, account_label):
-        try:
+    try:
+        async with oauth_account_store.signin_label(
+            user_sub=state.user_sub, provider_id=state.provider_id, mcp_name=state.mcp_name,
+            hint=state.account_label_hint, own_label=own_label, userinfo=userinfo,
+            identity=identity, issued=oauth_account_store.issued_by(token_set.raw, str(row["client_id"])),
+        ) as account_label:
             await asyncio.to_thread(
                 oauth_account_store.persist_oauth_account,
                 user_sub=state.user_sub,
@@ -664,9 +674,9 @@ async def _exchange_registered_client(
                 client_secret="",
                 token_url=str(auth.get("token_endpoint") or ""),
             )
-        except Exception:
-            await _revoke_grant()
-            raise
+    except Exception:
+        await _revoke_grant()
+        raise
     await run_db(regs.touch, row["id"])
     return ExchangeResult(
         email=userinfo.email, name=userinfo.name, account_label=account_label, state=state,

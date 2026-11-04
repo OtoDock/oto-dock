@@ -67,8 +67,8 @@ _CALL_TOOLS_HEAD = (
     "the line closes right after. Nothing you write after the call is heard.\n"
 )
 _CALL_TOOLS_TRANSFER = (
-    "- transfer_call(target): hands the caller to a colleague. Targets on this line: {targets}. "
-    "Tell the caller in one short sentence first, then call it with the target's name.\n"
+    "- transfer_call(target): hands the person on the line to a colleague. Targets on this line: {targets}. "
+    "Tell the person on the line in one short sentence first, then call it with the target's name.\n"
 )
 _CALL_TOOLS_NO_TRANSFER = (
     "- transfer_call: this line has no transfer targets; if asked, say you cannot transfer.\n"

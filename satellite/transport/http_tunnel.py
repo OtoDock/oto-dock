@@ -33,12 +33,17 @@ import contextlib
 import json
 import logging
 import re
+import secrets
 import socket
+import time
 import uuid
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from .. import config
+from ..background import spawn
 from ..config import HOOK_WAIT_S
 from .mcp_gateway import GATEWAY_PATH_PREFIX, LocalMcpGateway
 
@@ -122,6 +127,18 @@ _ALLOWLIST_REGEXES = [
     # request routes ride the /v1/agents wildcard above).
     re.compile(r"^/v1/community/skills$"),
     re.compile(r"^/v1/execution-layers$"),
+    # The settings tool (settings-mcp; 0.5.159): the catalog a
+    # person's own session reads and the card it asks for.
+    re.compile(r"^/v1/settings/(catalog|card)$"),
+    # The agent-creator tool's proposal cards (agent-creator-mcp; 0.5.162):
+    # the draw and the read of a card's state, exact shapes. Never the
+    # person's click (`/v1/cards/<id>/act` takes a sign-in, never a session).
+    re.compile(r"^/v1/cards(/[A-Za-z0-9-]{1,64})?$"),
+    # The same tool's reads (0.5.163): the community catalog's templates and
+    # department sets, and the departments the person may see. Exact paths;
+    # the routes judge the session's role proxy-side.
+    re.compile(r"^/v1/community/(agents|departments)$"),
+    re.compile(r"^/v1/departments$"),
     re.compile(r"^/mcp/[a-z0-9_-]+/.*$"),
 ]
 
@@ -152,20 +169,78 @@ def _is_allowed_path(path: str) -> bool:
     return any(rx.match(base) for rx in _ALLOWLIST_REGEXES)
 
 
-def _pick_local_port() -> int:
-    """Pick an ephemeral 127.0.0.1 port via the OS, return it.
+# The local link's self-check (0.5.168). Answered by this server from its own
+# memory, ahead of the gateway, the allowlist and the link check: never
+# tunneled, never on either allowlist.
+_SELF_CHECK_PATH = "/v1/tunnel/self-check"
+# One round trip's wait. A refused loopback connect takes about a second on
+# Windows (the SYN is retried after the reset).
+_CHECK_TIMEOUT_S = 3.0
+# Slow answers in a row before a rebind: a starved loop answers late, a
+# wedged listener never does.
+_SLOW_BEFORE_REBIND = 3
+# A link that stays down repeats its warning this often at most.
+_DOWN_REPEAT_S = 300.0
+# The 503 a request gets while the link to the platform is down is logged
+# this often at most.
+_REFUSAL_LOG_EVERY_S = 60.0
+# CPython's Proactor loop (Windows) closes a listening socket for good after
+# one failed accept and reports it to the loop's exception handler with this
+# message (proactor_events._start_serving).
+_ACCEPT_FAILED = "Accept failed on a socket"
+_ERROR_MAX = 200
 
-    Binds + immediately closes to grab the port; the actual aiohttp bind
-    re-binds to the same port. There's a tiny race where another process
-    could grab the port between bind/close and aiohttp's bind — acceptable
-    in practice on a single-user laptop.
+
+def _short(exc: BaseException) -> str:
+    text = str(exc) or type(exc).__name__
+    return text if isinstance(exc, OSError) else f"{type(exc).__name__}: {text}"
+
+
+def _clean(text: str) -> str:
+    """One line of printable text, bounded: it reaches the platform's log."""
+    return "".join(ch if ch.isprintable() else " " for ch in text)[:_ERROR_MAX]
+
+
+def _sock_address(sock) -> str:
+    try:
+        host, port = sock.getsockname()[:2]
+        return f"{host}:{port}"
+    except Exception:  # noqa: BLE001  # a socket the loop already closed names nothing
+        return "a socket"
+
+
+class _SelfCheckAccessFilter(logging.Filter):
+    """Keeps the self-check (one request every heartbeat) out of the access log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _SELF_CHECK_PATH not in record.getMessage()
+
+
+def make_loop_exception_handler(tunnel: "LocalTunnelServer", *, quiet_close_resets: bool):
+    """The satellite loop's exception handler.
+
+    An accept failure is never swallowed, whatever its exception: the
+    Proactor closes the listening socket right after this handler returns,
+    so it is logged and a heal is started (a task, which runs after the
+    close). ``quiet_close_resets`` (Windows) drops the close-time
+    ``ConnectionResetError`` noise of the Proactor's transports, a socket
+    torn down after its peer went. Everything else reaches the default
+    handler.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    def handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        message = str(context.get("message") or "")
+        exc = context.get("exception")
+        if message.startswith(_ACCEPT_FAILED):
+            logger.warning(
+                "tunnel: a listening socket stopped accepting (%s on %s); checking the local link",
+                _short(exc) if exc is not None else "no error", _sock_address(context.get("socket")),
+            )
+            tunnel.heal_soon("an accept failure")
+            return
+        if quiet_close_resets and (isinstance(exc, ConnectionResetError) or "WinError 10054" in message):
+            return
+        loop.default_exception_handler(context)
+    return handler
 
 
 class _PendingStream:
@@ -190,15 +265,37 @@ class LocalTunnelServer:
         self.ws_client = ws_client
         self.port: int = 0
         self._runner: web.AppRunner | None = None
-        self._site: web.TCPSite | None = None
+        # The listening socket is ours (``SockSite``): a check sees it closed
+        # under the server, as the Proactor leaves it after a failed accept.
+        self._site: web.SockSite | None = None
+        self._sock: socket.socket | None = None
         # stream_id → _PendingStream
         self._streams: dict[str, _PendingStream] = {}
         # The credential gateway for vendor MCPs (``/v1/mcp-gateway/``):
         # served here, never tunneled.
         self.gateway = LocalMcpGateway()
+        # The local link's state, in every heartbeat and the auth
+        # capabilities (``state()``).
+        self.ok = True
+        self.rebinds = 0
+        self.last_error = ""
+        self._slow = 0
+        self._down_logged_at = 0.0
+        self._refusal_logged_at: float | None = None
+        # The self-check's answer: another program on a reused port never passes.
+        self._token = secrets.token_hex(16)
+        self._heal_lock = asyncio.Lock()
+        self._heal_task: asyncio.Task | None = None
+        self._heal_chained = False
+        self._stopping = False
+        # Told the new port when a heal could not keep the old one.
+        self.on_port: Callable[[int], None] | None = None
+        access = logging.getLogger("aiohttp.access")
+        if not any(isinstance(f, _SelfCheckAccessFilter) for f in access.filters):
+            access.addFilter(_SelfCheckAccessFilter())
 
     async def start(self) -> int:
-        """Bind aiohttp to 127.0.0.1:<ephemeral>. Returns the chosen port."""
+        """Serve on 127.0.0.1:<ephemeral>. Returns the chosen port."""
 
         # Generous body cap. Inline image/media hook POSTs (display-mcp →
         # /v1/hooks/images base64-encode file bytes) routinely exceed
@@ -216,38 +313,278 @@ class LocalTunnelServer:
         self._runner = web.AppRunner(app, handle_signals=False)
         await self._runner.setup()
 
-        # Pick port via dedicated socket, then bind aiohttp to it.
-        port = _pick_local_port()
-        self._site = web.TCPSite(self._runner, "127.0.0.1", port)
-        await self._site.start()
-        self.port = port
+        port = await self._listen(0)
         self.gateway.start()
 
         logger.info("Local tunnel server listening on 127.0.0.1:%d", port)
         return port
 
+    async def _listen(self, port: int, *, share: bool = False) -> int:
+        """Serve on 127.0.0.1:<port> (0: the OS picks) through a socket of our
+        own. ``socket.create_server`` sets SO_REUSEADDR on POSIX only, as
+        asyncio does, so a plain bind never takes a port another program
+        holds. ``share`` sets it where the OS does not (Windows), for a rebind
+        onto a port only this server's old connections still hold."""
+        if share:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("127.0.0.1", port))
+                sock.listen(128)
+            except OSError:
+                sock.close()
+                raise
+        else:
+            sock = socket.create_server(("127.0.0.1", port), backlog=128)
+        site = web.SockSite(self._runner, sock, backlog=128)
+        try:
+            await site.start()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await site.stop()
+            sock.close()
+            raise
+        self._site, self._sock = site, sock
+        self.port = sock.getsockname()[1]
+        return self.port
+
+    async def _close_site(self) -> None:
+        """Stop serving on the current socket, best effort. The handlers of
+        connections it accepted run on (the runner stays)."""
+        site, sock = self._site, self._sock
+        self._site = self._sock = None
+        if site is not None:
+            # On a selector loop the first stop of a server whose socket was
+            # closed under it raises before aiohttp unregisters the site; a
+            # second stop finds the server closed and unregisters it. A site
+            # the runner no longer holds raises RuntimeError.
+            for _ in range(2):
+                try:
+                    await site.stop()
+                    break
+                except RuntimeError:
+                    break
+                except Exception:  # noqa: BLE001  # a dead listener's own close error
+                    continue
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.close()
+
     async def stop(self) -> None:
         """Shut down the aiohttp server and reject all pending streams."""
-        # Reject pending streams first so handlers wake up and return.
-        for _stream_id, stream in list(self._streams.items()):
-            with contextlib.suppress(asyncio.QueueFull):
-                stream.response_queue.put_nowait({
-                    "type": "http_response",
-                    "status": 503,
-                    "error": "tunnel-shutting-down",
-                    "headers": {},
-                    "body_b64": "",
-                    "body_eof": True,
-                })
-        self._streams.clear()
+        self._stopping = True
+        task = self._heal_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        async with self._heal_lock:
+            # Reject pending streams first so handlers wake up and return.
+            for _stream_id, stream in list(self._streams.items()):
+                with contextlib.suppress(asyncio.QueueFull):
+                    stream.response_queue.put_nowait({
+                        "type": "http_response",
+                        "status": 503,
+                        "error": "tunnel-shutting-down",
+                        "headers": {},
+                        "body_b64": "",
+                        "body_eof": True,
+                    })
+            self._streams.clear()
 
-        await self.gateway.stop()
-        if self._site is not None:
-            await self._site.stop()
-        if self._runner is not None:
-            await self._runner.cleanup()
-        self._site = None
-        self._runner = None
+            await self.gateway.stop()
+            await self._close_site()
+            if self._runner is not None:
+                await self._runner.cleanup()
+            self._runner = None
+
+    # --- The local link's self-check ---
+
+    def state(self) -> dict:
+        """The link's state as the heartbeat and the auth capabilities carry it."""
+        return {
+            "tunnel_ok": self.ok,
+            "local_tunnel_port": self.port,
+            "tunnel_rebinds": self.rebinds,
+            "last_tunnel_error": self.last_error,
+        }
+
+    def _listener_closed(self) -> bool:
+        sock = self._sock
+        return sock is None or sock.fileno() == -1
+
+    async def _round_trip(self) -> tuple[str, bool]:
+        """One request to the self-check path through the listening socket,
+        as a hook script makes it. ``("", False)`` when this server answers;
+        else the failure and whether it is definitive (a slow answer is not:
+        a starved loop answers late)."""
+        where = f"127.0.0.1:{self.port}"
+        if self._listener_closed():
+            return f"the listening socket at {where} was closed", True
+
+        async def _ask() -> bytes:
+            reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+            try:
+                writer.write(
+                    f"GET {_SELF_CHECK_PATH} HTTP/1.1\r\nHost: {where}\r\n"
+                    "Connection: close\r\n\r\n".encode()
+                )
+                await writer.drain()
+                return await reader.read()
+            finally:
+                writer.close()
+
+        try:
+            answer = await asyncio.wait_for(_ask(), _CHECK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return f"no answer at {where} within {_CHECK_TIMEOUT_S:.0f} s", False
+        except ConnectionRefusedError:
+            return f"connection refused at {where}", True
+        except OSError as e:
+            return f"{_short(e)} at {where}", True
+        if not answer.startswith(b"HTTP/1.1 200") or self._token.encode() not in answer:
+            return f"another program answers at {where}", True
+        return "", False
+
+    async def check_and_heal(self, trigger: str) -> bool:
+        """Check the local link and heal it when it is broken; ``self.ok``.
+        The work is a task this server owns, awaited through a shield: a
+        caller cancelled (the heartbeat of a dropped link) never stops a
+        rebind halfway, and a check already running is joined."""
+        task = self._heal_task
+        if task is None or task.done():
+            task = self._heal_task = spawn(
+                self._check_and_heal(trigger, report=False), name="tunnel-heal", owner="tunnel")
+        return await asyncio.shield(task)
+
+    def heal_soon(self, trigger: str) -> None:
+        """Start a heal from a callback (the loop's exception handler). A
+        check already running may have passed its round trip before the
+        socket closed: the heal follows it at its end (once, however many
+        failures arrive meanwhile). A heal that rebinds tells the platform
+        at once (``heartbeat_now``)."""
+        if self._stopping:
+            return
+        task = self._heal_task
+        if task is not None and not task.done():
+            if not self._heal_chained:
+                self._heal_chained = True
+                task.add_done_callback(lambda _t, trigger=trigger: self._chained_heal(trigger))
+            return
+        self._heal_task = spawn(
+            self._check_and_heal(trigger, report=True), name="tunnel-heal", owner="tunnel")
+
+    def _chained_heal(self, trigger: str) -> None:
+        self._heal_chained = False
+        self.heal_soon(trigger)
+
+    async def _check_and_heal(self, trigger: str, *, report: bool) -> bool:
+        async with self._heal_lock:
+            if self._stopping or self._runner is None:
+                return self.ok
+            error, definitive = await self._round_trip()
+            if not error:
+                self._slow = 0
+                self._set_state(True)
+                return True
+            if not definitive:
+                self._slow += 1
+                if self._slow < _SLOW_BEFORE_REBIND:
+                    logger.info("tunnel: the local link answered slowly (%s, %d in a row)",
+                                error, self._slow)
+                    return self.ok
+            self._slow = 0
+            # A link already down retries every tick: its own warning
+            # repeats every _DOWN_REPEAT_S (``_set_state``), the tries do not.
+            level = logging.WARNING if self.ok else logging.INFO
+            logger.log(level, "tunnel: the local link failed its check (%s, on %s); rebinding",
+                       error, trigger)
+            self.last_error = _clean(error)
+            rebound = await self._rebind()
+            after, after_definitive = await self._round_trip()
+            # A slow answer right after a rebind is not a failure: only a
+            # definitive one reports the link down. A rebind that could not
+            # listen keeps its own reason.
+            self._set_state(not (after and after_definitive), after if rebound else "")
+        if rebound and report:
+            heartbeat_now = getattr(self.ws_client, "heartbeat_now", None)
+            if heartbeat_now is not None:
+                await heartbeat_now()
+        return self.ok
+
+    def _set_state(self, ok: bool, error: str = "") -> None:
+        now = time.monotonic()
+        if ok and not self.ok:
+            logger.warning("tunnel: the local link at 127.0.0.1:%d answers again", self.port)
+        elif not ok and (self.ok or now - self._down_logged_at >= _DOWN_REPEAT_S):
+            logger.warning("tunnel: the local link is down: %s", error or self.last_error)
+            self._down_logged_at = now
+        if error:
+            self.last_error = _clean(error)
+        self.ok = ok
+
+    async def _nobody_listens(self, port: int) -> bool:
+        """True when no program accepts on 127.0.0.1:<port> (refused, or no
+        answer): the port is held only by connections our old listener
+        accepted."""
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port), _CHECK_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError):
+            return True
+        writer.close()
+        return False
+
+    async def _rebind(self) -> bool:
+        """Listen again on a fresh socket, on the same port when it can: every
+        session on this machine holds that port in its environment and its
+        MCP addresses. True when it listens again."""
+        port = self.port
+        await self._close_site()
+        how = ""
+        try:
+            await self._listen(port)
+            how = f"on the same port {port}"
+        except OSError as e:
+            first = e
+            if not config.HOST.posix and await self._nobody_listens(port):
+                # Windows refuses a plain bind while connections the old
+                # listener accepted still hold the port. With nobody else
+                # listening there, sharing it with them is this server's own
+                # restart, never another program's port.
+                try:
+                    await self._listen(port, share=True)
+                    how = f"on the same port {port}, beside its open connections"
+                except OSError:
+                    pass
+            if not how:
+                try:
+                    await self._listen(0)
+                    how = f"on a new port {self.port} (port {port}: {_short(first)})"
+                except OSError as again:
+                    self.last_error = _clean(f"could not listen again: {_short(again)}")
+                    logger.log(logging.WARNING if self.ok else logging.INFO,
+                               "tunnel: the local link could not listen again: %s", _short(again))
+                    return False
+        self.rebinds += 1
+        logger.warning("tunnel: the local link listens again %s (rebind %d)", how, self.rebinds)
+        if self.port != port and self.on_port is not None:
+            self.on_port(self.port)
+        return True
+
+    def _log_refusal(self, path: str) -> None:
+        """The 503 of a request made while the link to the platform is down,
+        logged once a minute at most with how long the link has been down."""
+        now = time.monotonic()
+        if self._refusal_logged_at is not None and now - self._refusal_logged_at < _REFUSAL_LOG_EVERY_S:
+            return
+        self._refusal_logged_at = now
+        down_for = getattr(self.ws_client, "link_down_for", None)
+        seconds = down_for() if callable(down_for) else None
+        logger.warning(
+            "tunnel: refused %s with 503: the link to the platform has been down for %s",
+            path, f"{seconds:.0f} s" if seconds is not None else "an unknown time",
+        )
 
     def dispatch_response(self, msg: dict) -> None:
         """Route an inbound http_response/http_response_chunk to the
@@ -300,6 +637,10 @@ class LocalTunnelServer:
         else:
             path_with_query = path
 
+        # The self-check: answered here, whatever the link's state.
+        if path == _SELF_CHECK_PATH:
+            return web.Response(text=self._token)
+
         # The credential gateway's own path: served from this machine's
         # memory (the vendor is dialled from here), never tunneled, and
         # ahead of the link check so it serves within its lease while the
@@ -337,6 +678,7 @@ class LocalTunnelServer:
         # If we're not authenticated to the platform, fail fast with 503
         # so the hook script doesn't hang.
         if not self.ws_client._authenticated:
+            self._log_refusal(path)
             return web.Response(
                 status=503,
                 body=json.dumps({"error": "tunnel-not-connected"}).encode(),

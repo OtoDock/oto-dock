@@ -204,6 +204,23 @@ async def _engine_catalog() -> dict[str, dict] | None:
     return _ENGINE_CATALOG
 
 
+#: A provider entry's ``kind`` for a self-hosted model server (the proxy's
+#: ``core.execution_layer.PROVIDER_LOCAL``, read off the catalog).
+PROVIDER_LOCAL = "local"
+
+
+async def _local_capable_layers() -> list[str] | None:
+    """The registered engines whose descriptor declares a local provider
+    (the ones an agent may limit to local models); None without a catalog."""
+    catalog = await _engine_catalog()
+    if catalog is None:
+        return None
+    return [
+        path for path, layer in catalog.items()
+        if any((p or {}).get("kind") == PROVIDER_LOCAL for p in (layer.get("providers") or []))
+    ]
+
+
 async def _valid_layers() -> list[str] | None:
     """The engine ids the platform registers, sorted; None without a catalog."""
     catalog = await _engine_catalog()
@@ -233,7 +250,7 @@ async def _tool_get_agent_config() -> str:
     lines = [f"# Agent config — `{AGENT_NAME}`"]
     for key in ("display_name", "description", "color",
                 "default_model", "default_effort",
-                "execution_path", "execution_paths",
+                "execution_path", "execution_paths", "local_only_engines",
                 "community_template", "community_template_version",
                 "setup_completed_at"):
         if key in info and info[key] not in (None, ""):
@@ -274,6 +291,12 @@ async def _tool_list_available_models() -> str:
     current_default = info.get("execution_path") if isinstance(info, dict) else None
     if current_default:
         current_layers.add(current_default)
+    # Engines resolve per person: the info route answers for the person
+    # of this session (the token names them) which allowed engines they
+    # can run here, and the one a new chat of theirs takes.
+    for_me = info.get("engines_for_me") if isinstance(info, dict) else None
+    engine_for_me = (info.get("engine_for_me") or "") if isinstance(info, dict) else ""
+    local_only = set(info.get("local_only_engines") or []) if isinstance(info, dict) else set()
 
     lines = [
         "# Available models", "",
@@ -299,10 +322,18 @@ async def _tool_list_available_models() -> str:
         enabled_here = layer_path in current_layers
         is_default = layer_path == current_default
         flag = (
-            "**default for this agent**" if is_default
-            else "**enabled for this agent**" if enabled_here
-            else "_available — call `update_execution_layers` to add it_"
+            "**the agent's default engine**" if is_default
+            else "**allowed on this agent**" if enabled_here
+            else "_not allowed — call `update_execution_layers` to allow it_"
         )
+        if enabled_here and isinstance(for_me, dict):
+            if for_me.get(layer_path):
+                flag += (" — your new chats take it" if layer_path == engine_for_me
+                         else " — you can run it")
+            else:
+                flag += " — you cannot run it here: connect it in User Settings, AI Engines"
+        if layer_path in local_only:
+            flag += " — local models only"
         display = layer.get("display_name") or layer_path
         lines.append(f"## {display} (`{layer_path}`) — {flag}")
         lines.append("")
@@ -323,10 +354,14 @@ async def _tool_list_available_models() -> str:
                 f"| `{m['value']}` | {m.get('label', '')} | {tier_cell} | {m.get('good_at') or ''} |")
         lines.append("")
     lines.append(
-        "Multi-step model change: if the model you want is on a layer "
-        "_not_ already enabled for this agent, first call "
-        "`update_execution_layers` to add it, then `update_default_model`, "
-        "then optionally `update_default_layer` to switch the default."
+        "Engines resolve per person: a new chat or an unpinned task of a "
+        "person runs on the allowed engine they use most (their own chats on "
+        "this agent in the last 30 days, else on every agent); a person with "
+        "no chats gets the agent's default when they hold it, else any "
+        "allowed engine they hold. Multi-step model change: if the model you "
+        "want is on an engine _not_ allowed on this agent, first call "
+        "`update_execution_layers` to allow it, then `update_default_model`, "
+        "then optionally `update_default_layer` to change the default."
     )
     return "\n".join(lines)
 
@@ -402,16 +437,18 @@ async def _tool_update_default_model(model_id: str) -> str:
     return f"✅ Default model set to `{model_id}` (on `{target_layer}` layer).{note}"
 
 
-async def _tool_update_execution_layers(layers: list[str]) -> str:
-    """Set this agent's execution_paths list.
+async def _tool_update_execution_layers(layers: list[str], local_only_layers: list[str] | None = None) -> str:
+    """Set the engines this agent may run on (its ``execution_paths`` list)
+    and, when given, the ones limited to local models.
 
     Wire format (per ``UpdateAgentRequest`` in ``api/agents.py``):
-    PATCH ``/v1/agents/{slug}`` with ``{"execution_paths": [...]}``. The
-    server uses ``execution_paths[0]`` as the new default layer and stores
-    the rest as auxiliary paths. So whichever layer should remain the
-    default must stay first in the list — we preserve that here by
-    placing the current default layer first if it survives the change,
-    otherwise the caller must call `update_default_layer` afterwards.
+    PATCH ``/v1/agents/{slug}`` with ``{"execution_paths": [...]}`` (plus
+    ``local_only_engines`` when the caller named them). The server uses
+    ``execution_paths[0]`` as the new default layer and stores the rest as
+    auxiliary paths. So whichever layer should remain the default must stay
+    first in the list — we preserve that here by placing the current
+    default layer first if it survives the change, otherwise the caller
+    must call `update_default_layer` afterwards.
     """
     if not isinstance(layers, list) or not layers:
         return "❌ Error: layers must be a non-empty list"
@@ -422,6 +459,15 @@ async def _tool_update_execution_layers(layers: list[str]) -> str:
         bad = [layer for layer in layers if layer not in valid]
         if bad:
             return f"❌ Error: invalid execution layer(s): {bad}. Valid: {valid}"
+    if local_only_layers is not None:
+        if not isinstance(local_only_layers, list):
+            return "❌ Error: local_only_layers must be a list"
+        local_capable = await _local_capable_layers()
+        if local_capable is not None:
+            bad = [layer for layer in local_only_layers if layer not in local_capable]
+            if bad:
+                return (f"❌ Error: {bad} cannot be limited to local models. "
+                        f"Engines with a local model server: {local_capable}")
     info = await _request("GET", f"/v1/agents/{AGENT_NAME}/info")
     current_default = info.get("execution_path") if isinstance(info, dict) else None
     # Preserve the current default at position 0 if it survives the change.
@@ -434,18 +480,22 @@ async def _tool_update_execution_layers(layers: list[str]) -> str:
         # primary becomes layers[0]. Surface this in the response so the
         # LLM knows it just swapped the default by side effect.
         pass
-    await _request(
-        "PATCH", f"/v1/agents/{AGENT_NAME}",
-        json={"execution_paths": ordered},
-    )
+    body: dict[str, Any] = {"execution_paths": ordered}
+    if local_only_layers is not None:
+        body["local_only_engines"] = list(local_only_layers)
+    await _request("PATCH", f"/v1/agents/{AGENT_NAME}", json=body)
     new_default = ordered[0]
+    note = ""
+    if local_only_layers is not None:
+        note = (f" Local models only on {list(local_only_layers)}." if local_only_layers
+                else " No engine is limited to local models.")
     if current_default and current_default not in layers:
         return (
-            f"✅ Execution layers updated to {ordered}. Default layer "
+            f"✅ Allowed engines updated to {ordered}. Default engine "
             f"changed from `{current_default}` to `{new_default}` because "
-            f"the old default was dropped."
+            f"the old default was dropped.{note}"
         )
-    return f"✅ Execution layers updated to {ordered}. Default layer remains `{new_default}`."
+    return f"✅ Allowed engines updated to {ordered}. Default engine remains `{new_default}`.{note}"
 
 
 async def _tool_update_default_layer(layer: str) -> str:
@@ -632,9 +682,9 @@ async def _tool_update_default_scope(default_scope: str) -> str:
     """Set the agent's `default_scope` to ``user`` or ``agent``.
 
     Drives the default `scope` value for every scope-aware MCP (tasks,
-    notifications, triggers, meetings, memory). Personal-leaning agents
-    use ``user``; operational agents that mostly do shared work use
-    ``agent``. The user-facing system prompt reflects this immediately
+    notifications, triggers, meetings, memory). ``user`` for a team whose
+    members work alone and hand finals over, ``agent`` for a department's
+    desk. The user-facing system prompt reflects this immediately
     on new sessions — already-warm sessions need a fresh chat to pick
     up the change.
     """
@@ -1077,7 +1127,8 @@ _TOOL_HANDLERS = {
     "update_description": lambda args: _tool_update_description(args.get("new_description", "")),
     "update_color": lambda args: _tool_update_color(args.get("hex_color", "")),
     "update_default_model": lambda args: _tool_update_default_model(args.get("model_id", "")),
-    "update_execution_layers": lambda args: _tool_update_execution_layers(args.get("layers", [])),
+    "update_execution_layers": lambda args: _tool_update_execution_layers(
+        args.get("layers", []), args.get("local_only_layers")),
     "update_default_layer": lambda args: _tool_update_default_layer(args.get("layer", "")),
     "update_default_scope": lambda args: _tool_update_default_scope(args.get("default_scope", "")),
     "update_default_execution_mode": lambda args: _tool_update_default_execution_mode(args.get("mode", "")),
@@ -1124,7 +1175,9 @@ async def _engine_schemas() -> dict[str, dict[str, Any]]:
     schemas = copy.deepcopy(_TOOL_SCHEMAS)
     valid = await _valid_layers()
     interactive = await _interactive_layers()
+    local_capable = await _local_capable_layers()
     layers_items = schemas["update_execution_layers"]["inputSchema"]["properties"]["layers"]["items"]
+    local_items = schemas["update_execution_layers"]["inputSchema"]["properties"]["local_only_layers"]["items"]
     layer_prop = schemas["update_default_layer"]["inputSchema"]["properties"]["layer"]
     if valid:
         layers_items["enum"] = list(valid)
@@ -1132,13 +1185,20 @@ async def _engine_schemas() -> dict[str, dict[str, Any]]:
         engines_text = ", ".join(valid)
     else:
         engines_text = "the engines the platform registers (see list_available_models)"
+    if local_capable:
+        local_items["enum"] = list(local_capable)
+        local_text = ", ".join(local_capable)
+    elif local_capable is not None:
+        local_text = "no engine of this platform"
+    else:
+        local_text = "the engines whose descriptor declares a local provider (see list_available_models)"
     interactive_text = (
         ", ".join(interactive) if interactive
         else "the engines whose descriptor declares supports_interactive_pty (see list_available_models)"
     )
     for name in ("update_execution_layers", "update_default_layer", "update_default_execution_mode"):
         schemas[name]["description"] = schemas[name]["description"].format(
-            engines=engines_text, interactive=interactive_text,
+            engines=engines_text, interactive=interactive_text, local_engines=local_text,
         )
     return schemas
 

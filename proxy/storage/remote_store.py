@@ -335,7 +335,7 @@ def set_device_grants(machine_id: str, grants: list[str]) -> None:
             conn.execute(
                 "UPDATE remote_machines SET device_grants = %s, "
                 "browser_mode = 'dedicated', browser_extension_token_enc = NULL, "
-                "browser_unattended = FALSE "
+                "browser_unattended = FALSE, browser_profile = '' "
                 "WHERE id = %s",
                 (json.dumps(cleaned), machine_id),
             )
@@ -360,6 +360,13 @@ class BrowserTargetSettings:
     #: Whether an unattended session (a task, a call, a meeting) may use the
     #: token; off, only a session a person drives gets it.
     unattended: bool = False
+    #: The machine's owner (the row's ``registered_by``): the token and the
+    #: owner's own accounts go with an agent-scope session only when its
+    #: person is this one (``config_builder.personal_owner_of``).
+    owner_sub: str = ""
+    #: ``Browser profile``: the profile that has the extension, as the
+    #: browser names it ("" = the one profile that has it).
+    profile: str = ""
 
 
 def _parse_browser_mode(raw) -> str:
@@ -402,6 +409,20 @@ def set_browser_extension_token(machine_id: str, token: str | None) -> None:
         conn.commit()
 
 
+BROWSER_PROFILE_MAX = 100
+
+
+def set_browser_profile(machine_id: str, profile: str) -> None:
+    """The machine's ``Browser profile`` (the endpoint trims and checks it;
+    "" clears it)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE remote_machines SET browser_profile = %s WHERE id = %s",
+            (profile, machine_id),
+        )
+        conn.commit()
+
+
 def set_browser_unattended(machine_id: str, enabled: bool) -> None:
     """Whether unattended sessions get the machine's own-browser token."""
     with get_conn() as conn:
@@ -412,10 +433,22 @@ def set_browser_unattended(machine_id: str, enabled: bool) -> None:
         conn.commit()
 
 
+def set_all_roles_run_here(machine_id: str, enabled: bool) -> None:
+    """An admin machine's "Every role of its agents runs here"
+    (``placement.admits_every_role``)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE remote_machines SET all_roles_run_here = %s WHERE id = %s",
+            (bool(enabled), machine_id),
+        )
+        conn.commit()
+
+
 def get_target_browser_settings(target: placement.PlacementCapabilities) -> BrowserTargetSettings:
-    """Browser-control mode + decrypted extension token for a remote target.
-    Dedicated (no token) for a local placement, an unknown machine, or one
-    on the dedicated profile — the token is decrypted only when the mode is
+    """Browser-control mode + decrypted extension token for a remote target,
+    with the machine's owner and its ``Browser profile``. Dedicated (no
+    token) for a local placement, an unknown machine, or one on the
+    dedicated profile — the token is decrypted only when the mode is
     ``own``, through this targeted SELECT (the column never rides a machine
     row, and never the placement the session persists; see
     ``_SECRET_COLUMNS``). A decrypt failure (key mismatch) is logged and
@@ -424,12 +457,16 @@ def get_target_browser_settings(target: placement.PlacementCapabilities) -> Brow
         return BrowserTargetSettings()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT browser_mode, browser_extension_token_enc, browser_unattended "
+            "SELECT browser_mode, browser_extension_token_enc, browser_unattended, "
+            "registered_by, browser_profile "
             "FROM remote_machines WHERE id = %s",
             (target.machine_id,),
         ).fetchone()
-    if not row or _parse_browser_mode(row["browser_mode"]) != "own":
+    if not row:
         return BrowserTargetSettings()
+    owner = str(row["registered_by"] or "")
+    if _parse_browser_mode(row["browser_mode"]) != "own":
+        return BrowserTargetSettings(owner_sub=owner)
     token = None
     enc = row["browser_extension_token_enc"]
     if enc:
@@ -443,7 +480,8 @@ def get_target_browser_settings(target: placement.PlacementCapabilities) -> Brow
                 target.machine_id[:8],
             )
     return BrowserTargetSettings(mode="own", extension_token=token,
-                                 unattended=bool(row["browser_unattended"]))
+                                 unattended=bool(row["browser_unattended"]),
+                                 owner_sub=owner, profile=str(row["browser_profile"] or ""))
 
 
 # ---------------------------------------------------------------------------

@@ -73,11 +73,11 @@ vi.mock('../components/AgentInstallModal', () => ({ default: () => null }))
 vi.mock('../components/departments/DepartmentsEditor', () => ({ default: () => <div data-testid="departments-editor" /> }))
 vi.mock('../components/CommunityAgentsBrowser', () => ({ default: () => null }))
 
-function mount() {
+function mount(entries: string[] = ['/agents']) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={entries}>
         <AgentsPage />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -105,6 +105,12 @@ describe('AgentsPage', () => {
     fireEvent.click(within(view).getByRole('button', { name: 'Departments' }))
     expect(within(view).getByRole('button', { name: 'Departments' })).toHaveAttribute('aria-pressed', 'true')
     expect(within(view).getByRole('button', { name: 'Grid' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('opens on the Departments tab when the URL asks for it', async () => {
+    mount(['/agents?view=departments'])
+    expect(screen.getByTestId('departments-editor')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Departments' })).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('shows the Departments tab for admins', async () => {

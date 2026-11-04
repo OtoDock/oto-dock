@@ -46,6 +46,7 @@ from pipeline.providers import (
 )
 from pipeline.state import CallState
 from pipeline.vad_serial import SerializedVad
+from proxy.client import report_duplex_usage
 from transport.base import TransportError
 
 from .llm_client import DuplexLlmClient
@@ -97,6 +98,9 @@ class DuplexSession(CallPipeline):
         self._frame_bytes_out = conn.frame_bytes_out
         self._byte_rate_out = self._rate_out * config.SAMPLE_WIDTH
         self.cfg = _DuplexCfg(cfg)
+        # The chat and the speaker the usage report names (the proxy records
+        # the conversation's speech under the person who spoke).
+        self._session_cfg = session_cfg
 
         lang = base_lang(str(session_cfg.get("language") or "") or "en")
         self._locked_language = lang
@@ -121,7 +125,9 @@ class DuplexSession(CallPipeline):
             thinking_filler_enabled=True,  # CLI first-token latency cover
         )
         def build_session_stt():
-            return build_stt(self.cfg, stt_provider)
+            # The second listen's wide form: a window with words whose
+            # stretches no word covers hold speech is heard again too.
+            return build_stt(self.cfg, stt_provider, wide_relisten=True)
         # A person dictating in "Automatic": the speaker's language is read
         # from the audio as on a route that detects.
         if session_cfg.get("language_detect"):
@@ -192,6 +198,22 @@ class DuplexSession(CallPipeline):
         # sampled ``latest_interim`` overlay alone made the caption reset
         # to each newest phrase (R4.6).
         self.stt.on_partial_final = self._on_stt_partial_final
+
+    def _speech_usage_reports(self, *, streamed: float, relistened: float, session_id: str) -> list:
+        """The conversation's speech is the speaker's usage: the stream's
+        seconds and the second listen's apart, reported to the proxy with the
+        chat and the speaker the session config named. A proxy that named
+        neither (older than this report) gets the call's relisten row as
+        before."""
+        cfg = self._session_cfg
+        chat_id, sub = str(cfg.get("chat_id") or ""), str(cfg.get("sub") or "")
+        if not chat_id or not sub:
+            return super()._speech_usage_reports(streamed=streamed, relistened=relistened, session_id=session_id)
+        if streamed <= 0 and relistened <= 0:
+            return []
+        provider = (self._route_settings.stt_provider or {}).get("provider_name", "deepgram")
+        return [report_duplex_usage(chat_id=chat_id, sub=sub, provider=provider, stream_seconds=streamed,
+                                    relisten_seconds=relistened, session_id=session_id)]
 
     async def _on_muted_audio(self, frame_len: int) -> None:
         """A mic frame arrived while muted/held and was dropped — keep the

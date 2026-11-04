@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from weasyprint.urls import URLFetchingError
 
 import pdf as pdf_mod
+import render_engine
 import safe_fs
 import shared
 
@@ -240,7 +241,7 @@ def html_doc(rig, tmp_path, monkeypatch):
     async def _no_libreoffice(*a, **kw):
         raise AssertionError("an HTML document reached LibreOffice")
 
-    monkeypatch.setattr(pdf_mod, "_libreoffice_convert", _no_libreoffice)
+    monkeypatch.setattr(render_engine, "_libreoffice_convert", _no_libreoffice)
     yield page
     outside.unlink()
 

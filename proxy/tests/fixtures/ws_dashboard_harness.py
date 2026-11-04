@@ -628,9 +628,11 @@ async def warm_new_chat(ws: FakeDashboardWebSocket, layer: FakeExecutionLayer,
     if text:
         msg["text"] = text
     ws.client_send(msg)
+    # A new chat on the default place names no computer until its start
+    # placed it (warmup_ready says where): the install bar keys by it.
     started = await ws.expect({
         "type": "warmup_started", "chat_id": ANY, "agent": slug,
-        "execution_path": "claude-code-cli", "execution_target": "local",
+        "execution_path": "claude-code-cli", "execution_target": "",
         "new_chat": True,
     })
     await ws.expect({"type": "notification_count", "count": 0})

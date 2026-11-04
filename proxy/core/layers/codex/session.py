@@ -62,6 +62,7 @@ _TOOL_ITEM_TYPES = frozenset({
 # ERROR with the ending and the turn's DONE.
 TURN_ENDING_EVENT = "__turn_ending__"
 from core.session.session_state import (
+    clear_ended_bg_commands,
     clear_session_liveness,
     get_session_user_tz,
     has_pending_prompt,
@@ -78,12 +79,11 @@ logger = logging.getLogger("codex-session")
 # Codex idle reaping is unified across all session kinds via
 # config.get_idle_timeout() (the admin `session_idle_timeout` setting); the reaper
 # reads it per-sweep. See core/concurrency.py.
-# Reaper spare for a turn held open by an unanswered `request_user_input`: the
-# daemon blocks on the server-request while the human decides, so `last_activity`
-# alone reads as idle and reaping it drops the waiter — the eventual answer then
-# hits a closed transport and is LOST (live 2026-08-06, T1). Waiting on a human is
-# not idleness: the reaper spares a session with a pending prompt, bounded by the
-# prompt's own wait (``session_state.PROMPT_WAIT_S``).
+# Reaper spare for a turn held open by an unanswered approval: the daemon blocks
+# on the server-request while the human decides, so `last_activity` alone reads
+# as idle and reaping it drops the waiter. Waiting on a human is not idleness:
+# the reaper spares a session with a pending prompt, bounded by the prompt's own
+# wait (``session_state.PROMPT_WAIT_S``).
 
 # Bounded warm-gate for MCP startup before the first turn (the analog of the
 # CLI's _wait_for_init): ``app_server_client.wait_for_mcp_startup`` — shared
@@ -180,6 +180,11 @@ class CodexAppServerSession:
 
         # Thread persistence: pre-populated for resume; captured on thread/start.
         self.thread_id: str | None = thread_id
+        # The model and effort the thread runs, from the thread/start or
+        # thread/resume answer: the collaboration mode needs a model, and a
+        # session the person did not pin runs the thread's.
+        self.thread_model = ""
+        self.thread_effort = ""
         # Codex refused the thread asked for and a new one started: the
         # layer reseeds the chat from its history (``mark_resume_refused``).
         self.resume_refused = False
@@ -291,9 +296,10 @@ class CodexAppServerSession:
             # ``excludeTurns``: the thread's history stays in its rollout,
             # unread here (Codex deprecates hydrating it into the answer).
             try:
-                await cast("AppServerClient", self._client).request("thread/resume", {
+                res = await cast("AppServerClient", self._client).request("thread/resume", {
                     "threadId": self.thread_id, "excludeTurns": True, **overrides,
                 })
+                self._note_thread_settings(res)
                 logger.info("Codex [%s] resumed thread %s", self.session_id[:8], self.thread_id)
             except AppServerError as e:
                 # Rollout gone (CODEX_HOME wiped / fresh machine) → start fresh.
@@ -306,6 +312,7 @@ class CodexAppServerSession:
         if not self.thread_id:
             res = await cast("AppServerClient", self._client).request("thread/start", overrides)
             self.thread_id = (res.get("thread") or {}).get("id") or ""
+            self._note_thread_settings(res)
             logger.info("Codex [%s] started thread %s", self.session_id[:8], self.thread_id)
 
         await self._warm_mcps()
@@ -368,11 +375,12 @@ class CodexAppServerSession:
             "approvalPolicy": self.approval_policy,
             "approvalsReviewer": approvals_reviewer(self.permission_mode),
             "sandboxPolicy": build_sandbox_policy(self.sandbox_mode, self.working_dir),
-            # Plan collaboration mode, re-asserted per turn (like sandboxPolicy) so a
-            # plan→build switch clears it on the next turn — self-contained, not
-            # relying on thread persistence.
-            "settings": {"collaborationMode": self._collaboration_mode()},
         }
+        # The collaboration mode, re-asserted per turn (like sandboxPolicy) so
+        # leaving Plan clears it on the next turn.
+        collaboration_mode = self._collaboration_mode()
+        if collaboration_mode:
+            turn_params["collaborationMode"] = collaboration_mode
         if not self.summary_refused:
             turn_params["summary"] = REASONING_SUMMARY
         # Pick up mid-session model/effort changes as per-turn overrides too.
@@ -767,13 +775,31 @@ class CodexAppServerSession:
         return self.permission_mode == PLAN_MODE
 
     def _collaboration_mode(self) -> dict:
-        """The Codex collaboration mode for this turn, derived from the platform
-        mode: ``plan`` iff the platform mode is plan (``plan_mode``) — a judge
-        session (CHECKS.md) runs the same read-only sandbox in the default
-        collaboration mode. Returns the MINIMAL ``{"mode": ...}`` — NOT the
-        full ``collaborationMode/list`` preset, whose ``reasoning_effort``
-        would override the user's selected effort."""
-        return {"mode": "plan"} if self.plan_mode else {"mode": "default"}
+        """The Codex collaboration mode for this turn, ``turn/start``'s
+        experimental top-level ``collaborationMode``: ``plan`` iff the
+        platform mode is plan (``plan_mode``); a judge session (CHECKS.md)
+        runs the same read-only sandbox in the default mode. ``settings``
+        carries the model and effort the session runs (the person's, else
+        the thread's): the field takes precedence over the turn's own, and a
+        ``collaborationMode/list`` preset would bring its own effort. A null
+        ``developer_instructions`` is the mode's built-in text. Empty when no
+        model is known (``settings.model`` is required)."""
+        model = self.model or self.thread_model
+        if not model:
+            return {}
+        return {
+            "mode": "plan" if self.plan_mode else "default",
+            "settings": {"model": model,
+                         "reasoning_effort": self.effort or self.thread_effort or None,
+                         "developer_instructions": None},
+        }
+
+    def _note_thread_settings(self, res: dict) -> None:
+        """The model and effort a ``thread/start`` or ``thread/resume``
+        answer names (``model`` is required there, ``reasoningEffort``
+        nullable)."""
+        self.thread_model = str((res or {}).get("model") or "")
+        self.thread_effort = str((res or {}).get("reasoningEffort") or "")
 
     async def _decide_permission(self, tool_name: str, tool_input: dict) -> dict:
         """The injected decision authority for the approval bridge — runs the
@@ -782,8 +808,8 @@ class CodexAppServerSession:
         return await session_events.pre_tool(self.session_id, tool_name, tool_input)
 
     async def _ask_question(self, questions: list) -> dict:
-        """The injected question authority for request_user_input — surfaces the
-        dashboard card and blocks for the human answer in-process (local Codex)."""
+        """The injected question authority for request_user_input — the card,
+        answered at once in-process (local Codex)."""
         from core.layers.codex import tool_names
         from core.session import session_events
         return await session_events.ask_question(
@@ -982,13 +1008,14 @@ class CodexAppServerSession:
     def _apply_bg_command_oob(self, method: str, params: dict) -> None:
         """Translate a between-turns background-terminal completion so the
         BackgroundCommandRegistry is marked done (the bg-command monitor awaits
-        it). The returned events are dropped — no pump is attached between
-        turns; the monitor's ``bg_commands_complete`` nudge is the visible
-        clear. Guarded — a failure here must never kill the router."""
+        it) and the terminal's own badge clears on the chat at once (no pump
+        is attached between turns to consume its ``BG_COMMAND_END``). Guarded
+        — a failure here must never kill the router."""
         if self.translator is None:
             return
         try:
-            self.translator.translate(CodexEvent(type=method, data=params))
+            clear_ended_bg_commands(
+                self.session_id, self.translator.translate(CodexEvent(type=method, data=params)))
         except Exception:
             logger.exception(
                 "Codex [%s] out-of-band bg-command apply failed",
@@ -1033,7 +1060,7 @@ class CodexAppServerSession:
             self._thread_consumers.setdefault(aid, asyncio.Queue())
             from core.events.bg_command_state import shorten_label
             reg.register_spawn(
-                aid, aid, label=shorten_label(p.get("description", "")))
+                aid, aid, label=shorten_label(p.get("description", "")), background=True)
             self._bg_supervisors[aid] = asyncio.create_task(
                 self._supervise_bg_subagent(aid)
             )
@@ -1048,12 +1075,15 @@ class CodexAppServerSession:
         resolve it. NEVER acquires ``self.lock`` — it runs concurrently with the
         user's / nudge's main turns. The shared _bg_agent_monitor (awaiting the
         registry) fires the cohort review nudge; this supervisor resolves only its
-        own sub-agent."""
-        CEILING = 600.0   # mirror _bg_agent_monitor's lost-terminal backstop
-        start = time.monotonic()
+        own sub-agent. It waits as long as the thread lives: each event stamps
+        the agent alive, and a terminal that never comes is the chat
+        monitor's to give up on (after the agent's silence), never a fixed
+        bound that would clear a research agent's badge while it works."""
+        from core.session.session_state import get_subagent_registry
+        reg = get_subagent_registry(self.session_id)
         q = self._thread_consumers.get(sub_tid)
         try:
-            while q is not None and (time.monotonic() - start) < CEILING:
+            while q is not None:
                 try:
                     method, params = await asyncio.wait_for(q.get(), timeout=5.0)
                 except asyncio.TimeoutError:
@@ -1061,19 +1091,13 @@ class CodexAppServerSession:
                         break
                     continue
                 self.last_activity = time.monotonic()
+                reg.note_alive(sub_tid)
                 if method == "__daemon_exit__":
                     break
                 if method == "turn/completed":
                     break
                 if method == "error" and not will_retry(params):
                     break
-            else:
-                if q is not None:
-                    logger.warning(
-                        "Codex [%s] bg sub-agent %s hit "
-                        "the %.0fs ceiling without a terminal — resolving",
-                        self.session_id[:8], sub_tid, CEILING
-                    )
         finally:
             self._resolve_bg_subagent(sub_tid)
 

@@ -29,7 +29,7 @@
     "IMAGE_SAVE_DIR": {"role": "workspace"}
   },
   "assignment_mode": "explicit",
-  "exclude_from": ["task"],
+  "exclude_from": ["meeting"],
 
   "tool_arg_paths": {
     "generate_image": {
@@ -61,7 +61,7 @@
       "loading": "always",
       "file": "skills/image-gen.md",
       "description": "Image generation tool descriptions and model selection guidance",
-      "default_exclude_from": ["task"]
+      "default_exclude_from": ["meeting"]
     }
   ],
   "permissions": {

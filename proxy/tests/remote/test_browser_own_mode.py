@@ -337,3 +337,46 @@ def test_the_unattended_routes(monkeypatch):
     assert owner.put(f"{MINE}/browser-unattended", json={"enabled": False}).status_code == 200
     assert writes == [("unattended", "machine-1", True)]
     assert owner_writes == [("unattended", "machine-1", False)]
+
+
+def test_the_browser_profile_routes(monkeypatch):
+    """Owner and admin set it like the mode; a name needs own mode, a clear
+    does not; a name that does not fit one line is refused."""
+    client, writes = _make_app(monkeypatch, role="admin", sub="user-sub-admin", machine=_machine())
+    monkeypatch.setattr(remote_store, "set_browser_profile",
+                        lambda mid, profile: writes.append(("profile", mid, profile)))
+    r = client.put(f"{ADMIN}/browser-profile", json={"profile": "  Work  "})
+    assert r.status_code == 200 and r.json() == {"ok": True, "browser_profile": "Work"}
+    assert client.put(f"{ADMIN}/browser-profile", json={"profile": "a\nb"}).status_code == 422
+    assert client.put(f"{ADMIN}/browser-profile", json={"profile": "x" * 101}).status_code == 422
+    owner, owner_writes = _make_app(monkeypatch, role="creator", sub="user-sub-owner",
+                                    machine=_machine(pairing_scope="user", registered_by="user-sub-owner",
+                                                     browser_mode="dedicated"))
+    monkeypatch.setattr(remote_store, "set_browser_profile",
+                        lambda mid, profile: owner_writes.append(("profile", mid, profile)))
+    assert owner.put(f"{MINE}/browser-profile", json={"profile": "Work"}).status_code == 422
+    assert owner.put(f"{MINE}/browser-profile", json={"profile": ""}).status_code == 200
+    # Another person's machine, and the admin route on a personal one.
+    other, _ = _make_app(monkeypatch, role="creator", sub="user-sub-other",
+                         machine=_machine(pairing_scope="user", registered_by="user-sub-owner"))
+    assert other.put(f"{MINE}/browser-profile", json={"profile": "Work"}).status_code == 403
+    admin_on_personal, _ = _make_app(monkeypatch, role="admin", sub="user-sub-admin",
+                                     machine=_machine(pairing_scope="user", registered_by="user-sub-owner"))
+    assert admin_on_personal.put(f"{ADMIN}/browser-profile", json={"profile": "Work"}).status_code == 403
+    assert writes == [("profile", "machine-1", "Work")]
+    assert owner_writes == [("profile", "machine-1", "")]
+
+
+def test_the_browser_profile_is_stored_read_and_reset_with_the_grant(machine):
+    remote_store.set_device_grants(machine["id"], ["browser"])
+    remote_store.set_browser_mode(machine["id"], "own")
+    remote_store.set_browser_profile(machine["id"], "Work")
+    s = remote_store.get_target_browser_settings(_p(placement.KIND_USER_REMOTE, machine["id"]))
+    assert (s.profile, s.owner_sub) == ("Work", "user-sub-admin")
+    assert remote_store.get_remote_machine(machine["id"])["browser_profile"] == "Work"
+    # The dedicated answer still names the owner, never the profile.
+    remote_store.set_browser_mode(machine["id"], "dedicated")
+    s = remote_store.get_target_browser_settings(_p(placement.KIND_USER_REMOTE, machine["id"]))
+    assert (s.mode, s.profile, s.owner_sub) == ("dedicated", "", "user-sub-admin")
+    remote_store.set_device_grants(machine["id"], [])
+    assert remote_store.get_remote_machine(machine["id"])["browser_profile"] == ""

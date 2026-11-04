@@ -1,0 +1,73 @@
+The XML schemas in this folder are the transitional schemas of ECMA-376,
+Office Open XML File Formats, 5th edition, Part 4 (Transitional Migration
+Features), Annex A, as Ecma International publishes them in
+OfficeOpenXML-XMLSchema-Transitional.zip inside
+https://ecma-international.org/wp-content/uploads/ECMA-376-4_5th_edition_december_2016.zip
+(sha256 of the inner zip: d34187520749998af306faf1b730e568b0ca6d88ad24638a407c0a9bb4ca04fc).
+They are copied unchanged, byte for byte; their sha256 sums follow the
+notice. The file-tools server reads them to check that documents follow the
+standard.
+
+The files carry no notice of their own. Ecma's text copyright policy
+applies its default notice to the standards published before it was
+written; that notice follows, as the policy gives it.
+
+COPYRIGHT NOTICE
+© Ecma International
+
+By obtaining and/or copying this work, you (the licensee) agree that you have read, understood, and will comply
+with the following terms and conditions.
+
+This document may be copied, published and distributed to others, and certain derivative works of it may be
+prepared, copied, published, and distributed, in whole or in part, provided that the above copyright notice and
+this Copyright License and Disclaimer are included on all such copies and derivative works. The only derivative
+works that are permissible under this Copyright License and Disclaimer are:
+(i)     works which incorporate all or portion of this document for the purpose of providing commentary or
+        explanation (such as an annotated version of the document),
+(ii)    works which incorporate all or portion of this document for the purpose of incorporating features that
+        provide accessibility,
+(iii)   translations of this document into languages other than English and into different formats and
+(iv)    works by making use of this specification in standard conformant products by implementing (e.g. by
+        copy and paste wholly or partly) the functionality therein.
+However, the content of this document itself may not be modified in any way, including by removing the
+copyright notice or references to Ecma International, except as required to translate it into languages other
+than English or into a different format.
+The official version of an Ecma International document is the English language version on the Ecma
+International website. In the event of discrepancies between a translated version and the official version, the
+official version shall govern.
+The limited permissions granted above are perpetual and will not be revoked by Ecma International or its
+successors or assigns.
+This document and the information contained herein is provided on an “AS IS” basis and ECMA
+INTERNATIONAL DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO ANY WARRANTY THAT THE USE OF THE INFORMATION HEREIN WILL NOT INFRINGE
+ANY OWNERSHIP RIGHTS OR ANY IMPLIED WARRANTIES OF MERCHANTABILITY OR FITNESS FOR
+A PARTICULAR PURPOSE.
+
+sha256 of each file:
+
+3fd0586f2637b98bb9886f0e0b67d89e1cc987c2d158cc7deb5f5b9890ced412  dml-chartDrawing.xsd
+4de4390a26e7e44e682ed98b39872cce2620f807f5b0de421567a43f74526388  dml-chart.xsd
+809f77f658f71e10f5cfbf99e25c895a23a4e62c81210b59a2fe8c7fb24849d2  dml-diagram.xsd
+5cb76dabd8b97d1e9308a1700b90c20139be4d50792d21a7f09789f5cccd6026  dml-lockedCanvas.xsd
+6978ba7e889070b0c3cb5b546b23e5a6c3516134afc53b87a21f482ca33f3858  dml-main.xsd
+5d389d42befbebd91945d620242347caecd3367f9a3a7cf8d97949507ae1f53c  dml-picture.xsd
+b4532b6d258832953fbb3ee4c711f4fe25d3faf46a10644b2505f17010d01e88  dml-spreadsheetDrawing.xsd
+2dbfd4719505bf39b568005994a433997cbeac59cebc9d4867d564c94e9ba03a  dml-wordprocessingDrawing.xsd
+39c6396b7b1f096885c3ceba5dab30e3ee14291c45a1d6fa6038ec4db69d88d0  pml.xsd
+3c6709101c6aaa82888df5d8795c33f9e857196790eb320d9194e64be2b6bdd8  shared-additionalCharacteristics.xsd
+0b364451dc36a48dd6dae0f3b6ada05fd9b71e5208211f8ee5537d7e51a587e2  shared-bibliography.xsd
+48675c4f82f6b097434d4b7e313635b790257cca58fa90dd0e8f19c9affa18ed  shared-commonSimpleTypes.xsd
+0ef4bb354ff44b923564c4ddbdda5987919d220225129ec94614a618ceafc281  shared-customXmlDataProperties.xsd
+0d103b99a4a8652f8871552a69d42d2a3760ac6a5e3ef02d979c4273257ff6a4  shared-customXmlSchemaProperties.xsd
+9c085407751b9061c1f996f6c39ce58451be22a8d334f09175f0e89e42736285  shared-documentPropertiesCustom.xsd
+bc92e36ccd233722d4c5869bec71ddc7b12e2df56059942cce5a39065cc9c368  shared-documentPropertiesExtended.xsd
+7b5b7413e2c895b1e148e82e292a117d53c7ec65b0696c992edca57b61b4a74b  shared-documentPropertiesVariantTypes.xsd
+132e44dc10f2959e3f585584e5d82e7b2e329691e3010646e497710bd9774152  shared-math.xsd
+12264f3c03d738311cd9237d212f1c07479e70f0cbe1ae725d29b36539aef637  shared-relationshipReference.xsd
+495debc8fa967b77ed37799747b049832f2c95b2ecdb9f19ddcd68f8c9f96ab9  sml.xsd
+335e9ecd40bb594ec4b916ac8c7b9eead4e16fe1b79f9d4105fdb1c43b66bb1c  vml-main.xsd
+585bedc1313b40888dcc544cb74cd939a105ee674f3b1d3aa1cc6d34f70ff155  vml-officeDrawing.xsd
+133c9f64a5c5d573b78d0a474122b22506d8eadb5e063f67cdbbb8fa2f161d0e  vml-presentationDrawing.xsd
+6bdeb169c3717eb01108853bd9fc5a3750fb1fa5b82abbdd854d49855a40f519  vml-spreadsheetDrawing.xsd
+475dcae1e7d1ea46232db6f8481040c15e53a52a3c256831d3df204212b0e831  vml-wordprocessingDrawing.xsd
+0f7784b36ddc42950e5ff354cd608b83b60e4de39325d5568913f1225365029b  wml.xsd

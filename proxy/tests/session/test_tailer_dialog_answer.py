@@ -59,6 +59,7 @@ def _store(monkeypatch):
     monkeypatch.setattr(db, "rebuild_chat_search", lambda cid: None)
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": "t"})
     monkeypatch.setattr(db, "update_chat", lambda cid, **kw: None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset", lambda cid, title: False)
     T._offsets.clear()
     T._tool_events.clear()
     T._attach_ts.clear()

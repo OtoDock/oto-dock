@@ -105,7 +105,8 @@ def world(temp_db, monkeypatch):
 
 def _pool(w, sid, agent, username, role="contributor", *, external=False, client="dashboard"):
     w.layer.sessions.add(sid)
-    w.ctx[sid] = SimpleNamespace(agent=agent, username=username, role=role, is_external=external)
+    w.ctx[sid] = SimpleNamespace(agent=agent, username=username, role=role, is_external=external,
+                                 session_scope="user", placement=SimpleNamespace(user_paired=False))
     w.client_type[sid] = client
 
 
@@ -355,3 +356,35 @@ async def test_register_subscribes_first_and_the_lifespan_calls_it(world, monkey
              and isinstance(n.func, ast.Attribute) and n.func.attr == "register"
              and isinstance(n.func.value, ast.Name) and n.func.value.id == "offboarding_sessions"]
     assert calls, "startup.py must register the offboarding closer"
+
+
+def _worker(w, sid, agent, username, role="editor", *, paired_by_person=True, run_id="r-lane"):
+    """A chat lane's task session: on the person's own computer it runs as
+    them (their name and role in an agent-scope context)."""
+    w.layer.sessions.add(sid)
+    w.ctx[sid] = SimpleNamespace(agent=agent, username=username, role=role, is_external=False,
+                                 session_scope="agent",
+                                 placement=SimpleNamespace(user_paired=paired_by_person))
+    w.client_type[sid] = "task"
+    w.running[run_id] = SimpleNamespace(done=lambda: False)
+    w.runs[run_id] = {"id": run_id, "agent": agent, "scope": "agent", "created_by": "x",
+                      "session_id": sid}
+
+
+@pytest.mark.asyncio
+async def test_a_lane_on_the_persons_computer_closes_with_their_tier(world):
+    """A chat lane runs as its delegator on their own computer: when they
+    lose the agent or the editor tier its session closes and its run stops;
+    the same lane on the agent's own machines (no person in its context)
+    and a lane of someone who kept the tier stay."""
+    w = world
+    db.set_user_agents(w.pat, [A, B], "user-admin", agent_roles={A: "editor", B: "editor"})
+    _worker(w, "lane-a", A, w.pat_name)
+    _worker(w, "lane-b", B, w.pat_name, run_id="r-lane-b")
+    _worker(w, "lane-platform", A, w.pat_name, paired_by_person=False, run_id="r-lane-p")
+    db.set_user_agents(w.pat, [A, B], "user-admin", agent_roles={A: "contributor", B: "editor"})
+    await closer.sweep(_event(w, offboarding.DEMOTED, AgentLoss(A, "editor", "contributor",
+                                                                "editor", "contributor")))
+    await _settle()
+    assert _closed(w) == {"lane-a"}
+    assert w.stopped == [("r-lane", closer.REASON)]

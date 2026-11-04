@@ -246,9 +246,11 @@ KNOWN_TS_SITES: dict[str, dict[str, int]] = {
     "dashboard/src/pages/agent/chat/useChatDuplexVoice.ts": {"thinking": 2, "error": 1},
     "dashboard/src/components/chat/VoiceControl.tsx": {"error": 1},
     "dashboard/src/hooks/useWakeWord.ts": {"error": 1},
-    # The STT / TTS backends' own protocol.
+    # The STT / TTS backends' own protocol (``nativeStt.ts``: the speech
+    # plugin's end reason).
     "dashboard/src/audio/backends/platformStt.ts": {"error": 1},
     "dashboard/src/audio/backends/platformTts.ts": {"error": 1},
+    "dashboard/src/audio/backends/nativeStt.ts": {"error": 1},
     # ``system`` as a theme and as an MCP instance scope.
     "dashboard/src/contexts/ThemeContext.tsx": {"system": 2},
     "dashboard/src/components/admin/McpInstanceManager.tsx": {"system": 7},

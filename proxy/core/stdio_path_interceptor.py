@@ -601,4 +601,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # PROXY_URL is a loopback address (the platform's own listener, or a
+    # satellite's tunnel): no proxy may stand between. urllib's default
+    # opener takes the environment's proxy and, on Windows, Internet
+    # Options' (whose <local> exemption skips only dotless hosts, never
+    # 127.0.0.1). Installed here, never at import: a test that loads the
+    # script keeps its own opener.
+    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
     sys.exit(main())

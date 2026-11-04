@@ -36,7 +36,7 @@ if _proxy_root not in sys.path:
 # Uses the shared `temp_db` fixture from conftest.py (autouse, provides clean PG)
 
 
-def _make_user(sub="user-1", role="member", agents=None, is_api_key=False):
+def _make_user(sub="user-1", role="member", agents=None, is_api_key=False, agent_roles=None):
     """Create a UserContext for testing."""
     from auth.providers import UserContext
 
@@ -46,6 +46,7 @@ def _make_user(sub="user-1", role="member", agents=None, is_api_key=False):
         name=sub,
         role=role,
         agents=agents or [],
+        agent_roles=agent_roles or {},
         is_api_key=is_api_key,
     )
 
@@ -215,10 +216,18 @@ class TestCheckRunAccess:
             self._check(run, user)
         assert exc_info.value.status_code == 403
 
-    def test_viewer_allowed_agent_scoped(self):
-        user = _make_user(sub="user-1", role="member", agents=["support-bot"])
+    def test_an_agent_scoped_run_takes_the_editor_tier(self):
+        # What the agent does on its own behalf: a viewer and a contributor
+        # are refused, an editor reads it.
         run = {"agent": "support-bot", "scope": "agent", "created_by": "support-bot"}
-        self._check(run, user)  # Should not raise
+        for role in ("viewer", "contributor"):
+            user = _make_user(sub="user-1", role="member", agents=["support-bot"],
+                              agent_roles={"support-bot": role})
+            with pytest.raises(HTTPException) as exc_info:
+                self._check(run, user)
+            assert exc_info.value.status_code == 403
+        self._check(run, _make_user(sub="user-1", role="member", agents=["support-bot"],
+                                    agent_roles={"support-bot": "editor"}))
 
     def test_viewer_blocked_no_agent_access(self):
         user = _make_user(sub="user-1", role="member", agents=[])
@@ -228,7 +237,8 @@ class TestCheckRunAccess:
         assert exc_info.value.status_code == 403
 
     def test_manager_allowed_agent_scoped(self):
-        user = _make_user(sub="mgr-1", role="creator", agents=["support-bot"])
+        user = _make_user(sub="mgr-1", role="creator", agents=["support-bot"],
+                          agent_roles={"support-bot": "manager"})
         run = {"agent": "support-bot", "scope": "agent", "created_by": "support-bot"}
         self._check(run, user)  # Should not raise
 
@@ -256,10 +266,13 @@ class TestCheckRunAccess:
         self._check(run, user)  # Should not raise -- admin can view all
 
     def test_legacy_run_no_scope_defaults_agent(self):
-        """Runs without scope field default to 'agent' -- visible to all with access."""
-        user = _make_user(sub="user-1", role="member", agents=["support-bot"])
+        """Runs without scope field default to 'agent' -- the editor tier reads them."""
+        user = _make_user(sub="user-1", role="member", agents=["support-bot"],
+                          agent_roles={"support-bot": "editor"})
         run = {"agent": "support-bot"}  # No scope, no created_by
         self._check(run, user)  # Should not raise (defaults to 'agent')
+        with pytest.raises(HTTPException):
+            self._check(run, _make_user(sub="user-1", role="member", agents=["support-bot"]))
 
 
 # ---------------------------------------------------------------------------

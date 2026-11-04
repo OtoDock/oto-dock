@@ -429,6 +429,14 @@ class OutboundCallAPI:
         finally:
             await ami.close()
 
+    def _ami_listening(self, server_id) -> bool:
+        """An AMI event listener covers the server and is logged in."""
+        if self.ami_manager is None:
+            return False
+        key = self.ami_manager.resolve_server_key(server_id)
+        client = self.ami_manager.action_client(key) if key is not None else None
+        return client is not None and client.connected
+
     async def _warmup_caller_session(self, call_id: str, route) -> None:
         """Pre-warm the caller agent and pre-generate the opening via WebSocket.
 
@@ -452,9 +460,13 @@ class OutboundCallAPI:
         # session, and tearing it down is what made answered outbound calls
         # forget why they called. caller_info also threads trigger_slug /
         # ${trigger.*} enrichment into the OPENING, not just later turns.
-        # An outbound AMI call's media leg names no channel to Redirect: the
-        # prompt must not promise a transfer. Twilio moves either direction.
-        can_transfer = self.cfg.twilio_server(getattr(route, "phone_server_id", None)) is not None
+        # The prompt lists the transfer targets only on a line that can move
+        # the person: Twilio either direction; an AMI call once the PBX's
+        # OriginateResponse names its channel to the server's event listener,
+        # which must be logged in now (until the report, or with none at all,
+        # the tool answers why).
+        server_id = getattr(route, "phone_server_id", None)
+        can_transfer = self.cfg.twilio_server(server_id) is not None or self._ami_listening(server_id)
         client = ProxyClient(
             model=route.agent,
             call_type="outbound",

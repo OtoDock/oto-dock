@@ -4,6 +4,8 @@
 
 export type AudioMode = 'native' | 'platform' | 'auto'
 export type Availability = 'unavailable' | 'native_only' | 'platform' | 'either'
+/** The capability's word for an Automatic pick that runs on the platform. */
+export const AUTOMATIC_ON_PLATFORM = 'platform'
 
 export interface ChatAudioCapability {
   tts: Availability
@@ -12,6 +14,10 @@ export interface ChatAudioCapability {
   stt_provider_id: number | null
   reason: string
   icons_enabled: boolean
+  /** Where the Automatic dictation language runs: the platform when a usable
+   *  provider is there and the policy allows it, else the device. Absent on
+   *  an older proxy, which reads as the device. */
+  stt_automatic?: typeof AUTOMATIC_ON_PLATFORM | 'device'
   /** Full-duplex conversation mode (phone engine on this chat). Absent on
    *  older proxies — absent means unavailable (fail-closed by design). */
   duplex?: { available: boolean; reason: string }
@@ -51,9 +57,11 @@ export interface STTSession {
   onPartial(handler: (text: string) => void): void
   onFinal(handler: (text: string) => void): void
   onError(handler: (err: Error) => void): void
-  // Fires when the recognizer stops on its own (silence / single-utterance end)
-  // so the UI can leave the "recording" state without a manual stop.
-  onEnd(handler: () => void): void
+  // Fires when the session is over (a silence end, a stop, an error) so the
+  // UI can leave the "recording" state without a manual stop. The device
+  // recognizer names its reason (`stopped`, `silence`, `error`, `idle`,
+  // `quick-ends`); the others pass none.
+  onEnd(handler: (reason?: string) => void): void
   // The platform engine moved the dictation to another language: the words
   // it placed for this session are `text` now (empty when nothing was heard
   // in the new language yet). A backend that never switches leaves it out.

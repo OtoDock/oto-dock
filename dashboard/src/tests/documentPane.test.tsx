@@ -31,6 +31,7 @@ import ChatDocumentPane from '@/pages/agent/chat/ChatDocumentPane'
 import { useDocumentPaneForm } from '@/pages/agent/chat/useDocumentPaneForm'
 import DocumentCard from '@/components/chat/media/DocumentCard'
 import ArtifactDock from '@/components/chat/artifacts/ArtifactDock'
+import { chipRef, resetFoldForTests } from '@/components/chat/artifacts/fold'
 import { paneChat, useDocumentPaneStore, useDocumentPushStore } from '@/store/documentPaneStore'
 import type { ChatDocument } from '@/api/documents'
 import { useDocumentChips } from '@/pages/agent/chat/useDocumentChips'
@@ -222,6 +223,56 @@ describe('ChatDocumentPane on the chat page', () => {
     fireEvent.pointerDown(container.querySelector('[data-document-pane]')!)
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(paneChat('c1').open).toBe(false))
+  })
+
+  it('floating: a minimize folds the box into its chip before it hides', async () => {
+    stubFetch()
+    resetFoldForTests()
+    const motions: { el: Element; onfinish: (() => void) | null; cancelled: boolean; finished: Promise<void>; finish: () => void; cancel: () => void }[] = []
+    Element.prototype.animate = function animate(this: Element) {
+      let done!: () => void
+      const a = {
+        el: this, onfinish: null as (() => void) | null, cancelled: false,
+        finished: new Promise<void>((r) => { done = r }),
+        finish() { this.onfinish?.(); done() },
+        cancel() { this.cancelled = true },
+      }
+      motions.push(a)
+      return a as unknown as Animation
+    }
+    const rect = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue(
+      { left: 10, top: 10, width: 300, height: 400, right: 310, bottom: 410, x: 10, y: 10, toJSON: () => ({}) } as DOMRect)
+    const chip = document.createElement('button')
+    document.body.appendChild(chip)
+    const off = chipRef('doc:fa')(chip)
+    try {
+      useDocumentPaneStore.getState().openFile('c1', 'fa')
+      const { container } = wrap(<ChatDocumentPane chatId="c1" placement="floating" hidden={false} userSub="me" />)
+      await screen.findAllByRole('tab')
+      const box = container.querySelector('[data-document-pane]')!.parentElement!
+      act(() => useDocumentPaneStore.getState().minimize('c1'))
+      expect(box.className).not.toContain('invisible')
+      expect(box.hasAttribute('inert')).toBe(true)
+      const fold = motions.find((m) => m.el === box)!
+      expect(motions.some((m) => m.el === chip)).toBe(true)
+      await act(async () => { fold.finish() })
+      expect(box.className).toContain('invisible')
+      expect(fold.cancelled).toBe(true)
+    } finally {
+      off?.()
+      chip.remove()
+      rect.mockRestore()
+      delete (Element.prototype as { animate?: unknown }).animate
+    }
+  })
+
+  it('floating: without motion a minimize hides the box at once', async () => {
+    stubFetch()
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    const { container } = wrap(<ChatDocumentPane chatId="c1" placement="floating" hidden={false} userSub="me" />)
+    await screen.findAllByRole('tab')
+    act(() => useDocumentPaneStore.getState().minimize('c1'))
+    expect(container.querySelector('[data-document-pane]')!.parentElement!.className).toContain('invisible')
   })
 
   it("renders nothing of another person's stored pane and asks for no token", async () => {

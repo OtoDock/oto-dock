@@ -2066,12 +2066,16 @@ class TestTaskPins:
         assert [(t.override_model, t.layer, t.notification_mode) for t in old] == [(None, None, "manual")] * 2
 
     def test_a_pin_the_agent_runs_and_a_mode_reach_the_row(self, tmp_path, temp_db):
+        from services.engines import engine_resolution
         from storage import database as db
         from storage.agents import agent_store
         layer = "claude-code-cli"
         model = _enabled_model(layer)
         out = _install_pinned(tmp_path, _pinned_task(override_model=model, notification_mode="none"))
-        assert agent_store.get_agent("pin-agent")["execution_path"] == layer
+        agent = agent_store.get_agent("pin-agent")
+        assert agent["execution_path"] == layer
+        # An installed agent allows every engine, like a created one.
+        assert json.loads(agent["execution_paths"]) == engine_resolution.every_engine(layer)
         assert out["task_pins_dropped"] == []
         row = next(t for t in db.list_dynamic_tasks(agent="pin-agent")
                    if t["community_template_item_slug"] == "weekly-brief")
@@ -2089,10 +2093,11 @@ class TestTaskPins:
         notes = out["task_pins_dropped"]
         assert len(notes) == 2, notes
         assert notes == [
-            "The task 'weekly-brief' runs on the agent's usual model and engine. "
-            "The engine it asks for is not turned on for this agent.",
-            "The task 'other-brief' runs on the agent's usual model and engine. "
-            "The model no-such-model is not turned on for Claude Code CLI.",
+            "The task 'weekly-brief' runs with no model choice, on its person's own engine "
+            "or the agent's default engine. The engine it asks for is not turned on for this agent.",
+            "The task 'other-brief' runs with no model choice, on its person's own engine "
+            "or the agent's default engine. The model no-such-model is not turned on for any "
+            "engine this agent allows.",
         ]
         rows = {t["community_template_item_slug"]: t for t in db.list_dynamic_tasks(agent="pin-agent")}
         # Seeded all the same, on the agent's default.
@@ -2109,7 +2114,7 @@ class TestTaskPins:
             "OpenAI Codex is not turned on for this agent.")
         monkeypatch.setattr(agent_store, "get_agent", lambda slug: {"execution_path": ""})
         assert inst.task_pin_problem("pin-blank", "no-such-model", None) == (
-            "The model no-such-model is not turned on for this agent.")
+            "The model no-such-model is not turned on for any engine this agent allows.")
 
     def test_a_retired_model_pin_runs_on_its_successor(self, tmp_path, temp_db, monkeypatch):
         import config

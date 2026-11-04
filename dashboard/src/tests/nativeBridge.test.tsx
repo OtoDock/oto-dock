@@ -10,11 +10,12 @@ import { join, relative } from 'node:path'
 import ts from 'typescript'
 
 import { cssColor, model } from '../../design/build.mjs'
-import { act, render } from '@testing-library/react'
+import { act, render, renderHook } from '@testing-library/react'
 import {
-  APP_PRIVACY_POLICY_URL, askNative, callNative, hasNativeBridge, saveNativeFile,
-  setNativeAuthInProgress, setNativeSwitchBusy,
+  APP_PRIVACY_POLICY_URL, STORE_REVIEW_TIMEOUT_MS, askNative, callNative, hasNativeBridge, isNativeSwitchBusy,
+  requestStoreReview, saveNativeFile, setNativeAuthInProgress, setNativeSwitchBusy,
 } from '@/lib/nativeBridge'
+import { useNativeSwitchBusy } from '@/pages/agent/chat/useNativeSwitchBusy'
 import { installFakeNativeChannel, watchRetiredAndroidName } from './fixtures/nativeChannel'
 
 afterEach(() => {
@@ -74,6 +75,57 @@ describe('in the app', () => {
     const answer = askNative('getInstallations', [], 3000)
     vi.advanceTimersByTime(3000)
     await expect(answer).resolves.toBeUndefined()
+  })
+
+  it('a store review is handed over only when the app says so, and passes nothing', async () => {
+    const ch = installFakeNativeChannel({ requestStoreReview: true })
+    await expect(requestStoreReview()).resolves.toBe(true)
+    expect(ch.posted[0]).toMatchObject({ m: 'requestStoreReview', a: [] })
+    ch.uninstall()
+    installFakeNativeChannel({ requestStoreReview: false })
+    await expect(requestStoreReview()).resolves.toBe(false)
+  })
+
+  it('a store review an app does not answer (older, or empty) reads not handed after its wait', async () => {
+    vi.useFakeTimers()
+    installFakeNativeChannel()
+    const answer = requestStoreReview()
+    vi.advanceTimersByTime(STORE_REVIEW_TIMEOUT_MS)
+    await expect(answer).resolves.toBe(false)
+  })
+})
+
+describe('the chat\'s switch report', () => {
+  // A switch would cut a live meeting or a voice conversation; a generating
+  // chat is not reported (its turn runs on the server).
+  const busyPosts = (ch: ReturnType<typeof installFakeNativeChannel>) =>
+    ch.posted.filter((p) => p.m === 'setSwitchBusy').map((p) => p.a[0])
+  const lastBusy = (ch: ReturnType<typeof installFakeNativeChannel>) => busyPosts(ch).slice(-1)[0]
+
+  it('a live meeting or voice conversation flags it, cleared when both end', () => {
+    const ch = installFakeNativeChannel()
+    const { rerender, unmount } = renderHook(
+      ({ meeting, voice }) => useNativeSwitchBusy(meeting, voice),
+      { initialProps: { meeting: false, voice: false } },
+    )
+    expect(busyPosts(ch)).toEqual([false])
+    rerender({ meeting: false, voice: true })
+    expect(isNativeSwitchBusy()).toBe(true)
+    expect(lastBusy(ch)).toBe(true)
+    // Still busy while either one lives: nothing is posted.
+    const posts = busyPosts(ch).length
+    rerender({ meeting: true, voice: true })
+    rerender({ meeting: true, voice: false })
+    expect(busyPosts(ch)).toHaveLength(posts)
+    expect(isNativeSwitchBusy()).toBe(true)
+    rerender({ meeting: false, voice: false })
+    expect(isNativeSwitchBusy()).toBe(false)
+    expect(lastBusy(ch)).toBe(false)
+    rerender({ meeting: true, voice: false })
+    expect(lastBusy(ch)).toBe(true)
+    unmount()
+    expect(isNativeSwitchBusy()).toBe(false)
+    expect(lastBusy(ch)).toBe(false)
   })
 })
 

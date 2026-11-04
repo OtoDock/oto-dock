@@ -117,6 +117,7 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
      "updated_at": "<stamp>"

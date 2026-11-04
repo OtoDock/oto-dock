@@ -46,9 +46,9 @@ Run with `python -m satellite`. The subpackages each own one concern.
 |---|---|
 | `__main__.py`, `config.py`, `engines.py`, `background.py` | `__main__.py` is the entry point and boot guard. `config.py` holds the host OS table (`config.HOST`), `SATELLITE_VERSION` and the vendored hashes. `engines.py` holds the `ENGINES` table. `background.py` holds `spawn(coro, name=, owner=)`, the one way to start a task nobody keeps: held until it ends, a death handed to the loop's exception handler under `owner:name`. |
 | `transport/` | the wire: `ws_client`, `lifecycle_update` (auto-update), `http_tunnel`, `mcp_gateway`, `file_sync` |
-| `sessions/` | engine sessions: `session_manager`, `cli_session`, `codex_session`, `alive_report`, `session_files`, `session_move` (a chat's session files moved on and off this machine, the `session_move` frame), `step_runner` (app steps), `mcp_install_support`, `mcp_interceptor` |
+| `sessions/` | engine sessions: `session_manager`, `cli_session`, `codex_session`, `alive_report`, `session_files`, `session_move` (a chat's session files moved on and off this machine, the `session_move` frame), `step_runner` (app steps and script checks, the `step_run` frame), `mcp_install_support` (MCP venvs on the satellite's own Python, the boot's reconcile, a failed install's cause), `mcp_interceptor` |
 | `terminal/` | interactive PTYs and the local `otodock` command: `local_socket`, `otodock_cli`, `otodock_proto`, `pty_session_base`, `pty_session`, `codex_pty_session`, `pty_relay`, `winpty_relay` |
-| `host/` | the machine: `host_probe`, `satellite_policy`, `auth_paths`, `safe_fs` (file opens beneath the agents root with no link followed), `env_hygiene`, `path_translator`, `cli_versions`, `session_retention` (the retention sweep's keep list applied to the transcripts here), `tray`, `service_unit` |
+| `host/` | the machine: `host_probe`, `satellite_policy`, `auth_paths`, `safe_fs` (file opens beneath the agents root with no link followed), `env_hygiene`, `path_translator`, `cli_versions` (the CLI pins, and the npm and Mac tool folders put on `PATH` at start), `session_retention` (the retention sweep's keep list applied to the transcripts here), `interpreters` (Git Bash, its `env.exe` and the install's Python on Windows, for a script's first line), `tray`, `service_unit`, `macos_app` (`OtoDock Satellite.app`, the Mac's login item, which `install.sh` builds by running it as a script) |
 | `_vendored/` | byte-for-byte copies of proxy modules. Never edit them (see "Development"). |
 
 `__main__` imports only `config` at module top, so the boot guard can roll a
@@ -72,6 +72,10 @@ offline the session falls back to the agent's target (the
 - The Claude Code and Codex CLIs follow the platform's pins at every
   reconnect. Node, uv and pnpm move only when the install command runs
   again, and an update never changes the machine's Python.
+- A Mac paired before 1.9.1 finds its CLIs again after the update alone:
+  from 0.5.160 the satellite puts Homebrew's and your own tool folders in
+  front of its `PATH` at start. Homebrew's `python@3.13`, the login item's
+  `PATH` and `OtoDock Satellite.app` reach it only when you pair it again.
 - On an opted-in plaintext link (`allow_insecure_transport`) the satellite
   refuses updates and uninstalls from the platform: run the installer again
   to update it.
@@ -90,8 +94,22 @@ offline the session falls back to the agent's target (the
 
 - Python 3.10 or newer (`PYTHON_MIN_VERSION` in `VERSIONS.md`). The pairing
   installer provisions one where it is missing: the distro's `python3` on
-  Linux, brew `python` on macOS, Python 3.12 through winget on Windows.
-  Auto-update keeps the interpreter the venv was built on.
+  Linux, Python 3.12 through winget on Windows. On macOS it takes the
+  platform's own minor, Homebrew's `python@3.13`, and builds the satellite's
+  venv on `$(brew --prefix)/opt/python@3.13/bin/python3.13`. It installs
+  Homebrew first when it finds none (on `PATH`, at `/opt/homebrew/bin/brew`
+  or at `/usr/local/bin/brew`): that needs an administrator account, whose
+  password it asks for once, and brings Apple's Command Line Tools. With
+  Homebrew there and no Command Line Tools, the installer stops and asks
+  you to run `xcode-select --install`. Without `python@3.13` it warns and
+  builds on Homebrew's newest Python, where tools written in Python may not
+  install. From 0.5.160 the satellite builds every MCP's venv on its own
+  Python, since Homebrew's plain `python3` moves to a newer minor that no
+  compiled package serves yet. Auto-update keeps the interpreter the
+  venv was built on.
+- macOS, for browser control: Google Chrome (or Edge, Brave, Chromium):
+  `brew install --cask google-chrome`, then open it once by hand, since the
+  first launch of a downloaded app asks whether to open it.
 - Network egress to the platform's public `wss://` endpoint.
 - Claude Code and/or Codex: the pairing installer installs them, with the
   rest of the developer toolchain.
@@ -115,6 +133,12 @@ and registers a **per-user** service (a systemd user unit with
 `loginctl enable-linger`, a launchd LaunchAgent, or a Windows logon
 Scheduled Task). Nothing runs as root or SYSTEM.
 
+On a Mac run the install command as yourself: it refuses root, as Homebrew
+does, and the toolchain comes from Homebrew. npm and the git credential
+helper need no `sudo` in Homebrew's folder. What an older installer's
+`sudo npm` left owned by root (`~/.npm`, the CLI packages and their links
+in Homebrew's folder) is given back to you.
+
 > **Windows: Python "App execution aliases".** On a fresh Windows 10 or 11
 > without a real Python, `python.exe` and `python3.exe` under
 > `%LOCALAPPDATA%\Microsoft\WindowsApps\` are Microsoft Store redirect
@@ -123,6 +147,31 @@ Scheduled Task). Nothing runs as root or SYSTEM.
 > shadowed by the alias), turn the aliases off: **Settings, Apps, Advanced
 > app settings, App execution aliases**, switch off `python.exe` and
 > `python3.exe`, then run the installer again.
+
+### macOS permissions
+
+macOS asks before the satellite may see the screen, use the mouse and
+keyboard, or read some folders. Each question names OtoDock Satellite and
+comes once. Your answer stays for the app.
+
+- The first time an agent uses computer control, macOS asks for
+  Accessibility and for Screen & System Audio Recording. On macOS 27 the
+  first list is called Device Control and Data Access. Before macOS 15 the
+  second is called Screen Recording.
+- On macOS 27 the first screenshot also asks whether OtoDock Satellite may
+  bypass the system private window picker. Screenshots work while it waits.
+- The first time a session reads your Documents, Desktop or Downloads
+  folder, macOS asks for that folder. A network or external drive asks the
+  same way. The command waits until you answer.
+- To skip the folder questions, turn on OtoDock Satellite once under Full
+  Disk Access in System Settings, Privacy & Security.
+- When a tool controls another app on the Mac, macOS asks once for each app,
+  under Automation. Browser control does not ask.
+- A switch you turn on reaches the next chat you start on this computer. A
+  chat that is already open keeps the old answer. If macOS offers Quit &
+  Reopen, choose Later, because quitting the satellite ends its chats.
+
+Windows and Linux ask none of these.
 
 ### Manual install
 
@@ -192,6 +241,8 @@ The hint keys are the `conf_section` / `conf_key` of each engine's row in
 ~/.oto-dock/
 ├── satellite.conf            # the daemon's configuration
 ├── satellite/                # the daemon's code and venv
+├── OtoDock Satellite.app/    # macOS: the login item's launcher (host/macos_app.py)
+├── .satellite-app.sha256     # macOS: the app's stamp. A match keeps the app and its permissions
 ├── steps/                    # app steps' scratch: one 0700 folder per running step, never synced
 ├── run/                      # the local control socket of the otodock command
 ├── agents/                   # agent folders, synced with the platform
@@ -226,7 +277,24 @@ reference.
   only when the unit is this install's own (`host/service_unit.is_own_unit`
   compares its `WorkingDirectory`: one OS user may run several satellites).
 - **macOS:** the LaunchAgent `~/Library/LaunchAgents/com.otodock.satellite.plist`
-  (`KeepAlive`, `RunAtLoad`).
+  (`KeepAlive`, `RunAtLoad`), started in your desktop session (`launchctl
+  bootstrap gui/<uid>`, also when you pair over SSH). Its `PATH` names
+  Homebrew's and your own tool folders, since launchd gives a login item
+  only the system ones. It runs `~/.oto-dock/OtoDock Satellite.app`, a small
+  app the installer builds and signs on the Mac (ad hoc, as
+  `com.otodock.satellite`), which starts the satellite and stays its
+  parent. macOS therefore lists the satellite as **OtoDock Satellite** in
+  System Settings, Privacy & Security: turn it on under Accessibility
+  (named Device Control and Data Access from macOS 27) and Screen & System
+  Audio Recording for computer control. Computer control asks for both on
+  its first use. After turning them on, start a new chat on the machine.
+  With no one signed in at the Mac's desktop the installer starts the
+  satellite in the background (`launchctl load`): computer control and the
+  permission questions wait for a desktop sign-in. A Mac without the
+  Command Line Tools or `codesign` runs the satellite without the app, and
+  macOS lists its permissions under Python. Running the install command
+  again over an existing install keeps the app and its permissions.
+  Removing the machine and pairing it again clears both: macOS asks again.
 - **Windows:** the per-user logon task `OtoDockSatellite` (no admin rights)
   and an HKCU Add/Remove Programs entry.
   `Get-ScheduledTask OtoDockSatellite | Get-ScheduledTaskInfo` inspects it.
@@ -263,12 +331,16 @@ WantedBy=default.target
   absent.
 
 The uninstall removes the service registration and the whole install folder
-(code, venv, agents, MCPs, sessions, config and the credentials synced down).
+(code, venv, agents, MCPs, sessions, config and the credentials synced down),
+and the `~/.local/bin/otodock` link when it points into that folder. On
+macOS it also clears the two permissions macOS gave OtoDock Satellite.
 The toolchain the pairing installed (git, gh, Python, Node, pnpm, uv, jq,
-ripgrep, poppler-utils, sqlite3, the Claude Code and Codex npm globals)
-**stays**: the installer skipped what was already there and keeps no record
-of what it added, and removing it blindly could break other software. The
-scripts print the `winget`, `apt` or `brew` commands for a full cleanup.
+ripgrep, poppler-utils, sqlite3, the Claude Code and Codex npm globals,
+and on macOS Homebrew itself, `python@3.13` and the git credential helper
+in Homebrew's `bin`) **stays**: the installer skipped what was already
+there and keeps no record of what it added, and removing it blindly could
+break other software. The scripts print the `winget`, `apt` or `brew`
+commands for a full cleanup.
 
 ## Development
 

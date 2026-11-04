@@ -20,6 +20,7 @@ from api.hooks import routing
 from api.sessions.sessions import verify_api_key_async, verify_session_match_async
 from core.session.session_state import (
     _dashboard_notify_queues,
+    _push_to_chat,
     _sessions,
     get_permission_queue,
     get_permission_request_session,
@@ -57,6 +58,10 @@ class HookToolResultRequest(BaseModel):
     # Interactive TUI mcp__ calls: feed the session allow-memory only, no
     # chat rendering (the terminal already rendered the result).
     memory_only: bool = False
+    # The sub-agent that made the call (the hook's own ``agent_id``; empty
+    # for the main agent and on older scripts). Its call is the turn's record
+    # and a sign of life, never a card in the main chat.
+    agent_id: str = ""
     # The paths the call's input named (file_path / path / notebook_path) —
     # the turn's record (session_events.post_tool). Empty on older scripts.
     tool_paths: list[str] = []
@@ -109,6 +114,12 @@ async def hook_tool_result(req: HookToolResultRequest, authorization: str | None
         tool_input={"_paths": list(req.tool_paths)} if req.tool_paths else None,
         is_error=req.is_error, source="forwarder", command=req.tool_command,
     )
+
+    if req.agent_id:
+        get_subagent_registry(req.session_id).note_alive(req.agent_id)
+        if result_files.opted_in(req.tool_name) is not None:
+            return {"status": "ok", "result_files": True}
+        return {"status": "ok"}
 
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
@@ -226,15 +237,18 @@ async def hook_subagent(req: HookSubagentRequest, authorization: str | None = He
     if chat_id and tool_use_id:
         mark_subagent_done(chat_id, tool_use_id)
 
-    # Per-agent WS completion. Pump path (turn still streaming → fg agents)
-    # first, else the session notify queue (turn ended → bg agents, no pump).
+    # Per-agent WS completion: the chat's pump while a turn streams (fg
+    # agents), else every socket viewing the chat (a bg agent ending between
+    # turns; a page reloaded since never registered this session). The
+    # session's own socket is the fallback when no chat resolves.
     event = {"type": wire.BG_AGENT_DONE, "tool_use_id": tool_use_id}
-    pushed = push_pump_event(chat_id, event) if chat_id else False
-    if not pushed:
+    if chat_id:
+        _push_to_chat(chat_id, event)
+    else:
         nq = _dashboard_notify_queues.get(req.session_id)
         if nq:
             with contextlib.suppress(Exception):
-                nq.put_nowait({"type": wire.BG_AGENT_DONE, "tool_use_id": tool_use_id})
+                nq.put_nowait(event)
     return {"status": "ok"}
 
 

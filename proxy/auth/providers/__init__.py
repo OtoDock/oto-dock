@@ -238,6 +238,18 @@ class UserContext:
         """
         return roles.can_edit(self.effective_role(agent))
 
+    def sees_agent_automations(self, agent: str) -> bool:
+        """May this caller see what ``agent`` does on its own behalf: its
+        agent-scope tasks, runs and their chats, triggers and notification
+        definitions? Seeing it is acting as the agent, so the editor tier
+        (``can_edit_agent``); the master key and a no-user session (the agent
+        itself, not an external caller) too. An ADDED filter: every caller
+        asks its reach test (``can_access_agent``, a no-user session's
+        delegation edge) first, never this alone."""
+        if self.is_service or (self.is_no_user_session and not self.is_external):
+            return True
+        return self.can_edit_agent(agent)
+
     def can_write_workspace(self, agent: str) -> bool:
         """Workspace-tier check: may this user WRITE this agent's shared
         workspace? True for admin + per-agent manager + editor +
@@ -1023,6 +1035,16 @@ def session_bound_to(param: str):
                 detail=f"A session acts only on the agent it was started for ('{user.agent}')",
             )
     return _bound
+
+
+def automation_agents(user: UserContext) -> list[str] | None:
+    """The agents whose agent-scope work ``user`` sees, for a SQL filter:
+    None for every agent (the master key, a platform admin, a no-user
+    session), else the assigned agents at the editor tier
+    (``UserContext.sees_agent_automations``)."""
+    if user.is_admin or user.sees_agent_automations(""):
+        return None
+    return [a for a in user.agents if user.sees_agent_automations(a)]
 
 
 def require_agent_access(user: UserContext, agent_name: str) -> None:

@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   useRemoteMachines, usePairMachine, useDeleteMachine, useAssignAgent, useUnassignAgent,
   useSetAutoUpdate, useTriggerUpdateNow, useSetAllowFullFs, useSetDeviceGrants,
-  useSetMaxSessions,
+  useSetMaxSessions, useSetAllRolesRunHere,
   DEVICE_CAPABILITY_INFO,
   deviceGrantBody,
   type DeviceCapabilityInfo,
@@ -16,7 +16,7 @@ import { useFlag } from '../../hooks/useFlag'
 import { hasAgentScope, modeOfAgent } from '../../lib/visibility'
 import { engineLabels, installedCliBinaries, runsRemote } from '../../lib/engines'
 import { cliChipInfo } from '../../lib/cliChip'
-import RemoteBadge from '../../components/RemoteBadge'
+import RemoteBadge, { MachineLinkNotice } from '../../components/RemoteBadge'
 import PairInstallCommand from '../../components/PairInstallCommand'
 import { BrowserModeSelect, BrowserTokenField } from '../../components/BrowserModeControls'
 import { browserModeDesc, browserModeOf } from '../../lib/remote/browserMode'
@@ -356,6 +356,48 @@ function MachineDeviceGrantsControls({ machine }: { machine: RemoteMachine }) {
 }
 
 
+// "Every role of its agents runs here": the machine has no sandbox, so below
+// the owner tier a chat of an agent whose default place it is runs on the
+// platform unless its admin turns this on. Turning it on asks first.
+const ALL_ROLES_HELP = "On, the chats of editors, contributors and viewers run on this computer, with the machine's own access."
+const ALL_ROLES_INFO = 'Off, their chats run on the OtoDock platform. Managers and admins run here either way. An outside caller always runs on the platform.'
+const ALL_ROLES_CONFIRM = "Chats of editors, contributors and viewers will run on this computer. They can reach every file this computer's user can. They also get its browser and computer control, and the accounts their chats use."
+
+function MachineRolesControls({ machine }: { machine: RemoteMachine }) {
+  const setAllRoles = useSetAllRolesRunHere()
+  const dialogs = useDialogs()
+  const { stateOf, run } = useSaveState()
+  const toggle = async (enabled: boolean) => {
+    if (enabled && !(await dialogs.confirm({
+      title: `Let every role run on ${machine.name}?`,
+      body: ALL_ROLES_CONFIRM,
+      confirmLabel: 'Allow',
+    }))) return
+    void run('roles', () => setAllRoles.mutateAsync({ machineId: machine.id, enabled }),
+      { failTitle: 'Who runs on this machine was not changed' })
+  }
+  return (
+    <div className="pt-2 border-t border-subtle space-y-2">
+      <p className="text-xs font-medium text-tertiary">Who runs here<SaveState state={stateOf('roles')} /></p>
+      <p className="text-3xs text-tertiary max-w-md">{ALL_ROLES_HELP}</p>
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-primary">
+        <label className="inline-flex items-center gap-1.5 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={machine.all_roles_run_here ?? false}
+            disabled={setAllRoles.isPending}
+            onChange={e => { void toggle(e.target.checked) }}
+            className="accent-action"
+          />
+          <span className="font-medium">Every role of its agents runs here</span>
+        </label>
+        <InfoTip label="Every role of its agents runs here">{ALL_ROLES_INFO}</InfoTip>
+      </div>
+    </div>
+  )
+}
+
+
 export default function RemoteMachinesPage() {
   const { data: machines, isLoading } = useRemoteMachines()
   const { data: satelliteStats } = useSatelliteStats()
@@ -487,10 +529,13 @@ export default function RemoteMachinesPage() {
                 machineName={m.name}
                 lastSeenIso={m.last_seen}
                 heartbeatAgeS={m.last_heartbeat_age_s ?? null}
+                linkDown={m.link_ok === false}
+                linkDownS={m.link_down_s}
               />
               <div className="min-w-0">
                 <p className="font-medium text-primary truncate">{m.name}</p>
                 <p className="text-xs text-tertiary truncate">{m.id.slice(0, 8)} · {m.capabilities?.os || 'unknown'}</p>
+                <MachineLinkNotice linkOk={m.link_ok} downS={m.link_down_s} error={m.link_error} detail={expandedId === m.id} />
               </div>
             </div>
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
@@ -603,6 +648,9 @@ export default function RemoteMachinesPage() {
               {/* Device-control consent */}
               <MachineDeviceGrantsControls machine={m} />
 
+              {/* Every role of its agents */}
+              <MachineRolesControls machine={m} />
+
               {/* Danger zone */}
               <div className="pt-2 border-t border-subtle">
                 {deleteConfirm === m.id ? (
@@ -673,6 +721,8 @@ export default function RemoteMachinesPage() {
                       lastSeenIso={m.last_seen}
                       heartbeatAgeS={m.last_heartbeat_age_s ?? null}
                       size="xs"
+                      linkDown={m.link_ok === false}
+                      linkDownS={m.link_down_s}
                     />
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium text-primary truncate">{m.name}</p>
@@ -682,6 +732,7 @@ export default function RemoteMachinesPage() {
                         {' · '}
                         {m.capabilities?.os || 'unknown'}
                       </p>
+                      <MachineLinkNotice linkOk={m.link_ok} downS={m.link_down_s} />
                     </div>
                     <span className={`${BADGE_BASE} ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected} shrink-0`}>
                       {m.status}

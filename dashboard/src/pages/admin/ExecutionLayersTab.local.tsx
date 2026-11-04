@@ -26,6 +26,7 @@ import { toastError } from '../../lib/http/apiJson'
 import { useInvokedForm } from '../../components/common/useInvokedForm'
 import Button from '../../components/ui/Button'
 import { Input, Select } from '../../components/ui/Field'
+import { HOVER_REVEAL_FADE } from '../../components/ui/classes'
 
 interface LocalEngine {
   id: string
@@ -155,7 +156,7 @@ function LocalEndpointRow({ group: g, layer, engines, onDiscover }: {
         <button
           onClick={() => canDiscover && here && onDiscover({ id: here.id, provider: g.provider, layers: enabledEngines(g, engines) })}
           disabled={!canDiscover}
-          className="text-xs text-link hover:text-link-hover transition-colors disabled:opacity-40 sm:opacity-0 sm:group-hover:opacity-100"
+          className={`text-xs text-link hover:text-link-hover transition-colors disabled:opacity-40 ${HOVER_REVEAL_FADE}`}
           title={canDiscover ? 'Discover the models this server offers' : 'Turn this server on for this engine first'}
         >
           Discover
@@ -185,7 +186,7 @@ function LocalEndpointRow({ group: g, layer, engines, onDiscover }: {
                 }
               }
             }}
-            className="text-xs text-status-danger-fg hover:underline sm:opacity-0 sm:group-hover:opacity-100"
+            className={`text-xs text-status-danger-fg hover:underline ${HOVER_REVEAL_FADE}`}
           >
             Remove
           </button>

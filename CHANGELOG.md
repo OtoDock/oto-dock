@@ -13,6 +13,93 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-11-04
+
+### Upgrade notes
+- **Memory topics over 32 KB stop growing** until the agent shrinks them, and one edit adds 2 KB at most. Admins set both
+  limits under System Settings.
+- **Only editors and managers now see an agent's own tasks, triggers and runs,** in apps too. Others see their
+  own. A shared task or trigger picks who is told of its runs, under Who is told: a new one tells editors and managers,
+  existing ones everyone.
+- **Scheduled tasks and delegated lanes can now create images, music and video** when the agent has those tools.
+- **A chat you delegate can run on your own computer when you ask for it** ("do this on my laptop"). There it runs as you,
+  with your AI account, browser and connected accounts. While that computer is offline the lane says so. Only you can continue it there.
+- **Every agent now allows every AI engine,** each person on their own account. A limit you set before is lifted once:
+  untick engines in Agent Settings, Configuration to set it again. The agent's own tasks still need the platform's subscription.
+- **A Mac paired before 1.9.1 starts chats again after the update.** Pair it again so every tool installs: its owner removes
+  it in Remote machines, pairs it and gives back its agents, browser and computer control. macOS asks again for its permissions.
+- **Paired computers update themselves to 0.5.168 at reconnect,** one restart each. Browser and computer control install again on their own.
+- **Dictation in Safari, on an iPhone or iPad and with the Automatic language now bills your speech provider.** To stay on the device, pick a
+  language in the microphone menu, and in Safari or on an iPhone or iPad set Dictation to Native under User Settings, Audio.
+- **Restored an older backup?** If Slack, Notion, Zoom or GitHub events stop, ask OtoDock support to reset them.
+- **GPT-6.1 Terra and Qwen 3.8 replace GPT-5.6 Terra and Qwen 3.6, and GPT-6.1 Sol joins Direct LLM.** Agents, chats and
+  tasks on them move at the server's first start. Terra costs less, Qwen 3.8 a third more. Add an old model back as a custom model to keep it.
+- **Sign-in addresses** (Setup, Security, OAuth Bearer Allowlist) are no longer added by OtoDock itself. Each MCP adds its own
+  and takes over a matching row an admin had, one installed before 1.9.1 at its next update or off and on. Remove custom
+  addresses there drops the admin rows.
+- **The server's images run on Debian 13.** An SSH host with a DSA key stops working: give it an ed25519 key. An agent's
+  Python 3.11 environment stops starting: delete it, the agent makes it again. An MCP needing Python 3.11: remove and
+  install it again under Admin, MCP Servers.
+- **On a source checkout the document editor now answers on its own computer only.** A reverse proxy on another computer
+  that reaches port 9981 needs `COLLABORA_BIND_IP=0.0.0.0` in config.env before you update. The first start then rebuilds
+  the file tools: twenty minutes with 6 GB free, while the rest works.
+
+### Added
+- **A department installs from the community in one step.** Its agents, shared library and paused schedules come too.
+- **An agent can propose a community agent, a department, or moving an agent into one.** The Agent Creator tool
+  searches the community catalog first and shows a card in the chat. Nothing changes until you press it.
+- **Ask an agent where a setting is, and change it in the chat.** Its card lets each person in the chat change
+  theirs. The agent never sees the value. A manager turns the Settings tool on under Agent Settings, MCPs.
+- **An agent can offer you a choice as a card with buttons.** A button answers, or does one thing with your own
+  permissions, and nothing happens until you press it.
+- **The iOS app, on TestFlight.** One app for more than one OtoDock, your company sign-in, dictation, notifications and
+  alarms with sound. Both apps ask for a rating, twice at most.
+- **Documents agents make are checked and look closer to the preview.** Word gains tracked changes and
+  comments, slides gain themes, spreadsheet formulas get their values, and PDF forms fill in.
+- **An admin can let every role's chats run on a platform machine.**
+- **Cartesia voices in the Text-to-Speech tools,** at a chosen speed and, in English, emotion. The microphone menu says
+  which recognizer listens.
+
+### Changed
+- **The Browse Community Agents page shows the apps a template brings.** An app copied from another agent follows its source.
+- **An editor or a manager can share one of their own personal memory topics with everyone on the agent.**
+- **Your own subscription now works on every agent that allows the engine.** Each agent lists first the engines you
+  use most there. A new chat opens on the first. In Configuration, **Only allow local models** keeps an agent local.
+- **Platform only joins the chat audio policy,** an admin choice that sends everyone's voice and dictation through your speech provider.
+- **Greek is heard better in a spoken conversation,** and its speech shows on the Usage pages under the person who spoke.
+- **Delegated work shows as a card in your chat,** and each delegated chat gets a short title with an icon. A lane from
+  your chat has your chat's tools and settings.
+- **The Notebook replaces library bulletins** (the old files stay). Agents one delegation step apart share dated notes there.
+- **Terminal chat windows fold into icons you can reorder,** and each chat keeps them. The company map opens on the agent you came from.
+- **Claude Code 2.1.312 and Codex 0.166.0,** installed on every machine at reconnect. Claude shows its plan review in Plan.
+- **Reports of replies** (Admin, Reports). Admins mark one handled or delete it. It is deleted a year after it was filed.
+
+### Fixed
+- **Dictation on the device keeps every phrase and survives a pause,** and says so when it hears nothing.
+- **Photos and files sent with a chat's first message stay in the chat,** reach an agent in a terminal, and are not
+  sent again on Resume. In a terminal chat a message shows once after a reload.
+- Background work keeps its badge until it ends and asks for approval at once. A follow-up reaches a running lane.
+- **A Mac pairs from a fresh install, and computer control asks for its two macOS permissions.** The browser starts on a
+  Mac where Chrome was never opened.
+- **Paired computers.** One that showed online while refusing every tool call now repairs its link. A chat shows only
+  its computer's install, a first workspace copy counts its files, and a message to a silent one ends in a card.
+- **Direct LLM, Docker MCPs and the Local Browser.** A chat stops waiting for a tool that never answers. A Docker MCP's
+  update shows its progress and runs once. The Local Browser no longer stops: a stuck tab restarts it.
+- A self-hosted Postiz signs in. Removing OtoDock at a vendor disconnects the account
+  and stops its events. Accounts a vendor stops accepting say Reconnect needed. Admin, Users lists last sign-ins. A Claude login ending soon offers Reconnect.
+- **Older chats and task runs load as you scroll the sidebar,** and a search result opens at the match.
+- **Small display fixes.** A check's condition and a weekday schedule read as sentences. Choosing where a chat runs
+  clears a phone's message box. Mouse-only buttons show on tablets and foldables. The offline computer notice can be closed.
+- **Codex plans in Plan again.** A question from an agent ends its reply and asks you. Cancel on a plan stops the agent.
+- **Phone calls.** An agent can call through another agent's line, and that agent speaks on the call. Calls an agent
+  placed can be transferred too, and a call's result reaches the chat at once.
+- **The Android app.** From Android 13, turning notifications off stops alarms too: keep them on for your alarms. Videos
+  turn with the phone. You can switch servers while a reply is still coming.
+- **Ubuntu 26.04.** Agents run again on a server or a paired computer installed on it.
+
+### Security
+- **A document cannot make the server fetch what it only links to.** pyasn1 0.6.5 closes four advisories.
+
 ## [1.9.0] - 2026-10-25
 
 ### Upgrade notes
@@ -1130,7 +1217,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.9.1...HEAD
+[1.9.1]: https://github.com/OtoDock/oto-dock/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/OtoDock/oto-dock/compare/v1.8.1...v1.9.0
 [1.8.1]: https://github.com/OtoDock/oto-dock/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/OtoDock/oto-dock/compare/v1.7.1...v1.8.0

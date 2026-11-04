@@ -2,15 +2,16 @@
 
 Creates charts as PNG images using matplotlib and pushes them inline
 to the dashboard chat via _push_image_preview. Optionally saves to file.
+
+matplotlib draws in a worker process (``isolation.run_parse``), never on
+the server's event loop, with a ``Figure`` and the Agg canvas (no pyplot
+state shared between charts); the parent validates, caps the size, saves
+and pushes the PNG the worker returns.
 """
 
+import functools
 import io
-
-import matplotlib
-
-matplotlib.use("Agg")  # Non-interactive backend
-import matplotlib.pyplot as plt
-import numpy as np
+import time
 
 from shared import (
     _push_image_preview,
@@ -132,7 +133,8 @@ def _value_grid(ax, value_axis: str):
 
 
 def _render_bar(ax, args: dict, horizontal: bool = False):
-    import matplotlib.pyplot as plt
+    import matplotlib
+    import numpy as np
 
     cats = args.get("categories", [])
     series = args.get("series", [])
@@ -143,7 +145,7 @@ def _render_bar(ax, args: dict, horizontal: bool = False):
 
     # Value labels only where they stay readable: one series, few bars.
     label_bars = n_series == 1 and 0 < len(cats) <= 12
-    label_color = plt.rcParams["text.color"]
+    label_color = matplotlib.rcParams["text.color"]
 
     for i, s in enumerate(series):
         offset = 0 if n_series == 1 else (i - n_series / 2 + 0.5) * width
@@ -211,7 +213,7 @@ def _render_line(ax, args: dict):
 
 
 def _render_pie(ax, args: dict, doughnut: bool = False):
-    import matplotlib.pyplot as plt
+    import matplotlib
 
     series = args.get("series", [{}])
     s = series[0] if series else {}
@@ -223,7 +225,7 @@ def _render_pie(ax, args: dict, doughnut: bool = False):
 
     # The slice edge is the figure background so slices read as separated on
     # dark styles too.
-    edge = plt.rcParams["figure.facecolor"]
+    edge = matplotlib.rcParams["figure.facecolor"]
     wedgeprops = {"edgecolor": edge, "linewidth": 2.5}
     if doughnut:
         wedgeprops["width"] = 0.42
@@ -248,9 +250,9 @@ def _render_pie(ax, args: dict, doughnut: bool = False):
     if doughnut and not (abs(total - 100) < 1.5 or abs(total - 1) < 0.05):
         ax.text(0, 0.06, _fmt_num(total), ha="center", va="center",
                 fontsize=22, fontweight="bold",
-                color=plt.rcParams["text.color"])
+                color=matplotlib.rcParams["text.color"])
         ax.text(0, -0.16, "total", ha="center", va="center",
-                fontsize=10.5, color=plt.rcParams["xtick.color"])
+                fontsize=10.5, color=matplotlib.rcParams["xtick.color"])
 
     # Categories moved off the slices into a side legend — only an explicit
     # legend:false suppresses it.
@@ -297,6 +299,8 @@ def _render_area(ax, args: dict):
 
 
 def _render_heatmap(ax, args: dict):
+    import numpy as np
+
     data = args.get("data", [])
     if not data:
         series = args.get("series", [])
@@ -309,7 +313,7 @@ def _render_heatmap(ax, args: dict):
     cmap = args.get("colormap", "YlOrRd")
     ax.grid(False)  # gridlines over cells are noise
     im = ax.imshow(arr, cmap=cmap, aspect="auto")
-    plt.colorbar(im, ax=ax, shrink=0.8)
+    ax.figure.colorbar(im, ax=ax, shrink=0.8)
 
     if cats:
         ax.set_xticks(range(len(cats)))
@@ -413,8 +417,78 @@ def _validate_series(chart_type: str, args: dict) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+CHART_DEADLINE_S = 60.0
+SIZE_MIN_IN = 1.0
+SIZE_MAX_IN = 40.0
+DPI = 150
+_CHART_ADVICE = "Draw a simpler chart (fewer points or series, a smaller size)"
+_RENDERERS = {
+    "bar": _render_bar,
+    "column": _render_bar,
+    "horizontal_bar": functools.partial(_render_bar, horizontal=True),
+    "line": _render_line,
+    "pie": _render_pie,
+    "doughnut": functools.partial(_render_pie, doughnut=True),
+    "scatter": _render_scatter,
+    "area": _render_area,
+    "heatmap": _render_heatmap,
+    "histogram": _render_histogram,
+}
+
+
+def _new_axes(fig_width: float, fig_height: float):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(fig_width, fig_height))
+    FigureCanvasAgg(fig)
+    return fig, fig.subplots()
+
+
+def render_png(args: dict, chart_type: str, fig_width: float, fig_height: float, style_name: str) -> bytes | str:
+    """Worker core: the chart as PNG bytes, or the error text."""
+    import matplotlib
+
+    style_params = STYLES.get(style_name, STYLES["modern"])
+    with matplotlib.rc_context(style_params):
+        fig, ax = _new_axes(fig_width, fig_height)
+        try:
+            _RENDERERS[chart_type](ax, args)
+        except Exception as exc:  # noqa: BLE001  # matplotlib on the caller's data raises anything from a renderer
+            return f"Error rendering {chart_type} chart: {exc}"
+        title = args.get("title", "")
+        if title:
+            ax.set_title(title, pad=15)
+        if args.get("x_label"):
+            ax.set_xlabel(args["x_label"])
+        if args.get("y_label"):
+            ax.set_ylabel(args["y_label"])
+        # Legend (not for pie/doughnut/heatmap)
+        series = args.get("series", [])
+        if args.get("legend", True) and chart_type not in ("pie", "doughnut", "heatmap") and len(series) > 1:
+            ax.legend(loc="best", framealpha=0.9)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=DPI, bbox_inches="tight", facecolor=fig.get_facecolor(),
+                    edgecolor="none")
+    return buf.getvalue()
+
+
+def _size(args: dict, key: str, default: float) -> float:
+    value = args.get(key, default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number of inches, not {value!r}") from None
+    if not SIZE_MIN_IN <= number <= SIZE_MAX_IN:
+        raise ValueError(f"{key} is {number:g} inches; give {SIZE_MIN_IN:g} to {SIZE_MAX_IN:g}")
+    return number
+
+
 async def handle_create_chart(args: dict) -> str:
     """Create a chart and display it inline in the chat."""
+    from isolation import run_parse
+
     chart_type = args.get("chart_type", "bar")
     if chart_type not in CHART_TYPES:
         return (f"Error: Unknown chart type '{chart_type}'. "
@@ -422,67 +496,20 @@ async def handle_create_chart(args: dict) -> str:
     err = _validate_series(chart_type, args)
     if err:
         return err
+    try:
+        fig_width, fig_height = _size(args, "width", 10), _size(args, "height", 6)
+    except ValueError as exc:
+        return f"Error: {exc}."
     title = args.get("title", "")
-    x_label = args.get("x_label", "")
-    y_label = args.get("y_label", "")
-    show_legend = args.get("legend", True)
-    style_name = args.get("style", "modern")
-    fig_width = float(args.get("width", 10))
-    fig_height = float(args.get("height", 6))
     save_path = args.get("save_path")
-
-    # Apply style
-    style_params = STYLES.get(style_name, STYLES["modern"])
-    with plt.rc_context(style_params):
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-        # Render chart
-        renderers = {
-            "bar": lambda: _render_bar(ax, args),
-            "column": lambda: _render_bar(ax, args),
-            "horizontal_bar": lambda: _render_bar(ax, args, horizontal=True),
-            "line": lambda: _render_line(ax, args),
-            "pie": lambda: _render_pie(ax, args),
-            "doughnut": lambda: _render_pie(ax, args, doughnut=True),
-            "scatter": lambda: _render_scatter(ax, args),
-            "area": lambda: _render_area(ax, args),
-            "heatmap": lambda: _render_heatmap(ax, args),
-            "histogram": lambda: _render_histogram(ax, args),
-        }
-
-        renderer = renderers.get(chart_type)
-        if not renderer:
-            plt.close(fig)
-            return f"Error: Unknown chart type '{chart_type}'. Supported: {', '.join(renderers.keys())}"
-
-        try:
-            renderer()
-        except Exception as exc:  # noqa: BLE001  # matplotlib on the caller's data raises anything from a renderer
-            plt.close(fig)
-            return f"Error rendering {chart_type} chart: {exc}"
-
-        # Apply labels and title
-        if title:
-            ax.set_title(title, pad=15)
-        if x_label:
-            ax.set_xlabel(x_label)
-        if y_label:
-            ax.set_ylabel(y_label)
-
-        # Legend (not for pie/doughnut/heatmap)
-        series = args.get("series", [])
-        if show_legend and chart_type not in ("pie", "doughnut", "heatmap") and len(series) > 1:
-            ax.legend(loc="best", framealpha=0.9)
-
-        fig.tight_layout()
-
-        # Render to PNG bytes
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                    facecolor=fig.get_facecolor(), edgecolor="none")
-        plt.close(fig)
-        buf.seek(0)
-        png_bytes = buf.getvalue()
+    try:
+        rendered = await run_parse(render_png, args, chart_type, fig_width, fig_height, args.get("style", "modern"),
+                                   _deadline_at=time.monotonic() + CHART_DEADLINE_S, _advice=_CHART_ADVICE)
+    except Exception as exc:  # noqa: BLE001  # the worker's limit or death is the tool's answer
+        return f"Error rendering {chart_type} chart: {exc}"
+    if isinstance(rendered, str):
+        return rendered
+    png_bytes = rendered
 
     # Optionally save to file
     saved_msg = ""
@@ -499,4 +526,4 @@ async def handle_create_chart(args: dict) -> str:
     caption = f"Chart: {title}" if title else f"{chart_type.replace('_', ' ').title()} chart"
     await _push_image_preview(png_bytes, "image/png", caption)
 
-    return f"{chart_type} chart created ({int(fig_width * 150)}x{int(fig_height * 150)}px).{saved_msg}"
+    return f"{chart_type} chart created ({int(fig_width * DPI)}x{int(fig_height * DPI)}px).{saved_msg}"

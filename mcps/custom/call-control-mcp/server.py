@@ -55,8 +55,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="transfer_call",
             description=(
-                "Hand the caller to one of the transfer targets named in your instructions. "
-                "Tell the caller in one short sentence FIRST, then call this with the "
+                "Hand the person on the line to one of the transfer targets named in your instructions. "
+                "Tell the person on the line in one short sentence FIRST, then call this with the "
                 "target's name; you leave the call. Only during a live call."
             ),
             inputSchema={

@@ -34,7 +34,7 @@ vi.mock('@/api/remoteMachines', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/remoteMachines')>()),
   useRemoteMachines: () => ({ data: [], isLoading: false }),
 }))
-vi.mock('@/components/RemoteBadge', () => ({ default: () => null }))
+vi.mock('@/components/RemoteBadge', () => ({ default: () => null, MachineLinkNotice: () => null }))
 
 import RemoteMachinesPage from '@/pages/admin/RemoteMachinesPage'
 

@@ -63,6 +63,11 @@ def test_the_members_and_the_frozen_spellings():
     assert by_name["user_agents_agent_role_check"] == roles.AGENT_ROLES
     assert by_name["agents_default_for_new_users_role_check"] == ("", "viewer", "contributor", "editor", "manager")
     assert by_name["shares_role_cap_check"] == roles.AGENT_ROLES
+    for name in ("dynamic_tasks_notify_audience_check", "triggers_notify_audience_check",
+                 "notifications_audience_check"):
+        assert by_name[name] == roles.AGENT_ROLES
+    automation = (PROXY_DIR / "storage" / "automation" / "schema.py").read_text(encoding="utf-8")
+    assert automation.count("audience IN ('manager', 'editor', 'contributor', 'viewer')") == 3
 
 
 def test_the_questions():

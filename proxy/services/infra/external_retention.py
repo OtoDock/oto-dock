@@ -224,16 +224,22 @@ def _session_files(agent: str, sid: str, tid: str) -> list[Path]:
 
 
 def _delete_phone_chat(chat: dict, stats: dict, dry_run: bool) -> None:
+    from core.session.session_manager import get_all_layers
+    from services.infra.retention import _unlink_with_companions
+    layers = list(get_all_layers().values())
     for f in _session_files(chat["agent"], chat.get("session_id") or "",
                             chat.get("codex_thread_id") or ""):
-        try:
-            size = f.lstat().st_size
-            if not dry_run:
-                f.unlink()
-            stats["caller_bytes_freed"] += size
-        except OSError:
-            continue
+        # The file and its engine's folder, beneath the agents root with no
+        # link followed (``retention._unlink``); only the bytes are kept.
+        counted = {"errors": 0, "files": 0, "bytes": 0}
+        _unlink_with_companions(layers, f, counted, "files", "bytes", dry_run)
+        stats["caller_bytes_freed"] += counted["bytes"]
+        stats["errors"] += counted["errors"]
     if not dry_run:
+        # A report outlives an ordinary chat; a caller's conversation is
+        # forgotten whole, as its caller was promised.
+        from storage import db_reply_reports
+        db_reply_reports.delete_for_chat(chat["id"])
         task_store.delete_chat(chat["id"])
     stats["phone_chats_deleted"] += 1
 

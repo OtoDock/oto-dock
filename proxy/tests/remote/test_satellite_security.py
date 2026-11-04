@@ -286,24 +286,15 @@ class TestUpdateAgentAdminGate:
     async def test_creator_cannot_set_remote_target(self):
         """Even a platform creator can't point an agent default at any remote machine."""
         from fastapi import HTTPException
-        from pydantic import BaseModel
 
-        from api.agents.agents import update_agent
+        from api.agents.agents import UpdateAgentRequest, update_agent
 
-        # UpdateAgentRequest may have many fields; mock minimal
         creator_user = _make_user("mgr-1", "creator")
         # The creator has access to the agent via agent_roles (per-agent manager)
         creator_user.agents = ["my-agent"]
         creator_user.agent_roles = {"my-agent": "manager"}
 
-        class _Req(BaseModel):
-            execution_target: str | None = None
-            execution_paths: list[str] | None = None
-            admin_only: bool = False
-            def model_dump(self, **kw):
-                return {k: v for k, v in self.__dict__.items() if v is not None}
-
-        req = _Req(execution_target="some-machine")
+        req = UpdateAgentRequest(execution_target="some-machine")
 
         with patch("api.agents.agents.agent_store") as ag:
             ag.agent_exists.return_value = True
@@ -316,20 +307,12 @@ class TestUpdateAgentAdminGate:
     @pytest.mark.asyncio
     async def test_admin_rejected_on_non_admin_machine(self):
         from fastapi import HTTPException
-        from pydantic import BaseModel
 
-        from api.agents.agents import update_agent
+        from api.agents.agents import UpdateAgentRequest, update_agent
 
         admin_user = _make_user("admin-1", "admin")
 
-        class _Req(BaseModel):
-            execution_target: str | None = None
-            execution_paths: list[str] | None = None
-            admin_only: bool = False
-            def model_dump(self, **kw):
-                return {k: v for k, v in self.__dict__.items() if v is not None}
-
-        req = _Req(execution_target="user-machine")
+        req = UpdateAgentRequest(execution_target="user-machine")
 
         with patch("api.agents.agents.agent_store") as ag, \
              patch("storage.remote_store.get_remote_machine") as gm:

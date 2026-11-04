@@ -305,6 +305,7 @@ def open_turn(chat: dict) -> bool:
 def targets_view(chat: dict, asker: Asker, *, blocked: str = "") -> dict:
     """The chip's answer for ``chat`` as ``asker`` sees it; ``blocked`` is a
     socket's own refusal (a voice conversation on the chat). Synchronous."""
+    from core.session import visibility
     from storage import remote_store
     cid = chat.get("id") or ""
     engine = chat_targets.chat_engine(chat)
@@ -354,7 +355,10 @@ def targets_view(chat: dict, asker: Asker, *, blocked: str = "") -> dict:
             "can_move": not refusal and not lock, "refusal": refusal or lock,
             "lock": {"sentence": lock} if lock else None,
             "moving": {"to_label": job.to_label, "progress": job.progress} if job else None,
-            "place_chosen": chosen}
+            "place_chosen": chosen,
+            # A Shared-only chat runs with the agent's accounts: the move
+            # dialog says which of them a personal computer gets.
+            "shared": visibility.is_shared_chat_owner(chat.get("user_sub"))}
 
 
 # -- the move ----------------------------------------------------------------------
@@ -1045,8 +1049,7 @@ async def _deliver_resume(chat: dict, job: _Job, asker: Asker) -> None:
             persist_event=_persist, allow_ws=False, allow_pty=False,
             persistent_fn=delivery._deliver_via_persistent,
             oneshot_fn=functools.partial(delivery._deliver_via_oneshot, permission_mode=mode,
-                                         client_type=kind, fresh_without_session=True,
-                                         note_prompt=True),
+                                         client_type=kind, fresh_without_session=True),
             on_outcome=_outcome,
         )
     except Exception:  # noqa: BLE001  # a rung that raises (the spawn's guard, a broken start) is undone like an undelivered nudge
@@ -1078,13 +1081,16 @@ def placement_blocked(chat: dict, person_sub: str, person_role: str) -> bool:
     if placement.is_local(pin) or not chat.get("agent"):
         return False
     from storage import remote_store
+    from storage.agents import agent_store
     machine = remote_store.get_remote_machine(placement.machine_of(pin))
     if machine is None:
         return False
     run_sub, run_role = _builds_as(chat, person_sub, person_role)
+    agent_default = (agent_store.get_agent(chat["agent"]) or {}).get("execution_target")
     return not placement.may_run_on(machine, run_sub=run_sub,
                                     run_can_manage=roles.can_manage(run_role),
-                                    user_paired_allowed=chat_targets.user_machines_allowed())
+                                    user_paired_allowed=chat_targets.user_machines_allowed(),
+                                    agent_default=agent_default)
 
 
 def _handover_refusal(chat: dict, asker: Asker) -> str:

@@ -15,7 +15,8 @@ interface Props {
 
 // Brief amber strip rendered above the chat input / task input. Soft
 // notice that the user's per-agent override is offline and the session
-// fell back to the agent default / local. Does not block input.
+// fell back to the agent default / local. Does not block input; the timer
+// or the Dismiss button hides it.
 export default function RemoteFallbackBanner({
   fallbackReason, machineName, durationMs = 8000,
 }: Props) {
@@ -42,7 +43,20 @@ export default function RemoteFallbackBanner({
       role="status"
       className="mb-2 w-full max-w-4xl mx-auto px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border text-xs text-status-warning-fg"
     >
-      {name} is offline, so this chat runs where the agent usually runs.
+      <div className="flex items-center gap-2">
+        <span className="min-w-0">
+          {name} is offline, so this chat runs where the agent usually runs.
+        </span>
+        <button
+          type="button"
+          onClick={() => setHidden(true)}
+          className="ml-auto shrink-0 px-1.5 py-0.5 rounded-control hover:underline"
+          title="Dismiss"
+          aria-label="Dismiss"
+        >
+          ×
+        </button>
+      </div>
     </div>
   )
 }

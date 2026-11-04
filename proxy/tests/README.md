@@ -82,9 +82,8 @@ required for the suite to be fast.
 
 The public `ci.yml` runs the proxy and audio suites twice: the `proxy` job on
 `ubuntu-latest` (a required check) and the `proxy-arm64` job on
-`ubuntu-24.04-arm` (the same steps on a GitHub-hosted arm64 runner; not a
-required check until it has a history of green runs — add it to the branch
-protection then). Both install the audio package with its `localmodels` extra,
+`ubuntu-24.04-arm` (the same steps on a GitHub-hosted arm64 runner, a
+required check too). Both install the audio package with its `localmodels` extra,
 so the bundled Silero VAD and Smart Turn models run for real there instead of
 skipping; the private `ci-private-python.yml` does the same on amd64 only
 (arm64 runners are billed on private repositories). Locally, the release gate

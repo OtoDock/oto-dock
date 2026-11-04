@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel
 
+from auth import roles
+
 logger = logging.getLogger("otodock.scheduler")
 
 
@@ -125,6 +127,10 @@ class TaskDefinition(BaseModel):
     # The run's permission mode, persisted: "" = Don't Ask (the unattended
     # word), the Auto word = the engine's own review.
     permission_mode: str = ""
+    # Who is told (``dynamic_tasks.notify_audience``): the lowest per-agent
+    # role an agent-scope task's notifications reach, admins always. A new
+    # task tells the editor tier; a row from before the column, every member.
+    notify_audience: str = roles.EDITOR
     # A delegate continue that changed the worker's model (``override_model``
     # is the new one, already on the chat row): the runner closes the chat's
     # live session before the round and never rides it warm, so the round

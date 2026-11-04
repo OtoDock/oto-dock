@@ -29,7 +29,7 @@ import psycopg
 #     supported on Opus 4.7+ (Anthropic, incl. 4.8) and the OpenAI gpt-5 family.
 #     Models without support silently fall back to "max" at wire time via the
 #     failsafe in each execution layer — see get_model_supports_xhigh().
-#   - "ultra" (Codex: gpt-5.6 Sol/Terra and GPT-6 Astra) is max reasoning PLUS Codex-native
+#   - "ultra" (Codex: GPT-6.1 Sol/Terra and GPT-6 Astra) is max reasoning PLUS Codex-native
 #     proactive multi-agent orchestration (parallel sub-agent workstreams inside
 #     one turn). Offered per-model via supports_ultra / get_model_supports_ultra()
 #     and mapped in core/layers/codex/helpers.map_effort_to_codex; every other
@@ -157,15 +157,14 @@ MODEL_REGISTRY: dict[str, dict] = {
     # Luna (2026-09-24): each at a LOWER or equal price on every element of
     # the tuple with the same effort ceilings (Sol: max + ultra; Luna: max,
     # no ultra), so the swaps are lossless MODEL_SUCCESSORS entries and the
-    # chain gpt-5.6-sol → gpt-6-sol → gpt-6.1-sol ends on 6.1. GPT-5.6 Terra
-    # stays (no cheaper same-capability successor on direct-llm). Prices per
+    # chain gpt-5.6-sol → gpt-6-sol → gpt-6.1-sol ends on 6.1. Prices per
     # 1M from developers.openai.com/api/docs/pricing at each swap, permanent.
     # Cache WRITES cost 1.25x the uncached input rate, cache reads 95% off on
     # 6.1 Sol (90% before) — reflected in the tuples. Codex 0.160.0 bundles
     # all three (VERSIONS.md); gpt-6.1-sol is its own default (priority 1,
     # default effort low, ultra delegating at xhigh) and is ABSENT from the
     # 0.156.1 catalog, so a Codex still on that pin refuses the id.
-    # Context: the GPT-6 and 5.6 models are 1.05M (922k input + 128k output);
+    # Context: the GPT-6 and 6.1 models are 1.05M (922k input + 128k output);
     # input beyond 272k bills the WHOLE request at the long-context tier
     # (2x input / 1.5x output), the ``long_context`` tuple on every row:
     # price_usage multiplies once a request's prompt passes the line. The
@@ -185,10 +184,12 @@ MODEL_REGISTRY: dict[str, dict] = {
         "context_window": 1_050_000,
         "long_context": (272_000, 2.0, 1.5),   # (prompt tokens over, input x, output x)
         "pricing": (2.0, 10.0, 2.50, 0.10),  # per 1M: (input, output, cache_write, cache_read)
-        "layers": ["codex-cli"],   # codex-cli only until the hosted relay prices it
+        "layers": ["codex-cli", "direct-llm"],
+        "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
         "supports_reasoning": True,
         "supports_xhigh": True,
-        "supports_ultra": True,   # Codex "ultra": proactive multi-agent on top of xhigh reasoning
+        "supports_ultra": True,   # Codex "ultra": proactive multi-agent on top of xhigh reasoning;
+                                  # the dashboard offers it only where the codex engine serves the model
         "tier": 2,
         "good_at": "substantial, well-scoped coding and analysis; complex or open-ended work belongs on the frontier",
     },
@@ -220,26 +221,35 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": 1,
         "good_at": "complex coding, architecture, subtle bugs, judgement calls and long autonomous work",
     },
-    "gpt-5.6-terra": {
-        "label": "GPT-5.6 Terra",
+    # GPT-6.1 Terra (2026-10-26; API id gpt-6.1-terra) replaced GPT-5.6
+    # Terra on both engines on 2026-10-31: below it on every element of the
+    # tuple ($2 / $12 / $2.50 / $0.20 before), the same 272k long-context
+    # tier and the same effort ceilings in Codex's catalog (low to max and
+    # ultra; Codex 0.166.0 is its first catalog with the id and an older
+    # Codex refuses it), so the swap is a lossless MODEL_SUCCESSORS entry.
+    # Prices per 1M from developers.openai.com/api/docs/models/gpt-6.1-terra:
+    # $1 in, $5 out, $1.25 cache write, $0.05 cached read.
+    "gpt-6.1-terra": {
+        "label": "GPT-6.1 Terra",
         "provider": "openai",
         "context_window": 1_050_000,
         "long_context": (272_000, 2.0, 1.5),
-        "pricing": (2.0, 12.0, 2.50, 0.20),  # 2026-07-30 cut ($2.50/$15 → $2/$12), permanent
+        "pricing": (1.0, 5.0, 1.25, 0.05),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli", "direct-llm"],
         "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
         "supports_reasoning": True,
         "supports_xhigh": True,
-        "supports_ultra": True,   # codex-cli only — the dashboard offers Ultra
-                                  # solely when the codex engine serves the model
+        "supports_ultra": True,   # Codex "ultra": proactive multi-agent on top of xhigh reasoning;
+                                  # the dashboard offers it only where the codex engine serves the model
         "tier": 3,
         "good_at": "drafting, summaries and bounded analysis",
     },
-    # GPT-6 Luna is on direct-llm too: the hosted relay prices per model and
-    # rejects unknown ids, so its relay row (otodock-commercial
-    # relay_vendors.py) must be served BEFORE an OSS release lists a new
-    # direct-llm builtin — a direct-llm row here without one fails every
-    # hosted install's titles and Luna chats.
+    # Every direct-llm builtin (GPT-6.1 Sol and Terra, GPT-6 Luna here) needs
+    # its hosted-relay row first: the relay prices per model and rejects
+    # unknown ids, so its row (otodock-commercial relay_vendors.py) must be
+    # served BEFORE an OSS release lists a new direct-llm builtin; a
+    # direct-llm row here without one fails every hosted install's titles and
+    # chats on it.
     "gpt-6-luna": {
         "label": "GPT-6 Luna",
         "provider": "openai",
@@ -257,14 +267,18 @@ MODEL_REGISTRY: dict[str, dict] = {
     },
     # (Older GPT-5.x builtins — gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex
     # — were retired with the 5.6 family, 5.6 Sol / 5.6 Luna with the GPT-6
-    # pair, GPT-6 Sol with 6.1 Sol. Pins with a successor move at boot; the
-    # others keep running; admins can re-add any as a custom model.)
+    # pair, GPT-6 Sol with 6.1 Sol, 5.6 Terra with 6.1 Terra. Pins with a
+    # successor move at boot; the others keep running; admins can re-add any
+    # as a custom model.)
 
     # --- Groq models (direct-llm; OpenAI-compatible API) ---
-    # gpt-oss-120b is GroqCloud production; qwen3.6-27b is Groq "preview" (kept
-    # anyway: it's Groq's recommended fast general-purpose tier). supports_reasoning
-    # per model (gpt-oss: yes; qwen3.6 is a hybrid thinker the GroqAdapter pins to
-    # non-thinking via reasoning_effort="none" — see openai_compat_adapter.py).
+    # gpt-oss-120b is GroqCloud production; qwen3.8-27b is Groq "preview" (kept
+    # anyway: it's Groq's recommended fast general-purpose tier). It replaced
+    # qwen3.6-27b on 2026-10-31, which Groq shut for free and developer keys on
+    # 2026-09-14, at Groq's new price ($0.80 / $4.00 per 1M, a third above
+    # 3.6's). supports_reasoning per model (gpt-oss: yes; qwen3.8 is a hybrid
+    # thinker the GroqAdapter pins to non-thinking via reasoning_effort="none"
+    # — see openai_compat_adapter.py).
     # No supports_xhigh (Groq has no xhigh tier). Admins can add more Groq /
     # Ollama / etc. models dynamically via the admin discover-models UI.
     # Cache pricing: Groq's automatic prompt caching bills cached input at a
@@ -272,11 +286,11 @@ MODEL_REGISTRY: dict[str, dict] = {
     # prompt_tokens_details.cached_tokens — cache_read = input/2 keeps the
     # cost rows exact whenever Groq reports a hit (models it doesn't cache
     # simply never report one).
-    "qwen/qwen3.6-27b": {
-        "label": "Qwen3.6 27B",
+    "qwen/qwen3.8-27b": {
+        "label": "Qwen3.8 27B",
         "provider": "groq",
         "context_window": 131_072,
-        "pricing": (0.60, 3.00, 0.0, 0.30),
+        "pricing": (0.80, 4.00, 0.0, 0.40),
         "layers": ["direct-llm"],
         "tier": 4,
         "good_at": "general-purpose answers served on Groq",
@@ -376,7 +390,7 @@ def get_model_supports_xhigh(model: str) -> bool:
 def get_model_supports_ultra(model: str) -> bool:
     """Return True if the model accepts the platform's "ultra" effort level.
 
-    Ultra is Codex-only (GPT-6.1 Sol, gpt-5.6 Terra, GPT-6 Astra): max reasoning plus
+    Ultra is Codex-only (GPT-6.1 Sol, GPT-6.1 Terra, GPT-6 Astra): max reasoning plus
     Codex-native proactive multi-agent orchestration. Registry-only on purpose — custom
     admin-added models have no supports_ultra column (the wire clamp in
     map_effort_to_codex is prefix-based, so a custom "gpt-6.1-sol-*" id still
@@ -423,7 +437,7 @@ def get_model_layers(model: str) -> list[str]:
     Resolution: MODEL_REGISTRY (builtins) → DB execution_layer_models (custom).
     Empty list = unknown model. Used to keep an agent's PRIMARY execution layer
     consistent with its default model — a model only runs on its own layer
-    (e.g. ``gpt-6.1-sol`` is ``codex-cli`` only), so the no-picker default (primary
+    (e.g. ``gpt-6-astra`` is ``codex-cli`` only), so the no-picker default (primary
     layer + default model) must agree or tasks hard-reject the model.
     """
     if not model:
@@ -463,7 +477,8 @@ MODEL_DEFAULT_CONTEXT_WINDOW = 200_000
 # fewer layers than the retired id would strand the other layer's pins).
 # sync_builtin_models retires the old row and the retired id then fails the
 # model-allowed check. Only list lossless swaps (same or lower price, same
-# capabilities, the same layers); a retirement WITHOUT a successor just
+# capabilities, the same layers), or a swap the vendor forces, named on its
+# line; a retirement WITHOUT a successor just
 # leaves the pins to the fallback. One line per retirement, no startup code.
 # The walk skips a retired id an admin has re-added as a custom row (the
 # admin chose to keep it; its pins stay). Pins the walk never sees — a
@@ -478,6 +493,11 @@ MODEL_SUCCESSORS: dict[str, str] = {
     "claude-sonnet-5": "claude-sonnet-5-5",   # the same tuple, window, flags and layers
     "gpt-6-sol": "gpt-6.1-sol",               # cheaper cached input, the rest equal
     "claude-haiku-4-5": "claude-haiku-5-5",   # 2026-10-13 — cheaper on every element, past its 100K line too; thinking, 1M, both engines
+    "gpt-5.6-terra": "gpt-6.1-terra",         # 2026-10-31 — cheaper on every element, the same ceilings, tier and engines
+    # The one entry that is NOT lossless: Qwen 3.8 costs a third more on input
+    # and output. Kept because Groq no longer serves Qwen 3.6 to free and
+    # developer keys, so a pin left on it fails.
+    "qwen/qwen3.6-27b": "qwen/qwen3.8-27b",   # 2026-10-31 — the same window, flags, tier and engine
 }
 
 
@@ -669,7 +689,8 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     Precedence (engine-contract lane, phase 2 — the declared default is the
     new middle term; the operator's rule is "the tier is the rule": each
     engine DECLARES its default as the best tier it serves with tier 1
-    offered but never defaulted):
+    offered but never defaulted; Direct LLM keeps the operator's Sonnet 5.5
+    (tier 3) though it serves GPT-6.1 Sol at tier 2):
       1. agents.default_model (the per-agent PIN), read through
          :func:`live_model_id` (a retired builtin as its successor). Two-mode:
          with ``layer=None`` it is returned with no check at all; with
@@ -721,7 +742,9 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     default_model = live_model_id((agent or {}).get("default_model") or "")
     if default_model:
         if not layer:
-            return default_model
+            if _pin_allowed_on(agent, path, default_model):
+                return default_model
+            return resolve_layer_default_model(path, agent_name=agent_name)
         # Layer override: honor the default only when that layer serves it
         # (mirror of ws/dashboard._model_allowed_for_path — fail OPEN on a
         # lookup error: this guards cross-layer poison, it is not the model
@@ -733,9 +756,19 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
             )
         except psycopg.Error:
             served = True
-        if served:
+        if served and _pin_allowed_on(agent, path, default_model):
             return default_model
     return resolve_layer_default_model(path, agent_name=agent_name)
+
+
+def _pin_allowed_on(agent: dict | None, layer: str, model: str) -> bool:
+    """A pinned model on an engine the agent restricts to local models must
+    be a local provider's; elsewhere every pin holds."""
+    from storage.agents.agent_store import _get_local_only_engines
+    if not agent or layer not in _get_local_only_engines(agent):
+        return True
+    from services.engines.engine_resolution import local_providers_of
+    return get_model_provider(model, layer=layer) in local_providers_of(layer)
 
 
 def resolve_layer_default_model(layer: str, *, agent_name: str = "") -> str:
@@ -763,6 +796,20 @@ def resolve_layer_default_model(layer: str, *, agent_name: str = "") -> str:
             f"Execution Layers."
         )
 
+    # An agent that runs local models only on this engine
+    # (``agents.local_only_engines``) never lands on a vendor builtin.
+    if agent_name:
+        local_only = _local_only_providers(layer, agent_name)
+        if local_only is not None:
+            local_rows = [m for m in enabled if (m.get("provider") or "") in local_only]
+            if not local_rows:
+                raise RuntimeError(
+                    f"No local model is enabled for agent '{agent_name}' "
+                    f"(execution_path='{layer}'), which allows only local "
+                    "models there. Add a local model server at Setup, AI Engines."
+                )
+            enabled = local_rows
+
     # Prefer a provider the platform pool can actually serve: a local-only
     # install would otherwise land on a vendor builtin and fail with "no
     # credentials". A pool with no providers (personal accounts only) applies
@@ -774,16 +821,31 @@ def resolve_layer_default_model(layer: str, *, agent_name: str = "") -> str:
         if served:
             enabled = served
 
-    # 2. The engine's DECLARED default, if it survived both filters above.
-    declared = _declared_default_model(layer)
-    if declared and any(m.get("model_id") == declared for m in enabled):
-        return declared
+    return ordered_layer_models(layer, enabled)[0]["model_id"]
 
-    # 3. Fall DOWN the tiers from the declared default, never up: a row whose
-    # tier is better (numerically lower) than the default's sorts LAST, so it
-    # is reached only when nothing at or below the default's tier is enabled
-    # and servable. Within a band: tier order, builtins first, registry
-    # order, created_at. Untiered custom rows count as the worst tier.
+
+def _local_only_providers(layer: str, agent_name: str) -> set[str] | None:
+    """The engine's local providers when ``agent_name`` runs local models
+    only on ``layer``; None when it does not (or the agent is unknown)."""
+    from storage.agents import agent_store
+    from storage.agents.agent_store import _get_local_only_engines
+    agent = agent_store.get_agent(agent_name)
+    if not agent or layer not in _get_local_only_engines(agent):
+        return None
+    from services.engines.engine_resolution import local_providers_of
+    return set(local_providers_of(layer))
+
+
+def ordered_layer_models(layer: str, rows: list[dict]) -> list[dict]:
+    """``rows`` (model rows of ``layer``) in the engine's own order: the
+    declared default first, then DOWN the tiers from it, never up: a row
+    whose tier is better (numerically lower) than the default's sorts LAST,
+    so it is reached only when nothing at or below the default's tier is
+    there. Within a band: tier order, builtins first, registry order,
+    created_at. Untiered custom rows count as the worst tier. The first row
+    is what an unpinned agent runs; the person's resolution walks the list
+    for the first provider they hold."""
+    declared = _declared_default_model(layer)
     default_tier = get_model_tier(declared)[0] if declared else None
 
     def _sort_key(m: dict) -> tuple:
@@ -791,6 +853,7 @@ def resolve_layer_default_model(layer: str, *, agent_name: str = "") -> str:
         tier_n = int(tier) if tier else 99
         above_default = default_tier is not None and tier_n < default_tier
         return (
+            m.get("model_id") != declared,
             above_default,
             tier_n,
             not m.get("is_builtin"),
@@ -798,8 +861,7 @@ def resolve_layer_default_model(layer: str, *, agent_name: str = "") -> str:
             m.get("created_at", ""),
         )
 
-    enabled.sort(key=_sort_key)
-    return enabled[0]["model_id"]
+    return sorted(rows, key=_sort_key)
 
 
 def _declared_default_model(layer: str) -> str:

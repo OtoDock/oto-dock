@@ -1430,8 +1430,10 @@ class TestSubdirLibraries:
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Bulletins — auto-injected shared context; authored at the source and,
-# since 1.5, by WRITABLE attachments (RO mirrors stay capture+heal)
+# The bulletin/ folder — a plain library folder since 1.9.1 (the Notebook
+# replaced its injection): the projector carries it like any content
+# (writable attachments adopt, RO mirrors capture+heal) and a rename still
+# moves the file with the name
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -1443,78 +1445,22 @@ class TestBulletins:
         (d / f"{name}.md").write_text(text)
         return d / f"{name}.md"
 
-    def test_injected_for_consumer_and_source(self, kl_subdir_env):
+    def test_a_bulletin_file_no_longer_loads(self, kl_subdir_env):
+        """Since 1.9.1 the Notebook replaced the injection:
+        the file stays a plain file of the library, read by nobody's
+        prompt, the consumer's or the source's."""
         self._write_bulletin("marketing", "Marketing", "Campaign freeze Friday.")
-        # Consumer of the marketing library sees it…
-        section = prompts._render_library_bulletins(CON_A)
-        assert section is not None
-        assert "# Library Bulletins" in section
-        assert "Marketing" in section and "Campaign freeze Friday." in section
-        assert f"from the **{SRC}** agent" in section
-        # …and the SOURCE agent itself sees its own library's bulletin.
-        own = prompts._render_library_bulletins(SRC)
-        assert own is not None and "this agent's own library" in own
+        assert not hasattr(prompts, "_render_library_bulletins")
+        for agent in (CON_A, SRC):
+            persona = config.get_agent_dir(agent) / "config" / "agent.md"
+            persona.parent.mkdir(parents=True, exist_ok=True)
+            persona.write_text("# Persona")
+            text = prompts.build_agent_prompt(agent) or ""
+            assert "# Persona" in text
+            assert "Campaign freeze Friday." not in text
+            assert "Library Bulletins" not in text
 
-    def test_missing_file_and_unnamed_library_skip(self, kl_env):
-        # kl_env's root library has no name and no bulletin file → nothing.
-        assert prompts._render_library_bulletins(CON_A) is None
-        # Named but still no file → still nothing.
-        db_knowledge_libraries.promote(SRC, created_by=ADMIN_SUB, name="Lib")
-        assert prompts._render_library_bulletins(CON_A) is None
-
-    def test_name_with_space_and_root_library(self, kl_env):
-        db_knowledge_libraries.promote(
-            SRC, created_by=ADMIN_SUB, name="Brand Guidelines")
-        self._write_bulletin("", "Brand Guidelines", "Use the new logo.")
-        section = prompts._render_library_bulletins(CON_B)
-        assert section and "Brand Guidelines" in section
-        assert "Use the new logo." in section
-
-    def test_utf8_boundary_truncation(self, kl_env):
-        db_knowledge_libraries.promote(SRC, created_by=ADMIN_SUB, name="Lib")
-        # 'α' is 2 bytes; an odd byte budget forces a split mid-character.
-        text = "α" * 3000  # 6000 bytes > 4096, cut lands mid-α
-        self._write_bulletin("", "Lib", text)
-        section = prompts._render_library_bulletins(CON_A)
-        assert section is not None
-        assert "�" not in section          # no mojibake from the cut
-        assert "truncated at 4 KB" in section
-        body = section.split("## Lib", 1)[1]
-        assert body.count("α") == 4096 // 2     # whole characters only
-
-    def test_header_explains_the_mechanism(self, kl_subdir_env):
-        """2026-09-01: the injected block must teach agents WHAT a bulletin
-        is (auto-loaded runtime broadcast, not memory, 4 KB budget) — the
-        old header was a single opaque sentence."""
-        self._write_bulletin("marketing", "Marketing", "Note.")
-        section = prompts._render_library_bulletins(CON_A)
-        assert "auto-loaded into the context of every agent attached" in section
-        assert "NOT a memory" in section
-        assert "first 4 KB" in section
-
-    def test_rw_attachment_gets_the_write_path_hint(self, kl_subdir_env):
-        self._write_bulletin("marketing", "Marketing", "Note.")
-        rw = prompts._render_library_bulletins(CON_B)   # marketing RW
-        assert ("Writable attachment — publish updates at "
-                f"`/knowledge/shared/{SRC}/marketing/bulletin/Marketing.md`"
-                in rw)
-        ro = prompts._render_library_bulletins(CON_A)   # marketing RO
-        assert "Writable attachment" not in ro
-        own = prompts._render_library_bulletins(SRC)
-        assert "File: `/knowledge/marketing/bulletin/Marketing.md`" in own
-
-    def test_near_cap_soft_warning(self, kl_env):
-        db_knowledge_libraries.promote(SRC, created_by=ADMIN_SUB, name="Lib")
-        self._write_bulletin("", "Lib", "x" * 3500)   # >3 KB soft, <4 KB cap
-        section = prompts._render_library_bulletins(CON_A)
-        assert "of the 4 KB injected cap" in section
-        assert "truncated" not in section
-        # Under the soft threshold → no warning line.
-        self._write_bulletin("", "Lib", "x" * 1000)
-        section = prompts._render_library_bulletins(CON_A)
-        assert "injected cap" not in section
-
-    def test_rw_mirror_bulletin_adopted_and_injected(
+    def test_rw_mirror_bulletin_adopted(
             self, kl_subdir_env, quiet_fanout):
         from services.knowledge import library_projector
         _run(library_projector.reconcile_source(SRC))
@@ -1531,9 +1477,6 @@ class TestBulletins:
         # …sibling mirrors get the read copy…
         assert (_mirror(CON_A) / "marketing" / "bulletin"
                 / "Marketing.md").read_text() == "Written by the attached team."
-        # …and injection (source-read) now carries the consumer's text.
-        section = prompts._render_library_bulletins(CON_A)
-        assert section and "Written by the attached team." in section
 
     def test_ro_mirror_bulletin_still_refused_and_healed(
             self, kl_subdir_env, quiet_fanout):
@@ -1553,7 +1496,6 @@ class TestBulletins:
         assert not (mir_a / "Marketing.md").exists()
         entries = recover_bin_store.list_for(CON_A, ADMIN_SUB, True, True, True)
         assert any("bulletin/Marketing.md" in e["rel_path"] for e in entries)
-        assert prompts._render_library_bulletins(CON_B) is None
 
     def test_rw_mirror_bulletin_delete_deletes_source(
             self, kl_subdir_env, quiet_fanout):
@@ -1567,7 +1509,6 @@ class TestBulletins:
         assert not src_file.exists()
         assert not (_mirror(CON_A) / "marketing" / "bulletin"
                     / "Marketing.md").exists()
-        assert prompts._render_library_bulletins(CON_A) is None
 
     def test_reconcile_adopts_rw_bulletin_direct_write(
             self, kl_subdir_env, quiet_fanout):
@@ -1582,8 +1523,6 @@ class TestBulletins:
         src_file = (config.get_agent_dir(SRC) / "knowledge" / "marketing"
                     / "bulletin" / "Marketing.md")
         assert src_file.read_text() == "swept in"
-        section = prompts._render_library_bulletins(CON_A)
-        assert section and "swept in" in section
 
     def test_source_bulletin_projects_to_mirrors_readonly_copy(
             self, kl_subdir_env, quiet_fanout):
@@ -1643,14 +1582,6 @@ class TestBulletins:
         assert r["status"] == "shared" and r["has_bulletin"] is False
         assert db_knowledge_libraries.library_name(
             SRC, "marketing") == "Campaigns"
-
-    def test_personal_only_consumer_gets_injection(self, kl_subdir_env):
-        db_knowledge_libraries.attach(
-            SRC, PERSONAL, writable=False, created_by=ADMIN_SUB,
-            subdir="marketing")
-        self._write_bulletin("marketing", "Marketing", "For everyone.")
-        section = prompts._render_library_bulletins(PERSONAL)
-        assert section and "For everyone." in section
 
     def test_get_reports_bulletin_presence(self, kl_subdir_env):
         from api.agents.knowledge_libraries import get_knowledge_attachments

@@ -128,3 +128,82 @@ def test_the_second_listen_report_is_on_the_service_key_allowlist():
     from auth.service_endpoints import is_service_endpoint_allowed
     assert is_service_endpoint_allowed("POST", "/v1/phone/usage/relisten")
     assert not is_service_endpoint_allowed("GET", "/v1/phone/usage/relisten")
+
+
+# ── A spoken conversation's speech (POST /v1/phone/usage/duplex) ─────
+
+def _duplex_rows():
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT user_sub, agent, scope, source_type, source_id, provider, audio_seconds, cost_usd "
+            "FROM usage_records WHERE source_type LIKE 'audio-stt-duplex%' ORDER BY source_type"
+        ).fetchall()
+
+
+def test_a_conversations_speech_is_the_speakers_rows_with_the_chats_agent(client):
+    """The speaker (the bridge's sub), never the chat's owner: an agent-scope
+    chat is owned by the shared owner, a task chat by its creator."""
+    import storage.database as task_store
+    task_store.create_chat("chat-dx", "agent::personal-assistant", "personal-assistant")
+    r = client.post(
+        "/v1/phone/usage/duplex", headers=_auth(),
+        json={"chat_id": "chat-dx", "sub": "user-speaker", "provider": "deepgram",
+              "stream_seconds": 42.5, "relisten_seconds": 3.25, "session_id": "dx-1"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["recorded"] is True
+    rows = _duplex_rows()
+    assert [(row["source_type"], row["user_sub"], row["agent"], row["scope"]) for row in rows] == [
+        ("audio-stt-duplex", "user-speaker", "personal-assistant", "user"),
+        ("audio-stt-duplex-relisten", "user-speaker", "personal-assistant", "user"),
+    ]
+    assert [row["audio_seconds"] for row in rows] == [pytest.approx(42.5), pytest.approx(3.25)]
+    assert all(row["provider"] == "deepgram" and row["source_id"] == "dx-1" and row["cost_usd"] > 0 for row in rows)
+
+
+def test_a_conversation_without_a_second_listen_writes_one_row_and_the_seconds_are_clipped(client):
+    import storage.database as task_store
+    task_store.create_chat("chat-dx2", "user-speaker", "personal-assistant")
+    r = client.post("/v1/phone/usage/duplex", headers=_auth(),
+                    json={"chat_id": "chat-dx2", "sub": "user-speaker", "provider": "deepgram",
+                          "stream_seconds": 10 * 3600.0})
+    assert r.json()["recorded"] is True
+    rows = _duplex_rows()
+    assert len(rows) == 1 and rows[0]["source_type"] == "audio-stt-duplex"
+    assert rows[0]["audio_seconds"] == pytest.approx(4 * 3600.0)
+
+
+def test_a_conversation_whose_chat_is_gone_records_nothing(client, caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="otodock"):
+        r = client.post("/v1/phone/usage/duplex", headers=_auth(),
+                        json={"chat_id": "chat-gone", "sub": "user-speaker", "provider": "deepgram",
+                              "stream_seconds": 5.0})
+    assert r.status_code == 200 and r.json()["recorded"] is False
+    assert _duplex_rows() == []
+    assert any("chat-gone is gone" in rec.getMessage() for rec in caplog.records)
+
+
+def test_a_duplex_report_needs_the_master_key_never_a_session_token(client):
+    import storage.database as task_store
+    from tests.conftest import live_session_token
+    task_store.create_chat("chat-dx3", "user-speaker", "personal-assistant")
+    body = {"chat_id": "chat-dx3", "sub": "user-speaker", "provider": "deepgram", "stream_seconds": 5.0}
+    assert client.post("/v1/phone/usage/duplex", json=body).status_code == 401
+    token = live_session_token("sess-dx", "personal-assistant", "user-speaker")
+    assert client.post("/v1/phone/usage/duplex", headers={"Authorization": f"Bearer {token}"},
+                       json=body).status_code == 401
+    # A report that names nobody, no chat or no provider is dropped, never guessed.
+    for missing in ({"sub": ""}, {"chat_id": ""}, {"provider": ""}, {"stream_seconds": 0}):
+        r = client.post("/v1/phone/usage/duplex", headers=_auth(), json={**body, **missing})
+        assert r.status_code == 200 and r.json()["recorded"] is False
+    assert _duplex_rows() == []
+
+
+def test_the_duplex_report_is_on_the_service_key_allowlist():
+    from auth.service_endpoints import is_service_endpoint_allowed
+    assert is_service_endpoint_allowed("POST", "/v1/phone/usage/duplex")
+    assert not is_service_endpoint_allowed("GET", "/v1/phone/usage/duplex")
+    assert not is_service_endpoint_allowed("POST", "/v1/phone/usage/duplex/other")
+

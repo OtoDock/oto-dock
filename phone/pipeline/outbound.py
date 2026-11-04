@@ -12,6 +12,7 @@ import time
 
 from proxy.client import TOOL_USE_SIGNAL
 from telephony.audio_socket import TYPE_AUDIO, TYPE_HANGUP, AudioSocketError
+from telephony.transfer import loggable_label
 
 from .markers import _CALL_COMPLETE_RE, _QUESTION_RE
 
@@ -20,6 +21,11 @@ logger = logging.getLogger("pipeline")
 #: How long a call that ends before adopting its pre-warmed client waits for
 #: the opening still generating on it (the client exists only once it is).
 UNADOPTED_OPENING_WAIT_S = 15.0
+#: How long the record waits for the agent's one-sentence outcome summary:
+#: the summary turn queues behind the engine's last turn at the proxy, and a
+#: local model takes 20 to 40 s a turn. Past it the record closes without.
+OUTCOME_SUMMARY_TIMEOUT_S = 45.0
+SUMMARY_UNAVAILABLE = "Call completed (summary unavailable)"
 #: Why an outbound call ended at the PIN gate, as the record and the chat
 #: read it.
 PIN_REFUSED = "the person who answered did not enter the PIN"
@@ -439,32 +445,26 @@ class OutboundMixin:
                 self._outbound_call_id, CallStatus.COMPLETED,
                 outcome=f"Transferred to {self.state._transferred_to}",
             )
-            logger.info("[%s] Outbound call transferred to %s", self.conn.peer_addr, self.state._transferred_to)
+            logger.info(
+                "[%s] Outbound call transferred to %s",
+                self.conn.peer_addr, loggable_label(self.state._transferred_to))
             return
         # An end the agent asked for counts, whoever hung up first.
         if self._control_pending_end():
             self.state._call_complete = True
 
         if self.state._call_complete:
-            # Ask the LLM for a 1-sentence outcome summary
             try:
-                summary_prompt = (
-                    "The call has ended. Based on the conversation, provide a single "
-                    "sentence summarizing the outcome (e.g., 'Reservation confirmed "
-                    "for 8pm Saturday, 4 people'). Reply ONLY with the summary, "
-                    "nothing else. Use the same language as the conversation."
-                )
-                summary_parts = []
-                async for token in self.llm.send_message(summary_prompt):
-                    if token is TOOL_USE_SIGNAL:
-                        continue
-                    summary_parts.append(token)
-                outcome = "".join(summary_parts).strip()
-                # Clean any session markers from summary
-                outcome = re.sub(r"\[//\]: # \(session:[a-f0-9-]+\)", "", outcome).strip()
+                outcome = await asyncio.wait_for(
+                    self._outcome_summary(), timeout=OUTCOME_SUMMARY_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning(
+                    "[%s] No outcome summary within %.0fs: the record closes without one",
+                    self.conn.peer_addr, OUTCOME_SUMMARY_TIMEOUT_S)
+                outcome = SUMMARY_UNAVAILABLE
             except Exception as e:  # noqa: BLE001  # the outcome summary is best effort, the call already ended
                 logger.error("[%s] Failed to get outcome summary: %s", self.conn.peer_addr, e)
-                outcome = "Call completed (summary unavailable)"
+                outcome = SUMMARY_UNAVAILABLE
 
             self._call_manager.update_status(
                 self._outbound_call_id,
@@ -482,6 +482,23 @@ class OutboundMixin:
             self._call_manager.update_status(
                 self._outbound_call_id, CallStatus.FAILED, error=how)
             logger.warning("[%s] Outbound call ended without completion: %s", self.conn.peer_addr, how)
+
+    async def _outcome_summary(self) -> str:
+        """The agent's one-sentence outcome of the call, for the record."""
+        summary_prompt = (
+            "The call has ended. Based on the conversation, provide a single "
+            "sentence summarizing the outcome (e.g., 'Reservation confirmed "
+            "for 8pm Saturday, 4 people'). Reply ONLY with the summary, "
+            "nothing else. Use the same language as the conversation."
+        )
+        summary_parts = []
+        async for token in self.llm.send_message(summary_prompt):
+            if token is TOOL_USE_SIGNAL:
+                continue
+            summary_parts.append(token)
+        outcome = "".join(summary_parts).strip()
+        # Clean any session markers from summary
+        return re.sub(r"\[//\]: # \(session:[a-f0-9-]+\)", "", outcome).strip()
 
     async def _handle_question(self, question_text: str) -> str | None:
         """Handle a [QUESTION:] marker from the caller agent.

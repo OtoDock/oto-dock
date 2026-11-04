@@ -235,6 +235,21 @@ class TestGenerate:
         assert "Saved to:" in out[0].text
         assert "displayed" not in out[0].text
 
+    def test_emotion_rides_the_voice_settings(self, monkeypatch, mod):
+        seen = {}
+
+        def handler(request):
+            if request.url.path == "/v1/audio/tts/generate":
+                seen["body"] = json.loads(request.content)
+                return httpx.Response(200, content=_wav_bytes(), headers={
+                    "X-Audio-Seconds": "0.50", "X-Provider-Used": "cartesia", "X-Voice-Used": "c1",
+                })
+            return httpx.Response(200, json={"ok": True})
+
+        _mock_proxy(monkeypatch, mod, handler)
+        _run(mod._handle_generate({"text": "Hello", "voice_id": "c1", "speed": 1.1, "emotion": "calm"}))
+        assert seen["body"]["voice_settings"] == {"speed": 1.1, "emotion": "calm"}
+
     def test_generate_requires_text(self, monkeypatch, mod):
         out = _run(mod._handle_generate({"text": "  "}))
         assert out[0].text.startswith("Error:")
@@ -297,8 +312,41 @@ class TestVoices:
         _mock_proxy(monkeypatch, mod, lambda request: httpx.Response(403, json={"detail": "Admin required"}))
         out = _run(mod._handle_add_voice({"public_owner_id": "o", "voice_id": "v"}))
         assert "admin-only" in out[0].text
+        # The refusal comes before the engine is asked: it also says Cartesia
+        # voices need no adding, for an agent that tried on Cartesia.
+        assert "Cartesia voices need no adding" in out[0].text
 
     def test_add_voice_success(self, monkeypatch, mod):
         _mock_proxy(monkeypatch, mod, lambda request: httpx.Response(200, json={"voice_id": "v9"}))
         out = _run(mod._handle_add_voice({"public_owner_id": "o", "voice_id": "v9"}))
         assert "generate_speech" in out[0].text and "v9" in out[0].text
+
+    def test_search_without_owner_ids_says_to_use_the_voice(self, monkeypatch, mod):
+        # Cartesia's results speak at once: no owner_id, no add step offered.
+        _mock_proxy(monkeypatch, mod, lambda request: httpx.Response(200, json={
+            "provider_name": "cartesia", "voices": [
+                {"id": "c1", "name": "Narrator", "languages": ["en"], "category": "public",
+                 "preview_url": "", "description": "male warm", "owner_id": ""},
+            ]}))
+        text = _run(mod._handle_search({"search": "warm"}))[0].text
+        assert "`c1`" in text and "owner_id" not in text
+        assert "add_library_voice" not in text
+        assert "Use a voice by passing its `voice_id` to `generate_speech`." in text
+
+    def test_the_voice_tools_name_both_engines(self, mod):
+        tools = {t.name: t for t in _run(mod.list_tools())}
+        for name in ("list_voices", "search_voice_library"):
+            assert "Cartesia" in tools[name].description
+            assert "ElevenLabs" in tools[name].description
+        assert tools["add_library_voice"].description.startswith("ElevenLabs only")
+        emotion = tools["generate_speech"].inputSchema["properties"]["emotion"]
+        assert {"calm", "neutral"} <= set(emotion["enum"])
+        assert "Cartesia only" in emotion["description"]
+
+    def test_a_blank_configured_language_is_not_listed(self, monkeypatch, mod):
+        _mock_proxy(monkeypatch, mod, lambda request: httpx.Response(200, json={
+            "provider_id": 5, "provider_name": "cartesia",
+            "configured": {"el": "", "en": "v-en"}, "voices": [],
+        }))
+        text = _run(mod._handle_list_voices({}))[0].text
+        assert "`en` → `v-en`" in text and "`el`" not in text

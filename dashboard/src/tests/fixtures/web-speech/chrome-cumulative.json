@@ -1,0 +1,105 @@
+{
+ "source": "The Web Speech specification and Chrome: every result of the session stays in the list, finals at their index, the interim entries after them; resultIndex is the first changed entry.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "hello"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": false,
+     "text": "hello world"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello world."
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello world."
+    },
+    {
+     "isFinal": false,
+     "text": "how"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello world."
+    },
+    {
+     "isFinal": false,
+     "text": "how are you"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello world."
+    },
+    {
+     "isFinal": true,
+     "text": "how are you?"
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "hello world.",
+   "how are you?"
+  ],
+  "replaces": [],
+  "interims": [
+   "hello",
+   "hello world",
+   "how",
+   "how are you"
+  ],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

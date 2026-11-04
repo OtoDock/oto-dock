@@ -448,8 +448,8 @@ def test_the_speech_check_at_8_khz_runs_on_the_audio_upsampled():
 
 # ── A call's turn ───────────────────────────────────────────────────
 
-def _turn(batch, *, speech, audio: bytes, stream_seconds=None) -> TurnRelisten:
-    t = TurnRelisten(transcribe=batch, norm=_norm, rate=RATE,
+def _turn(batch, *, speech, audio: bytes, stream_seconds=None, wide=False) -> TurnRelisten:
+    t = TurnRelisten(wide=wide, transcribe=batch, norm=_norm, rate=RATE,
                      speech=SpeechCheck(RATE, model_factory=lambda _rate: FakeModel(speech)),
                      stream_seconds=stream_seconds, label="el")
     t.ring.append(audio)
@@ -475,6 +475,56 @@ async def test_an_empty_window_over_speech_is_heard_again_at_once_and_spliced_by
     assert batch.cuts                                          # started before the take
     assert await t.complete("ένα τέσσερα", 2.0) == "ένα δύο τρία τέσσερα"
     assert await t.complete("ένα τέσσερα", 2.0) == "ένα τέσσερα"   # once
+
+
+async def test_the_wide_turn_hears_a_windows_uncovered_stretch_again_and_splices_by_time():
+    # A window that kept only its head and its tail: the stretch between
+    # them holds speech, the wide form listens to it again and the words go
+    # in by word time; the narrow form (calls) leaves a window with words.
+    batch = FakeBatch([("δύο", 1.2, 1.6), ("τρία", 2.0, 2.4)])
+    t = _turn(batch, speech=[(0.0, 6.0)], audio=_audio(7.0), wide=True)
+    t.window(start=0.0, end=4.0, text="ένα τέσσερα", words=[Word("ένα", 0.2, 0.6), Word("τέσσερα", 3.2, 3.8)], enabled=True)
+    await asyncio.sleep(0.05)
+    assert batch.cuts                                          # started before the take
+    assert await t.complete("ένα τέσσερα", 2.0) == "ένα δύο τρία τέσσερα"
+    assert await t.complete("ένα τέσσερα", 2.0) == "ένα τέσσερα"   # once
+    narrow = FakeBatch([("δύο", 1.2, 1.6)])
+    n = _turn(narrow, speech=[(0.0, 6.0)], audio=_audio(7.0))
+    n.window(start=0.0, end=4.0, text="ένα τέσσερα", words=[Word("ένα", 0.2, 0.6), Word("τέσσερα", 3.2, 3.8)], enabled=True)
+    await asyncio.sleep(0.05)
+    assert narrow.cuts == []
+    assert await n.complete("ένα τέσσερα", 2.0) == "ένα τέσσερα"
+
+
+async def test_the_wide_turns_second_stretch_never_repeats_the_firsts_words():
+    # Two stretches in one window. The second stretch's first cut hears
+    # nothing, so its wider cut reaches 1.5 s back into the first stretch
+    # and returns a word that stretch already recovered: kept once.
+    batch = FakeBatch([("δύο", 1.2, 1.6), ("τρία", 2.5, 2.9), ("πέντε", 4.0, 4.4)],
+                      answer=lambda length, words: [] if abs(length - 3.0) < 0.01 else words)
+    t = _turn(batch, speech=[(0.0, 6.0)], audio=_audio(7.0), wide=True)
+    t.window(start=0.0, end=6.0, text="ένα τέσσερα έξι",
+             words=[Word("ένα", 0.2, 0.6), Word("τέσσερα", 3.0, 3.4), Word("έξι", 5.4, 5.8)], enabled=True)
+    assert await t.complete("ένα τέσσερα έξι", 2.0) == "ένα δύο τρία τέσσερα πέντε έξι"
+    assert [round(c[1], 1) for c in batch.cuts] == [3.4, 3.0, 5.0]   # the first stretch's first cut, the second's two
+
+
+async def test_the_wide_turn_leaves_a_window_whose_stretches_hold_no_speech():
+    batch = FakeBatch([("δύο", 1.2, 1.6)])
+    t = _turn(batch, speech=[(0.0, 0.6), (3.2, 3.8)], audio=_audio(7.0), wide=True)
+    t.window(start=0.0, end=4.0, text="ένα τέσσερα", words=[Word("ένα", 0.2, 0.6), Word("τέσσερα", 3.2, 3.8)], enabled=True)
+    await asyncio.sleep(0.05)
+    assert batch.cuts == []
+    assert await t.complete("ένα τέσσερα", 2.0) == "ένα τέσσερα"
+
+
+async def test_the_wide_turns_words_follow_the_windows_own_text_when_the_turn_text_differs():
+    batch = FakeBatch([("δύο", 1.2, 1.6)])
+    t = _turn(batch, speech=[(0.0, 6.0)], audio=_audio(7.0), wide=True)
+    t.window(start=0.0, end=4.0, text="ένα τέσσερα", words=[Word("ένα", 0.2, 0.6), Word("τέσσερα", 3.2, 3.8)], enabled=True)
+    # The pipeline dispatched a live partial after the final: the window's
+    # own words take the recovered one in its place, by word time.
+    assert await t.complete("ένα τέσσερα και πέντε", 2.0) == "ένα δύο τέσσερα και πέντε"
 
 
 async def test_a_turn_text_unlike_its_finals_gets_the_words_after_the_final_before_them():

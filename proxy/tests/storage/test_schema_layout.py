@@ -19,6 +19,7 @@ EXPECTED_ORDER = [
     "init_tasks",
     "init_identity",
     "init_chats",
+    "init_cards",
     "init_usage",
     "init_mcp",
     "init_agents",
@@ -51,6 +52,7 @@ EXPECTED_ORDER = [
     "init_knowledge_libraries",
     "init_checks",
     "init_reply_reports",
+    "init_notebook",
     "init_schema_meta",
 ]
 
@@ -59,6 +61,8 @@ HOMES = {
     "storage.agents.schema": ["init_agents", "init_departments", "init_memory"],
     "storage.knowledge.schema": ["init_knowledge_libraries"],
     "storage.chat.schema": ["init_chats", "init_meetings", "init_reply_reports"],
+    "storage.cards.schema": ["init_cards"],
+    "storage.notebook.schema": ["init_notebook"],
     "storage.automation.schema": [
         "init_tasks", "init_notifications", "init_push", "init_webhooks", "init_triggers",
     ],

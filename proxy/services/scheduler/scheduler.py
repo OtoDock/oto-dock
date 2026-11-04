@@ -33,6 +33,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 import config
+from auth import roles
 from services.scheduler import runner, scheduler_triggers, shared, task_kinds
 from services.scheduler.delivery import (  # noqa: F401
     _deliver_task_result,
@@ -318,6 +319,7 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         override_execution_path=row.get("override_execution_path") or None,
         target_machine=row.get("target_machine") or "",
         permission_mode=row.get("permission_mode") or "",
+        notify_audience=row.get("notify_audience") or roles.VIEWER,
         app_id=row.get("app_id") or None,
         app_handler=row.get("app_handler") or None,
         checks=_checks_of(row.get("checks")),
@@ -527,6 +529,7 @@ async def add_dynamic_task(task: shared.TaskDefinition) -> str:
         override_execution_path=task.override_execution_path,
         target_machine=task.target_machine or "",
         permission_mode=task.permission_mode,
+        notify_audience=task.notify_audience,
         app_id=task.app_id,
         app_handler=task.app_handler,
         checks=json.dumps(list(task.checks)) if task.checks else "",

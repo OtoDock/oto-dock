@@ -15,9 +15,12 @@ line is ``{timestamp, type, payload}``. We read:
   - ``response_item`` with ``payload.type == "message"`` → a turn message:
     ``payload.role`` (user|assistant|developer) + ``payload.content[]`` blocks of
     ``{type: input_text|output_text, text}``.
-We KEEP user + assistant text and SKIP: the ``developer`` perms message, the synthetic
-first ``user`` message (the AGENTS.md / ``<environment_context>`` / ``<INSTRUCTIONS>``
-injection), and everything that isn't a message (reasoning, tool calls, events).
+We KEEP user + assistant text (an assistant message whose ``phase`` is
+``commentary``, the preamble before a step, as a progress note: the pump's
+assistant row with ``NOTE_ROW``) and SKIP: the ``developer`` perms message, the
+synthetic first ``user`` message (the AGENTS.md / ``<environment_context>`` /
+``<INSTRUCTIONS>`` injection), and everything that isn't a message (reasoning,
+tool calls, events).
 
 CODEX_HOME is per-(user, agent) scope — shared across that scope's chats — so, unlike
 the Claude tailer (which finds ``<session_id>.jsonl`` by name), this DISCOVERS THIS
@@ -68,6 +71,8 @@ import psycopg
 from core.session.history_seed import strip_seed_prefix
 from core.session.transcript_tailer import author_sub_for, line_time
 from core.session.transcript_tool_events import (
+    NOTE_ROW,
+    ROW_PRELUDE_RE,
     TailLocks,
     ToolEventBuffer,
     attach_result,
@@ -75,6 +80,7 @@ from core.session.transcript_tool_events import (
     persist_event,
     record_batch_usage,
 )
+from storage.chat.chat_titles import title_from_prompt
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.codex_rollout_tailer")
@@ -274,6 +280,9 @@ def resolve_and_tail(session_id: str, chat_id: str) -> dict:
     return tail_rollout(session_id, chat_id, path)
 
 
+# The ``MessagePhase`` of an assistant message written between steps.
+_COMMENTARY = "commentary"
+
 _SYNTHETIC_USER_PREFIXES = ("# AGENTS.md instructions", "<user_instructions>",
                             "<turn_aborted>")
 
@@ -301,65 +310,25 @@ def _extract_text(content) -> str:
     return ""
 
 
-# Injected prelude line(s): the `[Current time: ...]` stamp, the viewer
-# focus line and the parallel-activity line — twin of
-# ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored exact shapes only;
-# a satellite single-lines the launch-argument prompt, so a prelude may end
-# in spaces instead of a line break).
-_TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
-    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]'
-    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
-)
-
-
 def _title_from_prompt(text: str) -> str:
-    """Deterministic chat title from the first user message — mirrors
-    ``transcript_tailer._title_from_prompt`` / ``ws.dashboard._deterministic_title``
-    (first ~6 words / 48 chars, whitespace-collapsed, ellipsis if truncated).
-    Injected ``[Current time: ...]`` stamps are dropped first; a prompt with
-    nothing user-authored left returns "" so the chat stays untitled for the
-    next real prompt (callers skip the empty title)."""
-    out = text or ""
-    while True:
-        stripped = _TIME_PRELUDE_RE.sub("", out, count=1)
-        if stripped == out:
-            break
-        out = stripped
-    cleaned = " ".join(out.split())
-    if not cleaned:
-        return ""
-    words = cleaned.split(" ")
-    title = " ".join(words[:6])
-    cut = len(words) > 6
-    if len(title) > 48:
-        title = title[:48].rstrip()
-        cut = True
-    return title + ("…" if cut else "")
-
-
-# The prelude shapes as the prefix merge strips them: a satellite single-lines
-# the launch-argument prompt, so a prelude there is followed by a space and
-# the next line's words, not by a newline — hence ``\s*`` where the title
-# regex above demands the line end.
-_ROW_PRELUDE_RE = re.compile(
-    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
-    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]\s*'
-)
+    """The default title of a Codex terminal chat from its first user row
+    (``storage/chat/chat_titles.title_from_prompt``); "" when the row holds
+    nothing a person wrote, so the chat stays untitled for the next real
+    prompt (callers skip the empty title)."""
+    return title_from_prompt(text)
 
 
 def _user_row_key(text: str) -> str:
     """A user row as the prefix merge compares it: every leading prelude
-    dropped, whitespace folded. The DB holds the RAW prompt where the
-    dashboard persisted it at send time (the cold first prompt, a composer
-    send) and the STAMPED one where this tailer persisted it (a line typed
-    straight into the PTY); the rollout holds the stamped line, single-lined
-    on a satellite. All of those are one row."""
+    dropped (the shapes ``transcript_tool_events.ROW_PRELUDE_RE`` names),
+    whitespace folded. The DB holds the RAW prompt where the dashboard
+    persisted it at send time (the cold first prompt, a composer send) and
+    the STAMPED one where this tailer persisted it (a line typed straight
+    into the PTY); the rollout holds the stamped line, single-lined on a
+    satellite. All of those are one row."""
     out = text or ""
     while True:
-        stripped = _ROW_PRELUDE_RE.sub("", out, count=1)
+        stripped = ROW_PRELUDE_RE.sub("", out, count=1)
         if stripped == out:
             break
         out = stripped
@@ -390,12 +359,13 @@ def _persisted_prefix(chat_id: str) -> tuple[list[tuple[str, str]], set[str]]:
     ids are unique; a rollout re-read revisits each exactly once)."""
     from storage import database as task_store
     try:
-        rows = task_store.get_chat_messages(chat_id, limit=_PREFIX_LIMIT)  # newest-first
+        # The newest rows, in chronological order: the merge walks them oldest first.
+        rows = task_store.get_chat_messages(chat_id, limit=_PREFIX_LIMIT)
     except psycopg.Error:
         return [], set()
     out: list[tuple[str, str]] = []
     event_keys: set[str] = set()
-    for r in reversed(rows):
+    for r in rows:
         role = r.get("role")
         content = r.get("content") or ""
         if role in ("user", "assistant") and content:
@@ -1011,7 +981,9 @@ def _rollout_message(b: _RolloutBatch, obj: dict, payload: dict) -> None:
     if role == "user" and _is_synthetic_user(text):
         return  # AGENTS.md / environment-context injection
 
-    if role == "user" and b.first_user_text is None:
+    # The batch's first user row that titles anything: a photo alone (the
+    # attachments block) leaves the title to the next.
+    if role == "user" and b.first_user_text is None and _title_from_prompt(text):
         b.first_user_text = text
 
     # Turn-relevant either way — a prefix-skipped record is still the
@@ -1024,14 +996,20 @@ def _rollout_message(b: _RolloutBatch, obj: dict, payload: dict) -> None:
         b.ptr += 1
         return
 
-    # The dashboard warmup already persisted this exact prompt at
-    # send-time — skip the row, keep the turn signal/title (twin of the
-    # Claude tailer's consume; see transcript_tool_events).
+    # A prompt whose row exists (the dashboard's own send, a prompt the
+    # platform typed), matched by its typed key: skip the journaled copy,
+    # keep the turn signal and the title (twin of the Claude tailer's
+    # consume; see transcript_tool_events).
     if role == "user" and consume_sent_prompt(b.chat_id, text):
         return
 
+    # A commentary message is the preamble before a step: a progress note,
+    # the row the pump writes for it (the translator's ``_COMMENTARY``). The
+    # rollout carries the phase the message completed with.
+    note = role == "assistant" and payload.get("phase") == _COMMENTARY
     b.task_store.add_chat_message(
         b.chat_id, role, text,
+        event_data=NOTE_ROW if note else "",
         # Attribution is a property of the HUMAN turn (twin of the Claude
         # tailer's author_sub stamp); assistant rows carry none.
         author_sub=(author_sub_for(b.session_id) if role == "user" else ""),
@@ -1097,7 +1075,9 @@ def _finish_rollout_batch(b: _RolloutBatch) -> dict:
 def _maybe_backfill_title(session_id: str, chat_id: str, first_user_text: str | None) -> bool:
     """Backfill the chat title from the first user prompt — interactive chats can't
     title at send-time (the prompt rides argv/PTY). Only when still untitled, so we
-    never overwrite an existing title and it's idempotent across tails."""
+    never overwrite an existing title and it's idempotent across tails. The write
+    is conditional itself (a rename landing between the read and the write wins);
+    the read stays for the broadcast's owner and agent."""
     if not first_user_text or not chat_id:
         return False
     from storage import database as task_store
@@ -1105,9 +1085,8 @@ def _maybe_backfill_title(session_id: str, chat_id: str, first_user_text: str | 
         rec = task_store.get_chat(chat_id)
         if rec and not (rec.get("title") or "").strip():
             new_title = _title_from_prompt(first_user_text)
-            if not new_title:
+            if not new_title or not task_store.set_chat_title_if_unset(chat_id, new_title):
                 return False
-            task_store.update_chat(chat_id, title=new_title)
             try:
                 from services.notifications import notification_manager
                 notification_manager.broadcast_chat_title(

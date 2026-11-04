@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 openpyxl = pytest.importorskip("openpyxl")
 
-from excel import _anchor_cell, _describe_anchor, handle_write_xlsx, read_xlsx
+from excel import handle_write_xlsx, read_xlsx
+from formats.xlsx.read import _anchor_cell, _describe_anchor
 
 
 async def _async_ident(p, writing=False, **kw):
@@ -27,9 +28,9 @@ def _no_proxy(monkeypatch):
     async def _noop_preview(path, filename=None):
         return None
 
-    monkeypatch.setattr("excel._resolve_path", _async_ident)
     monkeypatch.setattr("shared._resolve_path", _async_ident)
-    monkeypatch.setattr("excel._push_preview", _noop_preview)
+    monkeypatch.setattr("shared._push_preview", _noop_preview)
+    monkeypatch.setattr("shared._notify_file_written", _noop_preview)
 
 
 def _write(args: dict) -> str:
@@ -215,8 +216,8 @@ def test_dropped_malformed_ops_are_reported(tmp_path):
             "not-a-json-op",
         ],
     })
-    assert "1 malformed operation item(s)" in msg
-    assert "NOT applied" in msg
+    assert "Nothing saved" in msg and not f.exists()
+    assert "op #1: this item could not be read as JSON" in msg
 
 
 def test_copy_range_readback_covers_target(tmp_path):
@@ -812,7 +813,7 @@ def test_remove_validation_exact_range(tmp_path):
     })
     assert _rules(f) == []
     assert "Notes:" in msg
-    assert "remove_data_validation on 'Sheet': 1 rule(s) removed" in msg
+    assert "op #0 remove_data_validation: 1 rule(s) removed from 'Sheet'" in msg
 
 
 def test_remove_validation_partial_overlap_removes_whole_rule(tmp_path):
@@ -931,7 +932,7 @@ def test_remove_validation_requires_range_or_all(tmp_path):
             {"type": "remove_data_validation"},
         ],
     })
-    assert "missing required key(s): range or all" in msg
+    assert "op #0 remove_data_validation: give range or all" in msg and not f.exists()
 
 
 def test_remove_validation_missing_sheet_errors(tmp_path):
@@ -942,7 +943,7 @@ def test_remove_validation_missing_sheet_errors(tmp_path):
             {"type": "remove_data_validation", "sheet": "Nope", "all": True},
         ],
     })
-    assert "Sheet 'Nope' not found" in msg
+    assert "sheet 'Nope': sheet 'Nope' does not exist" in msg
 
 
 def test_remove_then_readd_repair_flow(tmp_path):
@@ -1002,7 +1003,7 @@ def test_add_validation_overlap_warns(tmp_path):
              "validation_type": "list", "values": ["b"]},
         ],
     })
-    assert "overlaps existing validation at A2:A10" in msg
+    assert "overlaps the validation at A2:A10" in msg
     assert "use remove_data_validation first" in msg
     assert len(_rules(f)) == 2
 
@@ -1321,7 +1322,7 @@ def test_coercion_note_reports_count(tmp_path):
         ],
     })
     assert "Notes:" in msg
-    assert ("write_cells on 'Sheet': 2 ISO date/time value(s) written as "
+    assert ("op #0 write_cells: on 'Sheet': 2 ISO date/time value(s) written as "
             "real dates (dd/mm/yyyy)") in msg
 
 
@@ -1358,12 +1359,15 @@ def test_readback_and_read_render_dates_compactly(tmp_path):
 def test_op_key_wins_over_type_in_dispatch():
     """{"op": "add_chart", "type": "bar"} used to dispatch to an operation
     named 'bar' — 'type' is a parameter whenever an op key is present."""
-    from shared import _op_type
+    import excel
 
-    assert _op_type({"op": "add_chart", "type": "bar"}) == "add_chart"
-    assert _op_type({"operation": "add_data_validation", "type": "list"}) == "add_data_validation"
-    assert _op_type({"type": "write_cells"}) == "write_cells"
-    assert _op_type({}) == ""
+    chart = excel.CATALOG.resolve({"op": "add_chart", "type": "bar", "data_range": "A1:B3"})[1]
+    assert chart["op"] == "add_chart" and chart["chart_type"] == "bar"
+    rule = excel.CATALOG.resolve({"operation": "add_data_validation", "type": "list", "range": "A1",
+                                  "values": ["a"]})[1]
+    assert rule["op"] == "add_data_validation" and rule["validation_type"] == "list"
+    assert excel.CATALOG.resolve({"type": "write_cells", "start_cell": "A1", "values": [[1]]})[1]["op"] == \
+        "write_cells"
 
 
 # ---------------------------------------------------------------------------
@@ -1384,11 +1388,10 @@ def test_unknown_key_fails_loudly_and_op_is_not_applied(tmp_path):
             {"op": "add_chart", "data_range": "A1:B3", "anchor_cell": "K2"},
         ],
     })
-    assert "Op #1 add_chart: unknown key(s) 'anchor_cell'" in msg
-    assert "accepted: sheet, chart_type, anchor" in msg
-    assert '{"op":"help","name":"add_chart"}' in msg
-    wb = openpyxl.load_workbook(f)
-    assert wb.active._charts == []
+    assert "op #1 add_chart: unknown key 'anchor_cell' (Did you mean 'anchor'?)" in msg
+    assert "Accepted keys: sheet, chart_type, anchor" in msg
+    assert '{"op": "help", "name": "add_chart"} shows the full shape' in msg
+    assert "1 of 2 operations are not valid, so none ran" in msg and not f.exists()
 
 
 def test_missing_required_key_is_reported(tmp_path):
@@ -1398,7 +1401,7 @@ def test_missing_required_key_is_reported(tmp_path):
         "create_new": True,
         "operations": [{"op": "merge_cells"}],
     })
-    assert "Op #0 merge_cells: missing required key(s): range" in msg
+    assert "op #0 merge_cells: missing required key range" in msg
 
 
 def test_unknown_op_lists_valid_operations(tmp_path):
@@ -1408,8 +1411,9 @@ def test_unknown_op_lists_valid_operations(tmp_path):
         "create_new": True,
         "operations": [{"op": "paint_cells", "range": "A1"}],
     })
-    assert "unknown operation 'paint_cells' — valid: create_sheet, delete_sheet" in msg
-    assert '{"op":"help"}' in msg
+    assert "op #0: unknown operation 'paint_cells'" in msg
+    assert "Valid operations: create_sheet, delete_sheet" in msg
+    assert '{"op": "help"} lists every operation' in msg
 
 
 def test_op_name_and_key_aliases_resolve(tmp_path):
@@ -1460,7 +1464,7 @@ def test_help_only_touches_no_file(tmp_path):
     assert "write_xlsx operations" in msg
     for group in ("SHEETS", "CELLS", "FEATURES", "CHARTS"):
         assert group in msg
-    assert "add_chart: sheet?, chart_type?, anchor?" in msg
+    assert "add_chart: sheet?, chart_type? (default 'column'), anchor? (default 'E1')" in msg
     assert "conditional_format:" in msg and "remove_conditional_format:" in msg
 
 
@@ -1469,7 +1473,7 @@ def test_help_for_one_op_and_alias(tmp_path):
     msg = _write({"path": str(f), "operations": [{"op": "describe_ops", "name": "create_chart"}]})
     assert not f.exists()
     assert msg.startswith("add_chart: ")
-    assert "bar (HORIZONTAL)" in msg and "also accepted as: chart, create_chart" in msg
+    assert "bar (HORIZONTAL)" in msg and "also accepted as: create_chart, insert_chart, chart" in msg
     msg = _write({"path": str(f), "operations": [{"op": "help", "name": "no_such_op"}]})
     assert "No operation named 'no_such_op'" in msg
 
@@ -1485,7 +1489,7 @@ def test_help_inside_a_batch_still_saves(tmp_path):
         ],
     })
     assert f.exists() and "Workbook saved" in msg
-    assert "\n\nset_style: sheet?, range, bold?" in msg
+    assert "\n\nset_style: sheet?, range (A1 range, e.g. 'B2:D10'), bold?" in msg
 
 
 def test_friendly_error_shapes():
@@ -1517,6 +1521,7 @@ def _seed_table(f, rows=6, cols=3, **extra_ops):
     return _write({
         "path": str(f),
         "create_new": True,
+        "best_effort": True,
         "operations": [{"op": "write_cells", "start_cell": "A1", "data": header + body}]
         + list(extra_ops.get("then", [])),
     })
@@ -1630,6 +1635,7 @@ def test_series_length_mismatch_and_2d_values_error(tmp_path):
     ])
     assert "has 3 values but there are 2 categories" in msg
     assert "must be a single column or a single row" in msg
+    assert "2 failed and may be partly applied" in msg
     assert openpyxl.load_workbook(f).active._charts == []
 
 
@@ -1663,6 +1669,7 @@ def test_sheet_qualified_data_range_reads_another_sheet(tmp_path):
              "series": [{"values": "'My Data'!B2:B3"}], "anchor": "B20"},
             {"op": "add_chart", "data_range": "Nope!A1:B3"},
         ],
+        "best_effort": True,
     })
     wb = openpyxl.load_workbook(f)
     assert len(wb["Sheet"]._charts) == 2 and wb["My Data"]._charts == []
@@ -1719,8 +1726,8 @@ def test_bad_anchor_rejected_without_chart(tmp_path):
     assert openpyxl.load_workbook(f).active._charts == []
 
 
-def test_renaming_a_charted_sheet_warns_about_dangling_refs(tmp_path):
-    f = tmp_path / "dangling.xlsx"
+def test_renaming_a_charted_sheet_carries_the_chart_along(tmp_path):
+    f = tmp_path / "renamed.xlsx"
     msg = _write({
         "path": str(f),
         "create_new": True,
@@ -1731,7 +1738,29 @@ def test_renaming_a_charted_sheet_warns_about_dangling_refs(tmp_path):
             {"op": "rename_sheet", "old_name": "Sheet", "new_name": "Data"},
         ],
     })
-    assert "references sheet 'Sheet', which was renamed or deleted" in msg
+    assert "renamed or deleted" not in msg
+    chart = openpyxl.load_workbook(f)["Data"]._charts[0]
+    assert chart.series[0].val.numRef.f == "Data!$B$2:$B$3"
+
+
+def test_a_chart_left_dangling_by_another_tool_still_warns(tmp_path):
+    f = tmp_path / "dangling.xlsx"
+    _write({
+        "path": str(f),
+        "create_new": True,
+        "operations": [
+            {"op": "write_cells", "start_cell": "A1",
+             "data": [["m", "v"], ["jan", 1], ["feb", 2]]},
+            {"op": "add_chart", "data_range": "A1:B3"},
+        ],
+    })
+    wb = openpyxl.load_workbook(f)
+    wb.active._charts[0].series[0].val.numRef.f = "'Old data'!$B$2:$B$3"
+    wb.save(f)
+    msg = _write({"path": str(f), "operations": [
+        {"op": "write_cells", "cells": [{"cell": "D1", "value": 1}]}]})
+    assert "a chart on Sheet: a chart series is broken: it names a sheet the workbook does not have" in msg
+    assert "'Old data'!$B$2:$B$3" in msg
 
 
 def test_two_charts_in_two_writes_keep_distinct_anchors(tmp_path):
@@ -1764,6 +1793,7 @@ def _numbers(f, then):
     return _write({
         "path": str(f),
         "create_new": True,
+        "best_effort": True,
         "operations": [{"op": "write_cells", "start_cell": "A1",
                         "data": [["v", "s"], [5, "Done"], [50, "Open"], [500, "Done"]]}] + then,
     })
@@ -1835,6 +1865,7 @@ def test_cf_operands_quoted_refs_verbatim_and_text_operators(tmp_path):
     assert '<formula>NOT(ISERROR(SEARCH("on",B2)))</formula>' in sheet
     assert "notBetween needs formula: [low, high]" in msg
     assert "operator 'wobbly' is not one of" in msg
+    assert "2 failed and may be partly applied" in msg
 
 
 def test_cf_formula_rule_strips_leading_eq(tmp_path):
@@ -1904,7 +1935,8 @@ def test_remove_conditional_format_by_range_all_and_alias(tmp_path):
     })
     assert "no conditional-format rules intersect F1:F9" in msg
     assert "1 rule(s) removed" in msg
-    assert "the sheet has no conditional-format rules" in msg
+    assert "'Sheet' has no conditional-format rules" in msg
+    assert "2 changed nothing" in msg
     sheet, _ = _sheet_and_styles_xml(f)
     assert "<cfRule" not in sheet
 
@@ -1948,6 +1980,7 @@ def test_validation_without_bounds_is_refused(tmp_path):
             {"op": "add_data_validation", "range": "C1:C5", "validation_type": "custom"},
             {"op": "add_data_validation", "range": "C1:C5", "validation_type": "wobbly"},
         ],
+        "best_effort": True,
     })
     assert "validation_type is required" in msg
     assert msg.count("list validation needs values") == 2
@@ -1993,6 +2026,7 @@ def test_validation_bounds_operators_and_iso_dates(tmp_path):
             {"op": "add_data_validation", "range": "F1:F5", "validation_type": "date",
              "operator": "greaterThan", "value": "2026-01-01T10:00"},
         ],
+        "best_effort": True,
     })
     assert "date bound '2026-01-01T10:00' includes a time" in msg
     rules = {str(r.sqref): r for r in openpyxl.load_workbook(f).active.data_validations.dataValidation}
@@ -2002,3 +2036,155 @@ def test_validation_bounds_operators_and_iso_dates(tmp_path):
     assert (rules["D1:D5"].operator, rules["D1:D5"].formula1) == ("lessThan", "TIME(17,30,0)")
     assert (rules["E1:E5"].operator, rules["E1:E5"].formula1) == ("lessThanOrEqual", "20")
     assert "F1:F5" not in rules
+
+
+# ---------------------------------------------------------------------------
+# The shared batch: atomic saves, best_effort, previews, nested keys
+# ---------------------------------------------------------------------------
+
+
+def test_one_failed_op_saves_nothing_and_previews_nothing(tmp_path, monkeypatch):
+    f = tmp_path / "atomic.xlsx"
+    _make_wb(f, {"A1": "before"})
+    before = f.read_bytes()
+    previews = []
+
+    async def _record(path, filename=None):
+        previews.append(path)
+
+    monkeypatch.setattr("shared._push_preview", _record)
+    msg = _write({"path": str(f), "operations": [
+        {"op": "write_cells", "cells": [{"cell": "A1", "value": "after"}]},
+        {"op": "rename_sheet", "old_name": "Nope", "new_name": "X"},
+    ]})
+    assert msg.startswith("Nothing saved:") and "is unchanged" in msg
+    assert "op #1 rename_sheet: sheet 'Nope': sheet 'Nope' does not exist" in msg
+    assert "Readback" not in msg
+    assert f.read_bytes() == before and previews == []
+
+
+def test_best_effort_keeps_the_ops_that_worked(tmp_path, monkeypatch):
+    f = tmp_path / "partial.xlsx"
+    _make_wb(f, {"A1": "before"})
+    previews = []
+
+    async def _record(path, filename=None):
+        previews.append(path)
+
+    monkeypatch.setattr("shared._push_preview", _record)
+    msg = _write({"path": str(f), "best_effort": True, "operations": [
+        {"op": "write_cells", "cells": [{"cell": "A1", "value": "after"}]},
+        {"op": "rename_sheet", "old_name": "Nope", "new_name": "X"},
+    ]})
+    assert msg.startswith("Workbook saved:")
+    assert "(1 operations applied: 1 write_cells; 1 failed and may be partly applied)" in msg
+    assert openpyxl.load_workbook(f).active["A1"].value == "after"
+    assert previews == [str(f)]
+
+
+def test_a_typo_inside_a_cell_entry_is_refused_with_the_fix(tmp_path):
+    f = tmp_path / "typo.xlsx"
+    msg = _write({"path": str(f), "operations": [
+        {"op": "write_cells", "cells": [{"cell": "A1", "vaule": 3}]}]})
+    assert "unknown key 'cells[0].vaule' (Did you mean 'value'?)" in msg
+    assert not f.exists()
+
+
+def test_number_format_is_accepted_inside_a_cell_entry(tmp_path):
+    f = tmp_path / "fmt.xlsx"
+    _write({"path": str(f), "operations": [
+        {"op": "write_cells", "cells": [{"cell": "A1", "value": 0.25, "number_format": "percent"}]}]})
+    assert openpyxl.load_workbook(f).active["A1"].number_format == "0.00%"
+
+
+def test_theme_and_named_colours(tmp_path):
+    f = tmp_path / "colours.xlsx"
+    _write({"path": str(f), "operations": [
+        {"op": "write_cells", "cells": [{"cell": "A1", "value": "x"}]},
+        {"op": "set_style", "range": "A1", "font_color": "accent1", "fill_color": "lightyellow"},
+        {"op": "set_style", "range": "A2", "font_color": {"theme": "accent2", "tint": 0.4}},
+    ]})
+    ws = openpyxl.load_workbook(f).active
+    assert ws["A1"].font.color.theme == 4 and ws["A1"].fill.fgColor.rgb == "FFFFFFE0"
+    assert ws["A2"].font.color.theme == 5 and round(ws["A2"].font.color.tint, 2) == 0.4
+
+
+def test_a_bad_colour_is_refused_before_any_work(tmp_path):
+    f = tmp_path / "badcolour.xlsx"
+    msg = _write({"path": str(f), "operations": [
+        {"op": "set_style", "range": "A1", "fill_color": "notacolour"}]})
+    assert "was not touched" in msg and "fill_color" in msg and not f.exists()
+
+
+def test_chart_size_takes_units(tmp_path):
+    f = tmp_path / "size.xlsx"
+    _seed_table(f, then=[{"op": "add_chart", "data_range": "A1:B7", "width": "4in", "height": 6}])
+    chart = openpyxl.load_workbook(f).active._charts[0]
+    assert (round(chart.anchor.ext.width / 360000, 2), round(chart.anchor.ext.height / 360000, 2)) == (10.16, 6.0)
+
+
+def test_macro_and_template_workbooks_are_read(tmp_path):
+    import server
+
+    for ext in (".xlsm", ".xltx", ".xltm"):
+        assert server.READ_DISPATCH[ext].__module__ == "xlsx_tool"
+
+
+def test_every_line_break_in_a_cell_is_shown_as_a_mark(tmp_path):
+    f = tmp_path / "breaks.xlsx"
+    _make_wb(f, {"A1": "one\u2028two\x85three\u2029four", "A2": "crlf\r\nend"})
+    text = read_xlsx(str(f), None, 10)
+    assert "one⏎two⏎three⏎four" in text and "crlf⏎end" in text
+
+
+# ---------------------------------------------------------------------------
+# The loose values write_xlsx took before value types were checked
+# ---------------------------------------------------------------------------
+
+
+def test_loose_values_of_the_old_tool_still_save(tmp_path):
+    f = tmp_path / "loose.xlsx"
+    logo = _png(tmp_path)
+    msg = _write({"path": str(f), "operations": [
+        {"op": "write_cells", "start_cell": "A1", "data": [["m", "v"], ["jan", 1], ["feb", 2]]},
+        {"op": "set_style", "range": "A1", "bold": "yes", "italic": "no", "underline": "yes",
+         "border": "thin", "protection": "locked", "alignment": {"horizontal": "left", "indent": 1.5}},
+        {"op": "set_style", "range": "B1", "border": "medium", "strikethrough": "on"},
+        {"op": "set_style", "range": "C1", "border": "all"},
+        {"op": "protect_sheet", "allow_sort": "yes", "allow_filter": "no"},
+        {"op": "auto_column_width", "columns": "A"},
+        {"op": "auto_column_width", "columns": "B, C"},
+        {"op": "add_chart", "data_range": "A1:B3", "width": 0, "height": 0, "stacked": "no"},
+        {"op": "add_image", "image_path": str(logo), "cell": "E9", "width": 0},
+        {"op": "create_table", "range": "A1:B3", "name": "T", "show_row_stripes": "no"},
+        {"op": "conditional_format", "range": "B2:B3", "rule_type": "cell_is", "operator": ">",
+         "formula": 1, "bold": "yes", "stop_if_true": "yes"},
+        {"op": "add_data_validation", "range": "D2:D3", "values": ["a", "b"], "show_error": "yes",
+         "allow_blank": "no"},
+    ]})
+    assert msg.startswith("Workbook saved"), msg
+    assert "border 'all' is not a style name, so a thin box was drawn" in msg
+    ws = openpyxl.load_workbook(f).active
+    a1 = ws["A1"]
+    assert a1.font.b and not a1.font.i and a1.font.u == "single"
+    assert a1.border.left.style == "thin" and a1.protection.locked is True and a1.alignment.indent == 1.5
+    assert ws["B1"].border.top.style == "medium" and ws["B1"].font.strike
+    assert ws["C1"].border.bottom.style == "thin"
+    assert ws.protection.sort is False and ws.protection.autoFilter is not False
+    assert ws.column_dimensions["A"].width >= 8 and ws.column_dimensions["C"].width >= 8
+    chart = ws._charts[0]
+    assert (chart.anchor.ext.width, chart.anchor.ext.height) == (15 * 360000, int(7.5 * 360000))
+    assert ws._images[0].width == 8
+    assert ws.tables["T"].tableStyleInfo.showRowStripes is False
+    assert ws.data_validations.dataValidation[0].showErrorMessage is True
+
+
+def test_an_off_word_turns_a_style_off(tmp_path):
+    f = tmp_path / "off.xlsx"
+    _make_wb(f, {"A1": "x"})
+    _write({"path": str(f), "operations": [
+        {"op": "set_style", "range": "A1", "bold": True, "border": True}]})
+    _write({"path": str(f), "operations": [
+        {"op": "set_style", "range": "A1", "bold": "no", "border": "none", "protection": "unlocked"}]})
+    a1 = openpyxl.load_workbook(f).active["A1"]
+    assert not a1.font.b and a1.border.left.style is None and a1.protection.locked is False

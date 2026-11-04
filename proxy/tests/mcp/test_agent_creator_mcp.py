@@ -42,6 +42,8 @@ class TestPermissionMatrix:
             "OTO_PLATFORM_ROLE": "admin", "OTO_CAN_CREATE_AGENTS": "true",
         })
         assert mod.ENABLED_TOOLS == {
+            "search_community_agents", "list_departments", "propose_install",
+            "propose_department_install", "propose_move", "check_card",
             "list_building_blocks", "validate_agent_template", "create_agent",
         }
 
@@ -95,6 +97,132 @@ class TestManifestSanity:
         })
         assert set(mod._TOOL_SCHEMAS.keys()) == set(mod._TOOL_HANDLERS.keys())
         assert set(mod._TOOL_SCHEMAS.keys()) == mod._ALL_TOOLS
+        for schema in mod._TOOL_SCHEMAS.values():
+            assert schema["inputSchema"]["additionalProperties"] is False
+
+    def test_the_tiers_read_and_propose_below_create(self):
+        """The reads and the card draws never ask twice: the card is the
+        person's confirmation (services/cards)."""
+        manifest = json.loads((_MCP_DIR / "manifest.json").read_text())
+        tiers = {r["tool"]: r["tier"] for r in manifest["permissions"]["rules"]}
+        assert tiers["search_community_agents"] == tiers["list_departments"] == tiers["check_card"] == "open"
+        assert tiers["propose_install"] == tiers["propose_department_install"] == tiers["propose_move"] == "standard"
+        assert "create_agent" not in tiers and manifest["permissions"]["default_tier"] == "sensitive"
+        assert manifest["version"] == "1.3.2"
+
+
+class TestCards:
+    """The proposal tools draw one card each through the cards route with
+    the session's id, the action and its parameters, and repeat the
+    route's own sentence on a refusal; the search ranks templates and sets."""
+
+    def _mod(self, monkeypatch):
+        monkeypatch.setenv("OTO_SESSION_ID", "sid-creator")
+        return _load_server({
+            "OTO_AGENT_NAME": "x", "OTO_PLATFORM_ROLE": "admin", "OTO_CAN_CREATE_AGENTS": "true",
+            "PROXY_URL": "http://test", "PROXY_API_KEY": "k",
+        })
+
+    def _serve(self, monkeypatch, mod, answer):
+        import httpx
+        calls: list[tuple[str, str, dict]] = []
+
+        async def _request(self, method, url, **kw):
+            calls.append((method, url, kw.get("json") or {}))
+            status, body = answer(method, url)
+            return httpx.Response(status, json=body, request=httpx.Request(method, url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "request", _request)
+        return calls
+
+    def test_a_move_card_carries_the_session_the_action_and_the_parameters(self, monkeypatch):
+        import asyncio
+        mod = self._mod(monkeypatch)
+        calls = self._serve(monkeypatch, mod, lambda m, u: (200, {"status": "ok", "card_id": "card-1"}))
+        out = asyncio.run(mod._TOOL_HANDLERS["propose_move"](
+            {"agent": "alpha", "department_id": "dept-1", "level_id": "lvl-2", "note": "The Team level fits."}))
+        assert "A card is in the chat." in out and "card-1" in out
+        (call,) = calls
+        assert call[0] == "POST" and call[1].endswith("/v1/cards")
+        assert call[2] == {"session_id": "sid-creator", "note": "The Team level fits.",
+                           "buttons": [{"id": "move", "kind": "do", "action": "move_agent",
+                                        "params": {"agent": "alpha", "department_id": "dept-1", "level_id": "lvl-2"}}]}
+
+    def test_an_install_card_names_the_template_and_the_placement(self, monkeypatch):
+        import asyncio
+        mod = self._mod(monkeypatch)
+        calls = self._serve(monkeypatch, mod, lambda m, u: (200, {"status": "ok", "card_id": "card-2"}))
+        asyncio.run(mod._TOOL_HANDLERS["propose_install"](
+            {"template_slug": "yacht-crew", "department_id": "dept-1", "level_id": "lvl-2"}))
+        asyncio.run(mod._TOOL_HANDLERS["propose_department_install"](
+            {"set_slug": "yacht-office", "department_name": "Lady G"}))
+        install, dept = (c[2]["buttons"][0] for c in calls)
+        assert install == {"id": "install", "kind": "do", "action": "install_agent",
+                           "params": {"template_slug": "yacht-crew", "department_id": "dept-1", "level_id": "lvl-2"}}
+        assert dept == {"id": "install", "kind": "do", "action": "install_department_set",
+                        "params": {"set_slug": "yacht-office", "department_name": "Lady G"}}
+
+    def test_a_refusal_repeats_the_routes_sentence_and_nothing_else(self, monkeypatch):
+        import asyncio
+        mod = self._mod(monkeypatch)
+        self._serve(monkeypatch, mod, lambda m, u: (409, {"detail": "Manager or admin access required for this agent."}))
+        out = asyncio.run(mod._TOOL_HANDLERS["propose_move"]({"agent": "alpha", "department_id": "d", "level_id": "l"}))
+        assert out == "No card was drawn: Manager or admin access required for this agent."
+        self._serve(monkeypatch, mod, lambda m, u: (422, {"detail": [{"loc": ["body"], "msg": "x"}]}))
+        out = asyncio.run(mod._TOOL_HANDLERS["propose_move"]({"agent": "alpha", "department_id": "d", "level_id": "l"}))
+        assert out == f"No card was drawn: {mod.NO_ANSWER}"
+        # A paired machine's older satellite refuses the draw at its tunnel.
+        self._serve(monkeypatch, mod, lambda m, u: (403, {"error": "path-not-allowlisted"}))
+        out = asyncio.run(mod._TOOL_HANDLERS["propose_move"]({"agent": "alpha", "department_id": "d", "level_id": "l"}))
+        assert out == f"No card was drawn: {mod.OLDER_SATELLITE}"
+
+    def test_the_card_state_in_words(self, monkeypatch):
+        import asyncio
+        mod = self._mod(monkeypatch)
+        states = iter([
+            {"clicks": [], "outcome": None, "expired": None},
+            {"clicks": [{"button": "no", "status": "said", "detail": "Not now, thanks.", "by": "Maria"}], "outcome": None, "expired": None},
+            {"clicks": [{"button": "go", "status": "done", "by": "Nikos"}], "outcome": {"status": "done", "text": "Alpha is now in Eng as Team."}, "expired": None},
+            {"clicks": [], "outcome": {"status": "running", "text": "Being installed.", "lines": ["Installed Head as head."]}, "expired": None},
+            {"clicks": [], "outcome": None, "expired": "This card has expired. Ask again."},
+        ])
+        self._serve(monkeypatch, mod, lambda m, u: (200, next(states)))
+        read = lambda: asyncio.run(mod._TOOL_HANDLERS["check_card"]({"card_id": "card-1"}))
+        assert read() == "Nobody has pressed a button yet."
+        assert read() == "Maria answered: Not now, thanks."
+        assert read() == "Nikos pressed the button. Alpha is now in Eng as Team."
+        # An older platform's state names nobody.
+        assert read() == "Someone pressed the button. Being installed.\nIt is still running. Read the card again in a moment.\n- Installed Head as head."
+        assert read() == "The card expired: This card has expired. Ask again."
+
+    def test_check_card_quotes_the_id_so_it_reaches_no_other_route(self, monkeypatch):
+        import asyncio
+        mod = self._mod(monkeypatch)
+        calls = self._serve(monkeypatch, mod, lambda m, u: (200, {"clicks": [], "outcome": None, "expired": None}))
+        asyncio.run(mod._TOOL_HANDLERS["check_card"]({"card_id": "../settings/catalog"}))
+        (method, url, _body), = calls
+        assert method == "GET" and url.endswith("/v1/cards/..%2Fsettings%2Fcatalog")
+
+    def test_the_search_ranks_templates_and_sets(self, monkeypatch):
+        import asyncio
+        mod = self._mod(monkeypatch)
+        agents = {"agents": [
+            {"slug": "yacht-crew", "display_name": "Yacht Crew", "version": "0.2.2", "tags": ["yacht"],
+             "description": "The crew files.", "installed_as": ["yacht-crew"]},
+            {"slug": "personal-assistant", "display_name": "Personal Assistant", "version": "3.1.2", "tags": [],
+             "description": "Your everyday assistant.", "installed_as": []},
+        ]}
+        sets = {"departments": [
+            {"slug": "yacht-office", "name": "Yacht office", "version": "0.1.0", "tags": ["yacht"],
+             "description": "The five agents of a yacht management office.", "problems": [], "missing_members": [],
+             "members": [{"template": "yacht-crew", "display_name": "Yacht Crew", "level": "Team"}], "installed": []}]}
+        self._serve(monkeypatch, mod, lambda m, u: (200, agents if u.endswith("/agents") else sets))
+        out = asyncio.run(mod._TOOL_HANDLERS["search_community_agents"]({"query": "yacht"}))
+        assert "department set `yacht-office`" in out and "template `yacht-crew`" in out
+        assert "personal-assistant" not in out and "Part of the set: yacht-office." in out
+        assert out.index("yacht-office") < out.index("yacht-crew")
+        out = asyncio.run(mod._TOOL_HANDLERS["search_community_agents"]({"query": "zebra"}))
+        assert out.startswith("Nothing in the community catalog matches.")
 
 
 class TestRetries:

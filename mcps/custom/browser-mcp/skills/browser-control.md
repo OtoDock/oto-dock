@@ -75,6 +75,10 @@ Prefer opening your own tab over hijacking one that's already showing
 something. If the window gets closed (by the user or `browser_close`), the
 next browser action relaunches it automatically — a tool call right at that
 boundary may return one "browser was closed — retry" error; just retry it.
+If the shared browser stopped answering (a tab stuck after hours in the
+background), your first call can take about 30 seconds while a fresh browser
+starts. If that call times out, run it once more. The tabs from earlier work
+are then gone, and the sign-ins stay.
 On Firefox/WebKit (no shared attach) the profile is exclusive to one session
 at a time — if it reports busy, finish or close the other session and retry.
 
@@ -111,6 +115,17 @@ page the user was already on. What changes:
   admin, for a platform machine) ticked "Also let unattended runs (scheduled
   tasks, triggers, calls, meetings) use this browser"; otherwise they cannot
   use the browser.
+- **The connect page opens in the profile that has the extension.** The
+  machine's "Browser profile" setting names it; empty, the one profile that
+  has the extension is used. An error that lists the browser's profiles means
+  the setting names none of them, or several have the extension: tell the
+  user to set Browser profile in the machine's settings to one of the names.
+- **Uploads go through the page.** `browser_file_upload` works as in the
+  dedicated browser: after a click that opened a file chooser, call it with
+  the paths, or name the file field or drop area with `target`. The files
+  must sit in the session's folder, 10 MB at most per upload. For a drop
+  area, `browser_drop` also works. When the page does not take the file, say
+  so and ask the user to hand it to the page themselves.
 - **A "Welcome" tab in your group is the extension's own connect page** —
   you cannot see or drive it; ignore it and never try to close it.
 - `browser_close` disconnects your group; your tabs stay open in the user's

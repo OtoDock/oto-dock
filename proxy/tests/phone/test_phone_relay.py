@@ -259,14 +259,25 @@ def test_no_pinned_route_is_refused(relay_app, fake_daemon, monkeypatch):
 
 
 @pytest.mark.parametrize("over", [
-    {"enabled": False}, {"direction": "inbound"}, {"agent": "agent-y"},
+    {"enabled": False}, {"direction": "inbound"},
 ])
-def test_a_pinned_route_that_is_not_this_agents_enabled_outbound_route_is_refused(
+def test_a_pinned_route_that_is_not_an_enabled_outbound_route_is_refused(
         relay_app, fake_daemon, over):
     from storage.phone import phone_route_store
     phone_route_store.update_route("r-x", over)
     assert _post(relay_app, _user("ed4", "editor")).status_code == 403
     assert fake_daemon.calls == []
+
+
+def test_a_pinned_route_of_another_agent_places_the_call_as_that_agent(relay_app, fake_daemon):
+    """The admin pinned another agent's line to this agent's instance: the
+    call goes out on it and that agent speaks on the call (the daemon runs
+    the call as the route's agent)."""
+    from storage.phone import phone_route_store
+    phone_route_store.update_route("r-x", {"agent": "agent-y"})
+    r = _post(relay_app, _user("ed4c", "editor"))
+    assert r.status_code == 202, r.text
+    assert fake_daemon.calls[0]["json"]["route_id"] == "r-x"
 
 
 def test_a_missing_pinned_route_is_refused(relay_app, fake_daemon):

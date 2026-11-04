@@ -5,6 +5,7 @@ import { toSandboxVirtualPath } from '../../lib/paths'
 import { useFileThumbnail } from '../../hooks/useFileThumbnail'
 import FileIcon, { FolderIcon } from './FileIcon'
 import { useLongPress } from '../../hooks/useLongPress'
+import { HOVER_REVEAL_FADE } from '../ui/classes'
 
 interface Props {
   agent: string
@@ -219,7 +220,7 @@ export default function FileTile({
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
               onContextMenu({ clientX: rect.right, clientY: rect.bottom })
             }}
-            className="shrink-0 w-4 h-4 flex items-center justify-center rounded-sm text-secondary hover:text-primary opacity-100 md:opacity-0 md:group-hover:opacity-100"
+            className={`shrink-0 w-4 h-4 flex items-center justify-center rounded-sm text-secondary hover:text-primary ${selected ? '' : HOVER_REVEAL_FADE}`}
           >
             <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16">
               <circle cx="8" cy="3" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="8" cy="13" r="1.4" />

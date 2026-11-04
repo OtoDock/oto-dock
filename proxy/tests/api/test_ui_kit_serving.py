@@ -79,6 +79,20 @@ def test_loose_dist_files_revalidate_on_every_load(client, dist):
     assert "etag" in r.headers
 
 
+def test_the_boot_script_answers_a_revalidation_with_304(client, dist):
+    """``/boot.js`` loads before every first paint: a cold start sends the
+    ETag it holds and gets a 304, not the script again."""
+    (dist / "boot.js").write_text("document.documentElement.dataset.boot = '1'\n")
+    first = client.get("/boot.js")
+    assert first.status_code == 200 and first.headers["cache-control"] == "no-cache"
+    again = client.get("/boot.js", headers={"if-none-match": first.headers["etag"]})
+    assert again.status_code == 304
+    assert again.headers["cache-control"] == "no-cache"
+    (dist / "boot.js").write_text("document.documentElement.dataset.boot = 'two'\n")
+    changed = client.get("/boot.js", headers={"if-none-match": first.headers["etag"]})
+    assert changed.status_code == 200 and "two" in changed.text
+
+
 def test_ui_kit_miss_is_404_not_index(client):
     r = client.get("/ui-kit/missing.min.js")
     assert r.status_code == 404

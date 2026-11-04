@@ -57,4 +57,16 @@ describe('clampPopover', () => {
     const p = clampPopover({ top: 300, bottom: 300, left: 200, right: 200 }, panel, phone, { align: 'left', gap: 0 })
     expect(p).toEqual({ top: 300, left: 200, flipped: false })
   })
+
+  it('opens above an anchor that prefers it when it fits there, below when it does not', () => {
+    // The place chip at 360 wide, right over the message box.
+    const chip = { top: 620, bottom: 648, left: 240, right: 270 }
+    const menu = { width: 256, height: 120 }
+    const narrow = { width: 360, height: 780 }
+    expect(clampPopover(chip, menu, narrow, { align: 'right', prefer: 'above' }))
+      .toEqual({ top: 620 - 4 - 120, left: 14, flipped: true })
+    expect(clampPopover(chip, menu, narrow, { align: 'right' }).flipped).toBe(false)
+    const atTop = { top: 40, bottom: 68, left: 240, right: 270 }
+    expect(clampPopover(atTop, menu, narrow, { align: 'right', prefer: 'above' }).flipped).toBe(false)
+  })
 })

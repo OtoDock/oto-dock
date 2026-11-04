@@ -25,6 +25,11 @@ documented at [docs.otodock.io](https://docs.otodock.io).
   `dashboard/android/`. It adds native push, alarms and a location bridge. It
   runs the same dashboard over the same sockets, against the server address
   the person enters.
+- **The iOS app** is the same Capacitor shell for iPhone and iPad, in
+  `dashboard/ios/`. Its Swift code judges every message the dashboard sends
+  it. Its rules and their tests are a Swift package in
+  `dashboard/ios/OtoDockShell/`. It runs the same dashboard over the same
+  sockets.
 - **The satellite** is a daemon for remote Linux, macOS and Windows
   machines, in `satellite/`. It runs agent sessions on those machines, on
   Python 3.10 and newer. It starts with `python -m satellite`. It keeps one
@@ -112,14 +117,18 @@ happens, then where it happens in the code.
    `proxy/ws/dashboard_warmup.py`. The configuration and the prompt come from
    `proxy/core/config/config_builder.py`. The admission gate is
    `proxy/core/concurrency.py`.
-5. **Resolve the engine and where it runs.** The proxy reads the agent's
-   engine: `claude-code-cli`, `codex-cli` or `direct-llm`. It also reads the
-   placement. A person's own machine comes first, then the agent's machine,
-   then the platform itself. A remote placement returns the remote layer. An
-   unknown engine id is refused. `get_execution_layer` does this, in
-   `proxy/core/session/session_manager.py`. The placement order is decided
-   in `proxy/services/remote/remote_status.py` (`resolve_execution_target`),
-   and `proxy/storage/remote_store.py` holds the paired machines.
+5. **Resolve the engine and where it runs.** An agent lists the engines it
+   may run on: `claude-code-cli`, `codex-cli` or `direct-llm`. Each person
+   gets their own engine among them, worked out in
+   `proxy/services/engines/engine_resolution.py`. The page sends that engine
+   when the chat starts. Without one the proxy takes the agent's default. It
+   also reads the placement. A person's own machine comes first, then the
+   agent's machine, then the platform itself. A remote placement returns
+   the remote layer. An unknown engine id is refused. `get_execution_layer`
+   does this, in `proxy/core/session/session_manager.py`. The placement
+   order is decided in `proxy/services/remote/remote_status.py`
+   (`resolve_execution_target`), and `proxy/storage/remote_store.py` holds
+   the paired machines.
 6. **Start the engine in a sandbox.** For Claude Code, the CLI layer
    resolves the sandbox, and a persistent session spawns the CLI inside it.
    The sandbox is bubblewrap in its own network namespace. That namespace
@@ -326,10 +335,11 @@ the same. The remote layer is `RemoteExecutionLayer`, in
 
 ### The satellite's shared modules
 
-`satellite/_vendored/` holds byte-for-byte copies of six proxy modules. They
+`satellite/_vendored/` holds byte-for-byte copies of seven proxy modules. They
 are the MCP installer, the stdio path interceptor, the Codex app-server
-client, its approval bridge, the terminal query strips and the agent tree
-layout. `scripts/sync-satellite-code.sh` copies them. It pins their hashes in
+client, its approval bridge, the terminal query strips, the agent tree
+layout and the event-loop watchdog. `scripts/sync-satellite-code.sh` copies
+them. It pins their hashes in
 `satellite/config.py`, and the satellite refuses to start on a mismatch.
 
 The host OS table is a twin instead. The proxy defines it in
@@ -383,7 +393,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `.github/` | GitHub workflows, issue templates and README media |
 | `LICENSES/` | the licence texts REUSE.toml points at (the FSL and the third-party ones) |
 | `audio/` | shared editable package: cloud STT/TTS core used by proxy and phone |
-| `dashboard/` | React + Vite + TypeScript frontend (and the Android wrapper) |
+| `dashboard/` | React + Vite + TypeScript frontend (and the Android and iOS wrappers) |
 | `mcps/` | first-party MCP servers, shared helpers, the catalog's installed skill packages |
 | `phone/` | phone-call service: telephony, STT/TTS pipeline, proxy client |
 | `proxy/` | FastAPI backend, the platform core |
@@ -404,7 +414,8 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 |---|---|
 | `dashboard/android/` | the Capacitor Android app that wraps the dashboard |
 | `dashboard/build/` | build helpers vite.config.ts imports (precompression, the build id) |
-| `dashboard/design/` | the design tokens (tokens.json), their generator, the colour lint, the codemod, the reference page, the Figma variables and the mark's masters with their export (brand/) |
+| `dashboard/design/` | the design tokens (tokens.json), their generator, the colour lint, the codemod, the reference page, the Figma variables, the mark's masters with their export (brand/) and the settings catalog's generator |
+| `dashboard/ios/` | the Capacitor iOS app that wraps the dashboard (App/ the Xcode project, OtoDockShell/ the shell's rules and their tests) |
 | `dashboard/public/` | static files served as they are (the favicons and logos, the setup page, the boot screen's script) |
 | `dashboard/src/` | the React app |
 | `dashboard/ui-kit/` | the UI kit served to artifacts and app pages (tokens CSS, licences) |
@@ -438,12 +449,13 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `dashboard/src/components/audio/` | voice and dictation UI |
 | `dashboard/src/components/chat/` | chat surface: messages, input, tool activity |
 | `dashboard/src/components/common/` | shared widgets |
-| `dashboard/src/components/departments/` | departments editor |
+| `dashboard/src/components/departments/` | departments editor, and the dialog that installs a department set |
 | `dashboard/src/components/engines/` | AI engine accounts: the API-key form and the subscription windows |
 | `dashboard/src/components/icons/` | inline outline icons shared by the settings shell and the avatar menu |
+| `dashboard/src/components/notebook/` | the Notebook list the agent page and the department card share |
 | `dashboard/src/components/phone/` | phone call log and settings |
 | `dashboard/src/components/projects/` | delegation projects |
-| `dashboard/src/components/settings/` | the settings shell of User Settings, Agent Settings and Admin: the sidebar, the phone's section list, the section configs and the history trail behind back |
+| `dashboard/src/components/settings/` | the settings shell of User Settings, Agent Settings and Admin: the sidebar, the phone's section list, the section configs, the history trail behind back, and the settings catalog the chat's settings card reads |
 | `dashboard/src/components/sharing/` | the share popover and the shared-with-me surfaces |
 | `dashboard/src/components/ui/` | primitives |
 | `dashboard/src/components/usage/` | usage: the subscription pool cap section and the charts' colours |
@@ -500,8 +512,9 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/api/audio/` | speech providers and dictation |
 | `proxy/api/auth/` | login, users, OAuth, API keys, setup |
 | `proxy/api/billing/` | usage and limits, the relay credit balance, the OtoDock account connect |
+| `proxy/api/cards/` | cards in the chat: a tool's draw, the person's read and click |
 | `proxy/api/checks/` | checks: the agent's and a person's own documents, the verdicts, the cap, the session tools' routes |
-| `proxy/api/departments/` | departments: the org structure behind the agents map |
+| `proxy/api/departments/` | departments: the org structure behind the agents map, and the department sets of the community catalog |
 | `proxy/api/duplex/` | live voice conversations |
 | `proxy/api/events/` | event subscriptions |
 | `proxy/api/hooks/` | callbacks from inside sessions: permission, tool results, path resolution, credentials |
@@ -509,10 +522,12 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/api/mcp/` | MCP catalog, instances, credentials |
 | `proxy/api/media/` | media serving and transcoding |
 | `proxy/api/meetings/` | multi-agent meetings |
+| `proxy/api/notebook/` | the Notebook: the delegation tools' two routes, the agent and department pages' reads, a manager's delete |
 | `proxy/api/notifications/` | notifications |
 | `proxy/api/phone/` | phone servers, routes, call log, caller data, the call relay, the Twilio relay, the call tools' endpoint |
 | `proxy/api/remote/` | remote machines and targets |
 | `proxy/api/sessions/` | session control, plans, models, health |
+| `proxy/api/settings/` | the settings catalog a person's own session reads, and the card a setting draws in the chat |
 | `proxy/api/sharing/` | shares of apps and chats: internal grants, external links, the grantee surfaces |
 | `proxy/api/tasks/` | scheduled tasks and runs |
 
@@ -552,17 +567,19 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/services/agents/` | agent state: the setup state, the offboarding event and its subscribers, Shared-only membership, the repository instruction files lifted into the prompt, the provisioning steps after an agent or a membership commits |
 | `proxy/services/apps/` | app storage and rendering, the actions manifest and the platform catalog |
 | `proxy/services/billing/` | licensing, usage accounting |
+| `proxy/services/cards/` | cards in the chat: the words, the action catalog, the draw and the click |
 | `proxy/services/checks/` | checks: documents and their index, the changed set, the evaluator and the four kinds, the judge's spend |
-| `proxy/services/community/` | community catalogs: MCPs, agents (the template loader and its signatures), skills |
+| `proxy/services/community/` | community catalogs: MCPs, agents (the template loader and its signatures), department sets and their installer, skills |
 | `proxy/services/delegation/` | agent-to-agent delegation |
-| `proxy/services/departments/` | the department-to-delegation-edge compiler |
-| `proxy/services/engines/` | engine subscriptions, the pool, local endpoints |
+| `proxy/services/departments/` | placing an agent in a department, and the department-to-delegation-edge compiler |
+| `proxy/services/engines/` | engine subscriptions, the pool, local endpoints, and the engine each person's chats and tasks take |
 | `proxy/services/infra/` | cross-cutting infrastructure: retention, storage quotas, safe file opens, checked outbound HTTP, the release check, the git audit trail, API keys |
 | `proxy/services/knowledge/` | knowledge libraries and indexing |
 | `proxy/services/mcp/` | MCP registry, permissions, updater, dynamic context |
 | `proxy/services/media/` | media processing |
 | `proxy/services/meetings/` | meeting orchestration |
 | `proxy/services/memory/` | the memory system |
+| `proxy/services/notebook/` | the Notebook: who reads whom along the delegation edges, posting, the prompt section |
 | `proxy/services/notifications/` | notification manager |
 | `proxy/services/oauth/` | OAuth account flows |
 | `proxy/services/phone/` | phone configuration, identity, adapters, health, the call tools' registry, calls inside a chat |
@@ -576,15 +593,17 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 
 | Directory | What it holds |
 |---|---|
-| `proxy/storage/agents/` | agents, agent memory, departments |
+| `proxy/storage/agents/` | agents, agent memory, departments, department set installs |
 | `proxy/storage/automation/` | tasks, triggers, notifications, webhook subscriptions |
 | `proxy/storage/billing/` | subscriptions and usage |
+| `proxy/storage/cards/` | the cards a tool draws and the clicks a person makes |
 | `proxy/storage/chat/` | chats and meetings |
 | `proxy/storage/checks/` | the check index, the verdicts and the per-agent cap |
 | `proxy/storage/files/` | file sync state, tombstones, authorship, the recover bin, file pins, transfers |
 | `proxy/storage/identity/` | users, API keys, passkeys, the bearer allowlist, credentials |
 | `proxy/storage/knowledge/` | knowledge libraries and the library mirror state |
 | `proxy/storage/mcp/` | MCP instances, MCP requests, the MCP auto-update state |
+| `proxy/storage/notebook/` | the Notebook's entries and the delegation edges they follow |
 | `proxy/storage/phone/` | phone routes, servers and the call log |
 | `proxy/storage/prefs/` | per-user audio and UI preferences, audio providers |
 | `proxy/storage/sharing/` | shares of apps and chats (internal grants and external links) |
@@ -595,7 +614,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 |---|---|
 | `satellite/_vendored/` | byte-for-byte copies of proxy modules, kept by scripts/sync-satellite-code.sh and pinned by hash |
 | `satellite/bin/` | CLI entry points (otodock) |
-| `satellite/host/` | the machine: the host probe, path policy, safe file opens, environment hygiene, path translation, CLI versions, the tray, the service unit |
+| `satellite/host/` | the machine: the host probe, path policy, safe file opens, environment hygiene, path translation, CLI versions, the tray, the service unit, the macOS login item's app |
 | `satellite/sessions/` | engine sessions on the machine (Claude Code, Codex), app steps, MCP install support |
 | `satellite/terminal/` | PTY sessions and the local terminal socket |
 | `satellite/tests/` | pytest suite |

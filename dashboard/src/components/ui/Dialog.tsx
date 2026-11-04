@@ -26,6 +26,8 @@ const WRAPPER: Record<DialogPlacement, string> = {
 const PANEL = `${DIALOG_PANEL} max-w-md`
 const ON_ESCAPE: Record<DialogDismiss, boolean> = { any: true, escape: true, none: false }
 const ON_BACKDROP: Record<DialogDismiss, boolean> = { any: true, escape: false, none: false }
+/** How long a refused close request shakes the panel (`.oto-refuse`). */
+const REFUSE_MS = 300
 
 interface Props {
   /** Mounted is open unless this says otherwise. */
@@ -82,10 +84,27 @@ export default function Dialog({
   const closingRef = useRef(false)
   const keyUpSeenRef = useRef(false)
   const pressedBackdropRef = useRef(false)
+  // Escape or the app's Back on a dialog that waits for its own buttons (or
+  // is busy) shakes it, so the request is seen and the work stays; a shake
+  // in progress takes no second one (a held key does not buzz). A backdrop
+  // tap a dialog refuses by design never shakes.
+  const [refusing, setRefusing] = useState(false)
+  const refuseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useLayoutEffect(() => () => {
+    if (refuseTimerRef.current !== null) clearTimeout(refuseTimerRef.current)
+  }, [])
 
-  const request = useCallback((allowed: Record<DialogDismiss, boolean>) => {
+  const request = useCallback((allowed: Record<DialogDismiss, boolean>, shake = false) => {
     const now = latest.current
-    if (now.busy || !allowed[now.dismissible]) return
+    if (now.busy || !allowed[now.dismissible]) {
+      if (!shake || refuseTimerRef.current !== null) return
+      setRefusing(true)
+      refuseTimerRef.current = setTimeout(() => {
+        refuseTimerRef.current = null
+        setRefusing(false)
+      }, REFUSE_MS)
+      return
+    }
     now.onClose()
   }, [])
 
@@ -97,7 +116,7 @@ export default function Dialog({
     keyUpSeenRef.current = false
     pressedBackdropRef.current = false
     if (!dialogEl.open) dialogEl.showModal()
-    const pop = pushModalLayer({ id, el: dialogEl, portalRoot: rootEl, onEscape: () => request(ON_ESCAPE) })
+    const pop = pushModalLayer({ id, el: dialogEl, portalRoot: rootEl, onEscape: () => request(ON_ESCAPE, true) })
     return () => {
       pop()
       closingRef.current = true
@@ -112,9 +131,11 @@ export default function Dialog({
 
   if (!open) return null
 
-  const onCancel = (e: { preventDefault: () => void }) => {
+  const onCancel = (e: { preventDefault: () => void; target: EventTarget }) => {
+    // A dialog opened inside this one's React tree answers its own cancel.
+    if (dialogEl && e.target !== dialogEl) return
     e.preventDefault()
-    request(ON_ESCAPE)
+    request(ON_ESCAPE, true)
   }
   const onNativeClose = () => {
     if (!dialogEl || closingRef.current || dialogEl.open || !latest.current.open) return
@@ -122,7 +143,7 @@ export default function Dialog({
     // refuse twice): show it again first, so whatever the request opens
     // stacks above it, then ask.
     dialogEl.showModal()
-    request(ON_ESCAPE)
+    request(ON_ESCAPE, true)
   }
   // A dialog rendered inside this one's React tree (a request form inside a
   // catalog browser) sits in its own <dialog>, yet React bubbles its events
@@ -174,7 +195,7 @@ export default function Dialog({
       <div ref={wrapperRef} className={`flex min-h-full w-full justify-center ${WRAPPER[placement]}`}>
         {shown && (
           <PortalRootContext value={rootEl}>
-            <div className={panelClassName ?? PANEL}>
+            <div className={`${panelClassName ?? PANEL}${refusing && placement !== 'fullscreen' ? ' oto-refuse' : ''}`}>
               {title && (
                 <div className="flex items-center justify-between gap-3 border-b border-subtle px-4 py-3">
                   <h2 id={titleId} className="min-w-0 truncate font-semibold text-primary">{title}</h2>

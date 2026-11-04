@@ -63,7 +63,7 @@ def test_twilio_dtmf_log_carries_no_value():
 _LOG_CALLS = {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
 _LEADING = (
     "digit", "new", "entered", "candidate", "expected", "ch", "self.route.pin",
-    "route.pin", "self._channel", "dialable(", "number", "entry.label",
+    "route.pin", "self._channel", "self._target_channel(", "dialable(", "number", "entry.label",
     "target.get('number')",
 )
 _NAMES_ANYWHERE = ("digit", "entered", "candidate", "expected", "number", "dialable")

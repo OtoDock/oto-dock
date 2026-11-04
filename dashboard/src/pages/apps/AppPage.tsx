@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { rollbackNoticeText, useApp, useHideAppForMe, usePurgeApp, useRollbackApp, useUnpinApp, type PinnedApp } from '../../api/apps'
+import { rollbackNoticeText, useApp, useHideAppForMe, usePurgeApp, useRollbackApp, useSendToSource, useStopFollowing, useUnpinApp, type PinnedApp } from '../../api/apps'
 import { useAuth } from '../../contexts/AuthContext'
 import { isAdmin } from '../../lib/permissions'
 import { appKind } from '../../lib/kinds/app'
@@ -11,6 +11,8 @@ import AppMenu from '../../components/apps/AppMenu'
 import { RollbackConfirm, RollbackNotice, UnpinConfirm } from '../../components/apps/AppsOverlay'
 import AppApprovalCard from '../../components/apps/AppApprovalCard'
 import AppDeployCard from '../../components/apps/AppDeployCard'
+import AppFollowCard, { FollowConfirm, FollowNotice } from '../../components/apps/AppFollowCard'
+import { FOLLOW_CONFIRM, dismissedRelease, showsFollowCard, type FollowConfirmKind, type FollowNoticeState } from '../../components/apps/AppFollowCard.helpers'
 import AppLogsPanel from '../../components/apps/AppLogsPanel'
 import AppSettingsPanel from '../../components/apps/AppSettingsPanel'
 import SharePopover from '../../components/sharing/SharePopover'
@@ -106,10 +108,14 @@ export default function AppPage() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleteTyped, setDeleteTyped] = useState('')
+  const [confirmFollow, setConfirmFollow] = useState<FollowConfirmKind | null>(null)
+  const [followNotice, setFollowNotice] = useState<FollowNoticeState | null>(null)
   const unpin = useUnpinApp(app?.agent ?? '')
   const hideForMe = useHideAppForMe(app?.agent ?? '')
   const rollback = useRollbackApp(app?.agent ?? '')
   const purge = usePurgeApp(app?.agent ?? '')
+  const sendToSource = useSendToSource(app?.agent ?? '')
+  const stopFollowing = useStopFollowing(app?.agent ?? '')
   const hideShare = useHideShare()
   const patchShare = usePatchShare()
 
@@ -186,6 +192,8 @@ export default function AppPage() {
           onRemoveForMe={app.placement?.kind === GRANTEE_KIND.PERSON ? () => setConfirmRemove(app.placement!.share_id) : undefined}
           onShare={app.can_manage ? () => setSharing(true) : undefined}
           onRollback={app.can_manage ? () => { setConfirmUnpin(false); setConfirmRollback(true) } : undefined}
+          onSendToSource={app.can_manage && app.follows?.exists && app.follows.can_take ? () => setConfirmFollow(FOLLOW_CONFIRM.SEND) : undefined}
+          onStopFollowing={app.can_manage && app.follows ? () => setConfirmFollow(FOLLOW_CONFIRM.STOP) : undefined}
           onLogs={appKind(app).mayServe && app.can_manage ? () => setLogsOpen(true) : undefined}
           onSettings={appKind(app).hasSettings && app.can_manage ? () => setSettingsOpen(true) : undefined}
           onTogglePreview={appKind(app).hasPreviewBuild && app.can_manage ? () => setPreview((v) => !v) : undefined}
@@ -250,6 +258,32 @@ export default function AppPage() {
         />
       )}
       {rollbackNotice && <RollbackNotice notice={rollbackNotice} onClose={() => setRollbackNotice(null)} />}
+      {confirmFollow && (
+        <FollowConfirm
+          app={app}
+          kind={confirmFollow}
+          busy={confirmFollow === FOLLOW_CONFIRM.SEND ? sendToSource.isPending : stopFollowing.isPending}
+          onConfirm={() => {
+            setConfirmFollow(null)
+            if (confirmFollow === FOLLOW_CONFIRM.SEND) {
+              sendToSource.mutate(app.id, {
+                onSuccess: (r) => setFollowNotice({ text: r.text, error: false }),
+                onError: (e) => setFollowNotice({ text: (e as Error).message, error: true }),
+              })
+            } else {
+              stopFollowing.mutate(app.id, {
+                onSuccess: () => setFollowNotice({ text: `“${title}” no longer follows ${app.follows?.agent_name ?? 'its source'}’s app.`, error: false }),
+                onError: (e) => setFollowNotice({ text: (e as Error).message, error: true }),
+              })
+            }
+          }}
+          onCancel={() => setConfirmFollow(null)}
+        />
+      )}
+      {followNotice && (
+        <FollowNotice key={`${followNotice.release ?? 0}-${followNotice.text}`} notice={followNotice} app={app}
+          onClose={() => setFollowNotice(null)} />
+      )}
       {confirmUnpin && (
         <UnpinConfirm
           app={app}
@@ -288,6 +322,9 @@ export default function AppPage() {
       )}
       {app.deploy_state === DEPLOY_STATE.PENDING && <AppDeployCard key={`deploy-${app.id}`} app={app} agent={app.agent} />}
       {appNeedsApproval(app) && <AppApprovalCard key={app.id} app={app} agent={app.agent} />}
+      {app.deploy_state !== DEPLOY_STATE.PENDING && showsFollowCard(app, dismissedRelease(app.id)) && (
+        <AppFollowCard key={`follow-${app.id}-${app.follows?.update?.release ?? 0}`} app={app} agent={app.agent} onResult={setFollowNotice} />
+      )}
       {logsOpen && <AppLogsPanel key={`logs-${app.id}`} app={app} onClose={() => setLogsOpen(false)} />}
       {settingsOpen && <AppSettingsPanel key={`settings-${app.id}`} app={app} agent={app.agent} onClose={() => setSettingsOpen(false)} />}
       <div className="relative isolate flex-1 min-h-0 p-2">

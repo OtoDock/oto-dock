@@ -11,6 +11,7 @@ import logging
 import re
 from urllib.parse import parse_qs, urlparse
 
+import psycopg
 from fastapi import Body, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -179,6 +180,13 @@ async def _login_response(user_row: dict, auth_provider: str) -> JSONResponse:
     (password and passkey logins) the trusted-device cookie; every store read
     on the DB executor."""
     def _job():
+        # Every completed sign-in answers here (the password form, the
+        # second factor, a passkey, the app's exchange, single sign-on). The
+        # stamp is best-effort: a failed write never fails the sign-in.
+        try:
+            task_store.record_login(user_row["sub"])
+        except psycopg.Error:
+            logger.warning("Could not record the sign-in of %s", mask_email(user_row.get("email", "")))
         return user_payload(user_row), config.get_jwt_expiry_hours()
 
     user_data, hours = await run_db(_job)
@@ -852,7 +860,7 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
         if not allowed:
             raise HTTPException(
                 status_code=402,
-                detail=f"User limit reached ({current}/{max_users}). Upgrade your license to add more users.",
+                detail=f"User limit reached ({current}/{max_users}). The license in Setup, OtoDock sets the limit.",
             )
 
     # Upsert user in DB. The identity provider may have changed the platform

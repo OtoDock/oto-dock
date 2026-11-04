@@ -478,17 +478,7 @@ def _layer_items(run: _Run) -> None:
                                                      m["sub"], m["agent_role"])
             run.added(what)
             continue
-        prev_trig = old_trigs.get(trig.slug)
-        for r in rows:
-            if str(r.get("prompt") or "") == trig.prompt:
-                run.same()
-            elif prev_trig is not None and str(r.get("prompt") or "") == prev_trig.prompt:
-                if run.apply:
-                    db_tasks.update_dynamic_task(r["id"], {"prompt": trig.prompt,
-                                                           "name": f"[trigger] {trig.description or trig.slug}"})
-                run.replaced(what)
-            else:
-                run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
+        _merge_trigger_rows(run, trig, old_trigs.get(trig.slug), rows, what)
 
     def _notif_fields(item) -> dict:
         return {
@@ -549,6 +539,60 @@ def _task_groups(item) -> tuple[dict, dict, dict]:
     )
 
 
+def _merge_trigger_rows(run: _Run, trig, prev_trig, rows: list[dict], what: str) -> None:
+    """A template trigger's paired task rows against the new version: the
+    prompt a person did not change takes the new one, and so does who is
+    told, as on a task; a person's change is kept."""
+    from storage.automation import db_tasks
+    for r in rows:
+        changes: dict = {}
+        kept = False
+        if str(r.get("prompt") or "") != trig.prompt:
+            if prev_trig is not None and str(r.get("prompt") or "") == prev_trig.prompt:
+                changes.update({"prompt": trig.prompt,
+                                "name": f"[trigger] {trig.description or trig.slug}"})
+            else:
+                kept = True
+        aud_changes, aud_kept = _audience_change(r, trig, prev_trig)
+        changes.update(aud_changes)
+        kept = kept or aud_kept
+        if changes:
+            if run.apply:
+                db_tasks.update_dynamic_task(r["id"], changes)
+            run.replaced(what)
+        if kept:
+            run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
+        if not changes and not kept:
+            run.same()
+
+
+def _audience_group(item) -> dict:
+    """A template task's audience as its own group, empty when the template
+    names none (an update then never changes the row's)."""
+    return {"notify_audience": item.audience} if item.audience else {}
+
+
+def _untouched_audiences(prev) -> tuple[str, ...]:
+    """What a seeded row holds when nobody changed its audience since the
+    installed version: that version's value; the seeder's default when it
+    named none; the migration's or the seeder's for a record from before
+    1.9.1 (it carries no audience at all)."""
+    if prev.audience is None:
+        return (roles.VIEWER, roles.EDITOR)
+    return (prev.audience or roles.EDITOR,)
+
+
+def _audience_change(row: dict, item, prev) -> tuple[dict, bool]:
+    """``(changes, kept)`` for a seeded row's audience: a template that
+    names one moves a row nobody changed; a person's choice is kept."""
+    new_aud = _audience_group(item)
+    if not new_aud or _row_holds(row, new_aud):
+        return {}, False
+    if prev is not None and row.get("notify_audience") in _untouched_audiences(prev):
+        return new_aud, False
+    return {}, True
+
+
 def _field_value(key: str, value) -> str:
     text = str(value or "")
     # The boot walk rewrites a retired pin to its successor: not an edit.
@@ -576,6 +620,10 @@ def _merge_task_row(run: _Run, row: dict, item, prev, what: str) -> None:
             changes.update(new)
         else:
             kept = True
+    # Who is told: its own group, a person's choice kept.
+    aud_changes, aud_kept = _audience_change(row, item, prev)
+    changes.update(aud_changes)
+    kept = kept or aud_kept
     if changes:
         if run.apply:
             db_tasks.update_dynamic_task(row["id"], changes)
@@ -812,7 +860,8 @@ async def _layer_apps(run: _Run, new_data: dict) -> None:
                         res = await app_blueprints.import_folder(
                             run.agent, username, owner_sub, item.slug, item.dir,
                             template_slug=run.new.slug, tasks=list(item.blueprint.get("tasks") or []),
-                            cold=True, approve_as=by, template_ref=ref, triggers=trig_items)
+                            cold=True, approve_as=by, template_ref=ref, triggers=trig_items,
+                            origin=(run.new.slug, run.new.version))
                     except Exception as e:  # noqa: BLE001  # an app's deploy spans the store and the pipeline, it is reported kept
                         run.report["kept"].append({"what": what, "reason": f"the new version failed to deploy: {e}",
                                                    "path": "", "new_path": ""})
@@ -1197,7 +1246,8 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
             agent_slug, username, by_sub if username else None, slug, src,
             template_slug=str(data.get("slug") or ""), tasks=seeder._blueprint_tasks(src), cold=True,
             approve_as=by, template_ref=seeder.template_ref(str(data.get("slug") or ""), slug),
-            triggers=seeder._blueprint_triggers(src))
+            triggers=seeder._blueprint_triggers(src),
+            origin=(str(data.get("slug") or ""), str(data.get("version") or "")))
         return {"status": res.get("status"), "path": res.get("path")}
     if head == "checks" and len(rel.parts) >= 3:
         folder = src.parent

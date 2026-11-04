@@ -51,6 +51,7 @@ from auth.providers import UserContext, get_current_user, require_admin, require
 from services.billing import relay_client
 from services.mcp import mcp_registry
 from services.oauth import (
+    account_release,
     github_apps,
     mcp_authorization,
     oauth_account_store,
@@ -699,7 +700,7 @@ async def oauth_callback(
     # The exchange is one-shot: the rest of the flow must succeed.
     try:
         result = await oauth_engine.do_oauth_exchange(
-            code=code, state_token=state, iss=iss or "",
+            code=code, state_token=state, iss=iss or "", callback_provider=provider,
         )
     except Exception as e:
         # Never reflect the exception text — it can carry vendor response
@@ -738,6 +739,7 @@ async def oauth_exchange(
     try:
         result = await oauth_engine.do_oauth_exchange(
             code=body.code, state_token=body.state, iss=body.iss or "",
+            callback_provider=canonical_provider_id(provider),
         )
     except Exception as e:
         # Never reflect the exception text: it can carry a vendor's response
@@ -820,9 +822,11 @@ async def oauth_disconnect(
 
     # The whole disconnect runs under the account lock the refresh worker
     # holds across a rewrite, so a refresh in flight cannot recreate the
-    # file after the delete.
+    # file after the delete; the person's provider lock first, the order a
+    # connect takes, so no connect picks the label meanwhile.
     from core.credentials import credential_locks
-    async with credential_locks.get_lock(user.sub, provider_id, body.account_label):
+    async with credential_locks.get_lock(user.sub, provider_id, ""), \
+            credential_locks.get_lock(user.sub, provider_id, body.account_label):
         return await _disconnect_locked(
             provider, provider_id, body, user, manifest, token_dir,
         )
@@ -838,52 +842,25 @@ async def _disconnect_locked(
     prior_meta = await asyncio.to_thread(
         credential_store.get_account_meta, user.sub, body.mcp_name, body.account_label,
     )
-    if token_dir is not None:
-        token_data = await asyncio.to_thread(
+    # Another MCP of the provider still naming the label shares its token
+    # file: the login stays (no revoke, no delete, its relay route kept) and
+    # only this MCP's rows and subscriptions go.
+    kept_for = await asyncio.to_thread(
+        oauth_account_store.other_mcps_naming, user.sub, provider_id, body.mcp_name,
+        body.account_label,
+    )
+    token_data: dict = {}
+    revoked = False
+    if token_dir is not None and not kept_for:
+        read = await asyncio.to_thread(
             oauth_account_store.read_account_token, token_dir, body.account_label,
-        ) or {}
-
-        refresh_token = (
-            token_data.get("refresh_token", "") or token_data.get("token", "")
         )
-        if refresh_token:
-            # HOSTED accounts carry `extra.via_relay` (set at exchange time)
-            # and have NO local client_secret — route revoke through the relay,
-            # which holds the secret. Best-effort either way: a stub
-            # RelayNotConfigured (relay unbuilt) is swallowed below and local
-            # cleanup proceeds.
-            extra = token_data.get("extra") or {}
-            via_relay = bool(extra.get("via_relay"))
-            registered = extra.get("flow") == oauth_account_store.MCP_AUTHORIZATION_FLOW
-            try:
-                if via_relay:
-                    await relay_client.oauth_revoke(
-                        provider_id=provider, token=refresh_token,
-                    )
-                elif registered:
-                    await _revoke_registered_client(token_data, refresh_token)
-                else:
-                    # The client that issued the token is in the file; the
-                    # bundle's active kind is the fallback for an older
-                    # file (the admin may have switched kinds since).
-                    oauth_block = (manifest.credentials.oauth or {}) if manifest else {}
-                    app_cred = oauth_block.get("app_credential", "")
-                    creds = await asyncio.to_thread(
-                        credential_store.get_infra_credentials, app_cred,
-                    ) if app_cred else {}
-                    client_id, client_secret = oauth_engine._resolve_app_credentials(
-                        oauth_block, creds,
-                    )
-                    client_id = str(token_data.get("client_id") or client_id)
-                    client_secret = str(token_data.get("client_secret") or client_secret)
-                    provider_impl = get_provider(provider)
-                    await provider_impl.revoke(
-                        token=refresh_token,
-                        client_id=client_id,
-                        client_secret=client_secret,
-                    )
-            except Exception as e:  # noqa: BLE001  # the vendor revoke may fail, the local disconnect must still run
-                logger.warning("Best-effort revoke failed for %s: %s", provider, e)
+        token_data = read or {}
+        # Best-effort either way: a stub RelayNotConfigured (relay unbuilt)
+        # is swallowed and the local cleanup proceeds.
+        revoked = await account_release.revoke_account(
+            provider, token_data, manifest,
+            path=oauth_account_store.account_token_path(token_dir, body.account_label))
 
     # Best-effort vendor DELETE for webhook subscriptions tied
     # to the account being disconnected. Must run BEFORE we delete the
@@ -928,7 +905,7 @@ async def _disconnect_locked(
             body.mcp_name, body.account_label,
         )
 
-    if token_dir is not None:
+    if token_dir is not None and not kept_for:
         await asyncio.to_thread(
             oauth_account_store.delete_account_token, token_dir, body.account_label,
         )
@@ -938,6 +915,14 @@ async def _disconnect_locked(
         credential_store.delete_user_credentials,
         user.sub, body.mcp_name, body.account_label,
     )
+    # The relay's route to this account ends with it (a hosted account's
+    # exact pair, unless another account here holds it). A hosted GitHub-App
+    # account kept the relay forwarding on by itself: register it again.
+    from services.webhooks import relay_events
+    if not kept_for:
+        await relay_events.unbind_account(provider_id, token_data, revoked=revoked)
+    if oauth_app_kinds.is_github_app_meta(prior_meta) and prior_meta.get("hosted"):
+        relay_events.sync_provider_soon(provider_id)
     if oauth_app_kinds.is_github_app_meta(prior_meta) and prior_meta.get("user_id"):
         names = [m.name for m in (mcp_registry.get_mcps_by_provider(provider_id) or [])]
         others = await asyncio.to_thread(
@@ -956,29 +941,8 @@ async def _disconnect_locked(
     # now, not at the lease's end.
     from core.remote import mcp_gateway_push
     mcp_gateway_push.tick_soon()
-    return {"status": "ok"}
-
-
-async def _revoke_registered_client(token_data: dict, refresh_token: str) -> None:
-    """Revoke a token the MCP server's own authorization server issued to
-    the client this install registered: at the endpoint the file names, on
-    the issuer's origin, with the registration's secret when it has one."""
-    from storage.identity import oauth_client_registrations as regs
-
-    extra = token_data.get("extra") or {}
-    method = str(extra.get("token_endpoint_auth_method") or "none")
-    secret = ""
-    if method != "none":
-        reg_id = int(extra.get("registration_id") or 0)
-        row = await run_db(regs.get, reg_id)
-        if row is not None and row.get("issuer") == str(extra.get("issuer") or ""):
-            secret = await run_db(regs.client_secret, reg_id) or ""
-    await mcp_authorization.revoke(
-        str(extra.get("revocation_endpoint") or ""),
-        issuer=str(extra.get("issuer") or ""), token=refresh_token,
-        method=method, client_id=str(token_data.get("client_id") or ""),
-        client_secret=secret,
-    )
+    labels = [getattr(mcp_registry.get_manifest(n), "label", n) for n in kept_for]
+    return {"status": "ok", "kept_for": labels}
 
 
 # ---------------------------------------------------------------------------
@@ -1130,21 +1094,24 @@ async def device_code_poll(
             500,
             f"{provider}: userinfo returned no email/id/name after device-code success",
         )
-    account_label = body.account_label.strip() or userinfo.email
-
-    await asyncio.to_thread(
-        oauth_account_store.persist_oauth_account,
-        user_sub=user.sub,
-        mcp_name=body.mcp_name,
-        provider_id=provider,
-        account_label=account_label,
-        services=body.services,
-        token_set=token_set,
-        userinfo=userinfo,
-        client_id=client_id,
-        client_secret=client_secret,
-        token_url=provider_impl.token_url,
-    )
+    async with oauth_account_store.signin_label(
+        user_sub=user.sub, provider_id=provider, mcp_name=body.mcp_name,
+        hint=body.account_label, own_label=userinfo.email, userinfo=userinfo,
+        identity=userinfo.account_id, issued=oauth_account_store.issued_by(token_set.raw, client_id),
+    ) as account_label:
+        await asyncio.to_thread(
+            oauth_account_store.persist_oauth_account,
+            user_sub=user.sub,
+            mcp_name=body.mcp_name,
+            provider_id=provider,
+            account_label=account_label,
+            services=body.services,
+            token_set=token_set,
+            userinfo=userinfo,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_url=provider_impl.token_url,
+        )
     return {
         "status": "ok",
         "email": userinfo.email,
@@ -1307,13 +1274,13 @@ async def pat_save(
             or body.account_label.strip()
             or provider
         )
-    account_label = body.account_label.strip() or userinfo.email
     # Validate HERE with a friendly 400 — the label becomes a token FILENAME
     # and persist_oauth_account's deep validation would otherwise surface as
     # an opaque 500 ("Failed to save token") for something as innocent as a
     # trailing space or an emoji in a user-typed label.
     try:
-        oauth_account_store.validate_account_label(account_label)
+        if body.account_label.strip():
+            oauth_account_store.validate_account_label(body.account_label.strip())
     except ValueError as exc:
         raise HTTPException(
             400,
@@ -1323,19 +1290,24 @@ async def pat_save(
 
     # PATs have no client_id/client_secret; persist empty strings so the
     # refresh worker's zero-expiry guard skips them safely.
-    await asyncio.to_thread(
-        oauth_account_store.persist_oauth_account,
-        user_sub=user.sub,
-        mcp_name=body.mcp_name,
-        provider_id=provider,
-        account_label=account_label,
-        services=body.services,
-        token_set=token_set,
-        userinfo=userinfo,
-        client_id="",
-        client_secret="",
-        token_url=provider_impl.token_url,
-    )
+    async with oauth_account_store.signin_label(
+        user_sub=user.sub, provider_id=provider, mcp_name=body.mcp_name,
+        hint=body.account_label, own_label=userinfo.email, userinfo=userinfo,
+        identity=userinfo.account_id, issued=oauth_account_store.issued_by(token_set.raw, ""),
+    ) as account_label:
+        await asyncio.to_thread(
+            oauth_account_store.persist_oauth_account,
+            user_sub=user.sub,
+            mcp_name=body.mcp_name,
+            provider_id=provider,
+            account_label=account_label,
+            services=body.services,
+            token_set=token_set,
+            userinfo=userinfo,
+            client_id="",
+            client_secret="",
+            token_url=provider_impl.token_url,
+        )
     return {
         "status": "ok",
         "email": userinfo.email,

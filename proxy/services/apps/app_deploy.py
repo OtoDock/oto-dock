@@ -1103,9 +1103,13 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
 async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: str,
                         source_dir: Path, rel_dir: str, *, session_id: str = "",
                         cold: bool = False, approve_as: str = "",
-                        template_ref: str | None = None) -> dict:
+                        template_ref: str | None = None,
+                        origin: tuple[str, str] | None = None,
+                        hold: bool = False) -> dict:
     """The whole pipeline for one working folder; raises ``DeployError``
-    with the reason for the agent.
+    with the reason for the agent. ``hold`` parks the release for a person
+    whatever the manifest says (a release another agent's app sent,
+    services/apps/app_follow.py).
 
     A template seed runs it ``cold`` (APPS.md "Blueprints and templates"):
     no rendered check (the catalog's gate looked at the app) and no server
@@ -1113,7 +1117,9 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
     approved on behalf of that person, whose consent the seeder already
     judged (the target checks a human approval makes run here too, and a
     failing one leaves the release pending with the reason in
-    ``consent_refused``); ``template_ref`` stamps the row."""
+    ``consent_refused``); ``template_ref`` stamps the row, ``origin`` (a
+    template's slug and version) where the app's code came from
+    (app_blueprints.py)."""
     confine_to_scope(agent, username, source_dir)
     if session_id:
         from core.remote import remote_file_flow
@@ -1167,6 +1173,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         title=m.title or (slug if existing is None else None),
         rel_path=rel_dir, actions_json=m.actions_json, kind=task_store.APP_KIND_FOLDER,
         blocks=m.blocks(), template_ref=template_ref,
+        from_template=origin[0] if origin else None, from_version=origin[1] if origin else None,
     )
     # APPS.md "The contract": a deploy raises the per-app switch at once and
     # never lowers it: a release whose app.json says false parks, and the
@@ -1230,7 +1237,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         from services.apps import app_secrets
         waiting = await asyncio.to_thread(app_secrets.waiting_reason, row)
         lowers = m.requires_approval is False and bool(row.get("deploy_requires_approval"))
-        if bool(row.get("deploy_requires_approval")) or not approved or waiting:
+        if bool(row.get("deploy_requires_approval")) or not approved or waiting or hold:
             row = await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_PENDING,
                                pending_release=n) or row
             # One notification per waiting episode: a deploy that replaces a
@@ -1341,11 +1348,17 @@ async def reject_pending(row: dict) -> dict:
     if not n:
         raise DeployError("no release is waiting for approval")
     async with _deploy_lock(row["id"]):
+        tree = await asyncio.to_thread(releases.tree_sha, releases.app_release_dir(row) / str(n))
         await asyncio.to_thread(shutil.rmtree, releases.app_release_dir(row) / str(n), True)
         row = await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_IDLE,
                            pending_release=0) or row
         row = await _restore_live_manifest(row)
-        return {"status": RESULT_REJECTED, "app_id": row["id"], "release": n}
+        # A release another agent's app put here had replaced the working
+        # folder before anything was decided: put the live files back.
+        from services.apps import app_follow
+        warning = await app_follow.on_rejected(row, n, tree)
+        return {"status": RESULT_REJECTED, "app_id": row["id"], "release": n,
+                **({"warning": warning} if warning else {})}
 
 
 async def rollback_folder(row: dict) -> dict:

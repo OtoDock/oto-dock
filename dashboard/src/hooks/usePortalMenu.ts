@@ -33,12 +33,14 @@ export interface PortalMenu {
  * `aria-expanded={open}`; the panel `role="menu"`, its items
  * `role="menuitem"`. DocumentVersionsMenu is the radio-menu variant.
  */
-export function usePortalMenu({ align = 'left' }: { align?: 'left' | 'right' } = {}): PortalMenu {
+export function usePortalMenu(
+  { align = 'left', prefer }: { align?: 'left' | 'right'; prefer?: 'below' | 'above' } = {},
+): PortalMenu {
   const [anchor, setAnchor] = useState<AnchorBox | null>(null)
   const open = anchor !== null
   const buttonRef = useRef<HTMLButtonElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
-  const placement = usePopoverPlacement(anchor, panelRef, { align })
+  const placement = usePopoverPlacement(anchor, panelRef, { align, prefer })
   const portalRoot = usePortalRoot()
 
   const close = (refocus = true) => {

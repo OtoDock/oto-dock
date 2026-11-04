@@ -299,7 +299,14 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
     require_admin(user)
     if not mcp_registry.get_manifest(name):
         raise HTTPException(404, f"MCP '{name}' not found")
-    await asyncio.to_thread(mcp_store.set_mcp_enabled, name, True)
+    from core.credentials import catalog_install_registry
+    from services.community import manifest_hosts
+    async with catalog_install_registry.lock_for(name):
+        await asyncio.to_thread(mcp_store.set_mcp_enabled, name, True)
+        await asyncio.to_thread(manifest_hosts.after_enable, name)
+    # Its relay subscriptions receive again: the relay forwards their kinds.
+    from services.webhooks import relay_events
+    relay_events.sync_providers_of_mcp_soon(name)
 
     # Auto-start Docker container if applicable. Surface the result so the
     # admin UI can show a toast — previously this swallowed failures with a
@@ -336,7 +343,17 @@ async def disable_mcp(name: str, user: UserContext = Depends(get_current_user)):
     if m and m.category == "core" and name not in _PLATFORM_DISABLEABLE_CORE:
         raise HTTPException(400, "Core MCPs cannot be disabled at the platform level")
 
-    await asyncio.to_thread(mcp_store.set_mcp_enabled, name, False)
+    from core.credentials import catalog_install_registry
+    from services.community import manifest_hosts
+    async with catalog_install_registry.lock_for(name):
+        await asyncio.to_thread(mcp_store.set_mcp_enabled, name, False)
+        # The hosts its manifest allowed stop receiving a sign-in until it is
+        # enabled again.
+        await asyncio.to_thread(manifest_hosts.after_disable, name)
+    # Its subscriptions stay (a switch is undone) but receive nothing: the
+    # relay stops forwarding the kinds only they wanted.
+    from services.webhooks import relay_events
+    relay_events.sync_providers_of_mcp_soon(name)
 
     # Stop Docker container if applicable
     if m and _mt.is_container(m.server):
@@ -506,12 +523,28 @@ async def set_network_access(
 # Docker Lifecycle
 # ---------------------------------------------------------------------------
 
+_UPDATE_RUNS = "An update of this MCP is running: wait for it to finish."
+
+
+def _wait_for_changes(name: str, update_sentence: str = _UPDATE_RUNS) -> None:
+    """Refuse a container control while an update or another change of the
+    MCP (a source switch, an approved install) runs: two compose runs on one
+    project collide, and the update's own start undoes a stop."""
+    from core.credentials import catalog_install_registry
+    from services.mcp import mcp_updater
+    if mcp_updater.update_running(name):
+        raise HTTPException(409, update_sentence)
+    if catalog_install_registry.lock_for(name).locked():
+        raise HTTPException(409, "Another change to this MCP is running: wait for it to finish.")
+
+
 @router.post("/v1/admin/mcps/{name}/docker/start")
 async def docker_start(name: str, user: UserContext = Depends(get_current_user)):
     require_admin(user)
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
+    _wait_for_changes(name)
     ok = await asyncio.to_thread(docker_manager.start_container, m)
     if not ok:
         raise HTTPException(500, "Failed to start container")
@@ -524,6 +557,7 @@ async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
+    _wait_for_changes(name)
     ok = await asyncio.to_thread(docker_manager.stop_container, m)
     if not ok:
         raise HTTPException(500, "Failed to stop container")
@@ -536,6 +570,9 @@ async def docker_restart(name: str, user: UserContext = Depends(get_current_user
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
+    # The image an update names may still be on its way: a recreate now
+    # fails on it ("No such image").
+    _wait_for_changes(name, "An update is still downloading the image: wait for it to finish.")
     status = await asyncio.to_thread(docker_manager.get_container_status, m)
     if status not in docker_manager.PRESENT and status != docker_manager.STOPPED:
         raise HTTPException(409, "There is no container to restart: start it instead.")
@@ -1306,6 +1343,17 @@ async def _delete_mcp_locked(name: str) -> dict:
             "custom MCPs ship with the platform.",
         )
 
+    # The subscriptions that name the MCP go first, the vendor's
+    # registration before the row, while the manifest and the bound tokens
+    # still exist: left behind, they keep receiving for an MCP nobody has.
+    from services.webhooks import relay_events, subscription_manager
+    relay_in_use: set[str] = set()
+    try:
+        relay_in_use = set(await asyncio.to_thread(relay_events.providers_in_use))
+        await subscription_manager.cleanup_mcp_subscriptions(name)
+    except Exception:
+        logger.exception("Subscription cleanup raised for MCP %s (continuing with the delete)", name)
+
     # Remove all DB data (state, agent assignments, skills, config values).
     # Skill ids are bare identifiers — pass the manifest's ids so the
     # agent_skills rows go with the provider.
@@ -1317,6 +1365,8 @@ async def _delete_mcp_locked(name: str) -> dict:
     # Remove credentials (infra, service accounts, all user credentials)
     from storage.identity import credential_store
     await asyncio.to_thread(credential_store.delete_all_mcp_credentials, name)
+    from services.community import manifest_hosts
+    await asyncio.to_thread(manifest_hosts.after_removal, name)
 
     # The last check's row and a pending or finished source change belong to
     # the install that is going away.
@@ -1344,6 +1394,11 @@ async def _delete_mcp_locked(name: str) -> dict:
 
     # Re-scan manifests (a worker thread, under the registry's rescan lock)
     await mcp_registry.rescan()
+    # Its hosted accounts went with the credentials: the relay endpoint of
+    # each provider it named and the install used is registered again, off
+    # when nothing is left. A provider nothing used is never registered.
+    for provider_id in sorted(relay_events.manifest_providers(manifest) & relay_in_use):
+        relay_events.sync_provider_soon(provider_id)
 
     return {"status": "deleted", "name": name}
 
@@ -1372,28 +1427,35 @@ async def get_mcp_update_state(user: UserContext = Depends(get_current_user)):
     pending source changes and the switched ones not yet dismissed, so the
     MCP Servers page shows them on load without a new check.
     ``{updates: {name: info}, checked, checked_at, auto_update_enabled}``;
-    ``checked_at`` is empty when no check has run yet."""
+    ``checked_at`` is empty when no check has run yet. ``running`` and
+    ``finished`` are the update jobs (``mcp_updater.job_state``): the page
+    polls while one runs."""
     require_admin(user)
     from services.community import mcp_source_swap
     from services.mcp import mcp_updater
+    # The jobs first: a job is finished only after it dropped its offer, so
+    # the read that follows never shows an end beside the offer it cleared.
+    jobs = mcp_updater.job_state()
     state = await asyncio.to_thread(mcp_source_swap.build_update_state)
-    return {**state, "auto_update_enabled": await asyncio.to_thread(mcp_updater.auto_update_enabled)}
+    return {**state, **jobs,
+            "auto_update_enabled": await asyncio.to_thread(mcp_updater.auto_update_enabled)}
 
 
-@router.post("/v1/admin/mcps/{name}/update")
+@router.post("/v1/admin/mcps/{name}/update", status_code=202)
 async def update_mcp_version(name: str, user: UserContext = Depends(get_current_user)):
-    """Update an MCP to its latest version (admin).
+    """Start updating an MCP to its latest version (admin); answers at once.
 
     npm/pypi MCPs converge to the community catalog folder and install the latest
     version within the catalog ``version_constraint`` (also picks up integration
     manifest changes); Docker MCPs re-fetch from the catalog and pull (T2) /
-    rebuild (T1) the image. The actual work lives in
-    ``services/mcp/mcp_updater.update_one`` (shared with the weekly automatic-update
-    job), which holds the per-MCP install lock for the duration.
+    rebuild (T1) the image. The work is ``services/mcp/mcp_updater.update_one``
+    (shared with the weekly automatic-update job) run as a job: its phase and
+    its end read back from ``update-state``. 409 while an update of the MCP
+    runs, 404 for an unknown MCP.
     """
     require_admin(user)
     from services.mcp import mcp_updater
-    return await mcp_updater.update_one(name)
+    return mcp_updater.start_update(name)
 
 
 class AcceptSourceRequest(BaseModel):

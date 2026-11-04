@@ -9,7 +9,7 @@ Extracted from services/scheduler/scheduler.py to centralize config building.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import psycopg
 
@@ -36,6 +36,10 @@ from storage.agents import agent_store
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
 logger = logging.getLogger("otodock")
+
+# A delegated chat's stamps (``api/tasks/delegation.py``'s worker row).
+DELEGATE_WORKER_ROLE = "worker"
+DELEGATED_ORIGIN = "delegated"
 
 
 class TaskIdentity(NamedTuple):
@@ -183,13 +187,82 @@ class TaskTarget(NamedTuple):
     wanted_label: str            # the passed-over machine's name, else ""
 
 
-def _guard_passes(machine: dict | None, identity: TaskIdentity) -> bool:
-    """The placement guard for a task run of ``identity`` on ``machine``."""
+def worker_machine_owner(task) -> str | None:
+    """The delegator of a chat-surface worker (a delegate row running in a
+    chat that is not a task-run chat, made by a platform user who still
+    holds the editor tier on the agent): the person whose own computers the
+    worker may run on. None for every other run (a task, a task-surface
+    worker, a continuation) and once the delegator lost the agent or the
+    tier, which keeps no personal machine. Synchronous: the DB executor."""
+    if task.task_type != task_kinds.DELEGATE:
+        return None
+    chat_id = task.target_chat_id or ""
+    by = task.created_by or ""
+    if not chat_id or session_kind.is_task_chat_id(chat_id) or not by:
+        return None
+    if not task_store.get_user(by) or not roles.can_edit(acting_role_of(by, task.agent)):
+        return None
+    return by
+
+
+def owners_computer_person(task) -> str | None:
+    """The delegator when a chat worker's round is to run on their own
+    computer (its ``target_machine`` is a user machine they paired): its
+    spend is theirs, so their own limits apply too. Synchronous."""
+    owner = worker_machine_owner(task)
+    wanted = task.target_machine or ""
+    if not owner or not wanted or placement.is_local(wanted):
+        return None
+    row = remote_store.get_remote_machine(wanted)
+    if not row or placement.machine_is_admin_paired(row) or row.get("registered_by") != owner:
+        return None
+    return owner
+
+
+def attended_chat_worker(task, creds_sub: str | None) -> bool:
+    """A chat lane a person delegated from their own chat: a chat-surface
+    worker (``worker_machine_owner``: its delegator still holds the editor
+    tier) running as that person (user scope), whose round was delegated by
+    a session in the person's own dashboard chat (``task.parent_chat_id``:
+    not a task chat, not a phone chat, not another lane's chat). Such a lane
+    is built with the chat's tool context; every other run keeps the task
+    context, so a scheduled task, a trigger or a call never gets the tools
+    that need a person by opening a lane. The parent is in memory only: a
+    row reloaded after a restart has none and keeps the task context.
+    Synchronous: the DB executor."""
+    owner = worker_machine_owner(task)
+    if not owner or creds_sub != owner:
+        return False
+    parent_id = getattr(task, "parent_chat_id", None) or ""
+    if not parent_id or session_kind.is_task_chat_id(parent_id):
+        return False
+    parent = task_store.get_chat(parent_id)
+    if not parent or session_kind.of_chat(parent) is not session_kind.DASHBOARD:
+        return False
+    if parent.get("delegate_role") == DELEGATE_WORKER_ROLE or parent.get("origin") == DELEGATED_ORIGIN:
+        return False
+    return parent.get("user_sub") == owner
+
+
+def _owner_identity(owner: str, agent_name: str) -> tuple[str, str, str]:
+    """``(role, platform role, username)`` a chat worker runs with on its
+    delegator's own computer: the delegator's own. Synchronous."""
+    user = task_store.get_user(owner) or {}
+    return (acting_role_of(owner, agent_name), user.get("role") or "",
+            task_store.get_username_by_sub(owner) or "")
+
+
+def _guard_passes(machine: dict | None, identity: TaskIdentity, owner: str | None = None,
+                  *, agent: str) -> bool:
+    """The placement guard for a task run of ``identity`` of ``agent`` on
+    ``machine``; ``owner`` is a chat worker's machine owner
+    (``worker_machine_owner``)."""
     from services.remote import chat_targets
     return placement.may_run_on(
-        machine, run_sub=identity.creds_user_sub,
+        machine, run_sub=identity.creds_user_sub or owner,
         run_can_manage=roles.can_manage(identity.role),
-        user_paired_allowed=chat_targets.user_machines_allowed())
+        user_paired_allowed=chat_targets.user_machines_allowed(),
+        agent_default=(agent_store.get_agent(agent) or {}).get("execution_target"))
 
 
 def task_target(task, identity: TaskIdentity, *, agent: str = "") -> TaskTarget:
@@ -210,7 +283,8 @@ def task_target(task, identity: TaskIdentity, *, agent: str = "") -> TaskTarget:
     if override:
         if placement.is_local(override):
             return TaskTarget(placement.LOCAL, None, "")
-        if _guard_passes(remote_store.get_remote_machine(placement.machine_of(override)), identity):
+        if _guard_passes(remote_store.get_remote_machine(placement.machine_of(override)), identity,
+                         agent=agent_name):
             return TaskTarget(override, None, "")
         logger.warning("Task %s: the judge's machine %s is not one this run may use; "
                        "the agent's default runs it", getattr(task, "id", "?"),
@@ -223,12 +297,18 @@ def task_target(task, identity: TaskIdentity, *, agent: str = "") -> TaskTarget:
         return TaskTarget(placement.LOCAL, None, "")
     from services.remote import chat_targets
     row = remote_store.get_remote_machine(wanted)
-    if row and _guard_passes(row, identity) and remote_status.is_reachable(wanted):
+    owner = None if identity.creds_user_sub else worker_machine_owner(task)
+    if row and _guard_passes(row, identity, owner, agent=agent_name) and remote_status.is_reachable(wanted):
         return TaskTarget(wanted, None, "")
     label = chat_targets.label_of(wanted, row or {})
+    if (owner and row and not placement.machine_is_admin_paired(row)
+            and _guard_passes(row, identity, owner, agent=agent_name)):
+        # A chat worker on its delegator's own computer waits for it, as a
+        # chat placed there does: the round ends with the sentence.
+        return TaskTarget(placement.offline_sentinel(wanted), None, label)
     logger.info("Task %s: its machine %s cannot take this run (%s); the agent's default runs it",
                 getattr(task, "id", "?"), label,
-                "offline" if row and _guard_passes(row, identity) else "not allowed")
+                "offline" if row and _guard_passes(row, identity, agent=agent_name) else "not allowed")
     return TaskTarget(_resolved(), FALLBACK_TASK_MACHINE, label)
 
 
@@ -240,7 +320,7 @@ def task_machine_note(task, identity: TaskIdentity, actual_target: str) -> str:
     row = remote_store.get_remote_machine(wanted) if wanted else None
     label = chat_targets.label_of(wanted, row or {})
     used = chat_targets.place_phrase(actual_target)
-    if row and _guard_passes(row, identity):
+    if row and _guard_passes(row, identity, agent=task.agent):
         return f"{label} was offline, so this run used {used}."
     return f"{label} is not a machine this task may use now, so this run used {used}."
 
@@ -362,6 +442,7 @@ class _TaskSessionReads:
     agent_info: dict | None
     is_admin_only: bool
     vis: VisibilityResolution
+    chat_worker: bool
 
 
 def _task_session_reads(agent_name: str, task) -> _TaskSessionReads:
@@ -417,17 +498,22 @@ def _task_session_reads(agent_name: str, task) -> _TaskSessionReads:
     return _TaskSessionReads(
         identity=identity, platform_role=platform_role, resolved_targets=resolved_targets,
         agent_info=agent_info, is_admin_only=is_admin_only, vis=vis,
+        chat_worker=attended_chat_worker(task, creds_sub),
     )
 
 
 def _task_run_settings(agent_name: str, task, execution_path: str,
-                       agent_default_mode: str) -> tuple[str, str, bool]:
+                       agent_default_mode: str, *, stamped_model: str = "") -> tuple[str, str, bool]:
     """The run's model and effort and, when no lane override sets the mode,
     whether it runs interactive by default (the global kill switch, then the
-    agent's default), read from the store (a worker-thread job)."""
+    agent's default), read from the store (a worker-thread job). The model:
+    the task's pin, else what the runner stamped on the run's chat row
+    (``stamped_model``, the creator's own on their engine), else the
+    agent's for the run's engine."""
     from core import execution_mode
     model = config.resolve_run_model(
-        agent_name, getattr(task, "override_model", None), layer=execution_path)
+        agent_name, getattr(task, "override_model", None) or stamped_model or None,
+        layer=execution_path)
     effort = config.get_cli_effort(agent_name)
     # A task in Auto runs headless: the terminal's own ask after the
     # engine reviewer's decline limit would wait on nobody.
@@ -442,6 +528,9 @@ async def build_task_agent_config(
     task,
     session_id: str,
     trigger_payload: dict | None = None,
+    *,
+    execution_path: str = "",
+    model: str = "",
 ) -> AgentConfig:
     """Build an AgentConfig for task execution.
 
@@ -451,6 +540,11 @@ async def build_task_agent_config(
         agent_name: Agent slug.
         task: TaskDefinition with scope, created_by, etc.
         session_id: Session ID for the task execution.
+        execution_path, model: what the run's chat row was stamped with
+            when the runner created it (its pins, else the creator's own
+            engine for a user-scope run, else the agent's default:
+            ``scheduler/runner._task_engine_and_model``). The pins win as
+            before; a caller that passes neither gets the agent's default.
         trigger_payload: when this task was fired by a webhook
             trigger, the normalised payload (source, route, phone, email,
             did, body) is threaded through to ``get_dynamic_contexts`` so
@@ -485,6 +579,21 @@ async def build_task_agent_config(
     session_task_owner = cast("str", user_sub_for_creds) if identity.scope == "user" else ""
     session_task_username = task_username if (session_task_owner and task_username) else ""
 
+    # The run's engine, before the placement: the task's pin, else the engine
+    # the runner stamped on the run's chat row (a user-scope run's creator
+    # resolves it per person), else the agent's default. Codex needs the
+    # MCP config in TOML format (config.toml `[mcp_servers.*]`), NOT the
+    # Claude JSON format: a JSON blob written into config.toml hit Codex's
+    # strict TOML parser ("invalid statement") → exit 1 / blank terminal.
+    agent_info = reads.agent_info
+    execution_path = (getattr(task, "override_execution_path", None)
+                      or execution_path
+                      or (agent_info or {}).get("execution_path")
+                      or DEFAULT_EXECUTION_PATH)
+    from core.session.session_manager import capabilities_for_path
+    _caps = capabilities_for_path(execution_path)
+    mcp_format = _caps.mcp_config_format
+
     # Resolve the execution target + placement facts BEFORE the MCP config /
     # prompt / path_env below, so device-local MCPs (computer / browser / app
     # control) attach only on a satellite that grants the capability. A task
@@ -494,8 +603,15 @@ async def build_task_agent_config(
     # One decision with the runner's slot (``task_target``): a check's judge
     # mirrors the judged session's placement, or the platform when the check
     # says so (CHECKS.md), when the guard lets the judge run there; then the
-    # task's own machine while it may take the run; then the resolver.
+    # task's own machine while it may take the run; then the resolver. An
+    # engine that cannot run on a machine (Direct LLM: in-process) places
+    # the run on the platform, as the chat builder does.
     chosen = await asyncio.to_thread(task_target, task, identity, agent=agent_name)
+    if not _caps.runtime.supports_remote_execution and not placement.is_local(chosen.target):
+        logger.info("build_task_agent_config: %s resolved to %s, which runs on the "
+                    "platform alone; the machine %s is passed over",
+                    agent_name, execution_path, chosen.target[:8])
+        chosen = TaskTarget(placement.LOCAL, None, "")
     task_target_value = chosen.target
     judge = getattr(task, "judge", None) or None
     # The resolved placement, from one read of the machine row: the kind,
@@ -506,29 +622,38 @@ async def build_task_agent_config(
         remote_store.placement_of, task_target_value, _target_user_sub, agent_name,
     )
     is_remote = target.is_remote
+    # A chat worker on its delegator's own computer (``worker_machine_owner``):
+    # the placement guard judges it for that person, and the AI account it
+    # spends is theirs, never the pool's (the pool's account would land on a
+    # personal disk).
+    machine_owner = (await asyncio.to_thread(worker_machine_owner, task)
+                     if not user_sub_for_creds else None)
+    on_owners_computer = bool(machine_owner and target.user_paired)
+    # There it runs as that person, at their role, its token in their name,
+    # as their own Shared-only chat moved there does: the agent's own role
+    # and person-less token never reach a personal disk. The mount, the
+    # files and the MCP bindings stay the agent's.
+    token_sub = user_sub_for_creds or ""
+    security_username = task_username
+    if on_owners_computer:
+        task_role, task_platform_role, security_username = await asyncio.to_thread(
+            _owner_identity, cast("str", machine_owner), agent_name)
+        token_sub = cast("str", machine_owner)
     target_browser = await asyncio.to_thread(
         remote_store.get_target_browser_settings, target,
     )
+    vis = reads.vis
+    from core.config.config_builder import personal_machine_bundles, personal_owner_of
+    personal_owner = personal_owner_of(
+        target, vis.mount_username, machine_owner if on_owners_computer else user_sub_for_creds,
+        target_browser)
+    on_personal = target.user_paired and not vis.mount_username
+    owner_kw: dict[str, Any] = {"personal_owner": personal_owner} if on_personal else {}
     # The agent's MCP set on this placement, read once (the path_env values
     # and the assigned names below).
     agent_mcps = await asyncio.to_thread(
         mcp_registry.get_agent_mcps, agent_name, placement=target,
     ) or []
-
-    # Resolve the agent's execution layer BEFORE building the MCP config — Codex
-    # needs the MCP config in TOML format (config.toml `[mcp_servers.*]`), NOT the
-    # Claude JSON format. Without this the JSON blob was written into config.toml →
-    # Codex's strict TOML parser hit it ("invalid statement") → exit 1 / blank
-    # terminal. Mirrors core/config/config_builder.py (the chat path).
-    agent_info = reads.agent_info
-    # Delegate-spawn per-lane layer override beats the agent default
-    # (validated against the agent's enabled layers at spawn).
-    execution_path = (getattr(task, "override_execution_path", None)
-                      or (agent_info or {}).get("execution_path")
-                      or DEFAULT_EXECUTION_PATH)
-    from core.session.session_manager import capabilities_for_path
-    _caps = capabilities_for_path(execution_path)
-    mcp_format = _caps.mcp_config_format
 
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
@@ -537,6 +662,10 @@ async def build_task_agent_config(
             user_sub_for_creds,
             session_id=session_id,
             task_mode=True,
+            # A person's own chat lane takes the chat's tools; it is never
+            # the person's own chat, so the shared-chat context joins.
+            chat_worker=reads.chat_worker,
+            shared_chat=reads.chat_worker,
             task_scope=identity.scope,
             delegation_targets=resolved_targets,
             mcp_config_format=mcp_format,
@@ -551,11 +680,17 @@ async def build_task_agent_config(
             # memory and checks MCPs never (the document refuses them, this
             # is the second layer).
             only_mcps=(_judge_only_mcps(judge.get("mcps")) if judge else None),
+            **owner_kw,
         )
     )
 
     is_admin_only = reads.is_admin_only
-    vis = reads.vis
+    # No secret file of the agent's goes to a personal disk (the chat
+    # builder's rule): an agent-scope run there carries only what is its
+    # person's, the chat worker's delegator on their own computer.
+    secret_bundles = personal_machine_bundles(secret_bundles or {}, target, vis.mount_username,
+                                              agent_name, who="build_task_agent_config",
+                                              owner=personal_owner)
     # A person's own task on a Shared-only agent below the editor tier would
     # run from the agent's own CLI state: refused before a seat is taken.
     from core.sandbox.session_config_dir import refuse_agent_state_below_editor
@@ -595,7 +730,7 @@ async def build_task_agent_config(
     credential_env.update(oto_env.build_oto_env(
         agent_name=agent_name,
         username=vis.mount_username,        # MOUNT username ("" for agent scope)
-        user_sub=user_sub_for_creds or "",  # REAL creator sub — attribution
+        user_sub=token_sub,                 # REAL person — attribution
         user_role=task_role or "",
         platform_role=task_platform_role,
         session_id=session_id or "",
@@ -619,7 +754,7 @@ async def build_task_agent_config(
     # payload. Its iat is the session's token floor (``token_minted_at``).
     from auth.session_token import mint_session_env
     token_minted_at = mint_session_env(
-        credential_env, session_id or "", agent_name, user_sub_for_creds or "", external="",
+        credential_env, session_id or "", agent_name, token_sub, external="",
     )
 
     # A Codex config gets the credential environment written in, after
@@ -643,7 +778,7 @@ async def build_task_agent_config(
         _knowledge_libraries = ()
     task_security = SecurityContext(
         role=task_role,
-        username=task_username,             # REAL creator (attribution/identity)
+        username=security_username,         # REAL person (attribution/identity)
         agent=agent_name,
         is_admin_agent=is_admin_only,
         placement=target,
@@ -664,7 +799,13 @@ async def build_task_agent_config(
     # account row. trigger_payload threads from
     # trigger_manager → scheduler so webhook-fired tasks resolve
     # ${trigger.*} tokens for builder blocks.
-    assigned_mcp_names = [m.name for m in agent_mcps]
+    assigned_mcp_names = [
+        m.name for m in agent_mcps
+        # Only the MCPs that attach describe themselves, as in a chat: one
+        # left out on a person's computer (it signs in with the agent's own
+        # account) keeps its account's labels off the prompt there.
+        if m.name not in (excluded_mcps or {})
+    ]
     if judge:
         # The judge profile: the contexts and the permission block follow
         # the check's MCPs, as the MCP config does (only_mcps above), so a
@@ -679,14 +820,18 @@ async def build_task_agent_config(
         # Pre-resolved off-loop: the delegation + meetings providers are no-I/O.
         delegation_roster=await asyncio.to_thread(
             dynamic_context.build_delegation_roster, resolved_targets,
+            # The person whose accounts the run spends (the creator; the
+            # delegator on their own computer): the roster lists what they
+            # may run on each target.
+            user_sub_for_creds or (machine_owner if on_owners_computer else "") or "",
         ),
         meetings_access=await asyncio.to_thread(
-            dynamic_context.build_meetings_access,
-            user_sub_for_creds or "", task_role or "",
+            dynamic_context.build_meetings_access, token_sub, task_role or "",
         ),
         # Agent-scope runs are no-user sessions — their read reach is the
-        # delegation roster (user-scope runs follow the user).
-        nouser_reads=not user_sub_for_creds,
+        # delegation roster (user-scope runs and a worker on its delegator's
+        # computer follow the person).
+        nouser_reads=not token_sub,
         trigger_payload=trigger_payload,
         placement=target,
     )
@@ -703,10 +848,14 @@ async def build_task_agent_config(
         excluded_mcps=excluded_mcps or None,
         dynamic_contexts=dynamic_contexts or None,
         sandboxed=True,
-        client_type=session_kind.TASK.name,
+        # The manifests' exclusion word: the config build's context.
+        client_type=(session_kind.DASHBOARD.name if reads.chat_worker
+                     else session_kind.TASK.name),
+        shared_chat=reads.chat_worker,
         placement=target,
         mount_shared=vis.mount_shared,
         execution_path=execution_path or "",
+        read_only=bool(judge),
     )
     agent_prompt = (agent_prompt or "") + build_permission_context(
         task_security,
@@ -727,6 +876,7 @@ async def build_task_agent_config(
     agent_default_mode = (agent_info or {}).get("default_execution_mode", "") or ""
     resolved_model, resolved_effort, default_interactive = await asyncio.to_thread(
         _task_run_settings, agent_name, task, execution_path, agent_default_mode,
+        stamped_model=model,
     )
 
     # PROXY_TASK_OWNER/USERNAME/SCOPE are now delivered to MCPs via manifest
@@ -738,8 +888,9 @@ async def build_task_agent_config(
     # Acquire execution layer subscription (API key, OAuth, or local endpoint)
     # (execution_path already resolved above for sandbox rewrite gating)
     subscription_id = ""
-    # User-scoped tasks prefer the creator's subscription; agent-scoped use platform pool
-    sub_user = user_sub_for_creds
+    # User-scoped tasks prefer the creator's subscription; agent-scoped use
+    # platform pool, except a chat worker on its delegator's own computer.
+    sub_user = user_sub_for_creds or (machine_owner if on_owners_computer else None)
 
     # Prepare the persistent config dir — .codex/ for Codex, .claude/ otherwise.
     # The codex layer reads ``config.sandbox_host_claude_dir`` AS its CODEX_HOME;
@@ -823,10 +974,15 @@ async def build_task_agent_config(
         # Task creator — drives MCP-install progress delivery to their
         # TaskRunView (install_registry participant). "" for system tasks.
         user_sub=task.created_by or "",
+        # The placement guard's person: the run's own, else a chat worker's
+        # delegator; "" (nobody) for an agent-scope task, whose creator is
+        # not the person it runs as.
+        placement_sub=user_sub_for_creds or machine_owner or "",
         system_prompt=agent_prompt,
         mcp_config_path=str(mcp_config) if mcp_config else "",
         credential_env=credential_env or {},
         mcp_secret_bundles=secret_bundles or {},
+        excluded_mcps=frozenset(excluded_mcps or ()),
         # A check's judge; a task in Auto (the engine's own review); every
         # other run the unattended word (Don't Ask).
         permission_mode=(JUDGE_MODE if judge else task_run_mode(task)),

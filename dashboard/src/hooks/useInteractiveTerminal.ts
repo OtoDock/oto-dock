@@ -737,6 +737,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     // terminal stuck up. Reset the document/window scroll once focus leaves an
     // input (keyboard actually closing — not just hopping to the ChatInput).
     const resetScroll = () => {
+      if (tearingDown) return
       const a = document.activeElement
       const typing = !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || (a as HTMLElement).isContentEditable)
       if (typing) return
@@ -746,7 +747,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         term.scrollToBottom()  // keyboard closed → keep the terminal at the latest output
       } catch { /* noop */ }
     }
-    const onBlur = () => setTimeout(resetScroll, 150)
+    let blurTimer: ReturnType<typeof setTimeout> | undefined
+    const onBlur = () => { clearTimeout(blurTimer); blurTimer = setTimeout(resetScroll, 150) }
     term.textarea?.addEventListener('blur', onBlur)
     const vv = window.visualViewport
     const onVvResize = () => {
@@ -783,6 +785,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       touchTarget.removeEventListener('touchmove', onTouchMove, { capture: true })
       touchTarget.removeEventListener('touchend', onTouchEnd, { capture: true })
       term.textarea?.removeEventListener('blur', onBlur)
+      clearTimeout(blurTimer)
       vv?.removeEventListener('resize', onVvResize)
       // Release the GL context explicitly BEFORE disposing: term.dispose()
       // drops the WebGL addon but never frees its context, so every chat

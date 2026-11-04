@@ -3,7 +3,7 @@
 // Chat" go.
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
-  areaEntryBehind, fallbackChat, planBackToChat, readTrail, recordEntry, saveEntry,
+  areaEntryBehind, fallbackChat, planBackToChat, readTrail, recordEntry, saveEntry, trailHolds,
   clearTrail, type Trail,
 } from '@/components/settings/history'
 
@@ -127,5 +127,42 @@ describe('fallbackChat', () => {
     expect(fallbackChat(trailOf([], '/chat/other/c2'), 'ops')).toBe('/chat/ops')
     expect(fallbackChat(trailOf([], '/chat/ops-2'), 'ops')).toBe('/chat/ops')
     expect(fallbackChat(empty, 'ops')).toBe('/chat/ops')
+  })
+})
+
+describe('the entry keys', () => {
+  it('are kept beside the paths, and a push drops the ones above', () => {
+    let t = recordEntry(empty, 0, '/chat/a', 'PUSH', '')
+    t = recordEntry(t, 1, '/admin', 'PUSH', 'k1')
+    t = recordEntry(t, 2, '/admin/users', 'PUSH', 'k2')
+    t = recordEntry(t, 1, '/admin/usage', 'PUSH', 'k3')
+    expect(t.entries).toEqual({ 0: '/chat/a', 1: '/admin/usage' })
+    expect(t.keys).toEqual({ 0: '', 1: 'k3' })
+  })
+
+  it('tell the page life the trail belongs to', () => {
+    const t = recordEntry(recordEntry(empty, 0, '/chat/a', 'PUSH', ''), 1, '/admin', 'PUSH', 'k1')
+    expect(trailHolds(t, 1, 'k1', '/admin')).toBe(true)
+    expect(trailHolds(t, 1, 'other', '/admin')).toBe(false)
+    expect(trailHolds(t, 2, 'k2', '/admin/users')).toBe(false)
+    // A trail stored before the keys passes on its path alone.
+    expect(trailHolds(trailOf(['/chat/a', '/admin']), 1, 'k1', '/admin')).toBe(true)
+    expect(trailHolds(trailOf(['/chat/a', '/admin']), 1, 'k1', '/admin/users')).toBe(false)
+  })
+
+  it('never send a travel below the floor of a dropped trail', () => {
+    const t = { ...recordEntry(empty, 3, '/admin/users', 'POP', 'k3'), floor: 3 }
+    expect(planBackToChat(t, 3, '/chat/a')).toEqual({ kind: 'push', delta: 0, target: '/chat/a' })
+    const t2 = recordEntry(recordEntry(t, 4, '/admin', 'PUSH', 'k4'), 5, '/admin/usage', 'PUSH', 'k5')
+    expect(t2.floor).toBe(3)
+    expect(planBackToChat(t2, 5, '/chat/a')).toEqual({ kind: 'push', delta: 0, target: '/chat/a' })
+  })
+
+  it('give a travel the key it must arrive on', () => {
+    let t = recordEntry(empty, 0, '/chat/a', 'PUSH', '')
+    t = recordEntry(t, 1, '/admin', 'PUSH', 'k1')
+    t = recordEntry(t, 2, '/admin/users', 'PUSH', 'k2')
+    expect(planBackToChat(t, 2, '/')).toEqual({ kind: 'pop', delta: -2, key: '' })
+    expect(planBackToChat(trailOf(['/chat/a', '/admin']), 1, '/')).toEqual({ kind: 'pop', delta: -1 })
   })
 })

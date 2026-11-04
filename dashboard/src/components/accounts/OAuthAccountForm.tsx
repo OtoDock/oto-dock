@@ -38,6 +38,7 @@ import {
 } from '../../api/oauth'
 import { eventCatalogKey } from '../../api/subscriptions'
 import { useDialogs } from '../ui/dialogs'
+import { emitAppToast } from '../../lib/appToasts'
 import Button from '../ui/Button'
 import { Input } from '../ui/Field'
 import { BADGE_BASE, BADGE_TONE, FIELD, FIELD_REGULAR, FIELD_BORDER } from '../ui/classes'
@@ -415,11 +416,19 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
       return
     setError('')
     try {
-      await disconnect.mutateAsync({
+      const result = await disconnect.mutateAsync({
         provider: providerId,
         mcpName: integration.mcp_name,
         accountLabel: account.account_label,
       })
+      const keptFor = result.kept_for ?? []
+      if (keptFor.length > 0) {
+        emitAppToast({
+          severity: 'info',
+          title: `${label} is removed from ${integration.display_name}`,
+          body: `It stays connected for ${keptFor.join(', ')}, which use the same sign-in.`,
+        })
+      }
       onDone()
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : 'Failed to disconnect'
@@ -439,6 +448,9 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
 
   const showFlowPicker = methods.length > 1
   const isPatFlow = selectedFlow === 'personal_access_token'
+  // A personal access token that needs a reconnect takes a new token under
+  // its own label: a sign-in would not replace it.
+  const replacesToken = !!account?.needs_reconnect && account.flow === 'personal_access_token'
   const isDeviceCodeFlow = selectedFlow === 'device_code'
   const patUrl = meta?.pat_instructions_url || ''
   const patPlaceholder = meta?.pat_placeholder || 'Paste your token…'
@@ -487,7 +499,9 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         <div className="px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border">
           <div className="text-sm text-status-warning-fg">
             ⚠️ Reconnect needed: {reconnectReasonText(account.reconnect_reason)}.
-            Agents leave this account out until you click <strong>Reconnect</strong>.
+            {replacesToken
+              ? ' Agents leave this account out until you save a new token.'
+              : <> Agents leave this account out until you click <strong>Reconnect</strong>.</>}
           </div>
         </div>
       )}
@@ -697,7 +711,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
             </div>
           )}
         </div>
-      ) : isPatFlow && !account ? (
+      ) : (isPatFlow && !account) || replacesToken ? (
         <div className="space-y-2">
           {patUrl && (
             <p className="text-xs text-tertiary">
@@ -722,17 +736,21 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
             rows={3}
             className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} font-mono`}
           />
-          <Input
-            type="text"
-            value={patLabel}
-            onChange={(e) => setPatLabel(e.target.value)}
-            placeholder="Account label, optional"
-          />
-          <p className="text-xs text-tertiary">
-            Set a label to keep this token as its own account. Left empty, the
-            account&apos;s own name is used. Saving then replaces the token of
-            the account with that name.
-          </p>
+          {!account && (
+            <>
+              <Input
+                type="text"
+                value={patLabel}
+                onChange={(e) => setPatLabel(e.target.value)}
+                placeholder="Account label, optional"
+              />
+              <p className="text-xs text-tertiary">
+                Set a label to keep this token as its own account. Left empty, the
+                account&apos;s own name is used. Saving then replaces the token of
+                the account with that name.
+              </p>
+            </>
+          )}
           <div className="flex gap-2">
             <Button variant="primary" size="md"
               onClick={handlePatSave}
@@ -744,6 +762,14 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
             >
               {patSave.isPending ? 'Saving…' : 'Save token'}
             </Button>
+            {account && (
+              <Button variant="danger" size="md"
+                onClick={handleDisconnect}
+                disabled={disconnect.isPending}
+              >
+                {disconnect.isPending ? 'Disconnecting...' : 'Disconnect'}
+              </Button>
+            )}
           </div>
         </div>
       ) : (

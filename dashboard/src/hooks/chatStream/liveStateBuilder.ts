@@ -1,6 +1,7 @@
 import { liveBlockToMessageBlock } from '../../lib/messageBlocks'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
 import { LIVE_BLOCK, SYSTEM_SUBTYPE, WIRE, type LiveBlock } from '../../api/wireEvents'
+import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
 
 /**
  * Pure reconstruction of the live-state message list from ordered live_blocks.
@@ -87,7 +88,7 @@ export function buildLiveStateMessages(
         break
       case LIVE_BLOCK.COMMAND:
         pushBlock({
-          type: 'bgcommand',
+          type: BG_COMMAND_BLOCK,
           command: lb.command || '',
           description: lb.description || '',
           isActive: lb.active !== false,  // active flag survives reconnect

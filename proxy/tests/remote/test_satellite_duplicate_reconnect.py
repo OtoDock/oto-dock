@@ -203,3 +203,65 @@ async def test_a_transfer_that_starts_across_a_replacement_uses_the_new_connecti
         assert await asyncio.wait_for(push, 2) is True
         await mgr.deregister("m1", expected=new_conn)
         assert await mgr.drain_persists()
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_connection_cancels_its_tunnel_streams_and_names_its_silence(caplog):
+    """The old socket's tunnel streams can never be answered (the satellite
+    failed its side when that socket went): they are cancelled at the
+    replace, where deregister is a no-op, and the line says how long the old
+    socket had been silent."""
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.remote import satellite_http_tunnel
+    mgr = SatelliteConnectionManager()
+    dispatcher = MagicMock()
+    dispatcher.cancel_machine_streams = AsyncMock()
+    with patch("storage.remote_store.update_machine_status"), \
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None), \
+         patch.object(satellite_http_tunnel, "get_dispatcher", return_value=dispatcher), \
+         caplog.at_level(logging.WARNING, logger="otodock.satellite"):
+        old = await mgr.register("m1", _FakeWS(), {})
+        dispatcher.cancel_machine_streams.assert_not_awaited()  # a first connect
+        old.last_heartbeat -= 130
+        await mgr.register("m1", _FakeWS(), {})
+        dispatcher.cancel_machine_streams.assert_awaited_once_with(mgr, "m1")
+        assert await mgr.drain_persists()
+    assert "duplicate connection, closing old (silent for 130 s)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_sockets_late_heartbeat_leaves_the_live_connection_alone():
+    """The old socket's reader may still drain a heartbeat it received before
+    the swap: an old port or a link reported down must not land on the new
+    connection, whose port the next start reads. Its ack still counts."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from ws.satellite import _dispatch_frame
+    mgr = SatelliteConnectionManager()
+    with patch("storage.remote_store.update_machine_status"), \
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None), \
+         patch.object(mgr, "send_fire_and_forget", AsyncMock()), \
+         patch.object(mgr, "_retire_moved_port_sessions"):
+        old = await mgr.register("m1", _FakeWS(), {"local_tunnel_port": 41000})
+        new = await mgr.register("m1", _FakeWS(), {"local_tunnel_port": 41999})
+        stale = {"type": "heartbeat", "tunnel_ok": False, "local_tunnel_port": 41000,
+                 "tunnel_rebinds": 1, "last_tunnel_error": "the listening socket was closed"}
+        await _dispatch_frame(mgr, "m1", old, json.dumps(stale))
+        assert mgr.tunnel_port("m1") == 41999 and mgr.tunnel_ok("m1") is True
+        assert new.tunnel_rebinds == 0
+
+        # An ack read on the old socket still answers its command.
+        answered = asyncio.get_running_loop().create_future()
+        mgr._pending_acks["cmd-1"] = ("m1", answered, old)
+        await _dispatch_frame(mgr, "m1", old, json.dumps({"type": "ack", "command_id": "cmd-1"}))
+        assert answered.done()
+
+        # The live socket's own heartbeat is taken.
+        await _dispatch_frame(mgr, "m1", new, json.dumps(stale))
+        assert mgr.tunnel_port("m1") == 41000 and mgr.tunnel_ok("m1") is False
+        assert await mgr.drain_persists()

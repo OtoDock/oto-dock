@@ -19,6 +19,8 @@ import { useTurnEnd } from './chatStream/useTurnEnd'
 import { useStreamBlocks } from './chatStream/useStreamBlocks'
 import { useArtifactChannels } from './chatStream/useArtifactChannels'
 import { DELEGATE_RESULT, RUN_STATUS } from '../lib/status/run'
+import { backgroundSpawnOf, runningFor } from '../lib/chat/runningBackground'
+import { BG_COMMAND_BLOCK } from '../lib/kinds/block'
 import { errorText } from '../lib/http/apiJson'
 import { ASK_MODE, AUTO_REVIEW_MODE } from '../lib/engines/modes'
 
@@ -59,7 +61,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendBlock, seedDbHistory: seedDbRows, loadOlder, removePlaceholders,
     appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive,
-    ensureAssistantMsg, upsertPreviewBlock,
+    ensureAssistantMsg, upsertPreviewBlock, runningBackground, setRunningBackground, dropRunning,
   } = useChatMessages({ agents, meetingSpeakerRef, chatIdRef })
   const [mode, setMode] = useState(options.defaultMode ?? AUTO_REVIEW_MODE)
   const [model, setModel] = useState('')
@@ -100,19 +102,40 @@ export function useChatStream(options: UseChatStreamOptions) {
             type: 'delegate',
             startTime: 0,
           })
-        } else if (b.type === 'bgcommand' && b.isActive) {
+        } else if (b.type === BG_COMMAND_BLOCK && b.isActive) {
           out.push({
             id: b._toolId || `cmd-${out.length}`,
             description: b.description || b.command || 'Background command',
-            type: 'bgcommand',
+            type: BG_COMMAND_BLOCK,
             startTime: 0,
             background: true,
           })
         }
       }
     }
+    // Background work the history says still runs whose spawn is not in the
+    // loaded rows (started turns back): its badge, with no block behind it.
+    // A spawn with a block, running or not, is that block's to show.
+    const running = runningFor(runningBackground, chatId)
+    const shown = new Set<string>()
+    for (const msg of messages) {
+      for (const b of msg.blocks) {
+        const spawn = backgroundSpawnOf(b)
+        if (spawn) shown.add(spawn.id)
+      }
+    }
+    for (const e of running.agents) {
+      if (!shown.has(e.id)) {
+        out.push({ id: e.id, description: e.description || 'Subagent', type: 'general-purpose', startTime: 0, background: true })
+      }
+    }
+    for (const e of running.commands) {
+      if (!shown.has(e.id)) {
+        out.push({ id: e.id, description: e.description || 'Background command', type: BG_COMMAND_BLOCK, startTime: 0, background: true })
+      }
+    }
     return out
-  }, [messages])
+  }, [messages, runningBackground, chatId])
   // Mirror of messages for stale-closure-free reads inside WS callbacks
   // (onDone derives "is a bg subagent still running" to gate the turn ping).
   const messagesRef = useRef<DisplayMessage[]>([])
@@ -198,6 +221,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     loadingOlderRef, resetWindow, hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder, loadOlder,
     appendBlock, removePlaceholders, appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive, ensureAssistantMsg, upsertPreviewBlock,
+    runningBackground, setRunningBackground, dropRunning,
   }
   const meeting = useMeetingIdentity(core)
   const {
@@ -238,17 +262,17 @@ export function useChatStream(options: UseChatStreamOptions) {
         const hasRunning = msg.blocks.some(
           (b) =>
             (b.type === 'tool' && b.status === 'running')
-            || (b.type === 'subagent' && b.isActive)
-            || (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING)
-            || (b.type === 'bgcommand' && b.isActive),
+            || (b.type === 'subagent' && b.isActive && !b._background)
+            || (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING),
         )
         if (!hasRunning) return msg
         return {
           ...msg,
           blocks: msg.blocks.map((b) => {
             if (b.type === 'tool' && b.status === 'running') return { ...b, status: 'failed' as const }
-            if (b.type === 'subagent' && b.isActive) return { ...b, isActive: false, failed: true }
-            if (b.type === 'bgcommand' && b.isActive) return { ...b, isActive: false, failed: true }
+            // Background work outlives a Stop (the engine keeps it): its own
+            // done frame, or the session's end, clears it.
+            if (b.type === 'subagent' && b.isActive && !b._background) return { ...b, isActive: false, failed: true }
             if (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING) return { ...b, status: DELEGATE_RESULT.FAILED }
             return b
           }),

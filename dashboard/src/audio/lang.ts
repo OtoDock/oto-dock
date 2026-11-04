@@ -48,6 +48,13 @@ export function browserSttLang(): string {
   } catch { return 'en' }
 }
 
+// The device's own language, the whole tag: what the device recognizer gets
+// for the Automatic pick (it cannot identify a language, and its own
+// language is the one the device's keyboard speaks).
+export function deviceLanguage(): string {
+  try { return navigator.language || 'en-US' } catch { return 'en-US' }
+}
+
 // High-frequency function words per Latin language. A match-count scorer is enough
 // to PICK A VOICE — never has to be perfect; a multilingual TTS voice pronounces
 // the text either way. Greek is handled by script, above.

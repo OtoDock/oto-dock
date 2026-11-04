@@ -6,7 +6,11 @@ statement is idempotent (``CREATE ... IF NOT EXISTS``); see
 ``docs/architecture/DATABASE-SCHEMA.md``.
 """
 
+import logging
+
 from storage.schema_base import _drop_invalid_indexes, _index_exists
+
+logger = logging.getLogger("otodock")
 
 
 def init_chats(conn) -> None:
@@ -106,9 +110,11 @@ def init_chats(conn) -> None:
     # limit instead of sorting every chat), a session's chat (every hook with
     # chat side effects), the project and worker lookups polled every 10 s,
     # and the finished-unread backfill (partial: the query repeats the
-    # predicate, so generic plans use it too).
+    # predicate, so generic plans use it too), and a person's own chats per
+    # engine, which order the engines they see (partial: storage/chat/engine_use).
     _drop_invalid_indexes(conn, "idx_chats_agent_updated", "idx_chats_session",
-                          "idx_chats_project", "idx_chats_parent", "idx_chats_last_response")
+                          "idx_chats_project", "idx_chats_parent", "idx_chats_last_response",
+                          "idx_chats_own_engine_use")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_agent_updated ON chats (agent, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_session ON chats (session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_project ON chats (project_id)")
@@ -116,6 +122,10 @@ def init_chats(conn) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_chats_last_response ON chats (last_response_at) "
         "WHERE last_response_at IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chats_own_engine_use ON chats (user_sub, created_at) "
+        "WHERE source_type = 'chat' AND origin = 'dashboard' AND execution_path <> ''"
     )
 
     # Per-(chat, owner-identity) read markers for the sidebar unread indicator.
@@ -318,43 +328,112 @@ def init_reply_reports(conn) -> None:
     """A person's report of an agent's reply, for the install's admins
     (the ``report`` notification source): who, when, the chat and its
     reply's first row, the agent, the reason, the note, the reply's text as
-    the server stored it, and when the admins were told (``notified_at``:
-    the notice gap runs from a person's last notified report). One per
-    person and reply. The chat's deletion takes its reports (the content
-    lives with the chat); a message row can go alone (a turn replayed after a
+    the server stored it, the chat's title when it was reported, and when
+    the admins were told (``notified_at``: the notice gap runs from a
+    person's last notified report). One per person and reply. A report
+    outlives its chat (``chat_id`` set NULL, the text and the title kept)
+    and goes a year after it was filed (``db_reply_reports.KEEP_DAYS``, the
+    retention sweep); a message row can go alone (a turn replayed after a
     restart writes its rows again), so the message id carries no FK. An
-    admin may dismiss a report to the page's history (``dismissed_at``,
-    ``dismissed_by``) and restore it; nothing is deleted. Whole-table CREATE
-    in init (new-table pattern), with the two dismiss columns added after
-    for a database that made the table before them."""
+    admin marks a report handled (``handled_at``, ``handled_by``) or
+    dismisses it (``dismissed_at``, ``dismissed_by``), at most one of the
+    two, restores it, or deletes it. Whole-table CREATE in init (new-table
+    pattern), with the later columns added after for a database that made
+    the table before them; the foreign key of a table made with ON DELETE
+    CASCADE is rewritten once by ``migrate_chat``."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reply_reports (
             id            SERIAL PRIMARY KEY,
             reporter_sub  TEXT NOT NULL,
-            chat_id       TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            chat_id       TEXT REFERENCES chats(id) ON DELETE SET NULL,
             message_id    INTEGER NOT NULL,
             agent         TEXT NOT NULL DEFAULT '',
             reason        TEXT NOT NULL,
             note          TEXT NOT NULL DEFAULT '',
             reply_text    TEXT NOT NULL DEFAULT '',
+            chat_title    TEXT NOT NULL DEFAULT '',
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
             notified_at   TIMESTAMPTZ,
             dismissed_at  TIMESTAMPTZ,
             dismissed_by  TEXT NOT NULL DEFAULT '',
+            handled_at    TIMESTAMPTZ,
+            handled_by    TEXT NOT NULL DEFAULT '',
             UNIQUE (reporter_sub, message_id)
         )
     """)
-    # A database that made the table before an admin could dismiss a report:
-    # every existing report stays open.
+    # A database that made the table before an admin could dismiss, mark
+    # handled or outlive a chat: every existing report stays open, its
+    # title filled in by migrate_chat.
     conn.execute("ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ")
     conn.execute(
         "ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS dismissed_by TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute("ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS handled_at TIMESTAMPTZ")
+    conn.execute(
+        "ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS handled_by TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        "ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS chat_title TEXT NOT NULL DEFAULT ''"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reply_reports_reporter "
         "ON reply_reports (reporter_sub, created_at)"
     )
-    # A chat's deletion cascades here: without it every delete scans the table.
+    # A chat's deletion sets its reports' chat_id: without it every delete
+    # scans the table.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reply_reports_chat ON reply_reports (chat_id)"
     )
+    migrate_chat(conn)
+
+
+def migrate_chat(conn) -> None:
+    """The chat domain's forward migrations on an existing install, at
+    startup before the pool serves a request (``init_reply_reports`` calls
+    it). Reports outlive their chat (1.9.1): a ``reply_reports`` made with
+    ``chat_id NOT NULL ... ON DELETE CASCADE`` gets ``ON DELETE SET NULL``
+    and a nullable column, and every report's ``chat_title`` from its chat
+    (all of them still have one). Read from the catalog, so a boot after the
+    first does nothing, and it never runs on a table the CREATE above made:
+    not on a fresh install, the boot's drift probe nor a test database, so
+    the constraint DDL meets no pool (the reason the other constraints live
+    in ``run_migrations``). Inside a SAVEPOINT: a failure leaves the reports
+    going with their chat and the next boot tries again."""
+    fk = conn.execute(
+        "SELECT c.conname FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey) "
+        "WHERE t.relname = 'reply_reports' AND n.nspname = current_schema() "
+        "AND c.contype = 'f' AND c.confdeltype = 'c' AND a.attname = 'chat_id'"
+    ).fetchone()
+    col = conn.execute(
+        "SELECT a.attnotnull FROM pg_attribute a "
+        "JOIN pg_class t ON t.oid = a.attrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE t.relname = 'reply_reports' AND n.nspname = current_schema() "
+        "AND a.attname = 'chat_id' AND NOT a.attisdropped"
+    ).fetchone()
+    not_null = bool(col and col["attnotnull"])
+    if not fk and not not_null:
+        return
+    conn.execute("SAVEPOINT reply_reports_outlive_chats")
+    try:
+        conn.execute(
+            "UPDATE reply_reports r SET chat_title = COALESCE(c.title, '') "
+            "FROM chats c WHERE c.id = r.chat_id AND r.chat_title = ''"
+        )
+        if fk:
+            quoted = '"' + fk["conname"].replace('"', '""') + '"'
+            conn.execute(f"ALTER TABLE reply_reports DROP CONSTRAINT {quoted}")
+            conn.execute(
+                "ALTER TABLE reply_reports ADD CONSTRAINT reply_reports_chat_id_fkey "
+                "FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE SET NULL"
+            )
+        if not_null:
+            conn.execute("ALTER TABLE reply_reports ALTER COLUMN chat_id DROP NOT NULL")
+        conn.execute("RELEASE SAVEPOINT reply_reports_outlive_chats")
+        logger.info("reply_reports now outlive their chat")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT reply_reports_outlive_chats")
+        logger.exception("reply_reports could not be made to outlive their chat; the next boot retries")

@@ -9,18 +9,15 @@
         <item name="colorAccent">@color/colorAccent</item>
     </style>
 
-    <!-- The bars start on the boot field with light icons: the splash window
-         and the activity window agree while the splash fades, and the splash
-         library re-applies this theme's bar state when the splash view is
-         removed (MainActivity puts the page's own state back after it). Below
-         Android 15 the navigation bar is drawn in its window colour under the
-         field's bottom, so it takes the field's deep end. -->
+    <!-- The bars start with light icons over the boot field. They carry no
+         colour of their own on any Android version: MainActivity makes both
+         transparent (edge-to-edge) and paints the field, then the page's
+         colour, beneath them, and puts that back after the splash library
+         re-applies this theme at its hand-over. -->
     <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
         <item name="android:background">@null</item>
-        <item name="android:statusBarColor">@color/bootField</item>
-        <item name="android:navigationBarColor">@color/bootFieldDeep</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
     </style>
@@ -29,14 +26,13 @@
          icon background, so every level draws the icon at 288 dp (the mark
          127 dp wide), which the page's boot screen matches. A launch from a
          notification, or into the running task, prefers the icon over a flat
-         field (Android 13 and later honour it). -->
+         field (Android 13 and later honour it). The library's own theme makes
+         both bars transparent over the field. -->
     <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@color/bootField</item>
         <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
         <item name="android:windowSplashScreenBehavior" tools:targetApi="33">icon_preferred</item>
         <item name="postSplashScreenTheme">@style/AppTheme.NoActionBar</item>
-        <item name="android:statusBarColor">@color/bootField</item>
-        <item name="android:navigationBarColor">@color/bootField</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
     </style>

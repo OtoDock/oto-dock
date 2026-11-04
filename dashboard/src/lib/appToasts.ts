@@ -3,10 +3,12 @@
 // In-process pub/sub like fileUpdates.ts: AppToastHost subscribes and shows
 // it beside the delivered ones, with no inbox row behind it.
 
+import type { NotificationSeverity } from './status/notificationSeverity'
+
 export interface AppToast {
   title: string
   body: string
-  severity: 'info' | 'success' | 'warning' | 'danger'
+  severity: NotificationSeverity
 }
 
 type Listener = (t: AppToast) => void

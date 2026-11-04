@@ -45,6 +45,10 @@ Every STT/TTS provider also implements:
   a language, so a fresh row speaks every language out of the box. Use ONLY
   **account-independent** ids (public-library / premade voices — a
   workspace-added id 404s on other accounts). The admin's `voices` map wins.
+- TTS, optional: `list_voices()` / `search_voice_library(...)` /
+  `add_library_voice(...)`: the voice catalog an agent browses through the
+  text-to-speech tools. The base lists the configured map and refuses the
+  other two. Implement them when your vendor has a voices API.
 
 ## Register it
 

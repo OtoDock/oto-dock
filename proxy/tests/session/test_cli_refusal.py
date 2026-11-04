@@ -162,6 +162,8 @@ def test_normal_message_delta_stays_silent():
 
 def test_the_limit_matcher_knows_both_engines_notices():
     for text in (_LIMIT_TEXT, "You've hit your session limit · resets 3pm (UTC)",
+                 # 2.1.312 names the 5-hour window "5-hour limit".
+                 "You've hit your 5-hour limit · resets 3pm (UTC)",
                  "You've hit your usage limit. Upgrade to Pro or try again at 4:55 PM.",
                  "Claude AI usage limit reached|1790000000",
                  # The usage-credits wording of the same notice (first met live 2026-10-04),
@@ -273,3 +275,13 @@ async def test_the_pump_rests_the_subscription_by_the_limit_ending(temp_db, monk
     assert [(sid, e.reason, e.window, e.resets_at) for sid, e, _ in rests] == [
         ("sess-lim1", turn_ending.LIMIT, "seven_day", "2099-01-01T00:00:00+00:00")]
     assert rests[0][2] == ending.line()
+
+
+@pytest.mark.parametrize("subtype", ["checkpoint_done", "inherited_asks_settled",
+                                     "turn_began_before_init", "alive_before_init",
+                                     "rewind_stand_in"])
+def test_the_new_system_frames_of_2_1_312_are_quiet(subtype):
+    """Frames of cloud sessions, the runner and the rewind record: known, and
+    never a system row in a chat."""
+    tr = ClaudeCLIEventTranslator("sess-1")
+    assert tr.feed({"type": "system", "subtype": subtype, "uuid": "u-1"}) == []

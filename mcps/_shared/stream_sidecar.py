@@ -21,6 +21,20 @@ otherwise touching the protocol:
   * **Active close**: ``POST /internal/close-session {"session_id": "<oto>"}``
     (the OtoDock proxy calls this at agent-session close) tears the matching
     session down immediately. So "kill the proxy session → kill the MCP session."
+  * **Session count**: ``GET /internal/sessions?except_prefix=<p>`` answers
+    ``{"open": n}``, the sessions whose OtoDock id does not start with ``<p>``
+    (a container's own health checker excludes itself this way). No session
+    ids leave the container.
+
+An ATTACHED client stream counts as activity: the SSE forwarding loop
+refreshes the session on every keepalive/chunk it successfully writes, so a
+client quietly holding the standalone GET open (a warm CLI/codex daemon
+between turns) never has its session GC'd out from under it. Without this the
+GC destroyed the browser context at idle+10min and the still-attached client
+fell into a reconnect→404 retry storm. GC still fires once the client truly
+goes away: a dead peer fails the next keepalive write, the loop exits, the
+refreshes stop, and the TTL runs down as before. A request whose session the
+server no longer knows (it answers 404) drops that session from the map.
 
 Everything else is **streamed straight through** (transparent proxy) with no
 overall read-timeout — a long-running browser action must not be cut off, and the
@@ -29,17 +43,16 @@ request) passes untouched so the client sees server messages immediately. An idl
 SSE stream gets periodic keepalive comments so an idle-read timeout on any hop
 can't drop it.
 
-Session lifetime (measured + read from the @playwright/mcp 0.0.68 source,
-2026-07-06): the MCP server HEARTBEATS every streamable session — a
-server→client ``ping`` every 3s that must be answered within 5s, else it
-closes the session and destroys its browser context. Delivering the ping
-requires the session's standalone server→client SSE ``GET`` stream, so a
-session lives exactly as long as its client holds that GET open and answers
-pings. Agent sessions therefore persist across think-gaps while the CLI stays
-connected (page/tab state survives), and the container's healthprobe keepalive
-daemon does the same for the ONE probe session (see healthprobe.py — a
-fire-and-forget prober's sessions die ~5-8s after initialize, each leaking a
-browser context). A wedged tool call returns an error after
+Session lifetime (read from the @playwright/mcp source): from a session's
+first tool call the MCP server HEARTBEATS it — a server→client ``ping`` every
+3s that must be answered within 5s, else it closes the session and destroys
+its browser context. Delivering the ping requires the session's standalone
+server→client SSE ``GET`` stream, so a session lives exactly as long as its
+client holds that GET open and answers pings. Agent sessions therefore persist
+across think-gaps while the CLI stays connected (page/tab state survives), and
+a container's health checker must be the same kind of client (see camoufox's
+healthprobe.py: a fire-and-forget prober's sessions die seconds after their
+first call, each costing a browser context). A wedged tool call returns an error after
 ``PER_CALL_TIMEOUT_S`` rather than hanging the agent forever (non-streaming
 requests only; the long-lived SSE ``GET`` stays unbounded so real streams are
 never cut).
@@ -81,19 +94,9 @@ _KEEPALIVE = b": keepalive\n\n"
 # The long-lived SSE GET stays unbounded (sock_read=None) so real streams aren't cut.
 PER_CALL_TIMEOUT_S = int(os.environ.get("OTO_MCP_CALL_TIMEOUT_S", "90"))
 
-# ---------------------------------------------------------------------------
-# TEMPORARY WORKAROUND — suppress server→client (server-initiated) requests.
-#
-# History (workaround REMOVED 2026-07-06): @playwright/mcp@0.0.55 failed to
-# correlate server→client request responses (roots/list, ping), hanging every
-# first tool call ~60s; the OTO_MCP_SUPPRESS_SERVER_REQUESTS workaround
-# stripped the client's `roots` capability from `initialize` and 405'd the
-# standalone SSE GET so the server could never issue those requests. camoufox
-# now runs 0.0.68 (correlation fixed — sub-second navigates verified in
-# production with the flag unset everywhere), and rejecting the GET would kill
-# every session within seconds anyway: it carries the server's heartbeat ping
-# (see the module docstring + healthprobe.py). Do not resurrect the flag.
-# ---------------------------------------------------------------------------
+# The standalone SSE GET is never refused or altered here: it carries the
+# server's heartbeat ping, and a session whose pings go unanswered is closed
+# within seconds.
 
 # Headers that must not be copied verbatim across a proxy hop.
 _HOP_BY_HOP = {
@@ -124,6 +127,30 @@ def _touch(mcp_sid: str, oto: str = "") -> None:
     if oto:
         s["oto"] = oto
         _oto_to_mcp[oto] = mcp_sid
+
+
+def _refresh(mcp_sid: str) -> None:
+    """Refresh last-activity for an EXISTING session only — never (re)creates
+    an entry. The SSE forwarding loop calls this per successful write to an
+    attached client; a session already DELETEd/GC'd must not be resurrected
+    into the map by a straggling stream (its upstream state is gone — a ghost
+    entry would just delay the client's reconnect error)."""
+    s = _sessions.get(mcp_sid)
+    if s is not None:
+        s["last"] = time.time()
+
+
+def _stale_sids(now: float) -> list[str]:
+    """Sessions past the idle TTL (the GC's selection predicate)."""
+    return [sid for sid, s in list(_sessions.items())
+            if now - s["last"] > SESSION_IDLE_S]
+
+
+def _open_sessions(except_prefix: str = "") -> int:
+    """Sessions in the map whose OtoDock id does not start with the prefix
+    (an empty prefix counts them all)."""
+    return sum(1 for s in _sessions.values()
+               if not (except_prefix and s.get("oto", "").startswith(except_prefix)))
 
 
 def _forget(mcp_sid: str) -> None:
@@ -186,18 +213,25 @@ def _sweep_screenshots() -> None:
         log.info("screenshots sweep: removed %d orphan(s)", removed)
 
 
+async def _gc_pass() -> None:
+    now = time.time()
+    for sid in _stale_sids(now):
+        s = _sessions.get(sid)
+        if s is None:
+            continue  # closed meanwhile
+        log.info("idle-GC mcp=%s (idle %.0fs)", sid[:8], now - s["last"])
+        await _delete_upstream(sid)
+        _forget(sid)
+    _sweep_screenshots()
+
+
 async def _gc_loop() -> None:
     while True:
         await asyncio.sleep(GC_INTERVAL_S)
-        now = time.time()
-        stale = [sid for sid, s in list(_sessions.items())
-                 if now - s["last"] > SESSION_IDLE_S]
-        for sid in stale:
-            idle = now - _sessions[sid]["last"]
-            log.info("idle-GC mcp=%s (idle %.0fs)", sid[:8], idle)
-            await _delete_upstream(sid)
-            _forget(sid)
-        _sweep_screenshots()
+        try:
+            await _gc_pass()
+        except Exception:  # the GC is the leak backstop: one bad pass must not end it
+            log.exception("idle-GC pass failed")
 
 
 async def close_session_handler(request):
@@ -217,6 +251,14 @@ async def close_session_handler(request):
     _forget(mcp_sid)
     log.info("active close oto=%s mcp=%s status=%s", oto[:8], mcp_sid[:8], status)
     return web.json_response({"closed": True, "status": status})
+
+
+async def sessions_handler(request):
+    """Control endpoint — how many sessions are open, optionally leaving out
+    the ones whose OtoDock id starts with ``except_prefix``."""
+    from aiohttp import web
+    prefix = request.rel_url.query.get("except_prefix", "")
+    return web.json_response({"open": _open_sessions(prefix)})
 
 
 async def proxy_handler(request):
@@ -262,6 +304,10 @@ async def proxy_handler(request):
     resp_sid = upstream.headers.get("mcp-session-id", "")
     if resp_sid:
         _touch(resp_sid, oto)
+    # The server no longer knows this session (closed by its heartbeat, say):
+    # drop it so it neither waits for the idle GC nor counts as open.
+    if req_sid and upstream.status == 404:
+        _forget(req_sid)
 
     resp = web.StreamResponse(
         status=upstream.status,
@@ -270,6 +316,10 @@ async def proxy_handler(request):
     )
     await resp.prepare(request)
     is_sse = "text/event-stream" in upstream.headers.get("content-type", "").lower()
+    # The session this stream belongs to — every write that reaches the
+    # attached client refreshes it so the idle GC can't reap a session whose
+    # client is still connected (see the module docstring).
+    live_sid = resp_sid or req_sid
     try:
         if is_sse:
             # Long-lived SSE channel: forward each event as it arrives, and keep
@@ -286,6 +336,7 @@ async def proxy_handler(request):
                     done, _ = await asyncio.wait({read_task}, timeout=SSE_KEEPALIVE_S)
                     if read_task not in done:
                         await resp.write(_KEEPALIVE)  # idle → keepalive; read stays pending
+                        _refresh(live_sid)
                         continue
                     try:
                         chunk = read_task.result()
@@ -294,6 +345,7 @@ async def proxy_handler(request):
                         break
                     read_task = None
                     await resp.write(chunk)
+                    _refresh(live_sid)
             finally:
                 if read_task is not None and not read_task.done():
                     read_task.cancel()
@@ -304,7 +356,10 @@ async def proxy_handler(request):
         log.warning("stream %s: %s", path, e)
     finally:
         upstream.release()
-    await resp.write_eof()
+    # A client that already went away makes the last write raise: nothing to
+    # tell it, and aiohttp would log the traceback as a request error.
+    with contextlib.suppress(ConnectionResetError):
+        await resp.write_eof()
 
     # A client-initiated DELETE terminated the session — forget it locally too.
     if request.method == "DELETE" and req_sid:
@@ -316,6 +371,7 @@ def make_app():
     from aiohttp import web
     app = web.Application(client_max_size=256 * 1024 * 1024)
     app.router.add_post("/internal/close-session", close_session_handler)
+    app.router.add_get("/internal/sessions", sessions_handler)
     app.router.add_route("*", "/{path:.*}", proxy_handler)
     return app
 
@@ -326,8 +382,8 @@ async def main() -> None:
     from aiohttp.web_log import AccessLogger
 
     class _NoLoopbackAccessLogger(AccessLogger):
-        """Skip access-log lines for in-container (127.0.0.1) requests — the
-        healthprobe + its keepalive daemon (one ping answer every 3s ≈ 29k
+        """Skip access-log lines for in-container (127.0.0.1) requests — a
+        health checker's held session (one ping answer every 3s ≈ 29k
         lines/day of pure noise). Real traffic arrives via the container
         network (the proxy's forwarded requests), never loopback, and stays
         logged; the sidecar's own session open/close lifecycle lines are

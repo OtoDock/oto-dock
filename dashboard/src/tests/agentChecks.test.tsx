@@ -91,7 +91,7 @@ describe('AgentChecks', () => {
     renderPage()
     await waitFor(() => expect(screen.getByTestId('check-agent:coding')).toBeTruthy())
     expect(screen.getByTestId('check-agent:coding').textContent).toContain('mandatory')
-    expect(screen.getByTestId('check-agent:coding').textContent).toContain('writes code; on a commit')
+    expect(screen.getByTestId('check-agent:coding').textContent).toContain('when it writes code and the turn has a commit')
     expect(screen.getByTestId('check-agent:style').textContent).toContain('offered')
     expect(screen.getByTestId('check-agent:style').textContent).toContain('Needs a fix')
     expect(screen.getByTestId('check-agent:style').textContent).toContain('reports only')
@@ -246,5 +246,21 @@ describe('AgentChecks', () => {
     fireEvent.click(screen.getByTestId('check-save'))
     await waitFor(() => expect(screen.getByTestId('check-error').textContent).toContain('needs instructions for the judge'))
     expect(fetchSpy.mock.calls.some(([p]) => String(p).includes('/user-checks/'))).toBe(false)
+  })
+})
+
+describe('conditionWords', () => {
+  it('joins the parts of a condition with and, and reads a glob as a file that changes', async () => {
+    const { conditionWords } = await import('@/api/checks')
+    expect(conditionWords({ globs: ['workspace/x/**'] })).toBe('when a file matching workspace/x/** changes')
+    expect(conditionWords({ kinds: ['code', 'document'], events: ['commit'] }))
+      .toBe('when it writes code or documents and the turn has a commit')
+    expect(conditionWords({ events: ['tool:send_email'], places: ['git'], commands: ['^make'] }))
+      .toBe('when the turn has a call of the tool send_email, it writes inside a git checkout and it runs a command matching ^make')
+    expect(conditionWords({ always: true })).toBe('after every turn')
+    expect(conditionWords(undefined)).toBe('when it writes any file or runs any action')
+    for (const c of [{ globs: ['a/**', 'b/*.md'] }, { kinds: ['code'], globs: ['src/**'] }]) {
+      expect(conditionWords(c)).not.toMatch(/;|when it under/)
+    }
   })
 })

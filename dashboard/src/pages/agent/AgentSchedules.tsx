@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useTasks, useRunTaskNow, useDeleteTask, usePauseTask, useResumeTask, type Task } from '../../api/tasks'
-import { formatNextRun, describeSchedule, browserTimeZone } from '../../lib/format'
+import { formatNextRun, describeSchedule, browserTimeZone, rawCron } from '../../lib/format'
 import { useAuth } from '../../contexts/AuthContext'
+import { canEditAgent } from '../../lib/permissions'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
 import { TaskModelChip } from '../../components/common/TaskModelChip'
 import TransferredFrom from '../../components/TransferredFrom'
@@ -124,6 +125,12 @@ export default function AgentSchedules() {
           {filtered.length} of {allTasks.length}
         </span>
       </div>
+      {/* Below the editor tier the server lists only the person's own. */}
+      {name && !canEditAgent(user, name) && (
+        <p className="text-xs text-secondary" data-testid="own-tasks-only">
+          Tasks the agent runs on its own show for editors and managers.
+        </p>
+      )}
 
       {/* Desktop table */}
       <div className={`hidden md:block ${CARD} overflow-hidden`}>
@@ -153,8 +160,10 @@ export default function AgentSchedules() {
                     </div>
                   </td>
                   <td className="px-4 py-3 text-xs text-secondary">
-                    <div>{describeSchedule(task, browserTz)}</div>
-                    {task.schedule && <div className="font-mono text-tertiary mt-0.5">{task.schedule}</div>}
+                    <div className={rawCron(task) ? 'font-mono' : undefined}>{describeSchedule(task, browserTz)}</div>
+                    {task.schedule && !rawCron(task) && (
+                      <div className="font-mono text-tertiary mt-0.5">{task.schedule}</div>
+                    )}
                     {task.interval_seconds != null && <div className="font-mono text-tertiary mt-0.5">interval {task.interval_seconds}s</div>}
                   </td>
                   <td className="px-4 py-3 text-secondary text-xs">
@@ -260,7 +269,7 @@ export default function AgentSchedules() {
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary">
               <span className="min-w-0 break-words">
                 <span className="text-tertiary">Schedule:</span>{' '}
-                {describeSchedule(task, browserTz)}
+                <span className={rawCron(task) ? 'font-mono' : undefined}>{describeSchedule(task, browserTz)}</span>
               </span>
               <span className="min-w-0 break-words">
                 <span className="text-tertiary">Next:</span> {formatNextRun(task.next_run_time)}

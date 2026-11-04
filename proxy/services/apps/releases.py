@@ -200,6 +200,14 @@ def release_numbers(row: dict) -> list[int]:
     return [n for n in _all_numbers(row) if n != pending]
 
 
+def highest_number(row: dict) -> int:
+    """The highest release number on disk, a pending copy included (0 when
+    none): what a copy that follows a source compares with the number it
+    was taken at."""
+    numbers = _all_numbers(row)
+    return numbers[-1] if numbers else 0
+
+
 def current_number(row: dict) -> int:
     """The release the row serves (0 = not deployed yet: the working tree)."""
     rel = row.get("release_path") or ""
@@ -378,6 +386,18 @@ def copy_tree(source_dir: Path, dest_dir: Path, *, replace: bool = False) -> str
     except (FileExistsError, NotADirectoryError) as exc:
         raise ReleaseInvalid("data is reserved for the app's database, it cannot be a file") from exc
     return text
+
+
+def tree_hash(source_dir: Path) -> str:
+    """The hash a release cut from this working tree would carry
+    (``cut_folder_release``: the manifest text over the walked files), read
+    without copying; equal to the row's ``release_sha256`` while the working
+    tree is the one its latest release took."""
+    entries: dict[str, dict] = {}
+    for rel, _path in walk_tree(source_dir):
+        data = read_tree_file(source_dir, rel, max_size=MAX_RELEASE_FILE_BYTES)
+        entries[rel] = {"sha256": _sha256(data), "size": len(data)}
+    return _sha256(manifest_text(entries).encode("utf-8"))
 
 
 def manifest_text(entries: dict[str, dict]) -> str:

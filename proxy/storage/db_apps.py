@@ -175,6 +175,8 @@ def upsert_app(
     kind: str | None = None,
     blocks: dict[str, str] | None = None,
     template_ref: str | None = None,
+    from_template: str | None = None,
+    from_version: str | None = None,
 ) -> dict:
     """Create or update the (agent, username, slug) row. ``title`` /
     ``actions_json`` are only written when not None (metadata-only updates
@@ -184,8 +186,10 @@ def upsert_app(
     restore path (approval intact when the manifest is unchanged) — and
     clears a template row's hidden reason with it. ``kind`` (``file`` |
     ``folder``), ``blocks`` (the signed manifest blocks besides the
-    actions, canonical JSON text per column name) and ``template_ref`` (the
-    template a seeded row came from) are written only when given."""
+    actions, canonical JSON text per column name), ``template_ref`` (the
+    template a seeded row came from) and the origin pair ``from_template``,
+    ``from_version`` (where the code came from, kept by a bundle) are
+    written only when given."""
     now = datetime.now(timezone.utc).isoformat()
     block_sets = [(k, v) for k, v in (blocks or {}).items()
                   if k in MANIFEST_BLOCKS or k in UNSIGNED_BLOCKS]
@@ -213,6 +217,9 @@ def upsert_app(
             if template_ref is not None:
                 sets.append("template_ref=%s")
                 vals.append(template_ref)
+            if from_template is not None:
+                sets.extend(["from_template=%s", "from_version=%s"])
+                vals.extend([from_template, from_version or ""])
             for col, text in block_sets:
                 sets.append(f"{col}=%s")
                 vals.append(text)
@@ -231,11 +238,12 @@ def upsert_app(
             conn.execute(
                 """INSERT INTO pinned_apps
                    (id, agent, owner_sub, username, slug, title, rel_path,
-                    actions, position, kind, template_ref, created_at, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    actions, position, kind, template_ref, from_template, from_version,
+                    created_at, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (app_id, agent, owner_sub, username, slug, title or "",
                  rel_path, actions_json or "[]", nxt, kind or "file",
-                 template_ref or "", now, now),
+                 template_ref or "", from_template or "", from_version or "", now, now),
             )
             for col, text in block_sets:
                 conn.execute(f"UPDATE pinned_apps SET {col}=%s WHERE id=%s", (text, app_id))
@@ -540,6 +548,16 @@ def list_rows_by_template_ref(agent: str, template_ref: str) -> list[dict]:
             (agent, template_ref),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def set_follows(app_id: str, text: str) -> None:
+    """The lineage a copy keeps (services/apps/app_follow.py):
+    JSON text, or '' when the copy follows nothing (``app_follow`` reads and
+    writes it; ``upsert_app`` never touches it)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("UPDATE pinned_apps SET follows=%s, updated_at=%s WHERE id=%s", (text, now, app_id))
+        conn.commit()
 
 
 def set_template_state(app_id: str, state: str, *, hidden: bool | None = None) -> dict | None:

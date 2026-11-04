@@ -102,10 +102,10 @@ export interface EngineBehaviour {
   /** The engine's native tool names by role (`lib/tools/roles` is the
    *  canonical set they map into on the proxy). */
   tools: Record<string, string[]>
-  /** The engine's question tool holds the turn open for the platform's
-   *  answers (Codex); false when the proxy denies the call, shows the card
-   *  and the answer arrives as the next message (Claude headless). */
-  question_tool_holds_turn: boolean
+  /** The question tools that open no dialog holding the turn in the
+   *  engine's own terminal (Codex's async one). Headless, every question
+   *  shows as a card and the answer is the person's next message. */
+  nonblocking_question_tools: string[]
   /** The instruction files of the repositories in a person's workspace the
    *  proxy lifts into the session's prompt, the engine's own file first;
    *  empty when the engine needs none. Optional: absent on an older proxy. */

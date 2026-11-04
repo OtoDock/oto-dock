@@ -30,7 +30,7 @@ import functools
 import logging
 import time
 from datetime import datetime, timezone
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import psycopg
 
@@ -42,6 +42,9 @@ from services.scheduler import cut_turns
 from storage import database as task_store
 from storage.automation import run_status
 from storage.chat import open_turns
+
+if TYPE_CHECKING:
+    from core.events.turn_ending import TurnEnding
 
 logger = logging.getLogger("otodock.recovery")
 
@@ -142,9 +145,9 @@ async def sweep_expired() -> None:
     for rec in records:
         rid = rec.get("run_id")
         if rid:
-            await asyncio.to_thread(_fail_run, rid,
-                                    "Proxy restarted; satellite did not "
-                                    "reconnect in time")
+            await _fail_and_report(rid, rec.get("chat_id") or "",
+                                   "Proxy restarted; satellite did not "
+                                   "reconnect in time")
         logger.info(
             "Recovery: parked session %s deadline lapsed — failed run %s",
             (rec.get("chat_id") or "")[:16], rid or "(none)",
@@ -152,13 +155,74 @@ async def sweep_expired() -> None:
     await cut_turns.sweep_expired()
 
 
-def _fail_run(run_id: str, reason: str) -> None:
+def _fail_run(run_id: str, reason: str) -> bool:
+    """Fail a run still live; True when this call failed it."""
     run = task_store.get_run(run_id)
     if run and run_status.is_live(run.get("status")):
         task_store.update_run(
             run_id, status=run_status.FAILED, error_message=reason,
             completed_at=_now(),
         )
+        return True
+    return False
+
+
+def _lane_state(run_id: str, chat_id: str) -> tuple[dict | None, bool, int, int]:
+    """The run; whether the lane ran again (a newer run of its chat, or
+    another run that lives on it, admitted or waiting at the lane gate with
+    no start and no chat yet); and its chat's cursors: the row before the run
+    started (from the newest rows: a run longer than them reports their span)
+    and the last row now."""
+    run = task_store.get_run(run_id)
+    newest = (task_store.get_runs_for_chats([chat_id]).get(chat_id) or {}).get("id") or ""
+    ran_again = bool(chat_id) and (
+        newest != run_id
+        or any(r != run_id for r in task_store.live_delegate_run_ids_for_chat(chat_id)))
+    rows = task_store.get_chat_messages(chat_id) if chat_id else []
+    started = (run or {}).get("started_at") or ""
+    before = [r["id"] for r in rows if (r.get("created_at") or "") < started]
+    first = rows[0]["id"] - 1 if rows else 0
+    return run, ran_again, (max(before) if before else first), (rows[-1]["id"] if rows else 0)
+
+
+def _lane_facts(run: dict, chat_id: str, cursor: int, end: int) -> dict[str, Any]:
+    """The lane's facts a delegate result carries, as the runner passes them."""
+    return {"worker_chat_id": chat_id, "output_cursor": cursor,
+            "prompt_text": run.get("prompt_text") or "",
+            "run_started_at": run.get("started_at") or "", "turn_end_cursor": end}
+
+
+async def _fail_and_report(run_id: str, chat_id: str, reason: str) -> None:
+    """A parked run that will not come back fails with ``reason``, and its
+    delegator hears that the restart cut the lane, as from a replay that
+    never began (``_finalize_run``): the lane's round, collected as the
+    runner collects it, under the restart's ending, so a lane with no report
+    says so. A lane that ran again since, or that another round waits on
+    (its delegator continued it), is not reported."""
+    from core.events import turn_ending
+    if not await asyncio.to_thread(_fail_run, run_id, reason):
+        return
+    run, ran_again, cursor, end = await asyncio.to_thread(_lane_state, run_id, chat_id)
+    if run is None or not chat_id or ran_again:
+        return
+    await _report(run, run_status.FAILED, "", turn_ending.TurnEnding(reason=turn_ending.RESTARTED),
+                  **_lane_facts(run, chat_id, cursor, end))
+
+
+async def _report(run: dict, final: str, output: str, ending: TurnEnding | None,
+                  **lane: Any) -> None:
+    """The delegate hand-off of a run the recovery ended (best-effort;
+    ``_deliver_task_result`` gates itself on ``on_complete_agent``)."""
+    from services.scheduler import scheduler
+    dyn = await asyncio.to_thread(task_store.get_dynamic_task, run.get("task_id") or "")
+    if not dyn:
+        return
+    task = scheduler._row_to_task(dyn)
+    try:
+        await scheduler._deliver_task_result(task, final, output or "", run_id=run["id"],
+                                             ending=ending, **lane)
+    except Exception:
+        logger.exception("Recovery delegate delivery failed for %s", run["id"])
 
 
 def _placed_here(ctx, machine_id: str) -> bool:
@@ -322,10 +386,8 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
     for _sid, rec in to_fail:
         rid = rec.get("run_id")
         if rid:
-            await asyncio.to_thread(
-                _fail_run, rid,
-                "Proxy restarted; the remote session was lost",
-            )
+            await _fail_and_report(rid, rec.get("chat_id") or "",
+                                   "Proxy restarted; the remote session was lost")
         logger.info(
             "Recovery: run %s session not reported by %s — failed",
             rid or "(none)", machine_id[:8],
@@ -350,8 +412,8 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
         if state is None:
             rid = rec.get("run_id")
             if rid:
-                await asyncio.to_thread(
-                    _fail_run, rid, "Proxy restarted; the remote session was closed")
+                await _fail_and_report(rid, rec.get("chat_id") or "",
+                                       "Proxy restarted; the remote session was closed")
             await _decline(sid, "no security context for its run",
                            incarnation=info.get("incarnation") or "")
             continue
@@ -817,7 +879,8 @@ async def _finalize_run(run_id: str, chat_id: str, *, cut_short: bool = False) -
     run = await asyncio.to_thread(task_store.get_run, run_id)
     if not run or not run_status.is_live(run.get("status")):
         return  # already terminal (a concurrent path finished it)
-    output = await asyncio.to_thread(scheduler._collect_task_output, chat_id)
+    _run, _again, cursor, end = await asyncio.to_thread(_lane_state, run_id, chat_id)
+    output = await asyncio.to_thread(scheduler._collect_task_output, chat_id, cursor)
     chat_row = await asyncio.to_thread(task_store.get_chat, chat_id) or {}
     cost = chat_row.get("total_cost") or 0
     await asyncio.to_thread(
@@ -829,14 +892,5 @@ async def _finalize_run(run_id: str, chat_id: str, *, cut_short: bool = False) -
         error_message=ending.summary() if ending else None,
     )
     logger.info("Recovery: run %s %s after re-adopt", run_id, final)
-    # Delegate hand-off (best-effort; self-gates on on_complete_agent).
-    dyn = await asyncio.to_thread(
-        task_store.get_dynamic_task, run.get("task_id") or "",
-    )
-    if dyn:
-        task = scheduler._row_to_task(dyn)
-        try:
-            await scheduler._deliver_task_result(task, final, output or "", run_id=run_id,
-                                                 ending=ending)
-        except Exception:
-            logger.exception("Recovery delegate delivery failed for %s", run_id)
+    await _report({**run, "id": run_id}, final, output, ending,
+                  **_lane_facts(run, chat_id, cursor, end))

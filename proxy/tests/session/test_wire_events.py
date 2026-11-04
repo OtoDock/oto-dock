@@ -45,7 +45,7 @@ def test_every_frame_is_a_constant_and_every_constant_a_frame():
     # Every FRAMES key is the value of an upper-case module constant.
     values = set(_constants(wire).values())
     assert names <= values, sorted(names - values)
-    assert len(names) == 118
+    assert len(names) == 122
     # No frame name is spelled twice.
     assert len(_frame_constants()) == len(names)
 
@@ -66,7 +66,17 @@ def test_per_chat_is_derived_from_the_table():
     assert wire.STEERED in wire.PER_CHAT_FRAMES
     # A retired prompt's card belongs to the viewed chat's stream.
     assert wire.FRAMES[wire.PROMPT_RETIRED] == wire.Frame(True, None)
-    assert len(wire.PER_CHAT_FRAMES) == 59
+    assert len(wire.PER_CHAT_FRAMES) == 63
+
+
+def test_a_client_frame_loses_the_platforms_own_keys():
+    """A key starting with an underscore is a handler's word to another
+    handler (``_server_kick``, ``_artifact_framed``, ``_focus_line``): a
+    browser that sent one would run a turn with no user row."""
+    msg = {"type": wire.IN_CHAT, "text": "hi", "_server_kick": True, "_artifact_framed": True,
+           "_focus_line": "x", "queue_id": "q1"}
+    assert wire.client_frame(msg) == {"type": wire.IN_CHAT, "text": "hi", "queue_id": "q1"}
+    assert wire.client_frame({}) == {}
 
 
 def test_the_persisted_spellings():
@@ -81,7 +91,9 @@ def test_the_persisted_spellings():
     assert {f.persisted for f in wire.FRAMES.values() if f.persisted} <= wire.PERSISTED_EVENT_TYPES
     assert {"tool", "bg_nudge", "bg_command_nudge", "schedule_wake", "thinking", "system",
             "metadata", "mcp_cost", "context_compact", "check_verdict", "ui"} <= wire.PERSISTED_EVENT_TYPES
-    assert len(wire.PERSISTED_EVENT_TYPES) == 28
+    assert len(wire.PERSISTED_EVENT_TYPES) == 31
+    # The wake is a frame and its row keeps the frame's name.
+    assert wire.persisted_of(wire.SCHEDULE_WAKE) == wire.PERSISTED_SCHEDULE_WAKE == "schedule_wake"
 
 
 def test_the_rename_table_covers_every_forwarded_common_event():
@@ -307,7 +319,7 @@ _KEY_BOUND_FRAMES = ("DocumentPreviewFrame", "PromptRetiredFrame", "QueueCleared
                      "SteeredFrame", "QueueSnapshotFrame", "LiveStateFrame", "ErrorFrame",
                      "PermissionPromptFrame", "PlanReviewFrame", "QuestionFrame",
                      "DelegateResultFrame", "ShareInboxFrame", "PermissionResolvedFrame",
-                     "TextFrame", "ThinkingFrame", "ServerTurnStartFrame")
+                     "TextFrame", "ThinkingFrame", "ServerTurnStartFrame", "ScheduleWakeFrame")
 
 
 def test_the_mirror_declares_the_same_keys_per_frame():

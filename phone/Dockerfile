@@ -14,7 +14,7 @@
 # Telephony takes calls only once a PBX / SIP trunk or Twilio is configured
 # in the dashboard (Setup → Phone) — until then the service idles fail-closed.
 
-ARG PYTHON_IMAGE=python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530
+ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:ae14d4ce8771606477a81446e7ef429edd6762305fc50c84507c1041fa8285d1
 FROM ${PYTHON_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \

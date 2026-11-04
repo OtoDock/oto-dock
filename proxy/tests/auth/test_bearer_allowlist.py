@@ -85,6 +85,19 @@ class TestAllowlistMatcher:
             seeded_provider, "api.linear.app",
         ) is True
 
+    def test_only_an_mcps_row_counts_for_mcp_row_allows(self, seeded_provider):
+        """What waits for an Allow ignores an admin's rows: only a row an MCP
+        owns covers a host there, wildcards and case as the gateway reads them."""
+        assert not bearer_allowlist.mcp_row_allows(seeded_provider, "mcp.example.com")
+        bearer_allowlist.set_mcp_hosts("matcher-test-mcp", approved={(seeded_provider, "*.vendor.example"): "catalog"},
+                                       live={(seeded_provider, "*.vendor.example")}, by="catalog")
+        try:
+            assert bearer_allowlist.mcp_row_allows(seeded_provider, "API.vendor.example")
+            assert not bearer_allowlist.mcp_row_allows(seeded_provider, "vendor.example")
+            assert not bearer_allowlist.mcp_row_allows("another-provider", "api.vendor.example")
+        finally:
+            bearer_allowlist.forget_mcp("matcher-test-mcp")
+
     def test_wildcard_does_not_match_apex(self, seeded_provider):
         # `*.linear.app` does NOT match `linear.app` itself (fnmatch behavior).
         assert bearer_allowlist.is_host_allowed(
@@ -192,17 +205,15 @@ class TestManifestValidator:
 
 
 # ---------------------------------------------------------------------------
-# Seed coverage — Microsoft + Zoom must be pre-seeded
+# No predefined list, and the removal of an admin's rows
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _seeded_schema(temp_db):
-    """Re-run init_schema's seed loop AFTER conftest.temp_db's TRUNCATE
-    so the vendor-official hosts (microsoft/localhost, zoom/mcp.zoom.us) are
-    present. Function-scoped + dependent on temp_db to enforce ordering.
-    Idempotent — ON CONFLICT DO NOTHING means re-runs are safe.
-    """
+def _fresh_schema(temp_db):
+    """Re-run init_schema AFTER conftest.temp_db's TRUNCATE, as a boot does
+    on an existing database. Function-scoped and dependent on temp_db to
+    enforce ordering."""
     from storage import schema
     from storage.pg import get_conn
     with get_conn() as conn:
@@ -211,58 +222,39 @@ def _seeded_schema(temp_db):
     return temp_db
 
 
-@pytest.mark.usefixtures("_seeded_schema")
-class TestVendorHostSeeds:
-    """init_schema seeds the vendor-official hosts. The fixture above
-    re-runs the seed loop after temp_db's TRUNCATE so these tests are
-    independent of DB state.
-    """
+@pytest.mark.usefixtures("_fresh_schema")
+class TestNoPredefinedList:
+    """The boot inserts no row: every address belongs to an installed MCP's
+    manifest or to an admin, and a boot leaves an existing row alone."""
 
-    def test_microsoft_localhost_seeded(self):
-        """m365-mcp is a Docker container; bearer is forwarded to the
-        local container at http://localhost:${port}/mcp — NOT directly
-        to graph.microsoft.com (the container makes Graph calls itself
-        with the forwarded token)."""
-        entries = bearer_allowlist.list_allowed()
-        hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
-        assert ("microsoft", "localhost") in hosts
+    def test_a_boot_inserts_no_row(self):
+        assert bearer_allowlist.list_allowed() == []
 
-    def test_zoom_mcp_zoom_us_seeded(self):
-        """zoom-mcp is a remote bearer-required MCP at mcp.zoom.us."""
-        entries = bearer_allowlist.list_allowed()
-        hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
-        assert ("zoom", "mcp.zoom.us") in hosts
-
-    def test_postiz_api_postiz_com_seeded(self):
-        """postiz-mcp is a remote bearer-required MCP at api.postiz.com —
-        the user's Postiz API key rides as the bearer to the hosted MCP."""
-        entries = bearer_allowlist.list_allowed()
-        hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
-        assert ("postiz", "api.postiz.com") in hosts
-
-    def test_github_hosted_server_seeded(self):
-        """GitHub's hosted MCP server, reached through the credential
-        gateway with the person's own token."""
-        entries = bearer_allowlist.list_allowed()
-        hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
-        assert ("github", "api.githubcopilot.com") in hosts
-
-    def test_a_deleted_default_stays_deleted_across_the_seed(self):
-        """The seed inserts each default once (the ledger remembers it), so
-        an admin's deletion survives a restart; "Restore defaults" is the
-        way back."""
+    def test_a_boot_keeps_an_existing_row(self):
+        from storage import schema
         from storage.pg import get_conn
-        row = [e for e in bearer_allowlist.list_allowed()
-               if (e["provider_id"], e["host_pattern"]) == ("github", "api.githubcopilot.com")][0]
-        assert bearer_allowlist.delete_allowed(row["id"])
+        row_id = bearer_allowlist.add_allowed("slack", "mcp.slack.com", "system")
         with get_conn() as conn:
-            bearer_allowlist.seed_defaults(conn)
+            schema.init_schema(conn)
             conn.commit()
-        hosts = {(e["provider_id"], e["host_pattern"]) for e in bearer_allowlist.list_allowed()}
-        assert ("github", "api.githubcopilot.com") not in hosts
-        bearer_allowlist.restore_defaults()
-        hosts = {(e["provider_id"], e["host_pattern"]) for e in bearer_allowlist.list_allowed()}
-        assert ("github", "api.githubcopilot.com") in hosts
+        assert [(r["id"], r["source"]) for r in bearer_allowlist.list_allowed()] == [(row_id, "admin")]
+
+    def test_removing_the_admins_rows_keeps_every_mcp_row(self):
+        custom_id = bearer_allowlist.add_allowed("custom-prov", "custom.example.com")
+        bearer_allowlist.add_allowed("slack", "mcp.slack.com", "system")
+        bearer_allowlist.set_mcp_hosts("restore-test-mcp", approved={("custom-prov", "custom.example.com"): "catalog"},
+                                       live={("custom-prov", "custom.example.com")}, by="catalog")
+        try:
+            g0 = bearer_allowlist.generation()
+            rows = bearer_allowlist.remove_admin_rows()
+            assert bearer_allowlist.generation() > g0
+            assert not any(r["id"] == custom_id for r in rows)
+            assert [(r["provider_id"], r["host_pattern"], r["source"]) for r in rows] \
+                == [("custom-prov", "custom.example.com", "restore-test-mcp")]
+            assert bearer_allowlist.remove_admin_rows() == rows  # twice: nothing more goes
+            assert not bearer_allowlist.is_host_allowed("slack", "mcp.slack.com")
+        finally:
+            bearer_allowlist.forget_mcp("restore-test-mcp")
 
     def test_every_change_moves_the_generation(self):
         g0 = bearer_allowlist.generation()

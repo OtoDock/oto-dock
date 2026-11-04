@@ -118,6 +118,13 @@ def build_session_env(
     # opts back in. Mirrored on satellite CLI spawns (cli_session/pty_session).
     env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1"
 
+    # Claude Code offers an ``advisor`` tool on a claude.ai login (a remote
+    # flag, on in every T1 session): a second model call the result frame
+    # does not count (its usage names web search and fetch only), so the
+    # platform could neither meter nor show it. Off until it can. Mirrored on
+    # satellite CLI spawns (cli_session/pty_session).
+    env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
+
     # Standard OTO_* platform env vars (incl. OTO_SESSION_ID) — community MCPs
     # read these for scope-aware paths without per-manifest declarations.
     from core.sandbox.oto_env import build_oto_env, resolve_memory_and_scope

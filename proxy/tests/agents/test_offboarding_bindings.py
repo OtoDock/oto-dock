@@ -144,6 +144,36 @@ async def test_the_admin_delete_route_unregisters_through_the_lender_before_the_
     assert db.get_user(w.pat) is None
 
 
+@pytest.mark.asyncio
+async def test_the_admin_delete_route_releases_the_accounts_after_the_bindings(world, monkeypatch):
+    """The accounts are released (revoked, files deleted, routes ended)
+    after the bindings went through the lender's token and before the rows
+    cascade; the relay hears of the person's hosted GitHub account after."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from services.oauth import account_release
+    from services.webhooks import relay_events
+    w = world
+    seen: list[tuple] = []
+
+    async def release(sub):
+        seen.append(("release", sub, db.get_user(sub) is not None, sorted(w.deleted)))
+        return {"github"}
+    monkeypatch.setattr(account_release, "release_user_accounts", release)
+    monkeypatch.setattr(relay_events, "sync_provider_soon",
+                        lambda p: seen.append(("sync", p, db.get_user(w.pat) is None)))
+    app = _as_admin(w)
+    try:
+        resp = await asyncio.to_thread(lambda: TestClient(app).delete(f"/v1/admin/users/{w.pat}"))
+    finally:
+        from auth.providers import get_current_user
+        app.dependency_overrides.pop(get_current_user, None)
+    assert resp.status_code == 200, resp.text
+    assert seen == [("release", w.pat, True, [(A, w.pat), (B, w.pat)]), ("sync", "github", True)]
+
+
 def _as_admin(w):
     from app import app
     from auth.providers import UserContext, get_current_user

@@ -3,9 +3,9 @@ import { Trigger, useCreateTrigger, useEditTrigger, useFireTrigger, NOTIFY_SEVER
 import { useTasks } from '../../api/tasks'
 import { useApps } from '../../api/apps'
 import { useAgentInfo } from '../../api/agents'
-import { useSubscriptions } from '../../api/subscriptions'
+import { mcpStateSentence, subscriptionOptionLabel, useSubscriptions, type WebhookSubscription } from '../../api/subscriptions'
 import { useAuth } from '../../contexts/AuthContext'
-import { availableScopes, modeOfAgent } from '../../lib/visibility'
+import { availableScopes, modeOfAgent, SCOPE } from '../../lib/visibility'
 import { appKind } from '../../lib/kinds/app'
 import { TASK_KIND } from '../../lib/kinds/task'
 import { errorText } from '../../lib/http/apiJson'
@@ -13,6 +13,9 @@ import Dialog, { type DialogDismiss } from '../../components/ui/Dialog'
 import Button from '../../components/ui/Button'
 import { Input, Label, Select } from '../../components/ui/Field'
 import InfoTip from '../../components/ui/InfoTip'
+import { audienceOf } from '../../components/common/audience'
+import { WhoIsToldField } from '../../components/common/WhoIsTold'
+import { ROLE, type AgentRole } from '../../lib/permissions'
 import { DIALOG_PANEL, FIELD, FIELD_BORDER, FIELD_REGULAR } from '../../components/ui/classes'
 
 /** The "paste an id" choice of the subscription picker. */
@@ -43,6 +46,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
   const [notifyTitle, setNotifyTitle] = useState('')
   const [notifyBody, setNotifyBody] = useState('')
   const [notifySeverity, setNotifySeverity] = useState<NotifySeverity>('info')
+  const [audience, setAudience] = useState<AgentRole>(ROLE.EDITOR)
   const [debounce, setDebounce] = useState(0)
   // Optional vendor-subscription linkage. Empty = generic
   // webhook URL (otok_-authed). Non-empty = trigger fires from a
@@ -140,6 +144,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
               severity: notifySeverity,
               title: notifyTitle,
               body: notifyBody,
+              ...(scope === SCOPE.AGENT ? { audience } : {}),
             }
           : undefined,
         debounce_seconds: debounce,
@@ -200,6 +205,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
               info={scope === 'agent'
                 ? "One of this agent's subscriptions. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
                 : 'One of your personal subscriptions. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
+              hint={chosenMarkHint(linkableSubs, subscriptionChoice)}
             >
               <Select
                 value={subscriptionChoice}
@@ -209,7 +215,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
                 <option value="">Choose…</option>
                 {linkableSubs.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.provider_id}/{s.vendor_target} · {s.selected_events.join(', ') || '—'}
+                    {subscriptionOptionLabel(s)}
                   </option>
                 ))}
                 <option value={PASTE_ID}>Paste a subscription id…</option>
@@ -311,6 +317,9 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
                   className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR}`}
                 />
               </Field>
+              {scope === SCOPE.AGENT && (
+                <WhoIsToldField id="trigger-who-is-told" value={audience} onChange={setAudience} />
+              )}
             </>
           )}
         </div>
@@ -343,6 +352,8 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
   const [notifyTitle, setNotifyTitle] = useState(trigger.notify_title ?? '')
   const [notifyBody, setNotifyBody] = useState(trigger.notify_body ?? '')
   const [notifySeverity, setNotifySeverity] = useState(trigger.notify_severity)
+  const savedAudience = audienceOf(trigger.notify_audience)
+  const [audience, setAudience] = useState<AgentRole>(savedAudience)
   const [debounce, setDebounce] = useState(trigger.debounce_seconds)
   // The vendor source can be bound after creation — an app's trigger is
   // usually made before the agent's subscription exists, and a trigger
@@ -376,6 +387,7 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
           notify_body: notifyBody || null,
           debounce_seconds: debounce,
           ...(subscriptionId !== (trigger.subscription_id ?? '') ? { subscription_id: subscriptionId } : {}),
+          ...(trigger.scope === SCOPE.AGENT && audience !== savedAudience ? { notify_audience: audience } : {}),
         },
       })
       onClose()
@@ -398,7 +410,7 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
           info={trigger.scope === 'agent'
             ? "The agent's subscription this trigger fires from. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
             : 'The personal subscription this trigger fires from. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
-          hint="None means only the generic webhook URL fires it."
+          hint={chosenMarkHint(linkableSubs, subscriptionId) ?? 'None means only the generic webhook URL fires it.'}
         >
           <Select
             value={subscriptionId}
@@ -408,7 +420,7 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
             <option value="">None</option>
             {linkableSubs.map((s) => (
               <option key={s.id} value={s.id}>
-                {s.provider_id}/{s.vendor_target} · {s.selected_events.join(', ') || '—'}
+                {subscriptionOptionLabel(s)}
               </option>
             ))}
             {subscriptionId && !linkableSubs.some((s) => s.id === subscriptionId) && (
@@ -453,6 +465,9 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
                 className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR}`}
               />
             </Field>
+            {trigger.scope === SCOPE.AGENT && (
+              <WhoIsToldField id="trigger-who-is-told" value={audience} onChange={setAudience} />
+            )}
           </>
         )}
         <Field label="Debounce in seconds">
@@ -563,6 +578,10 @@ export function Modal({ onClose, title, busy = false, dismissible = 'any', child
 export function FormError({ text }: { text: string }) {
   if (!text) return null
   return <p role="alert" className="text-xs text-status-danger-fg">{text}</p>
+}
+
+function chosenMarkHint(subs: WebhookSubscription[], id: string): string | undefined {
+  return mcpStateSentence(subs.find((s) => s.id === id)?.mcp_state)
 }
 
 export function Field({ label, hint, info, children }: { label: string; hint?: string; info?: string; children: React.ReactNode }) {

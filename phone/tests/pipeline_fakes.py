@@ -256,8 +256,9 @@ class FakeSTT:
 
     # The call's second listen (``relisten.TurnRelisten``): ``completed``
     # rewrites a turn's text, ``wordless`` is a wordless turn's words.
-    def enable_turn_relisten(self):
+    def enable_turn_relisten(self, *, wide=False):
         self.turn_relisten = True
+        self.turn_relisten_wide = wide
 
     async def complete_turn(self, text, bound):
         self.completions = getattr(self, "completions", []) + [(text, bound)]

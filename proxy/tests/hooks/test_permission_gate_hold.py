@@ -177,3 +177,70 @@ def test_the_gate_stamps_its_call_with_this_hosts_clock(gate, monkeypatch):
     monkeypatch.setattr(gate.sys, "stdout", io.StringIO())
     gate.main()
     assert sent and sent[0]["hook_sent_at"] == 1234.5 and sent[0]["tool_name"] == "AskUserQuestion"
+
+
+def test_the_gate_forwards_the_calls_id(gate, monkeypatch):
+    """The body carries the hook input's ``tool_use_id``: a call the gate
+    allows in Plan is recorded under it for the CLI's own ask that follows
+    (Claude Code 2.1.299+); an input without one sends an empty id."""
+    import json
+    sent = []
+
+    def urlopen(req, timeout=0):
+        sent.append(json.loads(req.data))
+        return _Resp(b'{"decision": "allow"}')
+
+    monkeypatch.setattr(gate.urllib.request, "urlopen", urlopen)
+    monkeypatch.setenv("OTO_SESSION_ID", "s1")
+    monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("PROXY_API_KEY", "k")
+    for inp in ({"tool_name": "Bash", "tool_input": {}, "tool_use_id": "toolu_1"},
+                {"tool_name": "Bash", "tool_input": {}}):
+        monkeypatch.setattr(gate.sys, "stdin", io.StringIO(json.dumps(inp)))
+        monkeypatch.setattr(gate.sys, "stdout", io.StringIO())
+        gate.main()
+    assert [s["tool_use_id"] for s in sent] == ["toolu_1", ""]
+
+
+def _http_body(code, body: bytes):
+    return urllib.error.HTTPError("http://x", code, "x", {}, io.BytesIO(body))
+
+
+@pytest.mark.parametrize("failure, words", [
+    (lambda: urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+     "no answer at 127.0.0.1:57353: connection refused"),
+    (lambda: urllib.error.URLError(TimeoutError("timed out")), "no answer at 127.0.0.1:57353: timed out"),
+    (lambda: _http_body(503, b'{"error": "tunnel-not-connected"}'),
+     "this machine's link to OtoDock was down: 503"),
+    (lambda: _http_body(502, b'{"error": "tunnel-disconnected"}'),
+     "this machine's link to OtoDock dropped: 502"),
+    (lambda: _http_body(502, b'{"detail": "bad gateway"}'), "502 from the platform"),
+    (lambda: b"   ", "the platform's answer was cut off"),
+], ids=["refused", "timeout", "tunnel-503", "tunnel-502", "platform-502", "cut-off"])
+def test_the_hold_keeps_its_last_failure_in_words(gate, monkeypatch, failure, words):
+    gate._where = "127.0.0.1:57353"
+    _answers(gate, monkeypatch, [failure() for _ in range(50)])
+    assert gate._request_decision(object()) is None
+    assert gate._last_failure == words
+    assert gate._held_s == sum(gate._slept)
+
+
+def test_the_deny_names_the_failure_its_address_and_the_hold(gate, monkeypatch, capsys):
+    """The reason keeps its prefix and says which link failed: the field
+    incident read "platform unreachable" for hours with nothing listening
+    on the machine's tunnel port."""
+    import json
+    _answers(gate, monkeypatch,
+             [urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))] * 50)
+    for name, value in (("PROXY_URL", "http://127.0.0.1:57353"), ("PROXY_API_KEY", "k"),
+                        ("OTO_SESSION_ID", "s")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("OTO_HOOK_BRIDGED", raising=False)
+    monkeypatch.delenv("OTO_HOOK_DENY_ONLY", raising=False)
+    monkeypatch.setattr(gate.sys, "stdin", io.StringIO('{"tool_name": "Bash", "tool_input": {}}'))
+    gate.main()
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert out["permissionDecisionReason"] == (
+        "OtoDock platform unreachable (no answer at 127.0.0.1:57353: connection refused "
+        f"for {sum(gate._slept):.0f} s). Tool call denied (fail closed).")

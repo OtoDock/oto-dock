@@ -1,0 +1,21 @@
+{
+ "source": "The microphone refused before the recognizer started: the start fails with the sentence, nothing else is said.",
+ "events": [
+  {
+   "event": "error",
+   "error": "not-allowed"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "NOT_ALLOWED",
+  "finals": [],
+  "replaces": [],
+  "interims": [],
+  "errors": [],
+  "ended": [],
+  "recognizers": 1
+ }
+}

@@ -24,3 +24,7 @@ mathml2omml>=0.0.2
 ziamath>=0.13
 cairosvg>=2.9.1
 dwml>=0.3
+# Font metrics for measured text fit (advance widths of the fonts the image
+# ships); openpyxl parses workbooks through defusedxml when it is installed.
+fonttools>=4.50
+defusedxml>=0.7

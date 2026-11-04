@@ -194,3 +194,17 @@ describe('MarkdownContent — clickable file chips (chat context)', () => {
     expect(screen.queryByTestId('file-preview-body')).toBeNull()
   })
 })
+
+describe('MarkdownContent — inline code while the find bar is open', () => {
+  it('keeps the code text whole and highlights the prose around it', () => {
+    render(
+      <SearchProvider query="ruff">
+        <MarkdownContent>{'Gates: ruff on `relay_client.py` and `test_hosted_relay.py` clean.'}</MarkdownContent>
+      </SearchProvider>,
+    )
+    const chips = screen.getAllByText(/relay/).filter((el) => el.tagName === 'CODE')
+    expect(chips.map((c) => c.textContent)).toEqual(['relay_client.py', 'test_hosted_relay.py'])
+    expect(document.body.textContent).not.toContain('[object Object]')
+    expect(document.querySelector('mark')?.textContent).toBe('ruff')
+  })
+})

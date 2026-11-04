@@ -16,6 +16,8 @@ export const FLAG_DEFAULTS: { [K in FlagName]-?: FlagValue<K> } = {
   interactive_terminal_enabled: true,
   upload_max_bytes: 1024 * 1024 * 1024,
   recover_bin_max_bytes: 100 * 1024 * 1024,
+  store_review_enabled: true,
+  store_review_days: 90,
 }
 
 export function flagValue<K extends FlagName>(user: User | null | undefined, name: K): FlagValue<K> {

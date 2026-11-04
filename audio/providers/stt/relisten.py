@@ -44,7 +44,7 @@ import threading
 import time
 import wave
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -390,6 +390,44 @@ class _SecondListen:
                 return kept, cut
         return [], (0.0, 0.0)
 
+    def _merged(self, text: str, words: list[Word], extra: list[Word]) -> tuple[str, list[Word]]:
+        """``text`` (its timed ``words``) with ``extra`` words spliced in by
+        time: token by token where the words line up with the text, else
+        before and after the text as a block."""
+        if not extra:
+            return text, words
+        pairs = self._timed_tokens(text, words)
+        if pairs is not None:
+            pairs += [(w.word, w) for w in extra]
+        elif words:
+            first = words[0].start
+            before = [w for w in extra if _mid(w) < first]
+            after = [w for w in extra if _mid(w) >= first]
+            joined = " ".join([*(w.word for w in before), text, *(w.word for w in after)]).strip()
+            return joined, sorted([*words, *extra], key=lambda w: w.start)
+        else:
+            pairs = [(w.word, w) for w in extra] + ([(text, Word(text, 0.0, 0.0))] if text else [])
+        pairs.sort(key=lambda p: p[1].start)
+        return " ".join(t for t, _ in pairs).strip(), sorted([*words, *extra], key=lambda w: w.start)
+
+    def _timed_tokens(self, text: str, words: list[Word]) -> list[tuple[str, Word]] | None:
+        """The window's text tokens, each with the timed word it is (a
+        token that is punctuation alone rides with the word before it), or
+        None when they do not line up."""
+        out: list[tuple[str, Word]] = []
+        timed = iter(words)
+        for token in text.split():
+            if self._norm(token):
+                word = next(timed, None)
+                if word is None:
+                    return None
+                out.append((token, word))
+            elif out:
+                out[-1] = (f"{out[-1][0]} {token}", out[-1][1])
+            else:
+                return None
+        return out if words and next(timed, None) is None else None
+
 
 class Relisten(_SecondListen):
     """The FIFO, the re-listens and their bounds for one live stream."""
@@ -548,41 +586,6 @@ class Relisten(_SecondListen):
 
     # ── The merge and the release ──────────────────────────────────
 
-    def _merged(self, entry: _Held, extra: list[Word]) -> tuple[str, list[Word]]:
-        if not extra:
-            return entry.text, entry.words
-        pairs = self._timed_tokens(entry)
-        if pairs is not None:
-            pairs += [(w.word, w) for w in extra]
-        elif entry.words:
-            first = entry.words[0].start
-            before = [w for w in extra if _mid(w) < first]
-            after = [w for w in extra if _mid(w) >= first]
-            text = " ".join([*(w.word for w in before), entry.text, *(w.word for w in after)]).strip()
-            return text, sorted([*entry.words, *extra], key=lambda w: w.start)
-        else:
-            pairs = [(w.word, w) for w in extra] + ([(entry.text, Word(entry.text, 0.0, 0.0))] if entry.text else [])
-        pairs.sort(key=lambda p: p[1].start)
-        return " ".join(t for t, _ in pairs).strip(), sorted([*entry.words, *extra], key=lambda w: w.start)
-
-    def _timed_tokens(self, entry: _Held) -> list[tuple[str, Word]] | None:
-        """The window's text tokens, each with the timed word it is (a
-        token that is punctuation alone rides with the word before it), or
-        None when they do not line up."""
-        out: list[tuple[str, Word]] = []
-        words = iter(entry.words)
-        for token in entry.text.split():
-            if self._norm(token):
-                word = next(words, None)
-                if word is None:
-                    return None
-                out.append((token, word))
-            elif out:
-                out[-1] = (f"{out[-1][0]} {token}", out[-1][1])
-            else:
-                return None
-        return out if entry.words and next(words, None) is None else None
-
     def _complete(self, entry: _Held, recovered: list[Word]) -> None:
         # The recovered words, and every word the person was shown that the
         # second listen did not hear again (painted words never die).
@@ -596,11 +599,11 @@ class Relisten(_SecondListen):
             extra.append(w)
         extra.sort(key=lambda w: w.start)
         entry.relistened = bool(extra)
-        entry.out_text, entry.out_words = self._merged(entry, extra)
+        entry.out_text, entry.out_words = self._merged(entry.text, entry.words, extra)
         entry.done = True
 
     def _placeholder(self, entry: _Held) -> str:
-        return entry.out_text if entry.done else self._merged(entry, entry.shown)[0]
+        return entry.out_text if entry.done else self._merged(entry.text, entry.words, entry.shown)[0]
 
     def held_text(self) -> str:
         """The held windows' text as the person sees it meanwhile."""
@@ -668,13 +671,20 @@ class TurnRelisten(_SecondListen):
     all over ``RELISTEN_MIN_SPEECH_S`` of speech is listened to again at once,
     in the background (nothing waits for it there); the turn's take waits for
     what is still out, at most its bound, and gets the recovered words
-    spliced into the turn's text by time (``complete``)."""
+    spliced into the turn's text by time (``complete``).
+
+    The wide form (``wide``, the spoken conversation on a chat): a window
+    WITH words whose uncovered stretches hold speech (nova-3 keeps a Greek
+    window's tail) is listened to again as well, stretch by stretch, the
+    words spliced into that window's text by word time. Calls keep the
+    narrow form: their take's budget is tight, 8 kHz unmeasured."""
 
     _surface = "call"
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, *, wide: bool = False, **kwargs) -> None:
         super().__init__(**kwargs)
         self._turn: list[_Window] = []
+        self.wide = wide
 
     def reset(self, rate: int) -> None:
         """A new connection: its clock starts at zero; the turn's notes go."""
@@ -697,16 +707,54 @@ class TurnRelisten(_SecondListen):
         """A live final of ``[start, end)`` on the connection's clock."""
         window = _Window(start=start, end=end, text=text.strip(), words=list(words))
         self._turn.append(window)
-        if window.text or not enabled or self.closed or not self._speech.usable:
+        if not enabled or self.closed or not self._speech.usable:
+            return
+        if window.text and not self.wide:
             return
         if self._budget_left() <= 0:
             self._note_budget()
+            return
+        if window.text:
+            # The wide form: the stretches of the window no word covers.
+            stretches = []
+            for a, b in uncovered(start, end, window.words):
+                samples, _ = self.ring.samples(a, b)
+                if loud_seconds(samples, self.ring.rate) >= RELISTEN_MIN_SPEECH_S:
+                    stretches.append((a, b))
+            if stretches:
+                window.task = asyncio.get_running_loop().create_task(self._work_stretches(window, stretches))
             return
         stretch, at = self.ring.samples(start, end)
         if loud_seconds(stretch, self.ring.rate) < RELISTEN_MIN_SPEECH_S:
             return
         context, _ = self.ring.samples(max(0.0, at - SPEECH_CONTEXT_S), at)
         window.task = asyncio.get_running_loop().create_task(self._work(window, context, stretch))
+
+    async def _work_stretches(self, window: _Window, stretches: list[tuple[float, float]]) -> None:
+        """The wide form's listen: each stretch with speech in it, one cut
+        at a time, the words kept beside the window's own."""
+        began = time.monotonic()
+        try:
+            heard = []
+            for a, b in stretches:
+                stretch, at = self.ring.samples(a, b)
+                context, _ = self.ring.samples(max(0.0, at - SPEECH_CONTEXT_S), at)
+                heard.append((a, b, context, stretch))
+            gaps = await asyncio.to_thread(self._gaps, heard)
+            recovered: list[Word] = []
+            for a, b, _speech in gaps:
+                # Bounded by the stretch and compared against the words the
+                # earlier stretches recovered: a wider cut reaches back into
+                # them (dictation's ``Relisten._keep`` does the same).
+                words, _cut = await self._cuts(a, b, lambda found, a=a, b=b: self._keep(found, window, a, b, recovered))
+                recovered.extend(words)
+            window.recovered = sorted(recovered, key=lambda w: w.start)
+            logger.info("call re-listen (%s, wide): %d stretch(es) in a window with words, %d word(s) back in %.1f s",
+                        self.label, len(gaps), len(window.recovered), time.monotonic() - began)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001  # a re-listen that failed leaves the turn as the live stream left it
+            logger.warning("call re-listen failed: %s", e)
 
     async def _work(self, window: _Window, context: np.ndarray, stretch: np.ndarray) -> None:
         began = time.monotonic()
@@ -726,19 +774,26 @@ class TurnRelisten(_SecondListen):
         except Exception as e:  # noqa: BLE001  # a re-listen that failed leaves the turn as the live stream left it
             logger.warning("call re-listen failed: %s", e)
 
-    def _keep(self, words: list[Word], window: _Window) -> list[Word]:
+    def _keep(self, words: list[Word], window: _Window, a: float | None = None, b: float | None = None,
+              recovered: Sequence[Word] = ()) -> list[Word]:
+        """The cut's words inside ``[a, b)`` (the window when unset, a
+        stretch of it in the wide form, never past the window's end), not
+        over a live word, and not a repeat of a live, an already recovered
+        or an already kept word."""
+        start = window.start if a is None else a
+        end = window.end if b is None else min(b, window.end)
         live = [w for other in self._turn for w in other.words]
         kept: list[Word] = []
         for w in words:
             form = self._norm(w.word)
             if not form:
                 continue
-            if w.end <= window.start + 0.05 or w.start >= window.end + EDGE_TOLERANCE_S:
+            if w.end <= start + 0.05 or w.start >= end + EDGE_TOLERANCE_S:
                 continue
             if any(_overlap(w, c) > 0.5 * min(w.end - w.start, c.end - c.start) for c in live):
                 continue
             if any(self._norm(c.word) == form and abs(c.start - w.start) <= DUPLICATE_WITHIN_S
-                   for c in [*live, *kept]):
+                   for c in [*live, *recovered, *kept]):
                 continue
             kept.append(w)
         return kept
@@ -794,13 +849,29 @@ class TurnRelisten(_SecondListen):
             return " ".join(w.word for w in window.recovered)
 
         if self._same(text, " ".join(w.text for w in finals)):
-            pieces = sorted([(w.start, w.text) for w in finals] + [(g.start, said(g)) for g in gaps])
+            # A window with words of its own (the wide form) takes the
+            # recovered words by word time; a wordless one is its words.
+            pieces = [(w.start, self._merged(w.text, w.words, w.recovered)[0] if w in gaps else w.text) for w in finals]
+            pieces += [(g.start, said(g)) for g in gaps if not g.text]
+            pieces.sort(key=lambda p: p[0])
             return " ".join(p for _, p in pieces)
         # The turn's text is not the finals' alone (a live partial went out
-        # in a final's place, a segment was deduplicated): each window's
-        # words go after the last final before it, found in the text.
+        # in a final's place, a segment was deduplicated): a window with
+        # words of its own is found in the text and rewritten with its
+        # recovered words in place, by word time; a wordless window's words
+        # go after the last final before it, found in the text.
         out, at = text, 0
         for gap in gaps:
+            if gap.text:
+                i = out.find(gap.text, at)
+                if i >= 0:
+                    merged = self._merged(gap.text, gap.words, gap.recovered)[0]
+                    out = f"{out[:i]}{merged}{out[i + len(gap.text):]}"
+                    at = i + len(merged)
+                else:
+                    out = f"{out} {said(gap)}"
+                    at = len(out)
+                continue
             before = [w for w in finals if w.start < gap.start]
             add = said(gap)
             if not before:

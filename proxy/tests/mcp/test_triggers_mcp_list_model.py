@@ -1,6 +1,7 @@
 """triggers-mcp ``list_triggers``: a task-linked trigger names the model its
 task runs on (pinned or default, with the tier), an app trigger names its
-handler, a notify-only trigger stays plain."""
+handler, a notify-only trigger stays plain. ``list_subscriptions``: a
+subscription whose MCP is off or removed says so instead of its own status."""
 
 from __future__ import annotations
 
@@ -48,3 +49,40 @@ def test_list_names_the_linked_task_model_with_source_and_tier(monkeypatch):
     assert "action=task=Nightly model=gpt-6-sol [agent default]" in text
     assert "action=app=deploy-board/github" in text
     assert "action=notify(info)" in text
+
+
+def _subscription(**over):
+    base = {
+        "id": "s-1", "provider_id": "github", "account_label": "octo", "vendor_target": "octo/repo",
+        "selected_events": ["push"], "scope": "user", "status": "active", "mcp_state": "on",
+    }
+    base.update(over)
+    return base
+
+
+def test_list_subscriptions_marks_a_subscription_whose_mcp_is_off_or_removed(monkeypatch):
+    mod = _mod()
+
+    async def _get(path, params=None):
+        assert path == "/v1/subscriptions"
+        return {"subscriptions": [
+            _subscription(),
+            _subscription(id="s-2", mcp_state="off"),
+            _subscription(id="s-3", mcp_state="removed"),
+            _subscription(id="s-4", mcp_state=None),
+        ]}
+
+    monkeypatch.setattr(mod, "_get", _get)
+    lines = asyncio.run(mod._handle_list_subscriptions({}))[0].text.splitlines()
+    by_id = {line.rsplit("id=", 1)[1]: (i, line) for i, line in enumerate(lines) if "id=" in line}
+    assert "status=active" in by_id["s-1"][1]
+    # An older proxy sends no mcp_state: the row's own status stands.
+    assert "status=active" in by_id["s-4"][1]
+    i, off = by_id["s-2"]
+    assert "status=mcp_off" in off and "status=active" not in off
+    assert lines[i + 1].strip() == ("Its MCP is turned off. It receives no events until an admin "
+                                    "turns the MCP on again.")
+    i, removed = by_id["s-3"]
+    assert "status=mcp_removed" in removed
+    assert lines[i + 1].strip() == "Its MCP was removed. It receives no events. Delete it, or install the MCP again."
+    assert len(lines) == 1 + 4 + 2

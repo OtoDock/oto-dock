@@ -146,15 +146,17 @@ def get_verdict(verdict_id: str) -> dict | None:
 
 
 def list_verdicts(agent: str, *, user_sub: str | None = None, chat_id: str = "",
-                  check_name: str = "", limit: int = VERDICT_LIST_MAX, before: str = "") -> list[dict]:
+                  check_name: str = "", limit: int = VERDICT_LIST_MAX, before: str = "",
+                  agent_scope: bool = True) -> list[dict]:
     """Newest first. ``user_sub`` set → that user's own verdicts plus the
-    agent-scope ones (a member's slice); None → every verdict (a manager).
+    agent-scope ones (a member's slice; ``agent_scope=False`` leaves those out,
+    below the editor tier); None → every verdict (a manager).
     ``before`` (an ISO time) keeps the rows older than it — the page
     cursor of the Checks tab."""
     clauses = ["agent=%s"]
     args: list = [agent]
     if user_sub is not None:
-        clauses.append("(user_sub=%s OR user_sub='')")
+        clauses.append("(user_sub=%s OR user_sub='')" if agent_scope else "user_sub=%s")
         args.append(user_sub)
     if chat_id:
         clauses.append("chat_id=%s")

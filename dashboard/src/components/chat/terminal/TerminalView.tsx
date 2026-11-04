@@ -84,6 +84,7 @@ export default function TerminalView({ ws, chatId, className, agent, artifacts, 
     <div className={`relative flex-1 min-h-0 bg-surface-page overflow-hidden ${className || ''}`}>
       <div ref={containerRef} className="absolute inset-0" onMouseDown={focus} />
       <ArtifactWindows
+        chatId={chatId}
         windows={artifacts.windows}
         minimized={artifacts.minimized}
         onClose={artifacts.close}

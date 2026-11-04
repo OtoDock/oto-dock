@@ -9,35 +9,35 @@ Lightroom-style editing with research-backed algorithms:
 """
 
 import asyncio
-import contextlib
 import contextvars
 import functools
 import io
 import os
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from batch import run_batch
+from catalog import MISSING, Catalog, KeySpec, OpSpec
+from formats.pdf import image_tone
+from formats.pdf.pages import whole
+from results import Code, NoOp, OpCtx, OpError
 from shared import (
-    _RESOLVE_ERR_PREFIX,
     HOOK_TIMEOUT,
     PROXY_URL,
-    _checked_resolved,
     _current_session,
-    _dropped_note,
-    _normalize_operations,
     _notify_file_written,
-    _op_type,
     _push_image_preview,
     _resolve_path,
     _to_agents_relative,
-    logger,
     safe_open_write,
 )
+
+_EXAMPLE_PNG = "logo.png"
 
 # rembg background-removal model. We use ``isnet-general-use`` (noticeably
 # cleaner edges/hair than ``u2net`` at the same ~176MB size + CPU-speed class;
@@ -113,6 +113,8 @@ class _ImageEdit:
     out: str
     compress_quality: int | None = None
     compress_format: str | None = None
+    targets: dict[str, str] = field(default_factory=dict)   # convert_format's resolved outputs
+    segment: Any = None                                      # remove_background's model, set lazily
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +166,7 @@ def _tone_check_line(before: dict, after: dict) -> str:
     )
 
 
-def _op_resize(job: _ImageEdit, op: dict) -> None:
+def _op_resize(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
     w = int(op.get("width", job.img.width))
@@ -175,7 +177,7 @@ def _op_resize(job: _ImageEdit, op: dict) -> None:
         job.img = job.img.resize((w, h), Image.LANCZOS)
 
 
-def _op_crop(job: _ImageEdit, op: dict) -> None:
+def _op_crop(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     left = int(op.get("left", 0))
     top = int(op.get("top", 0))
     right = int(op.get("right", job.img.width))
@@ -183,7 +185,7 @@ def _op_crop(job: _ImageEdit, op: dict) -> None:
     job.img = job.img.crop((left, top, right, bottom))
 
 
-def _op_rotate(job: _ImageEdit, op: dict) -> None:
+def _op_rotate(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
     degrees = float(op.get("degrees", 0))
@@ -193,7 +195,7 @@ def _op_rotate(job: _ImageEdit, op: dict) -> None:
     )
 
 
-def _op_flip(job: _ImageEdit, op: dict) -> None:
+def _op_flip(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
     direction = op.get("direction", "horizontal")
@@ -203,7 +205,7 @@ def _op_flip(job: _ImageEdit, op: dict) -> None:
         job.img = job.img.transpose(Image.FLIP_TOP_BOTTOM)
 
 
-def _op_brightness(job: _ImageEdit, op: dict) -> None:
+def _op_brightness(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageEnhance
 
     job.img = ImageEnhance.Brightness(job.img).enhance(
@@ -211,7 +213,7 @@ def _op_brightness(job: _ImageEdit, op: dict) -> None:
     )
 
 
-def _op_contrast(job: _ImageEdit, op: dict) -> None:
+def _op_contrast(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageEnhance
 
     job.img = ImageEnhance.Contrast(job.img).enhance(
@@ -219,7 +221,7 @@ def _op_contrast(job: _ImageEdit, op: dict) -> None:
     )
 
 
-def _op_saturation(job: _ImageEdit, op: dict) -> None:
+def _op_saturation(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageEnhance
 
     job.img = ImageEnhance.Color(job.img).enhance(
@@ -227,7 +229,7 @@ def _op_saturation(job: _ImageEdit, op: dict) -> None:
     )
 
 
-def _op_sharpness(job: _ImageEdit, op: dict) -> None:
+def _op_sharpness(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageEnhance
 
     job.img = ImageEnhance.Sharpness(job.img).enhance(
@@ -235,14 +237,14 @@ def _op_sharpness(job: _ImageEdit, op: dict) -> None:
     )
 
 
-def _op_grayscale(job: _ImageEdit, op: dict) -> None:
+def _op_grayscale(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageOps
 
     job.img = ImageOps.grayscale(job.img)
     job.img = job.img.convert("RGB")
 
 
-def _op_sepia(job: _ImageEdit, op: dict) -> None:
+def _op_sepia(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image, ImageOps
 
     gray = ImageOps.grayscale(job.img)
@@ -257,7 +259,7 @@ def _op_sepia(job: _ImageEdit, op: dict) -> None:
     job.img = sepia
 
 
-def _op_invert(job: _ImageEdit, op: dict) -> None:
+def _op_invert(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image, ImageOps
 
     if job.img.mode == "RGBA":
@@ -269,32 +271,32 @@ def _op_invert(job: _ImageEdit, op: dict) -> None:
         job.img = ImageOps.invert(job.img.convert("RGB"))
 
 
-def _op_blur(job: _ImageEdit, op: dict) -> None:
+def _op_blur(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageFilter
 
     radius = float(op.get("radius", 2))
     job.img = job.img.filter(ImageFilter.GaussianBlur(radius=radius))
 
 
-def _op_sharpen(job: _ImageEdit, op: dict) -> None:
+def _op_sharpen(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageFilter
 
     job.img = job.img.filter(ImageFilter.SHARPEN)
 
 
-def _op_edge_enhance(job: _ImageEdit, op: dict) -> None:
+def _op_edge_enhance(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageFilter
 
     job.img = job.img.filter(ImageFilter.EDGE_ENHANCE_MORE)
 
 
-def _op_emboss(job: _ImageEdit, op: dict) -> None:
+def _op_emboss(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageFilter
 
     job.img = job.img.filter(ImageFilter.EMBOSS)
 
 
-def _op_auto_enhance(job: _ImageEdit, op: dict) -> None:
+def _op_auto_enhance(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageEnhance, ImageOps
 
     job.img = ImageOps.autocontrast(job.img)
@@ -302,7 +304,7 @@ def _op_auto_enhance(job: _ImageEdit, op: dict) -> None:
     job.img = ImageEnhance.Sharpness(job.img).enhance(1.1)
 
 
-def _op_color_temperature(job: _ImageEdit, op: dict) -> None:
+def _op_color_temperature(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
     temp = float(op.get("temperature", 5500))
@@ -320,7 +322,7 @@ def _op_color_temperature(job: _ImageEdit, op: dict) -> None:
         job.img = Image.merge("RGB", (r, g, b))
 
 
-def _op_exposure(job: _ImageEdit, op: dict) -> None:
+def _op_exposure(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
     gamma = float(op.get("gamma", 1.0))
@@ -340,7 +342,7 @@ def _op_exposure(job: _ImageEdit, op: dict) -> None:
         job.img = Image.merge(job.img.mode, channels)
 
 
-def _op_add_text(job: _ImageEdit, op: dict) -> None:
+def _op_add_text(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageDraw, ImageFont
 
     draw = ImageDraw.Draw(job.img)
@@ -348,7 +350,7 @@ def _op_add_text(job: _ImageEdit, op: dict) -> None:
     x = int(op.get("x", 10))
     y = int(op.get("y", 10))
     font_size = int(op.get("font_size", 24))
-    color = op.get("color", "#FFFFFF")
+    color = _rgb(op.get("color", "#FFFFFF"))
     try:
         font = ImageFont.truetype(
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -359,18 +361,21 @@ def _op_add_text(job: _ImageEdit, op: dict) -> None:
     draw.text((x, y), text, fill=color, font=font)
 
 
-def _op_add_border(job: _ImageEdit, op: dict) -> None:
+def _op_add_border(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageOps
 
     border_w = int(op.get("width", 5))
-    color = op.get("color", "#000000")
+    color = _rgb(op.get("color", "#000000"))
     job.img = ImageOps.expand(job.img, border=border_w, fill=color)
 
 
-def _op_paste_image(job: _ImageEdit, op: dict) -> None:
+def _op_paste_image(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
-    overlay_path = _checked_resolved(op["image_path"])
+    overlay_path = op["image_path"]
+    if not os.path.isfile(overlay_path):
+        raise OpError(Code.NOT_FOUND, f"the image {Path(overlay_path).name} does not exist", location="image_path",
+                      hint="Check the path.")
     overlay = Image.open(overlay_path)
     x = int(op.get("x", 0))
     y = int(op.get("y", 0))
@@ -391,7 +396,7 @@ def _op_paste_image(job: _ImageEdit, op: dict) -> None:
         job.img.paste(overlay, (x, y))
 
 
-def _op_add_watermark(job: _ImageEdit, op: dict) -> None:
+def _op_add_watermark(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image, ImageDraw, ImageFont
 
     txt = op.get("text", "WATERMARK")
@@ -420,404 +425,22 @@ def _op_add_watermark(job: _ImageEdit, op: dict) -> None:
     job.img = job.img.convert("RGB")
 
 
-def _op_highlights(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
-    from PIL import Image, ImageFilter
-
-    amount = float(op.get("amount", 0))
-    if amount != 0:
-        arr = np.array(job.img, dtype=np.float32) / 255.0
-        lum = (
-            0.299 * arr[:, :, 0]
-            + 0.587 * arr[:, :, 1]
-            + 0.114 * arr[:, :, 2]
-        )
-        blur_r = max(3, int(job.img.width * 0.025))
-        blur_img = job.img.filter(
-            ImageFilter.GaussianBlur(radius=blur_r)
-        )
-        arr_blur = np.array(blur_img, dtype=np.float32) / 255.0
-        inv_blur = 1.0 - arr_blur
-        overlay = np.where(
-            arr > 0.5,
-            1.0 - (1.0 - 2 * (arr - 0.5)) * (1.0 - inv_blur),
-            2.0 * arr * inv_blur,
-        )
-        compress = 0.5
-        lum_norm = lum / (1.0 - compress + 1e-7)
-        mask = np.clip(1.0 - (1.0 - lum_norm), 0, 1) ** 2
-        mask = mask[:, :, np.newaxis]
-        strength = (
-            (abs(amount) / 100.0) ** 1.5
-            * np.sign(amount)
-            * 0.6
-        )
-        if amount < 0:
-            arr = arr * (1 - mask * abs(strength)) + overlay * mask * abs(strength)
-        else:
-            arr = arr + mask * strength * (1.0 - arr) * 0.5
-        job.img = Image.fromarray(
-            np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
-        )
-
-
-def _op_shadows(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
-    from PIL import Image, ImageFilter
-
-    amount = float(op.get("amount", 0))
-    if amount != 0:
-        arr = np.array(job.img, dtype=np.float32) / 255.0
-        lum = (
-            0.299 * arr[:, :, 0]
-            + 0.587 * arr[:, :, 1]
-            + 0.114 * arr[:, :, 2]
-        )
-        blur_r = max(3, int(job.img.width * 0.025))
-        blur_img = job.img.filter(
-            ImageFilter.GaussianBlur(radius=blur_r)
-        )
-        arr_blur = np.array(blur_img, dtype=np.float32) / 255.0
-        inv_blur = 1.0 - arr_blur
-        overlay = np.where(
-            arr > 0.5,
-            1.0 - (1.0 - 2 * (arr - 0.5)) * (1.0 - inv_blur),
-            2.0 * arr * inv_blur,
-        )
-        compress = 0.5
-        mask = (
-            np.clip(1.0 - lum / (compress + 1e-7), 0, 1) ** 2
-        )
-        mask = mask[:, :, np.newaxis]
-        strength = (abs(amount) / 100.0) ** 1.5 * 0.6
-        if amount > 0:
-            arr = arr * (1 - mask * strength) + overlay * mask * strength
-        else:
-            arr = (
-                arr * (1 - mask * strength * 0.5)
-                + (arr * arr) * mask * strength * 0.5
-            )
-        job.img = Image.fromarray(
-            np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
-        )
-
-
-def _op_blacks(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
+def _op_remove_background(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
-    level = float(op.get("level", 0))
-    arr = np.array(job.img, dtype=np.float32) / 255.0
-    if level > 0:
-        lift = level / 100.0 * 0.08
-        arr = lift + arr * (1.0 - lift)
-    elif level < 0:
-        power = 1.0 + abs(level) / 100.0 * 0.5
-        arr = arr**power
-    job.img = Image.fromarray(
-        np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
-    )
-
-
-def _op_whites(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
-    from PIL import Image
-
-    level = float(op.get("level", 0))
-    arr = np.array(job.img, dtype=np.float32) / 255.0
-    if level > 0:
-        power = 1.0 - level / 100.0 * 0.15
-        mask = np.clip((arr - 0.6) / 0.4, 0, 1)
-        arr = arr * (1 - mask) + (arr**power) * mask
-    elif level < 0:
-        compress = 1.0 - abs(level) / 100.0 * 0.15
-        arr = np.where(
-            arr > compress,
-            compress + (arr - compress) * 0.3,
-            arr,
-        )
-    job.img = Image.fromarray(
-        np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
-    )
-
-
-def _op_clarity(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
-    from PIL import Image, ImageFilter
-
-    amount = float(op.get("amount", 20))
-    radius = max(3, int(job.img.width * 0.02))
-    scale = amount / 100.0 * 0.4
-    arr = np.array(job.img, dtype=np.float32)
-    lum = (
-        0.299 * arr[:, :, 0]
-        + 0.587 * arr[:, :, 1]
-        + 0.114 * arr[:, :, 2]
-    )
-    lum_img = Image.fromarray(lum.astype(np.uint8), "L")
-    lum_blur = np.array(
-        lum_img.filter(ImageFilter.GaussianBlur(radius=radius)),
-        dtype=np.float32,
-    )
-    detail = lum - lum_blur
-    midtone_w = np.exp(
-        -((lum / 255.0 - 0.5) ** 2) / (2 * 0.2**2)
-    )
-    lum_boost = detail * scale * midtone_w
-    lum_safe = np.maximum(lum, 1.0)
-    ratio = ((lum + lum_boost) / lum_safe)[:, :, np.newaxis]
-    arr = arr * ratio
-    job.img = Image.fromarray(
-        np.clip(arr, 0, 255).astype(np.uint8), job.img.mode
-    )
-
-
-def _op_dehaze(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
-    from PIL import Image
-    from scipy.ndimage import minimum_filter, uniform_filter
-
-    strength = float(op.get("strength", 0.3))
-    arr = np.array(job.img, dtype=np.float32) / 255.0
-    dark = np.min(arr, axis=2)
-    win = max(5, int(min(job.img.width, job.img.height) * 0.01))
-    try:
-        dark_channel = minimum_filter(dark, size=win)
-    except Exception:  # noqa: BLE001  # scipy's filter on an odd window raises anything, the raw channel stands
-        dark_channel = dark
-    n_pixels = max(1, int(dark_channel.size * 0.001))
-    flat_dark = dark_channel.flatten()
-    threshold = np.partition(flat_dark, -n_pixels)[-n_pixels]
-    bright_mask = dark_channel >= threshold
-    A = np.array(
-        [arr[:, :, c][bright_mask].mean() for c in range(3)]
-    )
-    A = np.clip(A, 0.5, 1.0)
-    norm = arr / (A[np.newaxis, np.newaxis, :] + 1e-7)
-    t_map = 1.0 - strength * np.min(norm, axis=2)
-    t_map = np.clip(t_map, 0.1, 1.0)
-    with contextlib.suppress(Exception):
-        t_map = uniform_filter(t_map, size=win * 4)
-    t_3d = t_map[:, :, np.newaxis]
-    arr = (arr - A[np.newaxis, np.newaxis, :]) / np.maximum(
-        t_3d, 0.1
-    ) + A[np.newaxis, np.newaxis, :]
-    job.img = Image.fromarray(
-        np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
-    )
-
-
-def _op_split_tone(job: _ImageEdit, op: dict) -> None:
-    import colorsys
-
-    import numpy as np
-    from PIL import Image
-
-    arr = np.array(job.img, dtype=np.float32) / 255.0
-    lum = (
-        0.299 * arr[:, :, 0]
-        + 0.587 * arr[:, :, 1]
-        + 0.114 * arr[:, :, 2]
-    )
-    fulcrum = 0.1845
-    x_offset = lum - fulcrum
-    x_norm = x_offset / (fulcrum + 1e-7)
-    weight = 4.0
-    with np.errstate(over="ignore"):
-        shadow_mask = 1.0 / (
-            1.0
-            + np.exp(np.clip(x_norm * weight, -20, 20))
-        )
-        highlight_mask = 1.0 / (
-            1.0
-            + np.exp(np.clip(-x_norm * weight, -20, 20))
-        )
-    s_comp = 1.0 - shadow_mask
-    h_comp = 1.0 - highlight_mask
-    midtone_mask = (
-        np.exp(-(x_offset**2) * weight / 4.0)
-        * s_comp**2
-        * h_comp**2
-        * 8.0
-    )
-
-    for zone_name, mask in [
-        ("shadows", shadow_mask),
-        ("midtones", midtone_mask),
-        ("highlights", highlight_mask),
-    ]:
-        zone = op.get(zone_name)
-        if not zone:
-            continue
-        hue = float(zone.get("hue", 0)) / 360.0
-        sat = float(zone.get("saturation", 50)) / 100.0
-        strength_z = float(zone.get("strength", 0.15))
-        tr, tg, tb = colorsys.hls_to_rgb(hue, 0.5, sat)
-        tint = (
-            np.array([tr, tg, tb], dtype=np.float32) - 0.5
-        )
-        zone_mask = mask[:, :, np.newaxis] * strength_z
-        arr = arr + tint[np.newaxis, np.newaxis, :] * zone_mask
-
-    job.img = Image.fromarray(
-        np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
-    )
-
-
-def _op_hsl_adjust(job: _ImageEdit, op: dict) -> None:
-    import numpy as np
-    from PIL import Image
-
-    arr = np.array(job.img, dtype=np.float32) / 255.0
-    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-    cmax = np.maximum(np.maximum(r, g), b)
-    cmin = np.minimum(np.minimum(r, g), b)
-    delta = cmax - cmin
-    light = (cmax + cmin) / 2
-    sat = np.where(
-        delta < 1e-7,
-        0,
-        delta / (1 - np.abs(2 * light - 1) + 1e-7),
-    )
-    hue = np.zeros_like(delta)
-    mask_r = (cmax == r) & (delta > 1e-7)
-    mask_g = (cmax == g) & (delta > 1e-7)
-    mask_b = (cmax == b) & (delta > 1e-7)
-    hue[mask_r] = (
-        60
-        * (
-            (g[mask_r] - b[mask_r])
-            / (delta[mask_r] + 1e-7)
-        )
-    ) % 360
-    hue[mask_g] = (
-        60
-        * (
-            (b[mask_g] - r[mask_g])
-            / (delta[mask_g] + 1e-7)
-        )
-        + 120
-    )
-    hue[mask_b] = (
-        60
-        * (
-            (r[mask_b] - g[mask_b])
-            / (delta[mask_b] + 1e-7)
-        )
-        + 240
-    )
-    hue = hue % 360
-
-    color_ranges = {
-        "red": (0, 45),
-        "orange": (30, 40),
-        "yellow": (60, 40),
-        "green": (120, 50),
-        "aqua": (180, 45),
-        "blue": (240, 45),
-        "purple": (270, 35),
-        "magenta": (330, 40),
-    }
-    sat_gate = np.clip(sat * 5, 0, 1)
-
-    for color_name, (center, width) in color_ranges.items():
-        adj = op.get(color_name)
-        if not adj:
-            continue
-        h_shift = float(adj.get("hue", 0))
-        s_shift = float(adj.get("saturation", 0)) / 100.0
-        l_shift = float(adj.get("lightness", 0)) / 100.0
-        diff = np.minimum(
-            np.abs(hue - center),
-            360 - np.abs(hue - center),
-        )
-        w = (
-            np.where(
-                diff < width,
-                0.5 * (1 + np.cos(np.pi * diff / width)),
-                0.0,
-            )
-            * sat_gate
-        )
-        if h_shift:
-            hue = hue + h_shift * w
-            hue = hue % 360
-        if s_shift:
-            sat = sat + s_shift * 0.5 * w
-            sat = np.clip(sat, 0, 1)
-        if l_shift:
-            light = light + l_shift * 0.3 * w
-            light = np.clip(light, 0, 1)
-
-    c = (1 - np.abs(2 * light - 1)) * sat
-    x = c * (1 - np.abs((hue / 60) % 2 - 1))
-    m = light - c / 2
-    h_sector = (hue / 60).astype(int) % 6
-    r_out = np.where(
-        h_sector == 0, c,
-        np.where(h_sector == 1, x,
-        np.where(h_sector == 4, x,
-        np.where(h_sector == 5, c, 0))),
-    )
-    g_out = np.where(
-        h_sector == 0, x,
-        np.where(h_sector == 1, c,
-        np.where(h_sector == 2, c,
-        np.where(h_sector == 3, x, 0))),
-    )
-    b_out = np.where(
-        h_sector == 2, x,
-        np.where(h_sector == 3, c,
-        np.where(h_sector == 4, c,
-        np.where(h_sector == 5, x, 0))),
-    )
-    arr_out = np.stack(
-        [(r_out + m), (g_out + m), (b_out + m)], axis=2
-    )
-    job.img = Image.fromarray(
-        np.clip(arr_out * 255, 0, 255).astype(np.uint8), "RGB"
-    )
-
-
-def _op_denoise(job: _ImageEdit, op: dict) -> None:
-    from PIL import Image, ImageFilter
-
-    strength = int(op.get("strength", 3))
-    ycbcr = job.img.convert("YCbCr")
-    y, cb, cr = ycbcr.split()
-    radius = max(1, strength * 0.8)
-    cb = cb.filter(ImageFilter.GaussianBlur(radius=radius))
-    cr = cr.filter(ImageFilter.GaussianBlur(radius=radius))
-    if strength >= 4:
-        y = y.filter(ImageFilter.GaussianBlur(radius=0.3))
-    ycbcr_out = Image.merge("YCbCr", (y, cb, cr))
-    job.img = ycbcr_out.convert("RGB")
-
-
-# ---------------------------------------------------------------------------
-# Edit — background removal, blur region, compress, convert
-# ---------------------------------------------------------------------------
-
-
-def _op_remove_background(job: _ImageEdit, op: dict) -> None:
-    from PIL import Image
-    from rembg import remove
-
-    job.img = remove(job.img, session=_get_rembg_session())
+    job.img = (job.segment or _segment)(job.img)
     # rembg returns RGBA with transparent background
     if job.img.mode != "RGBA":
         job.img = job.img.convert("RGBA")
     # If user wants a specific background color instead of transparent
     bg_color = op.get("background_color")
     if bg_color:
-        c = str(bg_color).lstrip("#")
-        r, g, b = int(c[:2], 16), int(c[2:4], 16), int(c[4:6], 16)
-        bg = Image.new("RGB", job.img.size, (r, g, b))
+        bg = Image.new("RGB", job.img.size, _rgb(bg_color))
         bg.paste(job.img, mask=job.img.split()[3])
         job.img = bg
 
 
-def _op_blur_region(job: _ImageEdit, op: dict) -> None:
+def _op_blur_region(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import ImageFilter
 
     # Blur a rectangular region (privacy: faces, plates, addresses)
@@ -838,7 +461,7 @@ def _op_blur_region(job: _ImageEdit, op: dict) -> None:
     top_coord = max(0, min(top_coord, job.img.height))
     right = max(left + 1, min(right, job.img.width))
     bottom = max(top_coord + 1, min(bottom, job.img.height))
-    radius = float(op.get("radius") or op.get("intensity") or op.get("strength") or 15)
+    radius = float(op.get("radius", 15))
     # Crop region, blur, paste back
     region = job.img.crop((left, top_coord, right, bottom))
     region = region.filter(
@@ -847,9 +470,9 @@ def _op_blur_region(job: _ImageEdit, op: dict) -> None:
     job.img.paste(region, (left, top_coord))
 
 
-def _op_compress(job: _ImageEdit, op: dict) -> None:
+def _op_compress(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     # Set compression for the final save
-    quality = int(op.get("quality", 75))
+    quality = whole(ctx, op.get("quality", 75), "quality")
     target_format = op.get("format", "").upper()
     if target_format == "JPG":
         target_format = "JPEG"
@@ -859,227 +482,324 @@ def _op_compress(job: _ImageEdit, op: dict) -> None:
         job.compress_format = target_format
 
 
-def _op_convert_format(job: _ImageEdit, op: dict) -> None:
+def _op_convert_format(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     # Convert to a different format by changing output path
-    target_format = op.get("format", "").lower()
-    if target_format:
-        if target_format == "jpg":
-            target_format = "jpeg"
-        new_ext = target_format if target_format != "jpeg" else "jpg"
-        job.out = str(Path(job.out).with_suffix(f".{new_ext}"))
+    target_format = _format_name(op.get("format", ""))
+    if not target_format:
+        raise NoOp("no format was given")
+    job.out = job.targets.get(target_format) or job.out
 
 
-_HANDLERS = {
-    "resize": _op_resize,
-    "crop": _op_crop,
-    "rotate": _op_rotate,
-    "flip": _op_flip,
-    "brightness": _op_brightness,
-    "contrast": _op_contrast,
-    "saturation": _op_saturation,
-    "sharpness": _op_sharpness,
-    "grayscale": _op_grayscale,
-    "sepia": _op_sepia,
-    "invert": _op_invert,
-    "blur": _op_blur,
-    "sharpen": _op_sharpen,
-    "edge_enhance": _op_edge_enhance,
-    "emboss": _op_emboss,
-    "auto_enhance": _op_auto_enhance,
-    "color_temperature": _op_color_temperature,
-    "exposure": _op_exposure,
-    "add_text": _op_add_text,
-    "add_border": _op_add_border,
-    "paste_image": _op_paste_image,
-    "add_watermark": _op_add_watermark,
-    "highlights": _op_highlights,
-    "shadows": _op_shadows,
-    "blacks": _op_blacks,
-    "whites": _op_whites,
-    "clarity": _op_clarity,
-    "dehaze": _op_dehaze,
-    "split_tone": _op_split_tone,
-    "hsl_adjust": _op_hsl_adjust,
-    "denoise": _op_denoise,
-    "remove_background": _op_remove_background,
-    "blur_region": _op_blur_region,
-    "compress": _op_compress,
-    "convert_format": _op_convert_format,
-}
+_FORMATS = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "tif": "tiff", "tiff": "tiff",
+            "bmp": "bmp", "gif": "gif"}
+_SUFFIX = {"jpeg": ".jpg", "png": ".png", "webp": ".webp", "tiff": ".tiff", "bmp": ".bmp", "gif": ".gif"}
 
 
-async def handle_edit_image(args: dict) -> str:
-    output_path = args.get("output_path")
-    # No output_path = in-place edit: the input IS the write target, so it
-    # must resolve as a write for the proxy's write-RBAC to fire (an editor
-    # could otherwise edit a /knowledge image in place through the
-    # read-resolved path). With an output_path the input stays read-only.
-    path = await _resolve_path(args["path"], writing=not output_path)
-    if not await asyncio.to_thread(os.path.exists, path):
-        return f"Error: File not found: {args['path']}"
-
-    if output_path:
-        out = await _resolve_path(output_path, writing=True)
-    else:
-        out = path
-
-    ops, dropped = _normalize_operations(args.get("operations"))
-    if args.get("operations") and not ops:
-        # A non-empty operations arg that normalizes to nothing means the
-        # caller's shape was unusable (double-encoded string, bare strings,
-        # …). Saving an unchanged copy here would read as success — fail
-        # loud instead.
-        return (
-            "Error: 'operations' could not be parsed into any operation "
-            "(expected a list of objects like {\"type\": \"resize\", ...}); "
-            "no edit was applied"
-        )
-    await _preresolve_paste_ops(ops)
-    edited = await _image_job(_edit_image_core, path, out, ops)
-    if isinstance(edited, str):
-        return edited
-    out = edited.out
-
-    # Flush platform-cache write to remote satellite (no-op for local).
-    await _notify_file_written(out)
-
-    # Push inline image preview
-    await _push_image_preview(
-        edited.preview, "image/jpeg", f"Edited: {Path(out).name}"
-    )
-
-    # Push file download link for full resolution
-    session_id, auth = _current_session()
-    if PROXY_URL and session_id and auth:
-        agents_rel = _to_agents_relative(out)
-        try:
-            async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
-                await client.post(
-                    f"{PROXY_URL}/v1/hooks/file",
-                    json={
-                        "session_id": session_id,
-                        "path": agents_rel,
-                        "filename": Path(out).name,
-                        "description": f"Full resolution ({edited.width}x{edited.height})",
-                    },
-                    headers={"Authorization": auth},
-                )
-        except httpx.HTTPError:
-            pass
-
-    result = (f"Image saved: {_to_agents_relative(out)} "
-              f"({edited.width}x{edited.height}, {len(ops)} operations applied)")
-    result += _dropped_note(dropped)
-    if edited.tone_check is not None:
-        result += "\n" + edited.tone_check
-    return result
+def _format_name(value: Any) -> str:
+    """A format the save takes (jpeg, png, webp, ...), "" for none."""
+    if not value:
+        return ""
+    name = _FORMATS.get(str(value).strip().lstrip(".").casefold())
+    if name is None:
+        raise OpError(Code.BAD_VALUE, f"the format '{value}' is not one edit_image writes", location="format",
+                      hint="Give png, jpeg, webp, tiff, bmp or gif.")
+    return name
 
 
-async def _preresolve_paste_ops(ops: list) -> None:
-    """Every paste_image op's ``image_path`` resolved in op order before the
-    thread starts (the lookup is the proxy's, per session, async). A lookup
-    that fails becomes the marker ``_checked_resolved`` raises at that op's
-    turn, so the failure is reported for that op with the lookup's own text;
-    an op without the key keeps raising for it there."""
-    for op in ops:
-        if _op_type(op) == "paste_image" and "image_path" in op:
-            try:
-                op["image_path"] = await _resolve_path(op["image_path"])
-            except Exception as exc:  # noqa: BLE001  # the op reports it at its turn, as when it resolved there
-                op["image_path"] = _RESOLVE_ERR_PREFIX + str(exc)
+def _rgb(value: Any) -> tuple[int, ...]:
+    from colors import parse_color
+
+    color = parse_color(value, allow_theme=False)
+    rgb = tuple(color.rgb)
+    return rgb if color.alpha in (None, 1, 1.0) else (*rgb, round(color.alpha * 255))
+
+
+def _segment(img: Any) -> Any:
+    from rembg import remove
+
+    return remove(img, session=_get_rembg_session())
+
+
+_PX = ("int", "float")
+_COLOR_KEY = ("color", "list")
+
+
+def _k(name: str, types: tuple[str, ...], default: Any = MISSING, help: str = "", **kw: Any) -> KeySpec:
+    return KeySpec(name, types, default=default, help=help, **kw)
+
+
+def _factor(note: str) -> tuple[KeySpec, ...]:
+    return (_k("factor", ("float",), 1.0, note),)
+
+
+_TONE_ZONE = (_k("hue", ("float",), 0, "0-360"), _k("saturation", ("float",), 50, "0-100"),
+              _k("strength", ("float",), 0.15, "0-1"))
+_HSL = (_k("hue", ("float",), 0, "degrees"), _k("saturation", ("float",), 0, "-100 to 100"),
+        _k("lightness", ("float",), 0, "-100 to 100"))
+_HSL_COLORS = ("red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta")
+
+CATALOG = Catalog("edit_image", [
+    OpSpec("resize", _op_resize, (_k("width", _PX, help="px; the image's own when left out"),
+                                  _k("height", _PX, help="px"),
+                                  _k("maintain_aspect", ("bool",), True, "fit inside width x height")),
+           "BASIC", examples=({"op": "resize", "width": 20},)),
+    OpSpec("crop", _op_crop, tuple(_k(n, _PX, help="px") for n in ("left", "top", "right", "bottom")), "BASIC",
+           examples=({"op": "crop", "left": 2, "top": 2, "right": 30, "bottom": 18},)),
+    OpSpec("rotate", _op_rotate, (_k("degrees", ("float",), 0, "clockwise"),
+                                  _k("expand", ("bool",), True, "grow the canvas to fit")),
+           "BASIC", examples=({"op": "rotate", "degrees": 90},)),
+    OpSpec("flip", _op_flip, (_k("direction", ("str",), "horizontal", "horizontal | vertical"),), "BASIC",
+           examples=({"op": "flip", "direction": "vertical"},)),
+    OpSpec("convert_format", _op_convert_format, (_k("format", ("str",), "", "png | jpeg | webp | tiff | bmp | gif"),),
+           "BASIC", note="Saves in another format: the output takes that extension.",
+           examples=({"op": "convert_format", "format": "webp"},)),
+    OpSpec("compress", _op_compress, (_k("quality", ("int", "float"), 75, "1-100 (JPEG, WebP)"),
+                                      _k("format", ("str",), "", "jpeg | webp | png")),
+           "BASIC", examples=({"op": "compress", "quality": 70},)),
+    OpSpec("exposure", _op_exposure, (_k("gamma", ("float",), 1.0, ">1 brightens, <1 darkens; midtone-weighted"),),
+           "TONE", examples=({"op": "exposure", "gamma": 1.2},)),
+    OpSpec("highlights", image_tone.op_highlights, (_k("amount", ("float",), 0, "-100 to 100"),), "TONE",
+           examples=({"op": "highlights", "amount": -30},)),
+    OpSpec("shadows", image_tone.op_shadows, (_k("amount", ("float",), 0, "-100 to 100"),), "TONE",
+           examples=({"op": "shadows", "amount": 30},)),
+    OpSpec("whites", image_tone.op_whites, (_k("level", ("float",), 0, "relative"),), "TONE",
+           examples=({"op": "whites", "level": 10},)),
+    OpSpec("blacks", image_tone.op_blacks, (_k("level", ("float",), 0, "relative: >0 lifts, <0 deepens"),),
+           "TONE", examples=({"op": "blacks", "level": -10},)),
+    OpSpec("brightness", _op_brightness, _factor("1 unchanged; linear, clips sooner than exposure"), "TONE",
+           examples=({"op": "brightness", "factor": 1.1},)),
+    OpSpec("contrast", _op_contrast, _factor("1 unchanged"), "TONE", examples=({"op": "contrast", "factor": 1.2},)),
+    OpSpec("clarity", image_tone.op_clarity, (_k("amount", ("float",), 20, "midtone local contrast"),), "TONE",
+           examples=({"op": "clarity", "amount": 20},)),
+    OpSpec("dehaze", image_tone.op_dehaze, (_k("strength", ("float",), 0.3, "0-1; darkens overall"),), "TONE",
+           examples=({"op": "dehaze", "strength": 0.3},)),
+    OpSpec("saturation", _op_saturation, _factor("1 unchanged"), "COLOR",
+           examples=({"op": "saturation", "factor": 1.2},)),
+    OpSpec("color_temperature", _op_color_temperature,
+           (_k("temperature", ("float",), 5500, "kelvin; above 5500 is warmer, below cooler"),),
+           "COLOR", examples=({"op": "color_temperature", "temperature": 4500},)),
+    OpSpec("grayscale", _op_grayscale, (), "COLOR", examples=({"op": "grayscale"},)),
+    OpSpec("sepia", _op_sepia, (), "COLOR", examples=({"op": "sepia"},)),
+    OpSpec("invert", _op_invert, (), "COLOR", examples=({"op": "invert"},)),
+    OpSpec("split_tone", image_tone.op_split_tone, tuple(
+        _k(zone, ("dict",), fields=_TONE_ZONE) for zone in ("shadows", "midtones", "highlights")), "COLOR",
+        examples=({"op": "split_tone", "shadows": {"hue": 210, "saturation": 40}},)),
+    OpSpec("hsl_adjust", image_tone.op_hsl_adjust, tuple(_k(c, ("dict",), fields=_HSL) for c in _HSL_COLORS),
+           "COLOR", examples=({"op": "hsl_adjust", "blue": {"saturation": 20}},)),
+    OpSpec("sharpness", _op_sharpness, _factor("1 unchanged"), "DETAIL", examples=({"op": "sharpness", "factor": 1.5},)),
+    OpSpec("denoise", image_tone.op_denoise, (_k("strength", ("int", "float"), 3, "1-5"),), "DETAIL",
+           examples=({"op": "denoise", "strength": 2},)),
+    OpSpec("blur", _op_blur, (_k("radius", ("float",), 2, "px"),), "DETAIL", examples=({"op": "blur", "radius": 1},)),
+    OpSpec("sharpen", _op_sharpen, (), "DETAIL", examples=({"op": "sharpen"},)),
+    OpSpec("edge_enhance", _op_edge_enhance, (), "DETAIL", examples=({"op": "edge_enhance"},)),
+    OpSpec("emboss", _op_emboss, (), "DETAIL", examples=({"op": "emboss"},)),
+    OpSpec("auto_enhance", _op_auto_enhance, (), "EFFECTS", examples=({"op": "auto_enhance"},)),
+    OpSpec("add_text", _op_add_text, (_k("text", ("str",), ""), _k("x", _PX, 10, "px"), _k("y", _PX, 10, "px"),
+                                      _k("font_size", _PX, 24, "px"), _k("color", _COLOR_KEY, "#FFFFFF")),
+           "EFFECTS", examples=({"op": "add_text", "text": "Αθήνα 2026", "x": 2, "y": 2, "font_size": 8},)),
+    OpSpec("add_border", _op_add_border, (_k("width", _PX, 5, "px"), _k("color", _COLOR_KEY, "#000000")),
+           "EFFECTS", examples=({"op": "add_border", "width": 2},)),
+    OpSpec("paste_image", _op_paste_image, (KeySpec("image_path", ("path",), required=True),
+                                            _k("x", _PX, 0, "px"), _k("y", _PX, 0, "px"),
+                                            _k("width", _PX, help="px; keeps the proportions"),
+                                            _k("opacity", ("float",), 1.0, "0-1")),
+           "EFFECTS", examples=({"op": "paste_image", "image_path": _EXAMPLE_PNG, "x": 1, "y": 1},)),
+    OpSpec("add_watermark", _op_add_watermark, (_k("text", ("str",), "WATERMARK"), _k("opacity", ("float",), 0.3, "0-1")),
+           "EFFECTS", examples=({"op": "add_watermark", "text": "ΔΕΙΓΜΑ"},)),
+    OpSpec("remove_background", _op_remove_background, (
+        _k("background_color", _COLOR_KEY, help="a colour behind the subject; transparent PNG when left out"),),
+        "EFFECTS", note="AI segmentation; the result has a transparent background unless background_color is given.",
+        examples=({"op": "remove_background", "background_color": "white"},)),
+    OpSpec("blur_region", _op_blur_region, (
+        *(_k(n, _PX, help="px") for n in ("x", "y", "width", "height", "left", "top", "right", "bottom")),
+        _k("radius", ("float",), 15, "blur strength", aliases=("intensity", "strength"))),
+        "EFFECTS", note="Blurs a rectangle (faces, plates, addresses): x, y, width, height or left, top, right, "
+                        "bottom.",
+        examples=({"op": "blur_region", "x": 2, "y": 2, "width": 10, "height": 8},)),
+], color_theme=False, notes="Pixel values count from the top left. Operations apply in order.")
+
+
+def contract_job(tmp_dir: str) -> _ImageEdit:
+    from PIL import Image
+
+    return _ImageEdit(Image.new("RGB", (40, 24), (120, 140, 160)), os.path.join(tmp_dir, "contract.png"),
+                      segment=lambda img: img.convert("RGBA"))
+
+
+def contract_fixtures(tmp_dir: str) -> dict[str, str]:
+    from PIL import Image
+
+    image = os.path.join(tmp_dir, _EXAMPLE_PNG)
+    Image.new("RGB", (8, 6), (31, 78, 121)).save(image)
+    return {_EXAMPLE_PNG: image}
 
 
 @dataclass
 class _EditedImage:
     """What the edit's thread hands back to the loop."""
-    out: str
-    width: int
-    height: int
-    preview: bytes
-    tone_check: str | None
+    text: str
+    saved: bool
+    out: str = ""
+    width: int = 0
+    height: int = 0
+    preview: bytes = b""
 
 
-def _edit_image_core(path: str, out: str, ops: list) -> "_EditedImage | str":
-    """In a worker thread: open the image, apply every operation, save it
-    beneath the mount and encode the chat preview. An operation that fails
-    or an output format nothing writes is the answer's text instead."""
+def _open_image(path: str) -> Any:
     from PIL import Image, ImageOps
 
     img = Image.open(path)
-    # Apply EXIF orientation so pixel data matches display orientation.
-    # Without this, manual rotations conflict with the EXIF orientation tag.
+    # EXIF orientation applied, so the pixels match what a viewer shows and
+    # a manual rotation does not fight the tag.
     img = ImageOps.exif_transpose(img) or img
-
-    # Ensure RGB for most operations
     if img.mode in ("RGBA", "P"):
-        has_alpha = img.mode == "RGBA" or (
-            img.mode == "P" and "transparency" in img.info
-        )
+        has_alpha = img.mode == "RGBA" or (img.mode == "P" and "transparency" in img.info)
         if not has_alpha:
             img = img.convert("RGB")
+    return img
 
-    has_tonal_op = any(_op_type(op) in _TONAL_OPS for op in ops)
+
+def _save_format(job: _ImageEdit) -> tuple[str, dict]:
+    from PIL import Image
+
+    save_format = Path(job.out).suffix.lstrip(".").upper()
+    if save_format == "JPG":
+        save_format = "JPEG"
+    if job.compress_format:
+        save_format = job.compress_format
+    if save_format not in ("JPEG", "PNG", "WEBP", "TIFF", "BMP"):
+        # A file object needs the format spelled out: the one Pillow
+        # registers for the suffix, else the output is refused.
+        save_format = Image.registered_extensions().get(Path(job.out).suffix.lower()) or ""
+    kwargs: dict[str, Any] = {}
+    if save_format == "JPEG":
+        kwargs = {"quality": job.compress_quality or 95, "subsampling": 0}
+    elif save_format == "PNG":
+        kwargs = {"compress_level": 6}
+    elif save_format == "WEBP":
+        kwargs = {"quality": job.compress_quality or 95}
+    return save_format, kwargs
+
+
+def _edit_image_core(path: str, out: str, ops: list, *, best_effort: bool, new_file: bool, total: int,
+                     rejected: list, pre_notes: dict, targets: dict[str, str]) -> _EditedImage:
+    """In a worker thread: the image opened, the batch run, and when it
+    commits the save beneath the mount and the chat preview."""
+
+    from PIL import Image
+
+    from results import render_outcome
+
+    img = _open_image(path)
+    has_tonal_op = any(op.get("op") in _TONAL_OPS for _, op in ops)
     # The tonal operations rebuild the image from 8-bit data in its own mode,
     # which a 1-bit image cannot take.
     if has_tonal_op and img.mode == "1":
         img = img.convert("L")
     before_stats = _tone_stats(img) if has_tonal_op else None
-
-    job = _ImageEdit(img, out)
-    for op in ops:
-        ot = _op_type(op)
-        try:
-            handler = _HANDLERS.get(ot) if isinstance(ot, str) else None
-            if handler is not None:
-                handler(job, op)
-            else:
-                logger.warning(
-                    f"edit_image: unknown operation '{ot}', skipping"
-                )
-        except Exception as exc:  # noqa: BLE001  # an op's failure becomes its error line, the other ops still run
-            return f"Error in operation '{ot}': {exc}"
+    job = _ImageEdit(img, out, targets=targets)
+    outcome = run_batch(ops, CATALOG, job, best_effort=best_effort, create_new=new_file, rejected=rejected,
+                        pre_notes=pre_notes, total=total)
+    existed = os.path.exists(out)
+    if not outcome.should_commit:
+        return _EditedImage(render_outcome(outcome, kind="Image", path=out, saved=False, existed=existed), False)
     img, out = job.img, job.out
-
-    # Save
-    # Check for compress operation overrides
-    compress_quality = job.compress_quality
-    compress_format = job.compress_format
-
-    save_format = Path(out).suffix.lstrip(".").upper()
-    if save_format == "JPG":
-        save_format = "JPEG"
-    if compress_format:
-        save_format = compress_format
-    if save_format not in ("JPEG", "PNG", "WEBP", "TIFF", "BMP"):
-        # A file object needs the format spelled out: the one Pillow
-        # registers for the suffix, else the output is refused.
-        save_format = Image.registered_extensions().get(Path(out).suffix.lower())
-        if not save_format:
-            return f"Error: unsupported output format '{Path(out).suffix}'"
+    save_format, save_kwargs = _save_format(job)
+    if not save_format:
+        return _EditedImage(f"Nothing saved: {_to_agents_relative(out)} was not written. The output format "
+                            f"'{Path(out).suffix}' is not one edit_image writes: use png, jpg, webp, tiff or bmp.",
+                            False)
     if save_format == "JPEG" and img.mode == "RGBA":
         img = img.convert("RGB")
-    save_kwargs = {}
-    if save_format == "JPEG":
-        save_kwargs["quality"] = compress_quality or 95
-        save_kwargs["subsampling"] = 0
-    elif save_format == "PNG":
-        save_kwargs["compress_level"] = 6
-    elif save_format == "WEBP":
-        save_kwargs["quality"] = compress_quality or 95
     # Beneath the mount, no link followed: a link at the output name is
     # replaced, a link on the way refuses the write.
     with safe_open_write(out) as fh:
         img.save(fh, format=save_format, **save_kwargs)
-
     buf = io.BytesIO()
     preview_img = img.copy()
     preview_img.thumbnail((1568, 1568), Image.LANCZOS)
     if preview_img.mode == "RGBA":
         preview_img = preview_img.convert("RGB")
     preview_img.save(buf, format="JPEG", quality=85)
-    tone_check = (_tone_check_line(before_stats, _tone_stats(img))
-                  if before_stats is not None else None)
-    return _EditedImage(out, img.width, img.height, buf.getvalue(), tone_check)
+    text = render_outcome(outcome, kind="Image", path=out, saved=True, existed=existed)
+    first, _, rest = text.partition("\n")
+    text = f"{first}\nSize: {img.width}x{img.height} px" + (f"\n{rest}" if rest else "")
+    if before_stats is not None:
+        text += "\n" + _tone_check_line(before_stats, _tone_stats(img))
+    return _EditedImage(text, True, out, img.width, img.height, buf.getvalue())
+
+
+async def _targets(ops: list, base: str) -> dict[str, str]:
+    """Each convert_format's output, resolved as a write: the extension it
+    gives the output is a path the proxy judges, like any other."""
+    found: dict[str, str] = {}
+    for _, op in ops:
+        if op.get("op") != "convert_format" or not op.get("format"):
+            continue
+        name = _FORMATS.get(str(op["format"]).strip().lstrip(".").casefold())
+        if name and name not in found:
+            found[name] = await _resolve_path(str(Path(base).with_suffix(_SUFFIX[name])), writing=True)
+    return found
+
+
+async def handle_edit_image(args: dict) -> str:
+    from batch import prepare_batch
+    from results import OpResult, render_rejected
+
+    best_effort = bool(args.get("best_effort", False))
+    prepared = prepare_batch(args.get("operations"), CATALOG)
+    answer = CATALOG.answer_help(prepared.help_ops)
+    if prepared.help_ops and not prepared.ops and not prepared.problems:
+        return answer
+    ops, problems, notes = CATALOG.resolve_batch(prepared.ops)
+    problems = [*prepared.problems, *problems]
+    if problems and not best_effort:
+        return _joined(render_rejected(problems, kind="Image", path=args["path"], total=prepared.total), answer)
+    output_path = args.get("output_path")
+    # No output_path: an in-place edit, so the input resolves as a write for
+    # the proxy's write rules to apply; with one the input stays a read.
+    path = await _resolve_path(args["path"], writing=not output_path)
+    if not await asyncio.to_thread(os.path.exists, path):
+        return f"Error: File not found: {args['path']}"
+    out = await _resolve_path(output_path, writing=True) if output_path else path
+    ops, path_problems = await CATALOG.preresolve(ops, main_path=out)
+    if path_problems and not best_effort:
+        return _joined(render_rejected([*problems, *path_problems], kind="Image", path=out, total=prepared.total,
+                                       existed=await asyncio.to_thread(os.path.exists, out)), answer)
+    try:
+        targets = await _targets(ops, out)
+    except Exception as exc:  # noqa: BLE001  # the proxy's refusal, whatever its type, answers the call
+        return f"Nothing saved: {_to_agents_relative(out)} was not written. The converted file's path was refused: {exc}"
+    rejected = [OpResult.from_error(p) for p in [*problems, *path_problems]]
+    edited = await _image_job(functools.partial(
+        _edit_image_core, path, out, ops, best_effort=best_effort, new_file=out != path,
+        total=prepared.total, rejected=rejected, pre_notes=notes, targets=targets))
+    if not edited.saved:
+        return _joined(edited.text, answer)
+    await _notify_file_written(edited.out)
+    await _push_image_preview(edited.preview, "image/jpeg", f"Edited: {Path(edited.out).name}")
+    # A download link to the full resolution.
+    session_id, auth = _current_session()
+    if PROXY_URL and session_id and auth:
+        try:
+            async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
+                await client.post(
+                    f"{PROXY_URL}/v1/hooks/file",
+                    json={
+                        "session_id": session_id,
+                        "path": _to_agents_relative(edited.out),
+                        "filename": Path(edited.out).name,
+                        "description": f"Full resolution ({edited.width}x{edited.height})",
+                    },
+                    headers={"Authorization": auth},
+                )
+        except httpx.HTTPError:
+            pass
+    return _joined(edited.text, answer)
+
+
+def _joined(*parts: str) -> str:
+    return "\n\n".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
@@ -1249,42 +969,3 @@ def _analyze_image_core(path: str) -> str:
         result.append(f"**Suggested fixes**: {'; '.join(issues)}")
 
     return "\n".join(result)
-
-
-# ---------------------------------------------------------------------------
-# OCR on images
-# ---------------------------------------------------------------------------
-
-
-async def handle_ocr_image(args: dict) -> str:
-    """Extract text from an image using tesseract OCR."""
-    import subprocess
-
-    path = await _resolve_path(args["path"])
-    if not await asyncio.to_thread(os.path.exists, path):
-        return f"Error: File not found: {args['path']}"
-
-    language = args.get("language", "eng")
-
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["tesseract", path, "stdout", "-l", language],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            return f"OCR error: {result.stderr.strip()}"
-
-        text = result.stdout.strip()
-        if not text:
-            return f"No text detected in {_to_agents_relative(path)}. The image may not contain text or may need preprocessing."
-
-        return (
-            f"**OCR Result** ({Path(path).name}, language: {language}):\n\n{text}"
-        )
-    except subprocess.TimeoutExpired:
-        return "OCR timed out (60s limit)"
-    except FileNotFoundError:
-        return "Error: tesseract-ocr is not installed in this environment"

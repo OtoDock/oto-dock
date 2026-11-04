@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 
 // ─── Connecting a ChatGPT account, the finish: a refused finish keeps the
 //     form open with the server's sentence instead of closing as if the
@@ -100,8 +101,8 @@ function renderCodexCard(subs: object[]) {
     name: 'codex-cli', display_name: 'OpenAI Codex', user_subscriptions: subs,
     platform_available: true, allow_platform_auth: true, capabilities: codex,
   }]
-  render(<ExecutionLayersSection />)
-  fireEvent.click(screen.getByText('Codex'))
+  render(<MemoryRouter><ExecutionLayersSection /></MemoryRouter>)
+  fireEvent.click(screen.getByText('Codex', { selector: 'span' }))
 }
 
 describe('User Settings: Connect ChatGPT in a dialog', () => {
@@ -186,5 +187,17 @@ describe('User Settings: Connect ChatGPT in a dialog', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
     expect(await screen.findByText(/You signed in as b@example.com, so a new subscription was added/)).toBeInTheDocument()
     expect(screen.getByRole('dialog')).toBeInTheDocument()
+  })
+
+  it('a Reconnect that refreshed an account the card already lists says it is already connected', async () => {
+    // The finish answers the row alone: one the card listed was refreshed, not added.
+    h.finishImpl.current = async () => ({ subscription: sub({ id: 's2', oauth_email: 'b@example.com' }) })
+    renderCodexCard([sub({ status: 'expired' }), sub({ id: 's2', oauth_email: 'b@example.com' })])
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    await screen.findByText('ABCD-EFGH')
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
+    expect(await screen.findByText(/You signed in as b@example.com, which is already connected\./)).toBeInTheDocument()
+    expect(screen.getByRole('dialog')).toHaveTextContent('“ChatGPT Plus (a@example.com)” is still expired')
   })
 })

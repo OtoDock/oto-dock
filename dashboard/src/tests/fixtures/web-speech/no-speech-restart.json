@@ -1,0 +1,55 @@
+{
+ "source": "Chrome's no-speech error after a few silent seconds, then end: a silence, restarted while held, nothing said.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "wait",
+   "ms": 8000
+  },
+  {
+   "event": "error",
+   "error": "no-speech"
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 150
+  },
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "later."
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "later."
+  ],
+  "replaces": [],
+  "interims": [],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 2
+ }
+}

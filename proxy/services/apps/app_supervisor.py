@@ -338,10 +338,13 @@ async def _health(inst: Instance) -> bool:
                 return False
             try:
                 r = await client.get(f"{inst.base_url}/_health")
-                if r.status_code < 500:
-                    return True
-            except httpx.HTTPError:
-                pass
+            except (httpx.HTTPError, OSError, AttributeError):
+                # A server not listening yet: anyio raises AttributeError
+                # (``getpeername`` on a socket the refused connect closed)
+                # beside httpx's own connect errors; it retries in the window.
+                r = None
+            if r is not None and r.status_code < 500:
+                return True
             await asyncio.sleep(0.25)
     return False
 

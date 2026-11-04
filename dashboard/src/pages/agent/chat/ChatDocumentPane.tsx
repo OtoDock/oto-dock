@@ -13,6 +13,8 @@ import { useDocumentTabs } from '../../../components/chat/media/documentTabs'
 import { chatDocumentsKey } from '../../../api/documents'
 import { leaveDocumentPane, useDocumentPaneStore, useDocumentPushStore } from '../../../store/documentPaneStore'
 import { pushEscHandler } from '../../../lib/escStack'
+import { usePaneFold } from '../../../components/chat/artifacts/fold'
+import { DURATION } from '../../../components/chat/artifacts/motion'
 
 export type { DocumentPaneForm } from './useDocumentPaneForm'
 import type { DocumentPaneForm } from './useDocumentPaneForm'
@@ -25,7 +27,7 @@ interface Props {
   userSub: string
 }
 
-const CLOSE_MS = 300
+const CLOSE_MS = DURATION.slow
 
 export default function ChatDocumentPane({ chatId, placement, hidden, userSub }: Props) {
   const { pane, docs, all } = useDocumentTabs(chatId)
@@ -88,7 +90,10 @@ export default function ChatDocumentPane({ chatId, placement, hidden, userSub }:
 
   if (ownerMismatch) return null
   if (placement === 'docked') return <Docked chatId={chatId} shown={shown} mounted={mounted} />
-  return <Floating chatId={chatId} shown={shown} mounted={mounted} attended={attended} />
+  return (
+    <Floating chatId={chatId} shown={shown} mounted={mounted} attended={attended}
+      folded={pane.open && pane.minimized && !hidden} active={pane.active} />
+  )
 }
 
 function Docked({ chatId, shown, mounted }: { chatId: string; shown: boolean; mounted: boolean }) {
@@ -119,7 +124,7 @@ function Docked({ chatId, shown, mounted }: { chatId: string; shown: boolean; mo
       ref={wrapperRef}
       data-document-pane-dock=""
       className={`h-full shrink-0 overflow-clip ${shown ? 'w-1/2' : 'w-0'} ${animate
-        ? 'transition-[width] duration-300 ease-in-out motion-reduce:transition-none' : ''}`}
+        ? 'transition-[width] duration-slow ease-standard motion-reduce:transition-none' : ''}`}
     >
       <div
         className={`h-full pb-3 pr-3 pt-12 ${shown ? '' : 'invisible'}`}
@@ -132,10 +137,15 @@ function Docked({ chatId, shown, mounted }: { chatId: string; shown: boolean; mo
   )
 }
 
-function Floating({ chatId, shown, mounted, attended }: {
+function Floating({ chatId, shown, mounted, attended, folded, active }: {
   chatId: string; shown: boolean; mounted: boolean; attended: boolean
+  /** Minimized (not hidden by an overlay): the box folds into its chip. */
+  folded: boolean
+  active: string | null
 }) {
   const overlayRef = useRef<HTMLDivElement | null>(null)
+  const boxRef = useRef<HTMLDivElement | null>(null)
+  const flying = usePaneFold(boxRef, { folded, shown, active })
   const [maxHeight, setMaxHeight] = useState<number | undefined>(undefined)
   const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.innerWidth < 640)
 
@@ -172,8 +182,9 @@ function Floating({ chatId, shown, mounted, attended }: {
   return (
     <div ref={overlayRef} className="pointer-events-none absolute inset-x-0 top-12 bottom-0 z-[15] overflow-clip">
       <div
+        ref={boxRef}
         className={`pointer-events-auto absolute flex flex-col ${narrow
-          ? 'inset-x-2 top-2' : 'right-3 top-3 w-[min(40rem,calc(100%-1.5rem))]'} ${shown ? '' : 'invisible'}`}
+          ? 'inset-x-2 top-2' : 'right-3 top-3 w-[min(40rem,calc(100%-1.5rem))]'} ${shown || flying ? '' : 'invisible'}`}
         style={{ height: 'min(80%, 44rem)', maxHeight }}
         inert={!shown}
         onPointerDown={() => useDocumentPushStore.getState().setAttended(chatId, true)}

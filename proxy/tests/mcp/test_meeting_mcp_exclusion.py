@@ -102,6 +102,27 @@ def test_shipped_manifests_opt_out_of_tasks_and_meetings():
     assert set(creator.exclude_from) == {"phone", "task", "meeting", "external"}
 
 
+def test_the_generation_tools_load_in_tasks_and_never_in_meetings():
+    """music-gen, image-gen and video-gen: an agent's tasks and delegated
+    lanes have the chats' tools (the admin who enabled them allowed the
+    spend), a meeting turn leaves them out, in its config and its prompt;
+    the tools that need a person present keep their task exclusion."""
+    from services.mcp.mcp_manifest_parse import _parse_manifest
+    from services.mcp.mcp_registry import session_exclusion_reason
+
+    root = PROXY_DIR.parent / "mcps" / "custom"
+    for name in ("music-gen-mcp", "image-gen-mcp", "video-gen-mcp"):
+        m = _parse_manifest(root / name / "manifest.json")
+        assert session_exclusion_reason(m, contexts={"task"}, external=False) is None
+        assert session_exclusion_reason(m, contexts={"task", "meeting"}, external=False) == \
+            "Excluded in meeting mode"
+        assert session_exclusion_reason(m, contexts={"meeting"}, external=False) is not None
+        assert [s.default_exclude_from for s in m.skills] == [["meeting"]]
+    for name in ("agent-config-mcp", "agent-creator-mcp", "mcps-mcp", "location-mcp"):
+        m = _parse_manifest(root / name / "manifest.json")
+        assert session_exclusion_reason(m, contexts={"task"}, external=False) == "Excluded in task mode"
+
+
 # ---------------------------------------------------------------------------
 # Forward direction of the agreement seam: the prompt may only advertise
 # servers (catalog rows + inline skills) that the session config loads.

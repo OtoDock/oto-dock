@@ -1,8 +1,8 @@
 {
   "name": "memory-mcp",
   "label": "Memory",
-  "description": "Persistent agent memory — the `memory` tool saves, updates, and deletes markdown topic files (shared agent scope + private user scope); content auto-loads into the system prompt",
-  "version": "2.0.1",
+  "description": "Persistent agent memory. The memory tool saves, updates and deletes markdown topic files in a shared agent scope and a private user scope. What it saves loads into the prompt by itself.",
+  "version": "2.1.0",
   "category": "core",
   "always_load": true,
 
@@ -31,17 +31,10 @@
 
   "skills": [
     {
-      "id": "memory-usage",
-      "loading": "always",
-      "file": "skills/memory.md",
-      "description": "Memory tool rules: scopes, revise instead of duplicate, what never to save",
-      "default_exclude_from": []
-    },
-    {
       "id": "memory-guide",
       "loading": "on_demand",
       "file": "skills/memory-guide/SKILL.md",
-      "description": "Worked examples for the memory tool — create, revise in place, append, delete, view — with the exact command shapes. Use when unsure how to write or edit a memory topic.",
+      "description": "Worked examples for the memory tool: create a topic, revise a fact in place, append, delete, read one section of a long topic, share a personal topic with the agent, and the exact command shapes. Use when unsure how to write or edit a memory topic.",
       "default_exclude_from": []
     }
   ],

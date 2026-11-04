@@ -423,7 +423,6 @@ def _cleanup(pump: ChatStreamPump, opened: list[str] = ()) -> None:
         # A wait opened with no waiter would outlive the test (a later
         # ``wait_for_permission`` of the same id would adopt it).
         session_state._permission_events.pop(rid, None)
-        session_state._question_events.pop(rid, None)
 
 
 async def _trace(name: str, chat_id: str, sid: str, steps: list[tuple], seams: _Seams,
@@ -573,6 +572,55 @@ async def test_trace_hook_items(temp_db, seams):
     await _trace("hook-items", "chat-pc-hooks", sid, steps, seams)
 
 
+async def test_trace_settings_card(temp_db, seams):
+    """The settings tool's card (api/settings): a block of the turn after
+    the tool that asked for it, persisted with the id and the label alone."""
+    sid = "sid-pc-settings"
+    steps = [
+        ("event", CommonEvent(type=TEXT, data={"content": "Finding the setting. "})),
+        ("event", CommonEvent(type=TOOL_USE, data={"name": "mcp__settings-mcp__get_setting", "tool_id": "toolu_settings"})),
+        ("event", CommonEvent(type=TOOL_INPUT, data={"name": "mcp__settings-mcp__get_setting", "summary": "user.general.wake-word",
+                                                     "tool_input": {"id": "user.general.wake-word"}})),
+        ("perm", _perm("settings_card")),
+        ("event", CommonEvent(type="tool_result", data={"name": "mcp__settings-mcp__get_setting", "tool_id": "toolu_settings"})),
+        ("event", CommonEvent(type=TEXT, data={"content": "The card is in the chat."})),
+        ("event", CommonEvent(type=DONE, data={})),
+    ]
+    await _trace("settings-card", "chat-pc-settings", sid, steps, seams)
+
+
+async def test_trace_action_card(temp_db, seams):
+    """A tool's action card (api/cards): a block of the turn after the tool
+    that asked for it, persisted with the words and the buttons' ids, labels
+    and kinds, never an action's parameters."""
+    sid = "sid-pc-action-card"
+    steps = [
+        ("event", CommonEvent(type=TEXT, data={"content": "Proposing the install. "})),
+        ("event", CommonEvent(type=TOOL_USE, data={"name": "mcp__agent-creator-mcp__propose_install", "tool_id": "toolu_card"})),
+        ("perm", _perm("action_card")),
+        ("event", CommonEvent(type="tool_result", data={"name": "mcp__agent-creator-mcp__propose_install", "tool_id": "toolu_card"})),
+        ("event", CommonEvent(type=TEXT, data={"content": "The card is in the chat."})),
+        ("event", CommonEvent(type=DONE, data={})),
+    ]
+    await _trace("action-card", "chat-pc-action-card", sid, steps, seams)
+
+
+async def test_trace_list_card(temp_db, seams):
+    """A tool's list card (api/cards): a block of the turn after the tool
+    that asked for it, persisted with the kind, the filters, the title and
+    the person; never a row of the list."""
+    sid = "sid-pc-list-card"
+    steps = [
+        ("event", CommonEvent(type=TEXT, data={"content": "Here are your schedules. "})),
+        ("event", CommonEvent(type=TOOL_USE, data={"name": "mcp__settings-mcp__show_list", "tool_id": "toolu_list"})),
+        ("perm", _perm("list_card")),
+        ("event", CommonEvent(type="tool_result", data={"name": "mcp__settings-mcp__show_list", "tool_id": "toolu_list"})),
+        ("event", CommonEvent(type=TEXT, data={"content": "The list is in the chat."})),
+        ("event", CommonEvent(type=DONE, data={})),
+    ]
+    await _trace("list-card", "chat-pc-list-card", sid, steps, seams)
+
+
 async def test_trace_hook_items_unwatched(temp_db, seams):
     """The same prompts with no viewer attached: the parked cards and the
     pings a driver that tells nobody gets."""
@@ -665,8 +713,9 @@ async def test_trace_no_live_state(temp_db, seams):
 
 
 async def test_trace_memory_and_mcp_tools(temp_db, seams):
-    """The memory tool's nudge reset and an MCP tool's start and result
-    through the registry (no manifest here: the branches run and find none)."""
+    """A memory tool's and an MCP tool's start and result through the
+    registry (no manifest here: the branches run and find none). The memory
+    nudge's counter is the memory API's to reset, so the pump leaves it."""
     sid = "sid-pc-mcp"
     from services.memory import memory_nudge
     memory_nudge._counters[sid] = 3
@@ -694,6 +743,7 @@ async def test_trace_memory_and_mcp_tools(temp_db, seams):
     ]
     try:
         await _trace("memory-and-mcp", "chat-pc-mcp", sid, steps, seams)
+        assert memory_nudge._counters[sid] == 3
     finally:
         memory_nudge._counters.pop(sid, None)
 

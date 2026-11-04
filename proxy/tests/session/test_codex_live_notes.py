@@ -78,6 +78,34 @@ async def test_every_turn_asks_for_the_reasoning_summary_and_keeps_the_effort():
     assert starts[0]["effort"] == "high"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,sandbox,word", [
+    ("plan", "read-only", "plan"), ("autoReview", "workspace-write", "default")])
+async def test_every_turn_sends_its_collaboration_mode_where_codex_reads_it(mode, sandbox, word):
+    # turn/start has no `settings` key (Codex 0.163 and 0.166): the mode is
+    # the experimental top-level field, with the model it requires.
+    s = CodexAppServerSession(
+        session_id="s1", agent_name="a", model="gpt-6.1-sol",
+        sandbox_mode=sandbox, working_dir="/tmp", permission_mode=mode,
+        config_dir="/tmp/.codex", thread_id="thr-1", effort="high",
+    )
+    s._started = True
+    s._client = _Client()
+
+    async def feed():
+        await asyncio.sleep(0.05)
+        s._default_consumer.put_nowait(("turn/completed", {"threadId": "thr-1",
+                                        "turn": {"status": "completed"}}))
+    feeder = asyncio.create_task(feed())
+    async for _ev in s.send_message("hello"):
+        pass
+    await feeder
+    start = next(p for m, p in s._client.requests if m == "turn/start")
+    assert "settings" not in start
+    assert start["collaborationMode"] == {"mode": word, "settings": {
+        "model": "gpt-6.1-sol", "reasoning_effort": "high", "developer_instructions": None}}
+
+
 # --- reasoning summaries -----------------------------------------------------
 
 def test_summary_parts_stream_as_one_thinking_block_with_a_break_between_parts():

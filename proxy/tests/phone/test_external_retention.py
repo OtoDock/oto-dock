@@ -199,6 +199,16 @@ def test_phone_chat_session_file_under_a_caller_tree(temp_db):
     assert not _chat_exists(chat_id) and not f.exists() and home.exists()
 
 
+def test_an_aged_phone_chat_takes_its_transcripts_folder(temp_db):
+    chat_id, _sid, f = _phone_chat(days_old=100)
+    folder = f.with_suffix("")
+    (folder / "subagents").mkdir(parents=True)
+    (folder / "subagents" / "a.jsonl").write_text("w" * 25)
+    stats = _sweep()
+    assert not _chat_exists(chat_id) and not f.exists() and not folder.exists()
+    assert stats["caller_bytes_freed"] >= 75 and stats["errors"] == 0
+
+
 def test_dry_run_reports_without_mutating(temp_db):
     home = _tree("dry", age_days=100)
     chat_id, _, f = _phone_chat(days_old=100)
@@ -343,3 +353,20 @@ def test_aged_check_verdicts_go_with_the_session_files_and_the_list_pages_by_tim
     _verdict(50)
     off = retention._run_sweep_sync(30, False, LiveSnapshot(), False)
     assert off["check_verdicts_deleted"] == 0 and len(db_checks.list_verdicts(AGENT)) == 3
+
+
+def test_an_aged_phone_chat_takes_its_reports(temp_db):
+    from storage import db_reply_reports
+    from storage.pg import get_conn
+    old_chat, _, _ = _phone_chat(days_old=100)
+    fresh_chat, _, _ = _phone_chat(days_old=5)
+    for cid, mid in ((old_chat, 201), (fresh_chat, 202)):
+        db_reply_reports.add("user-admin", cid, mid, agent="a1", reason="harmful", note="",
+                             reply_text="the caller's answer")
+    _sweep(dry_run=True)
+    with get_conn() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM reply_reports").fetchone()["n"] == 2
+    _sweep()
+    with get_conn() as conn:
+        rows = conn.execute("SELECT chat_id FROM reply_reports").fetchall()
+    assert [r["chat_id"] for r in rows] == [fresh_chat]

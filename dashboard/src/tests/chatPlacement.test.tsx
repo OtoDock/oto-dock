@@ -18,10 +18,9 @@ vi.mock('@/lib/appToasts', () => ({ emitAppToast: h.toast, onAppToast: () => () 
 
 import RunsOnChip, { ChatLockNotice, MoveRing } from '@/components/chat/RunsOnChip'
 import SystemEvent from '@/components/chat/SystemEvent'
-import BlockRenderer from '@/components/chat/ChatBlockRenderer'
-import { CHAT_MOVED_REASON, OUT, SYSTEM_SUBTYPE, WAKE_SOURCE, WIRE } from '@/api/wireEvents'
+import { CHAT_MOVED_REASON, OUT, SYSTEM_SUBTYPE, WIRE } from '@/api/wireEvents'
 import {
-  chatTargetsKey, leavesOffline, MOVE_MEMORY, moveMemoryOf, type AgentRunTargets, type ChatTargets, type RunTarget,
+  accountsStayFor, chatTargetsKey, leavesOffline, MOVE_MEMORY, moveMemoryOf, type AgentRunTargets, type ChatTargets, type RunTarget,
 } from '@/api/remoteMachines'
 import type { Task } from '@/api/tasks'
 import { TaskSettingsDialog, TaskSettingsModal } from '@/pages/agent/AgentSchedules.modals'
@@ -212,6 +211,35 @@ describe('the "Runs on" chip', () => {
       'The chat continues on Attic PC from a summary of the conversation.',
     )).toBeInTheDocument()
     expect(screen.queryByText(/is offline/)).toBeNull()
+  })
+
+  it("a shared chat going to a person's computer says the agent's accounts stay, and only then", async () => {
+    targets = { ...ON_SERVER, shared: true }
+    const { unmount } = withQuery(chip())
+    fireEvent.click(await screen.findByTestId('runs-on-chip'))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Attic PC/ }))
+    expect(screen.getByText(
+      "The chat continues on Attic PC. The agent's accounts stay on the server, except the ones you connected.",
+    )).toBeInTheDocument()
+    unmount()
+    // A personal chat, an older proxy that sends no flag: the plain sentence.
+    for (const t of [ON_SERVER, { ...ON_SERVER, shared: false }]) {
+      targets = t
+      const r = withQuery(chip())
+      fireEvent.click(await screen.findByTestId('runs-on-chip'))
+      fireEvent.click(screen.getByRole('menuitem', { name: /Attic PC/ }))
+      expect(screen.getByText('The chat continues on Attic PC.')).toBeInTheDocument()
+      r.unmount()
+    }
+  })
+
+  it('the accounts sentence needs a personal computer and the targets loaded', () => {
+    const shared = { ...ON_SERVER, shared: true }
+    expect(accountsStayFor(shared, 'm-attic')).toBe(true)
+    expect(accountsStayFor(shared, 'm-drill')).toBe(false)
+    expect(accountsStayFor(shared, 'local')).toBe(false)
+    expect(accountsStayFor(ON_SERVER, 'm-attic')).toBe(false)
+    expect(accountsStayFor(undefined, 'm-attic')).toBe(false)
   })
 
   it("the memory a move carries reads both places, an older proxy's answer as files", () => {
@@ -820,25 +848,3 @@ describe("the task dialog's mode", () => {
   })
 })
 
-describe("the platform's resume after the agent moved its chat", () => {
-  const wake = (source?: string) => render(
-    <BlockRenderer
-      block={{ type: 'schedulewake', prompt: 'You now run on drill-sat. Continue the work.', ...(source ? { source } : {}) }}
-      blockId="m1-b0" blockOrder={0} isUserMessage={false} onPermissionRespond={() => {}}
-    />,
-  )
-
-  it('reads "Continued after the move" with the nudge', () => {
-    wake(WAKE_SOURCE.MOVE)
-    const row = screen.getByTestId('move-resume-row')
-    expect(row).toHaveTextContent('Continued after the move')
-    expect(row).toHaveTextContent('You now run on drill-sat. Continue the work.')
-    expect(screen.queryByText('Scheduled wake')).toBeNull()
-  })
-
-  it("a schedule's own wake keeps its row", () => {
-    wake()
-    expect(screen.getByText('Scheduled wake')).toBeInTheDocument()
-    expect(screen.queryByTestId('move-resume-row')).toBeNull()
-  })
-})

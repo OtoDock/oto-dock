@@ -177,6 +177,9 @@ KNOWN_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "mcps/custom/display-mcp/app_tools.py": (
         "the display MCP reads the deploy answer as strings over the API (a Python constant never reaches it)",
         {"deploy_answer:pending approval": 2, "deploy_answer:refused": 3}),
+    "mcps/custom/file-tools-mcp/__tests__/test_server_assembly.py": (
+        "the standard library's secrets module in an allowed-imports set, not a server state",
+        {"app_server:secrets": 1}),
     "proxy/api/apps/apps.py": (
         "a substring test on the reorder route's error message, not a machine state", {"machine:stale": 1}),
     "proxy/api/hooks/app_deploy.py": (

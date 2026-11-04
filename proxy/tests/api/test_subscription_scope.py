@@ -307,6 +307,26 @@ class TestListDecoration:
             account_label=None, user=_viewer()))
         assert res["subscriptions"][0]["created_by_name"] == "Manager User"
 
+    def test_mcp_state(self, temp_db, monkeypatch):
+        """A row whose MCP was removed, or switched off, says so: it
+        receives nothing until then."""
+        from api.events.subscriptions import list_subscriptions
+        from storage.mcp import mcp_store
+        _seed_agents()
+        _sub(scope="service", owner="", agent=AG, vendor_target="o/r", created_by=M)
+
+        def listed():
+            res = asyncio.run(list_subscriptions(
+                scope="service", agent=AG, mcp_name=None, provider_id=None,
+                account_label=None, user=_viewer()))
+            return res["subscriptions"][0]["mcp_state"]
+        monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: _manifest() if name == MCP else None)
+        assert listed() == "on"
+        mcp_store.set_mcp_enabled(MCP, False)
+        assert listed() == "off"
+        monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: None)
+        assert listed() == "removed"
+
 
 # --- the account summary names the agents an account serves ------------------------
 

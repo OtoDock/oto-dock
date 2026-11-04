@@ -154,6 +154,38 @@
   .chat-older-in { animation: none; }
 }
 
+/* A dialog that will not close (components/ui/Dialog.tsx): Escape or the
+   app's Back on one that waits for its own buttons shakes it, within the
+   placement's padding; under reduced motion a ring shows for the same time,
+   an outline so the layout does not move. */
+@keyframes oto-refuse {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-4px); }
+  40%, 80% { transform: translateX(4px); }
+}
+.oto-refuse { animation: oto-refuse 0.3s ease-in-out; }
+@media (prefers-reduced-motion: reduce) {
+  .oto-refuse { animation: none; outline: 2px solid var(--color-focus-ring); outline-offset: 2px; }
+}
+
+/* The reply a chat opened at (`?message=`, pages/agent/chat/useMessageAnchor.ts):
+   a ring that fades over two seconds, a still one under reduced motion. An
+   outline set off from the bubble, so it clears the avatar and the text (the
+   message column's side padding holds the offset). */
+@keyframes oto-anchored {
+  from { outline-color: var(--color-focus-ring); }
+  to   { outline-color: transparent; }
+}
+[data-anchored] {
+  border-radius: 0.75rem;
+  outline: 2px solid transparent;
+  outline-offset: 4px;
+  animation: oto-anchored 2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-anchored] { animation: none; outline-color: var(--color-focus-ring); }
+}
+
 /* Sidebar chat row while its turn is generating — pulses the row BACKGROUND
    only (Tailwind's animate-pulse would pulse the title text too). Timing
    mirrors animate-pulse; pair with motion-reduce:animate-none + a static

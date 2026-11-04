@@ -35,11 +35,16 @@ finds the source.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import functools
 import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import psycopg
 
 import config
 from storage.identity import oauth_app_kinds
@@ -51,16 +56,31 @@ logger = logging.getLogger("otodock.oauth-account-store")
 # Path helpers (used by resolver + writeback)
 # ---------------------------------------------------------------------------
 
-def get_token_base_dir(provider_id: str) -> Path:
+def get_token_base_dir(provider_id: str, *, create: bool = True) -> Path:
     """Central token store root for one provider.
 
-    Returns ``sessions/{provider_id}-tokens/``. Created on demand.
+    Returns ``sessions/{provider_id}-tokens/``. Created on demand unless
+    ``create`` is false (a scan that only reads).
     """
     if not provider_id or not isinstance(provider_id, str):
         raise ValueError(f"provider_id must be a non-empty string, got {provider_id!r}")
     d = config.SESSIONS_DIR / f"{provider_id}-tokens"
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def other_account_files(provider_id: str, own: Path | None = None) -> list[Path]:
+    """Every person's token file of ``provider_id`` on this install but
+    ``own``, the app's installation files (``_app/``) left out."""
+    base = get_token_base_dir(provider_id, create=False)
+    if not base.is_dir():
+        return []
+    own_resolved = own.resolve() if own is not None else None
+    return [
+        path for user_dir in base.iterdir() if user_dir.is_dir() and user_dir.name != "_app"
+        for path in user_dir.glob("*.json") if path.resolve() != own_resolved
+    ]
 
 
 def get_token_dir(
@@ -351,6 +371,8 @@ def persist_oauth_account(
          is_default (first account → TRUE, otherwise unchanged).
       5. Insert credentials rows: GOOGLE_EMAIL + GOOGLE_SERVICES under
          the account_label.
+      6. Clear the account-removed mark on every row of the provider's
+         MCPs that names the label: they all read the file just written.
 
     This single entry point keeps the on-disk token, the DB account row,
     and the credentials row consistent.
@@ -396,16 +418,27 @@ def persist_oauth_account(
     # that union, not just this MCP's slice: readers like workspace-mcp's
     # google.auth pass the file's `scopes` on refresh, and a narrowed
     # record would narrow the refreshed token and break the other MCP.
-    _incremental = False
+    # A vendor whose grants accumulate per app and person (``grants_accumulate``,
+    # Meta's) returns the union too, so the same is recorded, but only over a
+    # file that holds the same login: a sibling's card would otherwise ask
+    # for access the token already has.
+    _incremental = _accumulates = False
     try:
         from auth.oauth_providers import get_provider
-        _incremental = getattr(
-            get_provider(provider_id), "supports_incremental_auth", False,
-        )
+        _impl = get_provider(provider_id)
+        _incremental = getattr(_impl, "supports_incremental_auth", False)
+        _accumulates = getattr(_impl, "grants_accumulate", False)
     except KeyError:
         pass
-    if _incremental:
-        prior = read_account_token(token_dir, account_label) or {}
+    prior = (read_account_token(token_dir, account_label) or {}) if (_incremental or _accumulates) else {}
+    if _accumulates and not _incremental:
+        prior_extra = prior.get("extra")
+        prior_extra = prior_extra if isinstance(prior_extra, dict) else {}
+        same_login = bool(userinfo.account_id) and str(prior.get("account_id") or "") == userinfo.account_id \
+            and issued_by(prior_extra, str(prior.get("client_id") or "")) == issued_by(token_set.raw, client_id)
+        if not same_login:
+            prior = {}
+    if prior:
         for s in prior.get("scopes") or []:
             if isinstance(s, str) and s and s not in seen:
                 seen.add(s)
@@ -457,8 +490,162 @@ def persist_oauth_account(
         userinfo_raw=userinfo.raw if isinstance(userinfo.raw, dict) else {},
         hosted=bool(token_set.raw.get("via_relay")),
     )
+    from services.webhooks import relay_notices
+    try:
+        relay_notices.clear_mark(user_sub, provider_id, account_label)
+    except psycopg.Error:
+        # The grant is written: a mark left on a sibling's row is read only
+        # while the file is gone, so it never fails the sign-in.
+        logger.warning("OAuth account %s/%s: the account-removed mark was not cleared",
+                       provider_id, account_label, exc_info=True)
 
     logger.info(
         "Persisted OAuth account: provider=%s mcp=%s user=%s account=%s",
         provider_id, mcp_name, user_sub[:8], account_label,
     )
+
+
+# ---------------------------------------------------------------------------
+# The label a sign-in lands on
+#
+# A token file is one vendor login, shared by every MCP of the provider whose
+# account row names its label (one login, the union of its scopes). So a
+# sign-in never writes into a file another MCP's row names unless the file
+# already holds the same login: choosing an account for one MCP must not move
+# another's.
+# ---------------------------------------------------------------------------
+
+_LABEL_DROPPED = re.compile(r"[^A-Za-z0-9._@+ -]+")
+_PAT_FLOW = "personal_access_token"
+# What a label's file says about a sign-in's login (``account_label_for``).
+_FREE, _SAME, _OTHER, _UNCOMPARED = "free", "same", "other", "uncompared"
+
+
+def issued_by(extra: dict, client_id: str) -> str:
+    """How a token was issued, from a token response's raw fields or a token
+    file's ``extra`` and ``client_id``. Ids from two issuers say nothing
+    about each other (Meta's user ids differ per app), so logins compare
+    only between files issued the same way."""
+    if extra.get("via_relay"):
+        return f"relay:{extra.get('app_kind') or ''}"
+    flow = str(extra.get("flow") or "")
+    if flow == MCP_AUTHORIZATION_FLOW:
+        return f"registered:{str(extra.get('issuer') or '').rstrip('/')}"
+    if flow == _PAT_FLOW:
+        return "pat"
+    return f"app:{client_id}"
+
+
+def clean_label(text: str, *, provider_id: str, identity: str) -> str:
+    """A vendor-given name as an account label: unchanged when the label rule
+    takes it; else the characters it refuses (a Greek or accented name, an
+    apostrophe) dropped and the spaces collapsed; the provider id and the
+    login id's tail when nothing is left."""
+    if _ACCOUNT_LABEL_RE.match(text or ""):
+        return text
+    label = " ".join(_LABEL_DROPPED.sub(" ", text or "").split())[:128].strip(" .")
+    if _ACCOUNT_LABEL_RE.match(label):
+        return label
+    tail = re.sub(r"[^A-Za-z0-9]", "", identity)[-8:]
+    return f"{provider_id} {tail}" if tail else provider_id
+
+
+def _numbered(base: str, n: int) -> str:
+    suffix = f" {n}"
+    return base[: 128 - len(suffix)].rstrip() + suffix
+
+
+def account_label_for(
+    token_dir: Path, *, hint: str, identity_label: str, identity: str, email: str,
+    issued: str, named_elsewhere,
+) -> str:
+    """The label a sign-in of the login ``identity`` (the vendor's id, ``""``
+    when it gave none) lands on. ``hint`` is the label of the card the
+    sign-in started from (a Reconnect), ``identity_label`` the login's own
+    (its email or name); ``named_elsewhere(label)`` says whether another MCP
+    of the provider names that label for this person.
+
+    A Reconnect keeps its card's label unless another MCP names it and its
+    file holds another login (or one that cannot be compared). An add, or a
+    Reconnect sent elsewhere, takes the file that already holds this login,
+    else the login's own label, numbered (``Name 2``) while that label's file
+    holds another login, or another MCP names it and its file holds no
+    comparable login or is gone (that row waits for its own card's
+    Reconnect). A file with no login recorded, or issued another way, cannot
+    be compared; a Reconnect's missing file is free."""
+    def state(label: str) -> str:
+        raw = read_account_token(token_dir, label)
+        if raw is None:
+            return _FREE
+        recorded = str(raw.get("account_id") or "")
+        extra = raw.get("extra")
+        extra = extra if isinstance(extra, dict) else {}
+        if not identity or not recorded or issued_by(extra, str(raw.get("client_id") or "")) != issued:
+            return _UNCOMPARED
+        # A file written when the vendor gave no id recorded the email.
+        if recorded == identity or ("@" in email and recorded == email):
+            return _SAME
+        return _OTHER
+
+    hint = (hint or "").strip()
+    if hint:
+        held = state(hint)
+        if held in (_SAME, _FREE) or not named_elsewhere(hint):
+            return hint
+    if identity:
+        for path in sorted(token_dir.glob("*.json")):
+            if path.stem != hint and _ACCOUNT_LABEL_RE.match(path.stem) and state(path.stem) == _SAME:
+                return path.stem
+    # A label another MCP names is never taken unless its file holds this
+    # login: a row whose file is gone (a sibling's disconnect before 1.9.1)
+    # waits for the person's own Reconnect of that card.
+    for n in range(1, 100):
+        label = identity_label if n == 1 else _numbered(identity_label, n)
+        held = state(label)
+        if held == _SAME or (held in (_FREE, _UNCOMPARED) and not named_elsewhere(label)):
+            return label
+    raise ValueError("no free account label")
+
+
+def other_mcps_naming(user_sub: str, provider_id: str, mcp_name: str, label: str) -> list[str]:
+    """The installed MCPs of ``provider_id`` other than ``mcp_name`` whose
+    account rows name ``label`` for this person (they share its file)."""
+    from services.mcp import mcp_registry
+    from storage.identity import credential_store
+    siblings = {m.name for m in mcp_registry.get_mcps_by_provider(provider_id)} - {mcp_name}
+    if not siblings:
+        return []
+    return sorted(siblings & set(credential_store.mcps_naming_label(user_sub, label)))
+
+
+def _pick_label(*, user_sub: str, provider_id: str, mcp_name: str, hint: str, own_label: str,
+                userinfo, identity: str, issued: str) -> str:
+    from storage import database as task_store
+    username = task_store.get_username_by_sub(user_sub)
+    if not username:
+        raise RuntimeError(f"User {user_sub[:8]} has no username — cannot persist OAuth tokens")
+    return account_label_for(
+        get_token_dir(username, provider_id=provider_id), hint=hint,
+        identity_label=clean_label(own_label, provider_id=provider_id, identity=identity),
+        identity=identity, email=userinfo.email, issued=issued,
+        named_elsewhere=lambda label: bool(other_mcps_naming(user_sub, provider_id, mcp_name, label)),
+    )
+
+
+@contextlib.asynccontextmanager
+async def signin_label(*, user_sub: str, provider_id: str, mcp_name: str, hint: str,
+                       own_label: str, userinfo, identity: str, issued: str):
+    """The label a sign-in persists under (``account_label_for``; ``own_label``
+    is the login's own, its email or the name the manifest reads), chosen and
+    written under the person's provider lock and then the label's own lock
+    (the one the refresh worker holds across a rewrite). The provider lock
+    is the key ``(person, provider, "")``, which no label can be; it is
+    always taken before a label lock and never while one is held."""
+    from core.credentials import credential_locks
+    async with credential_locks.get_lock(user_sub, provider_id, ""):
+        label = await asyncio.to_thread(functools.partial(
+            _pick_label, user_sub=user_sub, provider_id=provider_id, mcp_name=mcp_name,
+            hint=hint, own_label=own_label, userinfo=userinfo, identity=identity, issued=issued,
+        ))
+        async with credential_locks.get_lock(user_sub, provider_id, label):
+            yield label

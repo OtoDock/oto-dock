@@ -3,10 +3,12 @@
 import '@testing-library/jest-dom/vitest'
 import { afterEach } from 'vitest'
 import { cleanup } from '@testing-library/react'
+import { resetDocks } from '../store/artifactDockStore'
 
 afterEach(() => {
   cleanup()
   modals.length = 0
+  resetDocks()
 })
 
 // jsdom has HTMLDialogElement but neither showModal() nor close(), and no

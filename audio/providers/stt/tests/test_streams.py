@@ -820,8 +820,8 @@ def test_the_calls_second_listen_reaches_every_stream_and_the_active_completes()
     enabled: list[str] = []
 
     class Turned(WordStream):
-        def enable_turn_relisten(self):
-            enabled.append(self.language or "?")
+        def enable_turn_relisten(self, *, wide=False):
+            enabled.append(f"{self.language or '?'}{'+wide' if wide else ''}")
 
         async def complete_turn(self, text, bound):
             return f"{text} +{self.language}"
@@ -831,13 +831,22 @@ def test_the_calls_second_listen_reaches_every_stream_and_the_active_completes()
 
     async def run():
         ls = await opened(LanguageStreams(Turned, "en"))
-        ls.enable_turn_relisten()
+        ls.enable_turn_relisten(wide=True)
         await ls.send_audio(CHUNK)
         await ls.open("el")
-        assert len(enabled) == 2                                # the default, then the candidate built
+        # The default, then the candidate built (its language set after the
+        # switch is enabled), both in the wide form.
+        assert len(enabled) == 2 and all(e.endswith("+wide") for e in enabled)
         assert await ls.complete_turn("ένα", 2.0) == "ένα +en"   # the active stream's
         ls.turn_taken()
         assert sorted(taken) == ["el", "en"]
+        # A call's narrow form (the default) reaches the streams as such.
+        enabled.clear()
+        narrow = await opened(LanguageStreams(Turned, "en"))
+        narrow.enable_turn_relisten()
+        await narrow.send_audio(CHUNK)
+        await narrow.open("el")
+        assert len(enabled) == 2 and not any(e.endswith("+wide") for e in enabled)
     asyncio.run(run())
 
 

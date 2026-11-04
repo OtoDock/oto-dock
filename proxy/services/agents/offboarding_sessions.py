@@ -12,8 +12,10 @@ What closes: the person's chat sessions in every pool (Claude, Codex,
 Direct, a paired machine), their interactive terminals, their pre-warms, a
 Shared-only chat's session when the person is the one who warmed it, and
 their user-scope task runs (delegate workers included) on an agent they can
-no longer reach. What does not: agent-scope runs (they act as the agent;
-their ownership moves to the admin who made the change), meetings, phone
+no longer reach, and a chat lane they delegated that runs as them on their
+own computer (its session and its run: it took their role and token there).
+What does not: other agent-scope runs (they act as the agent; their
+ownership moves to the admin who made the change), meetings, phone
 calls (they end at hangup and the next call re-resolves its route),
 external callers and sessions another person warmed. A closed chat stays:
 its next message starts a session under the person's standing then.
@@ -51,7 +53,7 @@ CLOSE_BATCH_TIMEOUT_S = 120.0
 _CHAT_CLIENT_TYPES = ("dashboard", "")
 _LOGGED = 10
 # The kinds of live session the closer tells apart.
-_POOL, _INTERACTIVE, _PREWARM = "pool", "interactive", "prewarm"
+_POOL, _INTERACTIVE, _PREWARM, _WORKER = "pool", "interactive", "prewarm", "worker"
 
 _background: set[asyncio.Task] = set()
 # The pending later passes per person, with the event they sweep.
@@ -89,6 +91,7 @@ def _live_sessions() -> list[_Live]:
         get_session_client_type,
         get_session_security,
     )
+    from core.session.visibility import SCOPE_AGENT
 
     out: dict[str, _Live] = {}
     for sid, entry in list(prewarm._entries.items()):
@@ -107,7 +110,14 @@ def _live_sessions() -> list[_Live]:
             ctx = get_session_security(sid)
             if ctx is None or not ctx.username or ctx.is_external:
                 continue
-            if get_session_client_type(sid) not in _CHAT_CLIENT_TYPES:
+            client = get_session_client_type(sid)
+            if client == session_kind.TASK.name:
+                # A chat lane on its delegator's own computer runs as them
+                # (their name and role in an agent-scope context).
+                if ctx.session_scope == SCOPE_AGENT and ctx.placement.user_paired:
+                    out[sid] = _Live(sid, ctx.agent, _WORKER, ctx.role or "", "", ctx.username)
+                continue
+            if client not in _CHAT_CLIENT_TYPES:
                 continue
             out[sid] = _Live(sid, ctx.agent, _POOL, ctx.role or "", "", ctx.username)
     return list(out.values())
@@ -167,6 +177,18 @@ def _drop_queued_prompts(session_id: str) -> None:
         queue.clear()
 
 
+def _stop_worker_run(session_id: str) -> None:
+    """The run behind a chat lane's session, stopped as a platform
+    interrupt (its chat keeps what it wrote). Synchronous, on the loop."""
+    from services.scheduler import shared
+    from services.scheduler.scheduler import platform_cancel_run
+    from storage import database as task_store
+    for rid, running in list(shared._running_tasks.items()):
+        run = None if running.done() else task_store.get_run(rid)
+        if run and run.get("session_id") == session_id:
+            platform_cancel_run(rid, REASON)
+
+
 async def _close_one(v: _Live) -> None:
     if v.kind == _INTERACTIVE:
         from core.session import interactive_session
@@ -194,6 +216,8 @@ async def _close(victims: list[_Live], why: str) -> None:
             _drop_queued_prompts(v.session_id)
         else:
             _stop_turn(v.session_id)
+        if v.kind == _WORKER:
+            _stop_worker_run(v.session_id)
     for v in victims:
         if v.kind == _PREWARM:
             await prewarm.claim(v.session_id)

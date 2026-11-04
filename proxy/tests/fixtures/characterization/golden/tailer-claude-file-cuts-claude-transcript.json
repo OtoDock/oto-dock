@@ -148,6 +148,9 @@
   {
    "author_sub": "",
    "content": "Step 2 failed: the Read hook denied access to `/etc/hostname` because it's outside my allowed scope. I'll carry on with the other steps.",
+   "event_data": {
+    "note": true
+   },
    "role": "assistant",
    "sync_search": false
   },

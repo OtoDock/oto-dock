@@ -9,6 +9,7 @@ import { WIRE, type SteeredFrame } from '../../api/wireEvents'
 import type { WsCallbacks } from '../useDashboardWs.types'
 import type { DisplayMessage } from '../../components/chat/types'
 import { attachmentBlocks, delegatePromptCard } from '../../lib/messageBlocks'
+import { cleanUserMessageText } from '../../lib/transcriptCleanup'
 import type { StreamCore } from './core'
 
 /** A steer accepted by the engine, waiting for the block boundary where it
@@ -19,16 +20,18 @@ type HeldSteer = {
   images?: SteeredFrame['images']
   files?: SteeredFrame['files']
   meta?: SteeredFrame['event_data']
+  card?: SteeredFrame['card']
 }
 
 function steeredUserMessage(h: HeldSteer, id: string): DisplayMessage {
   // A continue steered into a running lane is the worker's next prompt: a
-  // card, keyed like its stored row (`db-<id>`) when the frame names it.
+  // card, keyed like its stored row (`db-<id>`) when the frame names it,
+  // its text as the stored row is drawn (the platform's wrappers dropped).
   const promptCard = h.meta?.agent_slug ? delegatePromptCard(h.meta.badge, id) : undefined
   return {
     id,
     role: 'user',
-    blocks: [...attachmentBlocks(h.images, h.files), { type: 'text', content: h.text }],
+    blocks: [...attachmentBlocks(h.images, h.files), { type: 'text', content: cleanUserMessageText(h.text) ?? h.text }],
     createdAt: new Date().toISOString(),
     agentSlug: h.meta?.agent_slug,
     agentDisplayName: h.meta?.agent_display_name,
@@ -36,6 +39,7 @@ function steeredUserMessage(h: HeldSteer, id: string): DisplayMessage {
     badge: h.meta?.badge,
     steered: true,
     ...(promptCard ? { delegateCard: promptCard } : {}),
+    ...(h.card ? { fromCard: true } : {}),
   }
 }
 
@@ -187,6 +191,7 @@ export function useQueueAndSteer(core: StreamCore, meetingActive: boolean) {
           role: 'user',
           blocks: [...attachmentBlocks(data.images, data.files), { type: 'text', content: data.text }],
           createdAt: new Date().toISOString(),
+          ...(data.card ? { fromCard: true } : {}),
         }
         setMessages((prev) => {
           const at = prev.length - 2
@@ -200,11 +205,13 @@ export function useQueueAndSteer(core: StreamCore, meetingActive: boolean) {
         return
       }
       // Queue processed — add user bubble (chips + text) + assistant placeholder.
+      // A card's say message wears the caption, as its stored row will.
       const userMsg: DisplayMessage = {
         id: `user-${Date.now()}`,
         role: 'user',
         blocks: [...attachmentBlocks(data.images, data.files), { type: 'text', content: data.text }],
         createdAt: new Date().toISOString(),
+        ...(data.card ? { fromCard: true } : {}),
       }
       // During meetings, skip the assistant placeholder — meeting agents create
       // their own messages. An empty placeholder would persist with loading dots
@@ -235,7 +242,7 @@ export function useQueueAndSteer(core: StreamCore, meetingActive: boolean) {
       // read it: the bubble waits for the next block boundary (the
       // flushPendingSteer calls in the block handlers + turn end).
       const held: HeldSteer = {
-        text: data.text, images: data.images, files: data.files, meta: data.event_data,
+        text: data.text, images: data.images, files: data.files, meta: data.event_data, card: data.card,
       }
       if (currentMsgRef.current && !data.message_id) {
         holdSteer(held)

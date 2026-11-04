@@ -11,6 +11,7 @@ import { apiFetch } from './auth'
 import type { PinnedApp } from './apps'
 import { useAuth } from '../contexts/AuthContext'
 import { apiJson, apiResponse, raiseApiError } from '../lib/http/apiJson'
+import { SET_INSTALL_STATUS, type SetInstallStatus } from '../lib/status/setInstall'
 
 export interface CommunityAgentRegistryEntry {
   slug: string
@@ -39,6 +40,9 @@ export interface CommunityAgentRegistryEntry {
   has_apps?: boolean
   has_user_apps?: boolean
   has_checks?: boolean
+  /** The apps the template brings, each with one line and a picture when
+   * the catalog has one (served through the proxy). Absent on an older proxy. */
+  apps?: { slug: string; title: string; visibility: 'agent' | 'user'; description?: string; picture_url?: string }[]
   platform_min_version: string | null
   deprecated: boolean
   deprecation_note: string | null
@@ -155,6 +159,17 @@ export interface CommunityAgentDetail {
   readme: string | null
 }
 
+/** The offer the install dialog makes when the template belongs to a set
+ * whose other members the person holds as standalone agents
+ * (the proxy's department_set_installer). */
+export interface SetOffer {
+  slug: string
+  name: string
+  level: string
+  members: { template: string; agent_slug: string; display_name: string; level: string }[]
+  existing: { id: string; name: string; version: string; members: string[] }[]
+}
+
 export interface InstallPreview {
   template_slug: string
   target_slug: string
@@ -176,6 +191,139 @@ export interface InstallPreview {
   apps?: PreviewApp[]
   checks?: PreviewCheck[]
   consent_scope?: 'everyone' | 'own'
+  /** Null when there is nothing to offer. Absent on an older proxy. */
+  set?: SetOffer | null
+}
+
+/** A department set of the catalog (the proxy's community_department_sets), with the
+ * departments this person may see that came from it. */
+export interface CommunityDepartmentSet {
+  slug: string
+  name: string
+  description: string
+  version: string
+  color: string
+  category: string
+  tags: string[]
+  author: string
+  author_url: string | null
+  platform_min_version: string | null
+  mode: string
+  reach: string
+  levels: string[]
+  members: { template: string; level: string; display_name: string; color: string; in_catalog: boolean }[]
+  library: { source: string; subdir?: string; writable?: boolean } | null
+  schedules: { member: string; task: string }[]
+  readme_url: string
+  deprecated: boolean
+  problems: string[]
+  missing_members: string[]
+  platform_compat_ok: boolean
+  installed: { id: string; name: string; version: string; members: string[] }[]
+}
+
+export interface SetPreviewMember {
+  template: string
+  level: string
+  display_name: string
+  version: string
+  platform_compat_ok: boolean
+  in_catalog: boolean
+  placed: string[]
+  standalone: string[]
+  action: 'new' | 'adopt'
+  slug: string
+  apps: PreviewApp[]
+  checks: PreviewCheck[]
+  required_mcps: InstallPreview['required_mcps']
+  blocked_mcps: string[]
+}
+
+export interface SetPreview {
+  set_slug: string
+  department_name: string
+  name_problem: string | null
+  mode: string
+  reach: string
+  levels: string[]
+  members: SetPreviewMember[]
+  library: { source: string; subdir: string; writable: boolean } | null
+  schedules: { member: string; task: string }[]
+  consent_scope: 'everyone' | 'own'
+  existing: { id: string; name: string; version: string; members: string[] }[]
+  running_job: string | null
+}
+
+export interface SetInstallJob {
+  id: string
+  set_slug: string
+  set_version: string
+  department_name: string
+  department_id: string
+  started_by: string
+  status: SetInstallStatus
+  members: { template: string; level: string; display_name: string; slug: string; action: string; status: string; detail: string }[]
+  lines: string[]
+  started_at: string
+  ended_at: string | null
+}
+
+export function useCommunitySets(enabled: boolean = true) {
+  return useQuery<{ departments: CommunityDepartmentSet[] }>({
+    queryKey: ['community-departments'],
+    queryFn: () => apiJson<{ departments: CommunityDepartmentSet[] }>('/v1/community/departments', {}, 'Could not load the department sets'),
+    enabled,
+    staleTime: 30_000,
+    retry: false,
+  })
+}
+
+export function useSetPreview(slug: string | null, departmentName: string, fresh: string[]) {
+  return useQuery<SetPreview>({
+    queryKey: ['community-department-preview', slug, departmentName, fresh.join(',')],
+    queryFn: () => {
+      const params = new URLSearchParams()
+      if (departmentName) params.set('department_name', departmentName)
+      if (fresh.length) params.set('new', fresh.join(','))
+      const qs = params.toString()
+      return apiJson<SetPreview>(`/v1/community/departments/${slug}/preview${qs ? `?${qs}` : ''}`, {}, 'Could not read the set')
+    },
+    enabled: !!slug,
+    staleTime: 5_000,
+    retry: false,
+  })
+}
+
+export function useInstallDepartmentSet() {
+  const qc = useQueryClient()
+  return useMutation<{ job_id: string; job: SetInstallJob }, Error,
+    { slug: string; department_name: string; consent: boolean; new: string[] }>({
+    mutationFn: ({ slug, ...body }) =>
+      apiJson<{ job_id: string; job: SetInstallJob }>(`/v1/community/departments/${slug}/install`, { method: 'POST', json: body }, 'Could not start the install'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['community-departments'] })
+    },
+  })
+}
+
+/** Polled while the job runs; the dialog shows its rows and lines. */
+export function useSetInstallStatus(jobId: string | null, enabled: boolean) {
+  const qc = useQueryClient()
+  return useQuery<SetInstallJob>({
+    queryKey: ['community-department-install', jobId],
+    queryFn: async () => {
+      const job = await apiJson<SetInstallJob>(`/v1/community/departments/installs/${jobId}`, {}, 'Could not read the install')
+      if (job.status !== SET_INSTALL_STATUS.RUNNING) {
+        void qc.invalidateQueries({ queryKey: ['agents'] })
+        void qc.invalidateQueries({ queryKey: ['departments'] })
+        void qc.invalidateQueries({ queryKey: ['community-agents'] })
+        void qc.invalidateQueries({ queryKey: ['community-departments'] })
+      }
+      return job
+    },
+    enabled: enabled && !!jobId,
+    refetchInterval: (q) => (q.state.data?.status === SET_INSTALL_STATUS.RUNNING || !q.state.data ? 2000 : false),
+  })
 }
 
 /** Browse all community agent templates. */
@@ -268,6 +416,9 @@ export function useTakeNewVersion() {
 
 export interface InstallFromCommunityResult {
   agent_slug: string
+  /** The offer's outcome, when the offer was taken. Absent on an older proxy. */
+  department?: { id: string; name: string } | null
+  department_lines?: string[]
   batch_id: string | null
   created_requests: {
     id: number
@@ -308,6 +459,8 @@ export function useInstallCommunityAgent() {
       /** The dialog's consent: the signature seen per app / check approved. */
       approve_apps?: Record<string, string>
       approve_checks?: Record<string, string>
+      /** The offer taken: the set's slug and the department's name. */
+      department_set?: { slug: string; name: string }
     }
   >({
     mutationFn: body =>
@@ -323,7 +476,9 @@ export function useInstallCommunityAgent() {
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['community-agents'] })
+      qc.invalidateQueries({ queryKey: ['community-departments'] })
       qc.invalidateQueries({ queryKey: ['agents'] })
+      qc.invalidateQueries({ queryKey: ['departments'] })
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
       // Installing a template assigns the installer as the new agent's
       // manager server-side — refresh the auth snapshot so

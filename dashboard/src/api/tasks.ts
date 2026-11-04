@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import { apiOk } from '../lib/http/apiJson'
 import { AUTO_REVIEW_MODE, DONT_ASK_MODE } from '../lib/engines/modes'
+import type { AgentRole } from '../lib/permissions'
 
 /** A task's permission mode: Don't Ask (every tool runs) or Auto (the
  *  engine's own reviewer checks what needs approval). */
@@ -39,8 +40,8 @@ export interface Task {
   override_execution_path: string | null
   effective_model: string
   effective_execution_path: string
-  // Where the effective model came from ('pinned' | 'agent default' |
-  // 'layer default'), its capability tier (1 = frontier … 4 = fast, null =
+  // Where the effective model came from ('pinned' | 'your engine' |
+  // 'agent default' | 'layer default'), its capability tier (1 = frontier … 4 = fast, null =
   // untiered) and the warnings for a pin that no longer resolves. Optional:
   // absent on an older proxy.
   effective_model_source?: string
@@ -67,6 +68,9 @@ export interface Task {
   // The run's permission mode: Don't Ask or Auto (the engine's own review).
   // Optional: absent on an older proxy.
   permission_mode?: TaskPermissionMode
+  // Who is told: the lowest per-agent role an agent-scope task's
+  // notifications reach. Optional: absent on an older proxy.
+  notify_audience?: AgentRole
   can_run: boolean
   can_delete: boolean
   can_pause: boolean
@@ -211,6 +215,22 @@ export const useEditTaskMode = () => {
     mutationFn: async ({ taskId, mode }: { taskId: string; mode: TaskPermissionMode }): Promise<void> => {
       await apiOk(`/v1/tasks/${taskId}/edit`, { method: 'POST', json: { permission_mode: mode } },
         "Could not change the task's mode")
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
+/** A task's name and who is told (POST /v1/tasks/{id}/edit with the fields
+ *  that changed). A refusal raises the server's sentence. */
+export const useEditTaskDetails = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ taskId, ...fields }: {
+      taskId: string; name?: string; notify_audience?: AgentRole
+    }): Promise<void> => {
+      await apiOk(`/v1/tasks/${taskId}/edit`, { method: 'POST', json: fields }, 'Could not save the task')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] })

@@ -11,6 +11,7 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
+from api.auth import _common
 from api.auth._router import router
 from auth import lan_check
 from auth.license import get_current_license, get_license_key, set_license_key
@@ -23,6 +24,7 @@ from auth.providers import (
 )
 from core import placement
 from core.background import spawn
+from services.notebook import entries as notebook_entries
 from storage import database as task_store
 from storage.pg import run_db
 
@@ -50,6 +52,11 @@ class PlatformSettingsRequest(BaseModel):
     offboarded_retention_days: str | None = None
     # Automatic MCP updates (services/mcp/mcp_autoupdate.py)
     mcp_auto_update_enabled: bool | None = None
+    # The apps' store review ask (api/auth/_common.py): on or off, and the
+    # days before the second ask. Parsed in the handler, so a word or a
+    # fraction is the handler's sentence and not a validation error.
+    store_review_enabled: bool | None = None
+    store_review_days: str | int | float | None = None
     # Read each OAuth account's 5-hour / weekly usage from the vendor
     # (services/engines/subscription_windows.py). Default ON (unset = on).
     subscription_windows_enabled: bool | None = None
@@ -88,6 +95,9 @@ class PlatformSettingsRequest(BaseModel):
     # admin) can be turned off; new ones are then refused.
     sharing_to_agents_enabled: bool | None = None
     sharing_to_departments_enabled: bool | None = None
+    # The Notebook's share of every prompt, in bytes (services/notebook/entries.py); 0 loads
+    # no entries.
+    notebook_inline_bytes: str | None = None
 
 
 class LicenseKeyRequest(BaseModel):
@@ -234,6 +244,9 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # updates in a low-traffic window, deferring docker MCPs that are in use.
         # Failure-only admin notification + an inline run-history log.
         "mcp_auto_update_enabled": settings.get("mcp_auto_update_enabled", "") != "0",
+        # The apps' store review ask (api/auth/_common.py). Default ON, 90 days.
+        "store_review_enabled": settings.get("store_review_enabled", "") != "0",
+        "store_review_days": _common.store_review_days_from(settings.get("store_review_days", "")),
         # Storage quotas (services/infra/storage_quota.py). MB; the value shown is the
         # effective limit (built-in default when unset); "0" = unlimited. Inode
         # caps ship but default off (0). `storage_quotas_enforced` reflects the
@@ -314,6 +327,8 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         "user_directory_visible_to_members": settings.get("user_directory_visible_to_members", "") != "0",
         "sharing_to_agents_enabled": settings.get("sharing_to_agents_enabled", "") != "0",
         "sharing_to_departments_enabled": settings.get("sharing_to_departments_enabled", "") != "0",
+        "notebook_inline_bytes": str(
+            notebook_entries.parse_inline_bytes(settings.get(notebook_entries.INLINE_BYTES_SETTING))),
     }
 
 
@@ -349,6 +364,42 @@ def _retention_days_shown(raw: str) -> int:
     return _retention.offboarded_days_from(raw)
 
 
+def _validated_store_review_days(value: str | int | float | None) -> int | None:
+    """The days before the second store review ask a PUT carries, refused
+    before anything is written when not a whole number in range."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if (not raw.isdecimal()
+            or not _common.STORE_REVIEW_DAYS_MIN <= int(raw) <= _common.STORE_REVIEW_DAYS_MAX):
+        raise HTTPException(
+            400, "The days before the second ask are a whole number from "
+                 f"{_common.STORE_REVIEW_DAYS_MIN} to {_common.STORE_REVIEW_DAYS_MAX}.")
+    return int(raw)
+
+
+async def _save_store_review(enabled: bool | None, days: int | None) -> None:
+    """The apps' store review ask: the switch, and the days already judged."""
+    if enabled is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, "store_review_enabled", "1" if enabled else "0")
+    if days is not None:
+        await asyncio.to_thread(task_store.set_platform_setting, "store_review_days", str(days))
+
+
+def _validated_notebook_bytes(value: str | None) -> int | None:
+    """The Notebook budget a PUT carries, refused before anything is
+    written when it is not a whole number in range; None when absent."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw.isdecimal() or int(raw) > notebook_entries.INLINE_BYTES_MAX:
+        raise HTTPException(
+            400, "The Notebook's share of the prompt is a whole number of bytes "
+                 f"from 0 to {notebook_entries.INLINE_BYTES_MAX:,}.")
+    return int(raw)
+
+
 @router.put("/v1/admin/platform-settings")
 async def set_platform_settings(
     req: PlatformSettingsRequest,
@@ -370,6 +421,8 @@ async def set_platform_settings(
             raise HTTPException(
                 400, f"offboarded_retention_days must be a whole number from 0 (keep for ever) "
                      f"to {_retention.OFFBOARDED_MAX_DAYS}")
+    notebook_bytes = _validated_notebook_bytes(req.notebook_inline_bytes)
+    store_review_days = _validated_store_review_days(req.store_review_days)
     if req.require_2fa:
         await _refuse_require_2fa_that_would_hold(u)
     if req.company_name is not None:
@@ -454,6 +507,10 @@ async def set_platform_settings(
     if archive_days is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting, "offboarded_retention_days", str(archive_days))
+    if notebook_bytes is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, notebook_entries.INLINE_BYTES_SETTING,
+            str(notebook_bytes))
     if req.offboarded_retention_enabled is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting, "offboarded_retention_enabled",
@@ -464,6 +521,7 @@ async def set_platform_settings(
             "mcp_auto_update_enabled",
             "1" if req.mcp_auto_update_enabled else "0",
         )
+    await _save_store_review(req.store_review_enabled, store_review_days)
     if req.session_retention_days is not None:
         # Clamp to the sweep's floor; garbage falls back to the default.
         from services.infra import retention as _retention

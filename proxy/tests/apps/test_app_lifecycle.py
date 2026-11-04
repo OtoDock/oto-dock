@@ -248,7 +248,7 @@ def test_the_purge_deletes_each_walked_file_by_the_path_it_was_walked_at(agent_t
 
     with patch.object(file_bookkeeping, "delete_platform_file", deleting), \
             patch.object(file_bookkeeping, "push_file_delete", AsyncMock()) as push:
-        count = asyncio.run(app_lifecycle._remove_workspace_folder(AGENT, agent_dir, folder))
+        count = asyncio.run(app_lifecycle.remove_workspace_folder(AGENT, agent_dir, folder))
     assert count == 4
     assert sorted(seen) == sorted(folder / rel for rel in (
         "app.json", "client/index.html", "client/js/app.js", ".env.example"))
@@ -271,7 +271,7 @@ def test_a_purge_that_leaves_a_linked_folder_in_place_announces_no_delete(agent_
     folder.symlink_to(other)
     push = AsyncMock()
     with patch.object(file_bookkeeping, "push_file_delete", push):
-        count = asyncio.run(app_lifecycle._remove_workspace_folder(AGENT, agent_tree, folder))
+        count = asyncio.run(app_lifecycle.remove_workspace_folder(AGENT, agent_tree, folder))
     assert count == 0
     assert (other / "keep.txt").read_text() == "k"
     push.assert_not_called()

@@ -15,7 +15,7 @@ fans out to the new socket.
 Module-level state:
   _inflight: dict[chat_id, InflightWarmup]   guarded by _lock
 
-Sweeper task in app.py removes entries with completed.is_set() or older than
+Sweeper task in startup.py removes entries with completed.is_set() or older than
 600s. Belt-and-suspenders for any path that forgets to unregister.
 """
 
@@ -181,7 +181,7 @@ async def sweep_stale() -> int:
     """Remove entries that are completed or older than _SWEEP_AGE_SECONDS.
 
     Returns count removed (for logging). Called periodically from a
-    background task in proxy/app.py.
+    background task in proxy/startup.py.
     """
     now = time.monotonic()
     removed = 0

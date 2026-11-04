@@ -72,6 +72,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("remote-layer")
 
+#: The first satellite whose Codex turn/start carries the collaboration mode
+#: where Codex reads it (the top-level ``collaborationMode``): an older one
+#: sends a key Codex drops, so Plan there yields no plan item.
+_COLLABORATION_MODE_SATELLITE = (0, 5, 166)
+
+
+def _plans_on(cm, machine_id: str) -> bool:
+    """Whether the machine's satellite puts a Plan turn in Codex's plan mode."""
+    try:
+        version = tuple(int(p) for p in (cm.satellite_version(machine_id) or "").split(".")[:3])
+    except ValueError:
+        return False
+    return version >= _COLLABORATION_MODE_SATELLITE
+
 # The start-payload keys the satellite's CodexSession / CodexPtySession read —
 # this engine's wire vocabulary, frozen with the satellites in the field.
 CREDENTIALS_PAYLOAD_KEY = "auth_json"
@@ -101,10 +115,6 @@ _ENDPOINT_PROVIDER_ENV = "_CODEX_ENDPOINT_PROVIDER"
 # 90 s cap on a local model (a changed tool list re-prefills for minutes
 # there), on top of the daemon spawn. Hosted sessions keep the 60 s budget.
 _LOCAL_MODEL_START_TIMEOUT_S = 180.0
-
-# A background sub-agent's supervisor gives up waiting for its terminal after
-# this long (a lost terminal must not hold the registry forever).
-_BG_SUBAGENT_CEILING_S = 600.0
 
 # How long the turn loop waits for a notification before it checks the
 # turn's life against its silence ceiling (turn_life).
@@ -512,14 +522,20 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         expected_cmd_id = info.current_send_command_id
         turn_start = time.monotonic()
         # Plan mode: mirror the local layer — a completed plan turn's `plan`
-        # item (else its last agent message) becomes a plan review right before
-        # DONE (layer.queue_plan_review; no plan file on the machine: the
-        # reviewed rows are a remote session's plans). `info.mode == "plan"`
+        # item becomes a plan review right before DONE (layer.queue_plan_review;
+        # no plan file on the machine: the reviewed rows are a remote session's
+        # plans); a turn with none ends as a plain turn. `info.mode == "plan"`
         # is the read-only plan signal (set by change_mode / at session start).
         in_plan = info.mode == PLAN_MODE_WORD
         plan_text = ""
-        final_plan_msg = ""
         turn_interrupted = False
+        if in_plan and not _plans_on(cm, info.machine_id):
+            logger.warning(
+                "Remote Codex %s: %s runs satellite %s, older than 0.5.166, so Plan "
+                "runs as a plain turn there (no plan item, no review card) until it updates",
+                info.session_id[:8], cm.satellite_name(info.machine_id),
+                cm.satellite_version(info.machine_id) or "unknown",
+            )
 
         # Emit the resume handle once → the pump persists chats.codex_thread_id
         # (the frozen METADATA key) so the thread resumes after a proxy
@@ -530,7 +546,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             yield ev
 
         async def _plan_review() -> None:
-            plan = (plan_text or final_plan_msg).strip()
+            plan = plan_text.strip()
             if in_plan and not turn_interrupted and plan:
                 await queue_plan_review(info.session_id, plan, None)
 
@@ -614,18 +630,15 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 if _iid and _item.get("type") in _TOOL_ITEM_TYPES:
                     (open_items.add if _m == "item/started" else open_items.discard)(_iid)
 
-            # Plan-mode capture (mirrors codex/layer.py): the `plan` item, else
-            # the last agentMessage, is the plan; a `turn/completed` interrupted
-            # status suppresses the review. Read the raw notification before
-            # translation.
+            # Plan-mode capture (mirrors codex/layer.py): the `plan` item is the
+            # plan; a `turn/completed` interrupted status suppresses the
+            # review. Read the raw notification before translation.
             if in_plan:
                 _method = raw.get("method", "")
                 if _method == "item/completed":
                     _item = (raw.get("params") or {}).get("item") or {}
                     if _item.get("type") == PLAN_ITEM and _item.get("text"):
                         plan_text = _item["text"]
-                    elif _item.get("type") == "agentMessage" and _item.get("text"):
-                        final_plan_msg = _item["text"]
                 elif _method == "turn/completed":
                     if ((raw.get("params") or {}).get("turn") or {}).get("status") == "interrupted":
                         turn_interrupted = True
@@ -897,12 +910,13 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 # A background terminal's exit (its item/completed, tagged with
                 # the ORIGINAL turn id) landed between turns — the badge gate
                 # must still resolve. Apply it out-of-band instead of dropping.
-                # Twin of the LOCAL router's _apply_bg_command_oob. Guarded — a
-                # failure here must never kill the router; the translated
-                # events are discarded (no pump is attached between turns; the
-                # monitor's ``bg_commands_complete`` nudge is the visible clear).
+                # Twin of the LOCAL router's _apply_bg_command_oob: the
+                # terminal's own badge clears on the chat at once (no pump is
+                # attached between turns to consume its BG_COMMAND_END).
+                # Guarded — a failure here must never kill the router.
                 try:
-                    self._translate(info, raw)
+                    from core.session.session_state import clear_ended_bg_commands
+                    clear_ended_bg_commands(info.session_id, self._translate(info, raw))
                 except Exception:
                     logger.exception(
                         "Remote session %s: out-of-band bg-command apply failed",
@@ -947,7 +961,8 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             if aid in state.bg_supervisors:
                 continue  # already supervised (carried over from a prior turn)
             state.thread_consumers.setdefault(aid, asyncio.Queue())
-            reg.register_spawn(aid, aid, label=shorten_label(p.get("description", "")))
+            reg.register_spawn(aid, aid, label=shorten_label(p.get("description", "")),
+                               background=True)
             state.bg_supervisors[aid] = asyncio.create_task(
                 self._supervise_bg_subagent(info, aid),
                 name=f"remote-codex-bgsup-{info.session_id[:8]}-{aid[-6:]}",
@@ -960,13 +975,15 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
     async def _supervise_bg_subagent(self, info: RemoteSessionInfo, sub_tid: str) -> None:
         """Drain ONE background sub-agent's thread buffer until it terminates,
         then resolve it. Runs concurrently with user/nudge turns (never blocks a
-        turn). The ceiling backstops a lost terminal. Mirrors the LOCAL
-        _supervise_bg_subagent."""
+        turn). It waits as long as the session lives; a lost terminal is the
+        chat monitor's to give up on, after the agent's silence. Mirrors the
+        LOCAL _supervise_bg_subagent."""
+        from core.session.session_state import get_subagent_registry
         state = cast("CodexRemoteState", info.engine_state)
-        start = time.monotonic()
+        reg = get_subagent_registry(info.session_id)
         q = state.thread_consumers.get(sub_tid)
         try:
-            while q is not None and (time.monotonic() - start) < _BG_SUBAGENT_CEILING_S:
+            while q is not None:
                 try:
                     raw = await asyncio.wait_for(q.get(), timeout=5.0)
                 except asyncio.TimeoutError:
@@ -974,6 +991,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                         break
                     continue
                 info.last_activity = time.monotonic()
+                reg.note_alive(sub_tid)
                 if raw is None:  # session ended
                     break
                 method = raw.get("method", "") if isinstance(raw, dict) else ""
@@ -981,13 +999,6 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     break
                 if method == "error" and not will_retry(raw.get("params") if isinstance(raw, dict) else None):
                     break
-            else:
-                if q is not None:
-                    logger.warning(
-                        "Remote session %s: bg sub-agent %s hit the %.0fs ceiling "
-                        "without a terminal — resolving",
-                        info.session_id[:8], sub_tid, _BG_SUBAGENT_CEILING_S,
-                    )
         finally:
             self._resolve_bg_subagent(info, sub_tid)
 

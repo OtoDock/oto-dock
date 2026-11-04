@@ -38,7 +38,7 @@ from proxy.client import fetch_pin_failures, report_call
 from proxy.management_ws import ManagementWSClient
 from telephony.ami_events import CHANNEL_RE, UNIQUEID_RE, AmiListenerManager
 from telephony.audio_socket import AudioSocketConnection, AudioSocketError
-from telephony.transfer import AmiTransfer, dial_outcome
+from telephony.transfer import AmiOutboundTransfer, AmiTransfer, dial_outcome
 
 # Track active calls
 _active_calls: dict[str, asyncio.Task] = {}
@@ -501,8 +501,8 @@ async def _handle_connection(
     # gate. Registration lives ONLY on this AudioSocket path — the Twilio
     # path enters _run_call directly and must never register.
     ami_reg: tuple[str, str] | None = None
-    # A transfer moves the registered channel (inbound AudioSocket calls
-    # only: an outbound call's media leg names no channel).
+    # A transfer moves the registered channel: an inbound call's from the
+    # register curl, an outbound call's from the PBX's OriginateResponse.
     transfer = None
     if not is_outbound and ami_manager is not None:
         uniqueid = str(
@@ -526,12 +526,14 @@ async def _handle_connection(
             )
     # An outbound call's channel comes from the PBX's OriginateResponse (the
     # listener keeps it under the call's audio uuid); the media leg and the
-    # event arrive in either order, so the binding may land after this point.
+    # event arrive in either order, so the binding may land after this point
+    # (the transfer handle reads the channel when the agent asks).
     outbound_bind: tuple[str, str] | None = None
     if is_outbound and ami_manager is not None:
         server_key = ami_manager.resolve_server_key(route.phone_server_id)
         if server_key is not None:
             outbound_bind = (server_key, call_uuid)
+            transfer = AmiOutboundTransfer(ami_manager, server_key, call_uuid)
             if ami_manager.bind_outbound(server_key, call_uuid, conn):
                 logger.info("Call %s: signalled DTMF bound from the PBX's OriginateResponse", call_uuid)
             else:

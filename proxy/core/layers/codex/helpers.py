@@ -178,10 +178,10 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
 # Platform "ultra" is an EXPLICIT user choice, never an alias for "max":
 # wire "ultra" is not a bigger reasoning budget but Codex-native multi-agent
 # orchestration (the model proactively spawns parallel sub-agent workstreams;
-# codex-rs sends the API the model's multi-agent effort — "max" on Terra and
-# the retired GPT-6 and 5.6 Sols, "xhigh" on GPT-6.1 Sol and Astra — and
-# flips MultiAgentMode::Proactive). It is offered
-# per-model in the dashboard (supports_ultra — GPT-6.1 Sol, gpt-5.6 Terra and
+# codex-rs sends the API the model's multi-agent effort — "max" on the
+# retired 5.6 Terra and GPT-6 and 5.6 Sols, "xhigh" on GPT-6.1 Sol, GPT-6.1
+# Terra and Astra — and flips MultiAgentMode::Proactive). It is offered
+# per-model in the dashboard (supports_ultra — GPT-6.1 Sol, GPT-6.1 Terra and
 # gpt-6-astra; OpenAI's own manifest caps Luna at "max") and clamps to the
 # model's ceiling everywhere else, so a stored "ultra" can never reach a
 # model/CLI that rejects it. It complements the platform's own delegation
@@ -201,12 +201,17 @@ _EFFORT_TO_CODEX: dict[str, str] = {
 # config.MODEL_REGISTRY (the dashboard gate) — this is the wire-level truth.
 # Exact GPT-6 ids rather than "gpt-6": a future GPT-6 tier without "max"
 # must not inherit the unlock, and "gpt-6-sol" does not match "gpt-6.1-sol".
-# The retired 5.6 Sol / Luna and GPT-6 Sol prefixes stay: a custom re-add,
-# or a live session whose row remaps at the next boot, keeps its ceiling
-# (Codex 0.160.0 to 0.163.0 catalogs: GPT-6.1 Sol and GPT-6 Sol low…max +
-# ultra, GPT-6 Luna low…max).
-_MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna")
-_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol")
+# Each tuple holds the registry's current ids first, then the retired ids
+# that are MODEL_SUCCESSORS keys ("gpt-5.6" covers 5.6 Sol, Luna and Terra):
+# a pin can still name one (a custom re-add the boot walk leaves alone, a
+# live session adopted before its row remaps, a pin written after the boot),
+# and it keeps its ceiling. Codex 0.166.0 still serves every one of them
+# (GPT-6.1 Sol and Terra, GPT-6 Sol and 5.6 Sol and Terra low…max + ultra,
+# GPT-6 Luna and 5.6 Luna low…max). An id that is neither leaves its tuple.
+_MAX_EFFORT_MODEL_PREFIXES = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+                              "gpt-5.6", "gpt-6-sol")
+_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra",
+                                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol")
 
 
 def map_effort_to_codex(effort: str, model: str = "") -> str:
@@ -232,7 +237,7 @@ def map_effort_to_codex(effort: str, model: str = "") -> str:
 
 # The reasoning summary every turn asks for (``turn/start`` ``summary``,
 # which holds for later turns too; thread/start has no such field). Codex's
-# catalog defaults every hosted model to "none" (0.162.1, 0.163.0), so without it no
+# catalog defaults every hosted model to "none" (0.162.1 to 0.166.0), so without it no
 # reasoning text ever streams. The satellite's turn params send the same.
 REASONING_SUMMARY = "auto"
 
@@ -294,7 +299,7 @@ def build_auth_json(token: str, *, auth_blob: dict) -> dict:
 
 def will_retry(params) -> bool:
     """Whether Codex retries the error an ``error`` notification reports.
-    The flag sits at the params' top level (0.156.1 to 0.163.0 schema); older builds
+    The flag sits at the params' top level (0.156.1 to 0.166.0 schema); older builds
     nested it in ``error``."""
     if not isinstance(params, dict):
         return False

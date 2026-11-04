@@ -52,10 +52,13 @@ def place_phrase(target: str | None, label: str = "", *, start: bool = False) ->
 
 @dataclass(frozen=True)
 class RunPerson:
-    """Whose session would run in a place, and at which role."""
+    """Whose session would run in a place, and at which role.
+    ``machine_owner`` is the person whose own computers a run of no person
+    may use: the delegator of a chat worker that runs as the agent."""
 
     sub: str | None
     role: str
+    machine_owner: str | None = None
 
 
 @dataclass
@@ -146,6 +149,7 @@ def offered(agent: str, person: RunPerson, *, engine_path: str,
     from core.session.session_manager import get_layer_capabilities
     from services.remote import remote_status
     from storage import remote_store
+    from storage.agents import agent_store
 
     resolved, _reason = remote_status.resolve_execution_target(agent, person.sub, person.role)
     default = placement.machine_of(resolved) or placement.LOCAL
@@ -157,9 +161,14 @@ def offered(agent: str, person: RunPerson, *, engine_path: str,
 
     allowed_user = user_machines_allowed()
     can_manage = roles.can_manage(person.role)
+    agent_default = (agent_store.get_agent(agent) or {}).get("execution_target")
+    # The guard's person: the run's own, else the machine owner a delegated
+    # chat worker names (their own computers only, never the admin machines
+    # their account sees).
+    run_sub = person.sub or person.machine_owner
     rows: dict[str, dict] = {}
-    if person.sub:
-        for m in remote_store.get_visible_machines_for_user(person.sub):
+    if run_sub:
+        for m in remote_store.get_visible_machines_for_user(run_sub):
             rows[m["id"]] = m
     if admin_asker and (not person.sub or can_manage):
         for m in remote_store.get_all_remote_machines():
@@ -174,8 +183,8 @@ def offered(agent: str, person: RunPerson, *, engine_path: str,
         if not allowed_user and not placement.machine_is_admin_paired(m):
             continue  # personal computers are turned off on this platform
         live = remote_status.get_live_machine_status(mid, machine=m)
-        guard = placement.may_run_on(m, run_sub=person.sub, run_can_manage=can_manage,
-                                     user_paired_allowed=allowed_user)
+        guard = placement.may_run_on(m, run_sub=run_sub, run_can_manage=can_manage,
+                                     user_paired_allowed=allowed_user, agent_default=agent_default)
         name = label_of(mid, m)
         why = ""
         if not guard:
@@ -239,7 +248,8 @@ def resolve_work_machine(agent: str, wanted: str, *, person: RunPerson, admin_as
     """The machine a task or a delegation names for its runs: ``(machine id,
     "")`` with ``""`` for the agent's default, or ``("", refusal)``. The run
     person is the task's (the creator for a user-scope task; no person for
-    an agent-scope one, which never runs on a personal machine). A machine
+    an agent-scope one, which never runs on a personal machine unless it is
+    a chat worker naming its delegator's own computer). A machine
     that is offline now is accepted (the run falls back to the default and
     says so); one the guard refuses, or that does not run the engine, is
     not. The refusal lists the names that would do. Synchronous."""

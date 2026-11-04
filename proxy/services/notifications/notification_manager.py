@@ -36,6 +36,7 @@ from typing import cast
 import psycopg
 
 import config
+from auth import roles
 from auth.providers import acting_role_of
 from core.session import session_kind
 
@@ -524,36 +525,53 @@ _AUDIENCE_TTL_S = 30.0
 
 @dataclass
 class _AudienceEntry:
-    subs: tuple[str, ...]
+    members: tuple[tuple[str, str], ...]   # (sub, role): admins as ``admin``
     fetched_at: float
     getter: object          # the store function that filled it (a stand-in misses)
     generation: int = 0     # bumped by every drop and invalidation
     stale: bool = False
     refreshing: bool = False
     placeholder: bool = False   # no list read yet: it answers fan-outs only
+    shared_only: bool = False   # the agent's mode, read with the members
+
+
+def _read_audience(getter, agent: str) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """One read of an agent's audience: its members and whether it is
+    Shared-only, on the caller's thread (never the loop's)."""
+    from core.session.visibility import is_shared_only
+    return tuple(getter(agent)), is_shared_only(agent)
 
 
 _audience: dict[str, _AudienceEntry] = {}
 _audience_tasks: set[asyncio.Task] = set()
 
 
-def agent_audience(agent: str, *, fan_out: bool = False) -> list[str]:
-    """Every user who sees ``agent``'s shared-only and task chats, from the
-    cache, as a fresh list. Callable from any thread. A miss (an agent with
-    no entry yet) reads the store on the caller's thread, except a
-    ``fan_out`` read on the loop: a caller that only delivers frames is
-    answered with nobody at once while one executor job fills the entry, and
-    the next frame reaches the audience. A check that refuses on the answer
-    never passes ``fan_out``."""
+def agent_audience(agent: str, *, fan_out: bool = False, floor: str | None = None) -> list[str]:
+    """Every user of ``agent`` (its members and the platform admins), from
+    the cache, as a fresh list; ``floor`` keeps those at or above that
+    per-agent role (``roles.meets_floor``). Callable from any thread. A miss
+    (an agent with no entry yet) reads the store on the caller's thread,
+    except a ``fan_out`` read on the loop: a caller that only delivers
+    frames is answered with nobody at once while one executor job fills the
+    entry, and the next frame reaches the audience. A check that refuses on
+    the answer never passes ``fan_out``."""
     if not agent:
         return []
-    getter = notification_store.get_agent_user_subs
+    members, _shared_only = _audience_of(agent, fan_out=fan_out)
+    return [sub for sub, role in members if floor is None or roles.meets_floor(role, floor)]
+
+
+def _audience_of(agent: str, *, fan_out: bool) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """``(members, shared_only)`` of ``agent`` from the cache, refreshed as
+    ``agent_audience`` says."""
+    getter = notification_store.get_agent_members
     entry = _audience.get(agent)
     if entry is None or entry.getter is not getter:
         entry = _audience[agent] = _placeholder(getter)
-    elif not entry.stale and time.monotonic() - entry.fetched_at < _AUDIENCE_TTL_S:
-        return list(entry.subs)
-    return list(_refresh_audience(agent, entry, getter, fan_out=fan_out))
+        return _refresh_audience(agent, entry, getter, fan_out=fan_out)
+    if not entry.stale and time.monotonic() - entry.fetched_at < _AUDIENCE_TTL_S:
+        return entry.members, entry.shared_only
+    return _refresh_audience(agent, entry, getter, fan_out=fan_out)
 
 
 def _placeholder(getter) -> _AudienceEntry:
@@ -561,7 +579,7 @@ def _placeholder(getter) -> _AudienceEntry:
 
 
 def _refresh_audience(agent: str, entry: _AudienceEntry, getter, *,
-                      fan_out: bool) -> tuple[str, ...]:
+                      fan_out: bool) -> tuple[tuple[tuple[str, str], ...], bool]:
     """A stale or placeholder entry. On the loop thread a stale entry is
     served and refreshed in one executor job (one in flight per agent), and
     a placeholder is served so to a fan-out only. On any other thread, and
@@ -575,15 +593,15 @@ def _refresh_audience(agent: str, entry: _AudienceEntry, getter, *,
     if loop is None or (entry.placeholder and not fan_out):
         generation = entry.generation
         try:
-            subs = tuple(getter(agent))
+            members, shared_only = _read_audience(getter, agent)
         except Exception:
             if entry.placeholder and _audience.get(agent) is entry:
                 _audience.pop(agent, None)
             raise
-        _store_audience(agent, generation, subs, getter)
-        return subs
+        _store_audience(agent, generation, members, getter, shared_only)
+        return members, shared_only
     _start_audience_refresh(loop, agent, entry, getter)
-    return entry.subs
+    return entry.members, entry.shared_only
 
 
 def _start_audience_refresh(loop, agent: str, entry: _AudienceEntry, getter) -> None:
@@ -597,7 +615,7 @@ def _start_audience_refresh(loop, agent: str, entry: _AudienceEntry, getter) -> 
 async def _refresh_audience_job(agent: str, generation: int, getter) -> None:
     from storage.pg import run_db
     try:
-        subs = tuple(await run_db(getter, agent))
+        members, shared_only = await run_db(_read_audience, getter, agent)
     except psycopg.Error:
         logger.warning("audience refresh of %s failed; serving the last list",
                        agent, exc_info=True)
@@ -605,10 +623,11 @@ async def _refresh_audience_job(agent: str, generation: int, getter) -> None:
         if entry is not None:
             entry.refreshing = False
         return
-    _store_audience(agent, generation, subs, getter)
+    _store_audience(agent, generation, members, getter, shared_only)
 
 
-def _store_audience(agent: str, generation: int, subs: tuple[str, ...], getter) -> None:
+def _store_audience(agent: str, generation: int, members: tuple[tuple[str, str], ...],
+                    getter, shared_only: bool = False) -> None:
     """Land a refreshed list unless the entry moved on while the read was in
     flight (a drop, an invalidation): then it stays stale and the next read
     refreshes again."""
@@ -618,7 +637,8 @@ def _store_audience(agent: str, generation: int, subs: tuple[str, ...], getter) 
     entry.refreshing = False
     if entry.generation != generation:
         return
-    _audience[agent] = _AudienceEntry(subs, time.monotonic(), getter, generation)
+    _audience[agent] = _AudienceEntry(members, time.monotonic(), getter, generation,
+                                      shared_only=shared_only)
 
 
 def invalidate_audience(agent: str = "") -> None:
@@ -642,7 +662,7 @@ def _fill_new_audience(agent: str) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    getter = notification_store.get_agent_user_subs
+    getter = notification_store.get_agent_members
     entry = _audience.setdefault(agent, _placeholder(getter))
     if entry.placeholder:
         _start_audience_refresh(loop, agent, entry, getter)
@@ -654,19 +674,25 @@ def _drop_from_audience(sub: str, agents) -> None:
         if entry is None:
             continue
         _audience[agent] = _AudienceEntry(
-            tuple(s for s in entry.subs if s != sub), entry.fetched_at,
+            tuple(m for m in entry.members if m[0] != sub), entry.fetched_at,
             entry.getter, entry.generation + 1, stale=True,
-            placeholder=entry.placeholder)
+            placeholder=entry.placeholder, shared_only=entry.shared_only)
 
 
 async def _on_offboard(event) -> None:
     """The offboarding subscriber: a person who lost access to an agent
     leaves its audience before the admin's request completes; a lost row
-    with access kept (a platform admin unassigned) only refreshes the entry;
-    a lower role changes nothing; a deleted person leaves every entry."""
+    with access kept (a platform admin unassigned) and a lower role (the
+    entry carries roles) leave it at once and come back at the new role when
+    its refresh lands (a demoted editor never gets the next frame of the
+    agent's own runs); a deleted person leaves every entry."""
     from services.agents import offboarding
     if event.reason == offboarding.DELETED:
         _drop_from_audience(event.sub, list(_audience))
+    elif event.reason == offboarding.DEMOTED:
+        # Out at once, back at the new role when the refresh lands: a stale
+        # entry is served on the loop while it refreshes.
+        _drop_from_audience(event.sub, [a.agent for a in event.agents])
     elif event.reason == offboarding.REMOVED:
         _drop_from_audience(event.sub, [a.agent for a in event.agents if a.lost_access])
         for loss in event.agents:
@@ -679,9 +705,9 @@ def _register_audience_invalidation() -> None:
     offboarding.subscribe("audience-cache", _on_offboard, priority=5)
 
 
-def _read_all_audiences() -> dict[str, tuple[str, ...]]:
+def _read_all_audiences() -> dict[str, tuple[tuple[tuple[str, str], ...], bool]]:
     from storage.agents import agent_store
-    return {a["slug"]: tuple(notification_store.get_agent_user_subs(a["slug"]))
+    return {a["slug"]: _read_audience(notification_store.get_agent_members, a["slug"])
             for a in agent_store.get_all_agents()}
 
 
@@ -692,7 +718,7 @@ def _schedule_audience_warmup() -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    getter = notification_store.get_agent_user_subs
+    getter = notification_store.get_agent_members
 
     async def job() -> None:
         from storage.pg import run_db
@@ -702,9 +728,9 @@ def _schedule_audience_warmup() -> None:
             logger.warning("audience warm-up failed; entries fill on first use", exc_info=True)
             return
         now = time.monotonic()
-        for agent, subs in lists.items():
+        for agent, (members, shared_only) in lists.items():
             if agent not in _audience:
-                _audience[agent] = _AudienceEntry(subs, now, getter)
+                _audience[agent] = _AudienceEntry(members, now, getter, shared_only=shared_only)
 
     task = loop.create_task(job())
     _audience_tasks.add(task)
@@ -720,18 +746,27 @@ def reset_audience_cache() -> None:
 
 def chat_status_targets(owner_sub: str, agent: str) -> list[str]:
     """Real users who should see live/read state for a chat owned by
-    ``owner_sub``: the owner — or, for a synthetic owner, every user of the
-    agent (admins included). Synthetic owners are the shared-only chat owner
+    ``owner_sub``: the owner — or, for a synthetic owner, the agent's users
+    (admins included). Synthetic owners are the shared-only chat owner
     (``agent::<slug>``) AND the scheduler's agent-scope task-chat owner
     (``task::<slug>``) — the latter fans out so scheduled-run pulses reach the
-    sidebar's task mode. The synthetic paths read the audience cache as a
-    fan-out (every caller delivers frames)."""
+    sidebar's task mode. What the agent does on its own behalf reaches the
+    editor tier: a ``task::`` owner's run, and an ``agent::`` owner on an
+    agent that is not Shared-only (only a delegated worker a no-user session
+    spawned owns it there). A Shared-only agent's pool reaches every member.
+    The synthetic paths read the audience cache as a fan-out (every caller
+    delivers frames, never a store read on the loop; the agent's mode rides
+    in the cache entry)."""
     from core.session.visibility import is_shared_chat_owner, is_task_chat_owner
     if is_shared_chat_owner(owner_sub) or is_task_chat_owner(owner_sub):
+        if not agent:
+            return []
         try:
-            return agent_audience(agent, fan_out=True) if agent else []
+            members, shared_only = _audience_of(agent, fan_out=True)
         except psycopg.Error:
             return []
+        own_work = is_task_chat_owner(owner_sub) or not shared_only
+        return [sub for sub, role in members if not own_work or roles.can_edit(role)]
     return [owner_sub] if owner_sub else []
 
 
@@ -933,13 +968,19 @@ def chat_turn_origin(chat_id: str) -> tuple[str, str, str] | None:
 # --- Target resolution ---
 
 
-def resolve_targets(scope: str, target: str | None) -> list[str]:
-    """Resolve notification scope + target to a list of user_sub IDs."""
+def resolve_targets(scope: str, target: str | None, audience: str | None = None) -> list[str]:
+    """Resolve notification scope + target to a list of user_sub IDs. An
+    agent-scope ``audience`` (who is told: the lowest per-agent role) keeps
+    the agent's users at or above it, platform admins always; it narrows
+    the agent's users, never widens them."""
     if scope == "user":
         return [target] if target else []
     elif scope == "agent":
         if not target:
             return []
+        if audience:
+            return [sub for sub, role in notification_store.get_agent_members(target)
+                    if roles.meets_floor(role, audience)]
         return notification_store.get_agent_user_subs(target)
     elif scope == "global":
         return notification_store.get_all_user_subs()
@@ -965,6 +1006,17 @@ def agent_label(agent_slug: str | None) -> str:
     except psycopg.Error:
         row = None
     return (row or {}).get("display_name") or agent_slug
+
+
+def turn_end_words(label: str, *, asked: bool, plan: bool = False) -> tuple[str, str]:
+    """The end-of-turn notice's title and body: a turn that left a plan to
+    review or asked the person a question waits for them (the words of the
+    mid-turn ping and of the terminal), any other one finished."""
+    if plan:
+        return f"{label} needs your input", "Review the plan"
+    if asked:
+        return f"{label} needs your input", "Waiting for your answer"
+    return f"{label} finished", "Response ready"
 
 
 def push_title(title: str, agent_slug: str | None) -> str:
@@ -998,14 +1050,19 @@ async def fire_notification(
     agent_slug: str | None = None,
     chat_id: str | None = None,
     href: str = "",
+    audience: str | None = None,
 ) -> list[dict]:
     """Fire a notification to all resolved targets.
 
     Creates a delivery record per user (so the inbox is always populated regardless of channel)
     then routes to WS / native push per the mutually-exclusive policy in ``_deliver_to_user``.
     ``href`` is a dashboard path the row opens instead of the agent/chat deep link.
+    ``audience`` narrows an agent-scope notification to the agent's users at
+    or above that role (who is told). An agent-scope row's chat link reaches
+    only the editor tier: a contributor or a viewer cannot open the agent's
+    own chats, so their row carries no "open the chat".
     """
-    user_subs = await run_db(resolve_targets, scope, target)
+    user_subs = await run_db(resolve_targets, scope, target, audience)
     if not user_subs:
         logger.warning(
             "No targets resolved for notification: scope=%s, target=%s", scope, target
@@ -1017,12 +1074,18 @@ async def fire_notification(
         # a recipient deleted since the targets were resolved costs their
         # row alone, never the others'.
         out: list[tuple[str, dict]] = []
+        from core.session.visibility import SCOPE_AGENT
+        openers = None
+        if chat_id and scope == SCOPE_AGENT and target:
+            openers = {sub for sub, role in notification_store.get_agent_members(target)
+                       if roles.can_edit(role)}
         for user_sub in user_subs:
             try:
                 out.append((user_sub, notification_store.create_delivery(
                     user_sub=user_sub, title=title, body=body, severity=severity,
                     scope=scope, source=source, notification_id=notification_id,
-                    agent_slug=agent_slug, chat_id=chat_id, href=href,
+                    agent_slug=agent_slug, href=href,
+                    chat_id=chat_id if openers is None or user_sub in openers else None,
                 )))
             except Exception:
                 logger.exception("notification delivery row for %s failed", user_sub[:8])
@@ -1593,7 +1656,7 @@ def start() -> None:
     global _scheduler_ref
     _scheduler_ref = sched_module.get_scheduler()
 
-    # DB tables initialized in app.py via pg_schema.init_schema()
+    # DB tables initialized in startup.py via pg_schema.migrate_database()
 
     # Schedule all enabled notifications
     _schedule_all_notifications()
@@ -1709,6 +1772,7 @@ async def _fire_scheduled_notification(notification_id: str) -> None:
         notification_id=notification_id,
         agent_slug=notif.get("agent_slug"),
         chat_id=notif.get("chat_id"),
+        audience=notif.get("audience"),
     )
 
 

@@ -119,6 +119,9 @@ class OAuthProvider(ABC):
     #: file, and without the union a second MCP's connect would replace it
     #: with a token record missing the first MCP's scopes.
     supports_incremental_auth: bool = False
+    # The vendor keeps every permission a person granted the app, so a
+    # re-consent's token holds the union (Meta).
+    grants_accumulate: bool = False
 
     # ------------------------------------------------------------------
     # Abstract surface

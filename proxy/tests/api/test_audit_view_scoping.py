@@ -9,6 +9,9 @@ carry a real (or no-user) identity — only the MASTER key (`is_service`) is
 unfiltered (H1/H2 for tasks; the C3 hardening extended the same re-key to
 triggers, notifications, and subscriptions).
 
+The member personas hold the editor role on the agent: below it the agent's
+own rows drop out of every view (``test_shared_automations_below_editor.py``).
+
 Run: cd proxy && venv/bin/pytest tests/api/test_audit_view_scoping.py -v
 """
 
@@ -46,7 +49,8 @@ def _admin() -> UserContext:
 
 
 def _viewer() -> UserContext:
-    return UserContext(sub=V, email="v@t.com", name="Viewer", role="member", agents=[AG])
+    return UserContext(sub=V, email="v@t.com", name="Viewer", role="member", agents=[AG],
+                       agent_roles={AG: "editor"})
 
 
 def _apikey() -> UserContext:
@@ -57,7 +61,7 @@ def _user_session() -> UserContext:
     """User-backed per-session JWT: is_api_key=True + the real user's identity."""
     return UserContext(
         sub=V, email="v@t.com", name="Viewer", role="member",
-        agents=[AG], agent_roles={AG: "viewer"},
+        agents=[AG], agent_roles={AG: "editor"},
         is_api_key=True, session_id="sess-1", agent=AG)
 
 
@@ -216,7 +220,7 @@ class TestSessionJwtTaskScoping:
         # A user-backed per-session JWT: is_api_key=True + real sub/roles.
         return UserContext(
             sub=V, email="v@t.com", name="Viewer", role="member",
-            agents=[AG], is_api_key=True, session_id="sess-1", agent=AG)
+            agents=[AG], agent_roles={AG: "editor"}, is_api_key=True, session_id="sess-1", agent=AG)
 
     def _seed_defs(self, monkeypatch):
         from api.tasks import tasks as tasks_mod

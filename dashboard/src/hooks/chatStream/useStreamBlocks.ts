@@ -8,12 +8,13 @@ import { useRef } from 'react'
 import { useChatStore } from '@/store/chatStore'
 import { notePushedDocument, pushedDocumentFromFrame } from '@/store/documentPaneStore'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
-import { answeredBetweenTurns, continuesAbove, costBilledOf, delegateResultBadge, delegateResultBlocks, delegateResultCard, delegateResultSignature, nudgeBlock, nudgeNote, reviewSpeaker, reviseOlderPlanReviews } from '../../lib/messageBlocks'
+import { answeredBetweenTurns, continuesAbove, costBilledOf, delegateResultBadge, delegateResultBlocks, delegateResultCard, delegateResultSignature, nudgeBlock, nudgeNote, reviewSpeaker, reviseOlderPlanReviews, wakeMessage } from '../../lib/messageBlocks'
 import { DELEGATE_TOOL, ROLE, toolRole } from '../../lib/tools/roles'
 import { SYSTEM_SUBTYPE, WIRE, type SystemFrame } from '../../api/wireEvents'
 import { DELEGATE_RESULT, type DelegateBlockStatus } from '../../lib/status/run'
 import { CHAT_PHASE } from '../../lib/status/chat'
 import { evictedBy } from '../../lib/kinds/artifact'
+import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
 import type { WsCallbacks } from '../useDashboardWs.types'
 import type { MeetingParticipant, StreamCore } from './core'
 
@@ -51,7 +52,7 @@ export function useStreamBlocks(core: StreamCore, deps: {
     agents, chatIdRef, discardingRef, abortedRef, thinkingBufRef, messagesRef, meetingSpeakerRef, prePlanModeRef,
     mode, setMode,
     setMessages, currentMsgRef, reviewNudgeRef, appendBlock, ensureAssistantMsg, appendToLastTextBlock,
-    updateToolBlock, updateToolBlockByName, updateSubagentActive, updateCommandActive, removePlaceholders,
+    updateToolBlock, updateToolBlockByName, updateSubagentActive, updateCommandActive, removePlaceholders, dropRunning,
     upsertPreviewBlock,
     setTurnStartTime, setThinkingActive, setCompressingActive, setPermissionPending, setWorkflows,
     setTotalCost, setBilledCost, setToolCost, setCostBilled, setContextUsed, setContextMax, setCacheStats, setCurrentTodos, setCurrentGoal,
@@ -114,13 +115,13 @@ export function useStreamBlocks(core: StreamCore, deps: {
 
   const callbacks: Pick<WsCallbacks,
     'onText' | 'onThinking' | 'onToolStart' | 'onToolInfo' | 'onToolResult' | 'onToolEnd' | 'onTaskSpawn'
-    | 'onDelegateSpawn' | 'onDelegateResult' | 'onBgAgentDone' | 'onBgCommandSpawn' | 'onBgCommandDone'
+    | 'onDelegateSpawn' | 'onDelegateResult' | 'onScheduleWake' | 'onBgAgentDone' | 'onBgCommandSpawn' | 'onBgCommandDone'
     | 'onBgAgentsComplete' | 'onBgCommandsComplete' | 'onWorkflowStart' | 'onWorkflowProgress' | 'onWorkflowEnd'
     | 'onFgAgentsComplete' | 'onPermissionPrompt' | 'onPlanMode' | 'onPlanReview' | 'onPromptRetired'
     | 'onPermissionResolved' | 'onSystem'
     | 'onImages' | 'onImageGenerating' | 'onMcpCost' | 'onImageGenFailed' | 'onLimitWarning' | 'onLimitReached'
     | 'onUrl' | 'onFile' | 'onVideo' | 'onAudio' | 'onMediaProcessing' | 'onMediaFailed' | 'onDocumentPreview'
-    | 'onQuestion' | 'onMetadata' | 'onContextCompact' | 'onTodoUpdate' | 'onGoalUpdate'> = {
+    | 'onQuestion' | 'onSettingsCard' | 'onActionCard' | 'onListCard' | 'onMetadata' | 'onContextCompact' | 'onTodoUpdate' | 'onGoalUpdate'> = {
     onText: (content, note = false) => {
       if (discardingRef.current || abortedRef.current) return
       if (!currentMsgRef.current) {
@@ -376,7 +377,8 @@ export function useStreamBlocks(core: StreamCore, deps: {
           agentDisplayName: delegateAgent?.display_name,
           agentColor: delegateAgent?.color || '',
           badge: delegateResultBadge(data.status, data.report_missing === true),
-          delegateCard: delegateResultCard(data.task_id || data.task_name, blocks),
+          delegateCard: delegateResultCard(data.task_id || data.task_name, blocks,
+            { taskName: data.task_name, workerChatId: data.worker_chat_id }),
         }
         // A result pushed while this chat's turn streams: the turn goes on
         // in a fresh bubble below it (the stream only grows the LAST
@@ -391,6 +393,27 @@ export function useStreamBlocks(core: StreamCore, deps: {
         if (continuation) currentMsgRef.current = continuation
         setMessages((prev) => (continuation ? [...prev, result, continuation] : [...prev, result]))
       }
+    },
+
+    onScheduleWake: (data) => {
+      if (discardingRef.current) return
+      // The turn a wake starts is its own, never a background review.
+      reviewNudgeRef.current = null
+      // Its own prefix: a bubble minted this very millisecond must not share
+      // the id.
+      const card = wakeMessage(data, `wake-${Date.now()}`, new Date().toISOString())
+      // A wake typed into a streaming turn (a steer into an open terminal
+      // turn): the turn goes on in a fresh bubble below the card, as the
+      // stored rows lay it out; otherwise the answer's first words open one.
+      const streaming = currentMsgRef.current
+      const continuation: DisplayMessage | null = streaming ? {
+        id: `stream-${Date.now()}`,
+        role: 'assistant',
+        blocks: [],
+        createdAt: new Date().toISOString(),
+      } : null
+      if (continuation) currentMsgRef.current = continuation
+      setMessages((prev) => (continuation ? [...prev, card, continuation] : [...prev, card]))
     },
 
     onBgAgentDone: (data) => {
@@ -412,7 +435,7 @@ export function useStreamBlocks(core: StreamCore, deps: {
       // from it, keyed by _toolId). bg_command_done clears it by the same id.
       // Rendered on top of the command's normal tool card.
       appendBlock({
-        type: 'bgcommand',
+        type: BG_COMMAND_BLOCK,
         command: data.command || '',
         description: data.description || '',
         isActive: true,
@@ -439,6 +462,7 @@ export function useStreamBlocks(core: StreamCore, deps: {
         return
       }
       noteReviewNudge(SYSTEM_SUBTYPE.BG_AGENTS_COMPLETED, msg.count)
+      dropRunning('agents')
       // All background agents completed (sent by bg_nudge before auto-response).
       // Mark ALL remaining bg subagent blocks as done. Array identity is
       // preserved when nothing matched (same rationale as onDone's map).
@@ -471,6 +495,7 @@ export function useStreamBlocks(core: StreamCore, deps: {
         return
       }
       noteReviewNudge(SYSTEM_SUBTYPE.BG_COMMANDS_COMPLETED, msg.count)
+      dropRunning('commands')
       // All background commands finished (sent by bg_command_nudge before the
       // review turn). The per-command bg_command_done can't deliver post-turn
       // (the turn's pump is gone), so this is the reliable clear — mark ALL
@@ -480,11 +505,11 @@ export function useStreamBlocks(core: StreamCore, deps: {
         const next = prev.map((msg) => {
           if (msg.role !== 'assistant') return msg
           const hasCmd = msg.blocks.some(
-            (b) => b.type === 'bgcommand' && b.isActive,
+            (b) => b.type === BG_COMMAND_BLOCK && b.isActive,
           )
           if (!hasCmd) return msg
           const blocks = msg.blocks.map((b) =>
-            b.type === 'bgcommand' && b.isActive
+            b.type === BG_COMMAND_BLOCK && b.isActive
               ? { ...b, isActive: false }
               : b,
           )
@@ -824,6 +849,25 @@ export function useStreamBlocks(core: StreamCore, deps: {
         type: 'question', toolName: data.tool_name, toolInput: data.tool_input,
         requestId: data.request_id,
       })
+    },
+
+    onSettingsCard: (data) => {
+      if (discardingRef.current) return
+      ensureAssistantMsg()
+      appendBlock({ type: 'setting', settingId: data.setting, label: data.label, catalogVersion: data.catalog_version })
+    },
+
+    onActionCard: (data) => {
+      if (discardingRef.current) return
+      ensureAssistantMsg()
+      appendBlock({ type: 'card', cardId: data.card_id, title: data.title, text: data.text, note: data.note || '',
+                    buttons: data.buttons || [], options: data.options || [] })
+    },
+
+    onListCard: (data) => {
+      if (discardingRef.current) return
+      ensureAssistantMsg()
+      appendBlock({ type: 'list', kind: data.kind, filters: data.filters || {}, title: data.title, person: data.person })
     },
 
     onMetadata: (data) => {

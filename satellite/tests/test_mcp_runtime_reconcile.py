@@ -70,12 +70,13 @@ async def test_reconcile_rebuilds_stale_interpreter(tmp_path):
 
     with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock) as pin, \
          patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
-               return_value=InstallResult(ok=True, log="ok", version_hash="h")) as inst:
+               return_value=InstallResult(ok=True, log="ok", version_hash="h", venv_python="3.x")) as inst:
         results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
 
     assert results == {"py-mcp": "ok-py-reconcile"}
     pin.assert_awaited_once()
     inst.assert_awaited_once()
+    assert inst.await_args.kwargs["python_spec"] == mis.mcp_python_spec()
     assert not venv.exists()  # old venv removed; pin + install are mocked
     marker = json.loads((mcp / mis._RUNTIME_MARKER).read_text())
     assert marker["python"] == f"{sys.version_info[0]}.{sys.version_info[1]}"
@@ -261,3 +262,184 @@ def test_reconcile_ends_with_the_interpreter_prune(tmp_path):
     asyncio.run(mis.reconcile_mcp_runtimes(tmp_path, None))
     assert (uvp / "cpython-3.13.14-linux").is_dir()
     assert not (uvp / "cpython-3.11.9-linux").exists()
+
+
+# ── a venv newer than the satellite (a Mac's Homebrew moved ahead) ───────
+
+
+def _custom_py(mcps: Path, minor_delta: int, marker: dict | None = None) -> Path:
+    (mcps / "custom").mkdir(parents=True, exist_ok=True)
+    mcp = _make_mcp(mcps, "custom", "py-mcp", {"name": "py-mcp", "server": {"runtime": "python"}})
+    (mcp / "requirements.txt").write_text("x\n")
+    _write_pyvenv(mcp / "venv", sys.version_info[0], sys.version_info[1] + minor_delta)
+    (mcp / "venv" / "old-file").write_text("the old venv")
+    if marker is not None:
+        (mcp / mis._RUNTIME_MARKER).write_text(json.dumps(marker))
+    return mcp
+
+
+@pytest.mark.parametrize("host, rebuilt", [("darwin", True), ("linux", False)])
+def test_a_newer_venv_is_rebuilt_on_a_mac_only(tmp_path, monkeypatch, host, rebuilt):
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of(host))
+    mcp = _custom_py(tmp_path, +2)
+    assert mis._needs_python_reconcile(mcp / "venv", sys.version_info[:2], mcp) is rebuilt
+
+
+def test_a_newer_venv_the_package_floor_kept_stays(tmp_path, monkeypatch):
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of("darwin"))
+    target = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    mcp = _custom_py(tmp_path, +1, marker={"python": target})
+    assert mis._needs_python_reconcile(mcp / "venv", sys.version_info[:2], mcp) is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rebuild_puts_the_old_venv_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of("darwin"))
+    mcps = tmp_path / "mcps"
+    mcp = _custom_py(mcps, +2)
+
+    async def half_made(uv_bin, venv_dir, *a, **kw):
+        venv_dir.mkdir()  # uv made a venv; the package install then fails
+
+    with patch.object(mis, "_uv_venv_pinned", side_effect=half_made), \
+         patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=False, log="error: offline")):
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+    assert results == {"py-mcp": "failed"}
+    assert (mcp / "venv" / "old-file").read_text() == "the old venv"
+    assert not list(mcps.glob(".venv-aside-*"))
+    assert not (mcp / mis._RUNTIME_MARKER).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_that_succeeds_drops_the_old_venv(tmp_path, monkeypatch):
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of("darwin"))
+    mcps = tmp_path / "mcps"
+    mcp = _custom_py(mcps, +2)
+    with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock), \
+         patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", version_hash="h")):
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+    assert results == {"py-mcp": "ok-py-reconcile"}
+    assert not (mcp / "venv" / "old-file").exists()
+    assert not list(mcps.glob(".venv-aside-*"))
+
+
+def test_the_mcp_venv_pin_is_this_satellites_own_python(tmp_path, monkeypatch):
+    minor = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of("darwin"))
+    monkeypatch.setattr(mis.sys, "base_prefix", str(tmp_path))
+    assert mis.mcp_python_spec() == minor  # no interpreter under the prefix
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / f"python{minor}").write_text("")
+    assert mis.mcp_python_spec() == str(tmp_path / "bin" / f"python{minor}")
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of("windows"))
+    assert mis.mcp_python_spec() is None
+
+
+# ── the cause of a failed install, as the session is told ───────────────
+
+_NO_RUST = """Using Python 3.15.2 environment at: venv
+  × Failed to build `rpds-py==0.30.0`
+  ├─▶ The build backend returned an error
+  ╰─▶ Call to `maturin.build_wheel` failed (exit status: 1)
+      [stderr]
+      error: rustc not found
+        Caused by: `cargo metadata` exited with an error: cargo not found
+      hint: This usually indicates a problem with the package or the build environment."""
+_NO_WHEEL = """  × No solution found when resolving dependencies:
+  ╰─▶ Because pyyaml>=6.0.2 has no usable wheels and workspace-mcp==2.0.1 depends on pyyaml>=6.0.2, we can conclude that workspace-mcp==2.0.1 cannot be used."""
+_NO_HEADERS = """  File "<string>", line 294, in <module>
+RequiredDependencyException: The headers or library files could not be found for libheif, a required dependency."""
+
+
+@pytest.mark.parametrize("log, cause", [
+    (_NO_RUST, "Failed to build `rpds-py==0.30.0` / error: rustc not found / "
+               "Caused by: `cargo metadata` exited with an error: cargo not found"),
+    (_NO_WHEEL, "No solution found when resolving dependencies: / Because pyyaml>=6.0.2 has no usable wheels"),
+    (_NO_HEADERS, "RequiredDependencyException: The headers or library files could not be found for libheif"),
+])
+def test_the_cause_of_a_failed_install_comes_first(log, cause):
+    out = mis.install_failure_cause(log)
+    assert out.startswith(cause)
+    assert not any(g in out for g in ("×", "├", "╰", "▶", "hint:"))
+
+
+def test_a_log_with_no_cause_line_keeps_its_end():
+    assert mis.install_failure_cause("x" * 900 + " the last words").endswith("the last words")
+    assert len(mis.install_failure_cause("x" * 900)) == 500
+    long_cause = mis.install_failure_cause("error: " + "y " * 500)
+    assert len(long_cause) <= 600 and long_cause.endswith("...")
+
+
+def test_a_network_line_leads_the_cause_and_survives_the_cut():
+    log = "\n".join([
+        "  × Failed to build `rpds-py==0.30.0`",
+        *(f"      error: failed to run custom build command for `pyo3-build-config v0.25.{i}`" for i in range(12)),
+        "        failed to download from `https://index.crates.io/config.json`",
+    ])
+    out = mis.install_failure_cause(log)
+    assert out.startswith("failed to download from `https://index.crates.io/config.json` / Failed to build")
+    assert len(out) <= 600 and out.endswith("...")
+
+
+# ── the rebuild's marker and the venvs a stopped rebuild set aside ───────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venv_python, made_minor, marked", [
+    ("/opt/py/bin/python3.x", None, True),   # made on the pin by the install
+    ("", "target", True),                    # made on the pin beforehand
+    ("", "newer", False),                    # uv's own default: tried again
+])
+async def test_a_rebuild_is_marked_reconciled_only_on_the_pin(tmp_path, monkeypatch, venv_python, made_minor, marked):
+    monkeypatch.setattr(mis.config, "HOST", mis.config.of("darwin"))
+    mcps = tmp_path / "mcps"
+    mcp = _custom_py(mcps, +2)
+    delta = {"target": 0, "newer": 2}
+
+    async def made(uv_bin, venv_dir, *a, **kw):
+        if made_minor:
+            _write_pyvenv(venv_dir, sys.version_info[0], sys.version_info[1] + delta[made_minor])
+
+    with patch.object(mis, "_uv_venv_pinned", side_effect=made), \
+         patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", version_hash="h", venv_python=venv_python)):
+        assert await mis.reconcile_mcp_runtimes(mcps, "/fake/uv") == {"py-mcp": "ok-py-reconcile"}
+    assert (mcp / mis._RUNTIME_MARKER).exists() is marked
+
+
+def _stopped_rebuild(mcps: Path, *, marker: dict | None, half_built: bool) -> tuple[Path, Path]:
+    """An MCP whose rebuild a stopped satellite left: its old venv aside,
+    maybe a half-built new one, maybe the marker a finished rebuild writes."""
+    mcp = _custom_py(mcps, +2, marker=marker)
+    aside = mcps / ".venv-aside-custom-py-mcp"
+    (mcp / "venv").rename(aside)
+    if half_built:
+        _write_pyvenv(mcp / "venv", sys.version_info[0], sys.version_info[1])
+    return mcp, aside
+
+
+@pytest.mark.parametrize("half_built", [False, True])
+def test_a_rebuild_a_stopped_satellite_left_gets_its_old_venv_back(tmp_path, half_built):
+    mcps = tmp_path / "mcps"
+    mcp, aside = _stopped_rebuild(mcps, marker=None, half_built=half_built)
+    mis._settle_venv_asides(mcps, sys.version_info[:2])
+    assert (mcp / "venv" / "old-file").read_text() == "the old venv"
+    assert not aside.exists()
+
+
+def test_a_rebuild_that_finished_before_the_stop_keeps_its_new_venv(tmp_path):
+    mcps = tmp_path / "mcps"
+    target = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    mcp, aside = _stopped_rebuild(mcps, marker={"python": target}, half_built=True)
+    mis._settle_venv_asides(mcps, sys.version_info[:2])
+    assert (mcp / "venv" / "pyvenv.cfg").exists() and not (mcp / "venv" / "old-file").exists()
+    assert not aside.exists()
+
+
+def test_an_aside_whose_mcp_is_gone_is_dropped(tmp_path):
+    mcps = tmp_path / "mcps"
+    (mcps / ".venv-aside-custom-gone-mcp").mkdir(parents=True)
+    mis._settle_venv_asides(mcps, sys.version_info[:2])
+    assert not list(mcps.glob(".venv-aside-*"))

@@ -62,6 +62,12 @@ export default function AppDeployCard({ app, agent }: Props) {
   const changes = status?.changes
   const waiting = status?.waiting ?? ''
   const lowersApproval = status?.lowers_approval === true
+  // A release an update from the source cut is held whatever the app's
+  // setting says (services/apps/app_follow.py), so the card says where it came from.
+  const heldFrom = pending && app.follows?.held_release === pending
+    ? app.follows.agent_name || app.follows.agent
+    : ''
+  const requiresApproval = status ? status.deploy_requires_approval : true
   const manifestChanged = status ? !status.manifest_approved : !app.actions_approved
   const showsManifest = manifestChanged && !(app.manifest_empty ?? app.actions.length === 0)
   const busy = approve.isPending || reject.isPending
@@ -88,7 +94,11 @@ export default function AppDeployCard({ app, agent }: Props) {
                 ? 'What the app may do is approved. A secret it needs has no value yet.'
                 : lowersApproval
                   ? 'Deploys of this app wait for a person until this release is approved.'
-                  : 'Deploys of this app always wait for a person.'}
+                  : heldFrom
+                    ? `This release came from ${heldFrom}’s app, so it waits for a person here.`
+                    : requiresApproval
+                      ? 'Deploys of this app always wait for a person.'
+                      : 'This release waits for a person before it goes live.'}
           </p>
           {lowersApproval && (
             <p className="mt-0.5 text-status-warning-fg" data-testid="deploy-lowers-approval">

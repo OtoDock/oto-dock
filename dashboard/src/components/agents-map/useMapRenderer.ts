@@ -14,7 +14,6 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
-import type { User } from '../../api/auth'
 import {
   ENTER_STAGE_DIST, STAGE_ZOOM_MAX, STAGE_ZOOM_MIN, WHEEL_EXIT_ACCUM,
   WHEEL_HOLD_GAP_MS, WHEEL_HOLD_MS,
@@ -52,7 +51,7 @@ export interface StageRefs {
 
 export function useMapRenderer({
   containerRef, bagRef, stageRefs, onUnavailable, setAssetsTick, setRowCap,
-  setUserMoved, user,
+  setUserMoved, anchorSlug,
 }: {
   containerRef: RefObject<HTMLDivElement | null>
   bagRef: RefObject<SceneBag | null>
@@ -64,9 +63,9 @@ export function useMapRenderer({
   setRowCap: Dispatch<SetStateAction<number>>
   /** Set once, on the first grab of the controls. */
   setUserMoved: Dispatch<SetStateAction<boolean>>
-  /** The mount-time user (`user?.default_agent` for the pose park) — the
-   * effect runs once and reads the argument it was called with. */
-  user: User | null
+  /** The agent the map opens on (the pose park's `f` stamp) — the effect
+   * runs once and reads the argument it was called with. */
+  anchorSlug: string
 }) {
   // --- renderer lifecycle -------------------------------------------------
   useEffect(() => {
@@ -127,14 +126,15 @@ export function useMapRenderer({
     // whole-map pose (also viewScale-scaled) stays reachable by hand.
     controls.maxDistance = 150 * vs0
 
-    // The map OPENS on the favorite's stage, but that pose needs the
-    // agents+departments queries — until they land the camera would show
-    // a zoomed-out nowhere and then jump (round 12 complaint). Parking it
-    // at the FAVORITE's remembered stage pose makes the wait look like the
-    // destination; the real snap lands ≈ where we already are. The writer
-    // only persists the favorite's own stage (see the stage-pose effect),
-    // and the `f` stamp guards a favorite change between sessions — a
-    // mismatch just means the default pose, corrected by the first snap.
+    // The map OPENS on the anchor's stage (the agent the person came from,
+    // else the favorite), but that pose needs the agents+departments
+    // queries — until they land the camera would show a zoomed-out nowhere
+    // and then jump (round 12 complaint). Parking it at the ANCHOR's
+    // remembered stage pose makes the wait look like the destination; the
+    // real snap lands ≈ where we already are. The writer only persists the
+    // anchor's own stage (see the stage-pose effect), and the `f` stamp
+    // guards an anchor change between opens — a mismatch just means the
+    // default pose, corrected by the first snap.
     // (v2: v1 entries had no identity and parked the LAST VISITED
     // department — the "opens rotated to Engineering" live-hit.)
     try {
@@ -144,7 +144,7 @@ export function useMapRenderer({
         if (Array.isArray(p.c) && p.c.length === 3
           && Array.isArray(p.t) && p.t.length === 3
           && [...p.c, ...p.t].every(Number.isFinite)
-          && !!p.f && p.f === user?.default_agent) {
+          && !!p.f && p.f === anchorSlug) {
           camera.position.set(p.c[0], Math.max(2, p.c[1]), p.c[2])
           controls.target.set(p.t[0], p.t[1], p.t[2])
         }

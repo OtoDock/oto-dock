@@ -242,8 +242,10 @@ async def _build_external_config(
     # only on a LOCAL target — satellites never sync externals/, so a remote
     # call keeps the agent-scope mount (caller memory still works: the
     # memory API keys on the token, proxy-side). Defensive today: an
-    # external identity is a viewer and resolve_execution_target forces every
-    # non-owner role to local, so a tree-bearing call never resolves remote.
+    # external identity is a viewer and resolve_execution_target keeps a
+    # session below the owner tier with no person (an external identity) on
+    # the platform host whatever the machine's every-role switch says, so a
+    # tree-bearing call never resolves remote.
     external_home = ""
     if ident.has_tree:
         if is_remote:
@@ -446,6 +448,7 @@ async def _build_external_config(
         credential_env=credential_env,
         token_minted_at=token_minted_at,
         mcp_secret_bundles=secret_bundles or {},
+        excluded_mcps=frozenset(excluded_mcps or ()),
         execution_target=phone_target_value,
         execution_path=execution_path,
     )

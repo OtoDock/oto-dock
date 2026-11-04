@@ -3,7 +3,7 @@
 // what the back arrow pops, the list injected behind a cold deep link, and
 // where "Back to Chat" lands.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { act, render, screen, fireEvent } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { BrowserRouter, Link, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { useEffect } from 'react'
 import HistoryTrail from '@/components/settings/HistoryTrail'
@@ -333,5 +333,48 @@ describe('Back to Chat', () => {
     await click('to chat')
     expect(page()).toBe('root at /')
     expect(idx()).toBe(0)
+  })
+})
+
+describe('another page life', () => {
+  const store = (trail: object) => sessionStorage.setItem('otodock.settingsTrail', JSON.stringify(trail))
+  const key = () => (window.history.state as { key?: string } | null)?.key
+
+  it('the injected entries keep their keys', async () => {
+    await coldLoad('/chat/ops/c1')
+    await click('open admin users')
+    expect(idx()).toBe(2)
+    const keys = readTrail().keys ?? {}
+    expect(keys[2]).toBe(key())
+    expect(typeof keys[1]).toBe('string')
+    expect(keys[1]).not.toBe(keys[2])
+  })
+
+  it("a keyed load on an entry the trail does not hold drops the other life's trail", async () => {
+    await coldLoad('/chat/ops/c1')
+    await click('open admin users')
+    store({ entries: { 0: '/chat/ops/c1', 1: '/admin', 2: '/admin/usage' }, keys: { 0: 'a', 1: 'b', 2: 'c' }, lastChat: '/chat/ops/c1' })
+    cleanup()
+    render(<App />)
+    await settle()
+    expect(readTrail().entries).toEqual({ 2: '/admin/users' })
+    expect(readTrail().floor).toBe(2)
+    // Back to Chat travels into no entry below: it pushes the chat from here.
+    await click('to chat')
+    expect(page()).toBe('chat at /chat/ops/c1')
+    expect(idx()).toBe(3)
+  })
+
+  it('a travel that lands on another key pushes the chat from there', async () => {
+    narrow = false
+    await coldLoad('/chat/ops/c1')
+    await click('open admin')
+    await click('Users')
+    expect(idx()).toBe(2)
+    const trail = readTrail()
+    store({ ...trail, keys: { ...trail.keys, 0: 'stale' } })
+    await click('to chat')
+    expect(page()).toBe('chat at /chat/ops/c1')
+    expect(idx()).toBe(1)
   })
 })

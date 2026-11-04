@@ -20,14 +20,16 @@ import json
 import logging
 import re
 import uuid
+from types import SimpleNamespace
 from typing import Literal, cast
 
 import psycopg
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
-import config
+from auth import roles
 from auth.providers import UserContext, get_current_user, require_auth, require_user
+from core import placement
 from core.session import session_kind
 from core.session.visibility import (
     chat_history_owner,
@@ -39,6 +41,7 @@ from services.delegation import file_transfer, lane_status, result_files
 from services.delegation.spawn_authz import (
     authorize_spawn,
     check_delegation_chain,
+    check_spawn_cap,
     validate_spawn_overrides,
 )
 from services.scheduler import lane_steer, scheduler, task_kinds
@@ -172,6 +175,22 @@ def _worker_mid_turn(chat_id: str) -> bool:
     return bool(task_store.list_runs(limit=1, chat_id=chat_id, status=run_status.RUNNING))
 
 
+def _follow_up_waits(chat_id: str) -> bool:
+    """A follow-up whose steer was refused queues a run on the chat: it adds
+    no parallel worker when that run will wait behind a live turn (the lane
+    gate, ``lanes._settle_prior_lane``, waits on a live pump only) and no
+    other run is already waiting there (waiting runs are let go together
+    when the turn ends)."""
+    from core.events.stream_pump import _active_pumps
+    pump = _active_pumps.get(chat_id)
+    if pump is None or pump.is_done:
+        return False
+    driving = lane_steer.running_delegate_run(chat_id)
+    others = [rid for rid in task_store.live_delegate_run_ids_for_chat(chat_id)
+              if not driving or rid != driving["id"]]
+    return not others
+
+
 def _round_drives_live_terminal(chat_id: str, continue_session: str | None) -> bool:
     """The runner's predicate (the round's first step,
     ``TaskRun._open_round``): a continue round on a resumable session
@@ -260,6 +279,42 @@ async def _continue_model_change(
     return True
 
 
+def _continue_machine(chat: dict, agent: str, scope: str, created_by: str | None) -> str:
+    """Where a continue of a chat worker runs: the worker's own computer
+    when the continuing person owns it (the delegator continuing their own
+    lane), else the agent's default. A task-run chat keeps the default.
+    Synchronous: the DB executor."""
+    from api.tasks.tasks import task_run_person
+    from services.remote import chat_targets
+    from storage import remote_store
+    pin = chat.get("execution_target") or ""
+    if session_kind.is_task_chat_id(chat.get("id") or "") or placement.is_local(pin):
+        return ""
+    row = remote_store.get_remote_machine(placement.machine_of(pin))
+    if not row or placement.machine_is_admin_paired(row):
+        return ""
+    person = task_run_person(agent, scope, created_by, chat_worker=True)
+    run_sub = person.sub or person.machine_owner
+    allowed = placement.may_run_on(row, run_sub=run_sub, run_can_manage=roles.can_manage(person.role),
+                                   user_paired_allowed=chat_targets.user_machines_allowed())
+    return placement.machine_of(pin) if allowed else ""
+
+
+def _owners_computer_person(machine: str, created_by: str | None) -> str | None:
+    """The delegating person when the worker is to run on a computer they
+    paired themselves (``task_config_builder.owners_computer_person``'s rule
+    at the spawn: the lane then spends their accounts, so its engine is
+    theirs too); None for the platform, an admin machine or no person.
+    Synchronous."""
+    if not machine or placement.is_local(machine) or not created_by:
+        return None
+    from storage import remote_store
+    row = remote_store.get_remote_machine(machine)
+    if not row or placement.machine_is_admin_paired(row) or row.get("registered_by") != created_by:
+        return None
+    return created_by
+
+
 @router.post("/v1/delegation/spawn")
 async def spawn_delegate(
     req: SpawnDelegateRequest,
@@ -301,6 +356,7 @@ async def spawn_delegate(
             source_agent=req.source_agent,
             surface=req.surface,
             x_agent_name=x_agent_name,
+            continuing=continued_chat is not None,
         )
     )
 
@@ -322,15 +378,18 @@ async def spawn_delegate(
     )
     if ov_model or ov_layer:
         await asyncio.to_thread(
-            validate_spawn_overrides, effective_agent, ov_layer, ov_model,
+            functools.partial(validate_spawn_overrides, effective_agent, ov_layer, ov_model,
+                              user_sub=authz.created_by or ""),
         )
-    from api.tasks.tasks import _validate_checks, resolve_task_machine
+    from api.tasks.tasks import _validate_checks, resolve_task_machine, task_audience
     # The worker's machine, after the clamp: the run person is the
     # delegating person for a user-scope worker, nobody for an agent-scope
-    # one (never a personal machine). A continue ignores it.
+    # one; a chat-surface worker may also name the delegating person's own
+    # computer (it runs there as the agent). A continue keeps the worker's
+    # computer for its owner only (below).
     worker_machine = "" if req.continue_id else await resolve_task_machine(
         u, effective_agent, req.machine, scope=authz.scope, created_by=authz.created_by,
-        engine_path=ov_layer or "")
+        engine_path=ov_layer or "", chat_worker=req.surface == "chat")
     checks = await _validate_checks(effective_agent, req.checks, u)
 
     # Callback anchors come from the caller's OWN session token (the
@@ -372,6 +431,23 @@ async def spawn_delegate(
                 "one of your own chats.",
             )
         worker_chat_id = continued_chat["id"]
+        # A worker running on another person's computer is theirs to drive:
+        # nobody else continues or steers it while its session lives there.
+        from services.remote import chat_move
+        lock = await asyncio.to_thread(chat_move.lock_sentence, continued_chat, u.acting_sub or "")
+        if lock:
+            raise HTTPException(409, lock)
+        worker_machine = await asyncio.to_thread(
+            _continue_machine, continued_chat, effective_agent, authz.scope, authz.created_by)
+        # The parallel cap counts a continue that starts work: one on an idle
+        # worker, or one that moves the worker to another model (that only
+        # happens on an idle worker, and respawns it). A follow-up to a
+        # worker in the middle of a turn is counted below, only when it
+        # neither steers that turn nor waits behind it. Before any write.
+        asks_model_change = bool(req.model) and req.model != (continued_chat.get("model") or "")
+        follow_up = not asks_model_change and await asyncio.to_thread(_worker_mid_turn, worker_chat_id)
+        if not follow_up:
+            await asyncio.to_thread(check_spawn_cap, authz.created_by)
         # The chat's CURRENT session — re-read here, not a stale anchor.
         continue_session = continued_chat.get("session_id") or None
         # The existing worker keeps its configuration: re-derive the
@@ -419,26 +495,45 @@ async def spawn_delegate(
             )
             return {**steered, "scope": authz.scope, "scope_note": None,
                     "project_id": project_id or None}
+        if follow_up and not await asyncio.to_thread(_follow_up_waits, worker_chat_id):
+            await asyncio.to_thread(
+                functools.partial(check_spawn_cap, authz.created_by, follow_up=True))
     elif req.surface == "chat":
         worker_chat_id = str(uuid.uuid4())
-        # The run's own rule (config.resolve_run_model), so the row the
-        # header and billing read names the model the run spawns on; the
-        # row's layer/mode seed the continue re-derivation above.
-        # Layer-aware: with a per-lane layer override, the agent-default
-        # model may be foreign to that engine.
+        # The run's own rule (the runner's ``_task_engine_and_model``: the
+        # lane's pins, else the engine of the person whose accounts the lane
+        # spends on the worker agent (its delegator on their own computer,
+        # whatever the scope; the delegating person of a user-scope lane),
+        # else the agent's default), so the row the header and billing read
+        # names the engine and model the run spawns on; the row's layer/mode
+        # seed the continue re-derivation above.
         try:
-            worker_model = await asyncio.to_thread(
-                config.resolve_run_model, effective_agent, ov_model, layer=ov_layer)
+            from services.scheduler.runner import _task_engine_and_model
+            worker_layer, worker_model = await asyncio.to_thread(
+                _task_engine_and_model,
+                SimpleNamespace(agent=effective_agent, scope=authz.scope,
+                                created_by=authz.created_by,
+                                override_execution_path=ov_layer or None,
+                                override_model=ov_model or None),
+                run_person=await asyncio.to_thread(
+                    _owners_computer_person, worker_machine, authz.created_by))
         except (RuntimeError, psycopg.Error):
-            worker_model = ov_model or ""
+            worker_layer, worker_model = ov_layer or "", ov_model or ""
         worker_row = await asyncio.to_thread(
             task_store.create_chat,
             worker_chat_id, authz.chat_owner, effective_agent, "auto",
             model=worker_model, origin="delegated",
-            execution_path=ov_layer or "", execution_mode=ov_mode or "",
+            execution_path=worker_layer, execution_mode=ov_mode or "",
             parent_chat_id=parent_chat_id, project_id=project_id,
             delegate_role="worker", title=req.name,
         )
+        if worker_machine and not placement.is_local(worker_machine):
+            # The chat sits where its work was named to run from the start:
+            # a first round that finds the computer offline leaves the chat
+            # there, and its owner's continue goes back to it.
+            await asyncio.to_thread(
+                task_store.update_chat, worker_chat_id, execution_target=worker_machine)
+            worker_row = {**worker_row, "execution_target": worker_machine}
         from services.apps import catalog
         catalog.announce_new_chat(worker_row)
 
@@ -489,6 +584,8 @@ async def spawn_delegate(
         respawn_for_model=respawn_for_model,
         target_machine=worker_machine,
         checks=checks,
+        # A worker a task run delegates tells who that run tells.
+        notify_audience=await task_audience(u, None),
     )
     await scheduler.add_dynamic_task(task)
     # The persistent callback anchor (survives browser close / proxy restart)
@@ -955,9 +1052,14 @@ async def list_delegation_sessions(
                 # dashboard pools.
                 pool_owner = (shared_chat_owner(slug) if acting is None
                               else chat_history_owner(slug, acting))
-                for c in task_store.list_chats(pool_owner, agent=slug, limit=limit):
+                # Below the editor tier the agent's own work stays out: its
+                # runs and the pool's delegated workers.
+                hide = not u.sees_agent_automations(slug)
+                for c in task_store.list_chats(pool_owner, agent=slug, limit=limit,
+                                               hide_agent_runs=hide and pool_owner != acting):
                     rows[c["id"]] = c
-                for c in task_store.list_task_chats(slug, acting or "", limit=limit):
+                for c in task_store.list_task_chats(slug, acting or "", limit=limit,
+                                                    own_only=hide):
                     rows[c["id"]] = c
             merged = sorted(rows.values(), key=lambda c: c.get("updated_at") or "",
                             reverse=True)[:limit]

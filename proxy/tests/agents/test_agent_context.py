@@ -686,6 +686,9 @@ def _roster_env(monkeypatch, *, models, default_model="m-default",
                         lambda layer=None: [dict(m) for m in models])
     monkeypatch.setattr(app_config, "resolve_agent_model",
                         lambda slug, layer=None: default_model)
+    # A session with no person lists the engines the platform pool serves.
+    from services.engines import subscription_pool
+    monkeypatch.setattr(subscription_pool, "layer_platform_configured", lambda layer: True)
 
 
 def test_build_delegation_roster_enabled_only_default_first(monkeypatch):
@@ -698,7 +701,9 @@ def test_build_delegation_roster_enabled_only_default_first(monkeypatch):
     (layer,) = roster["worker"]
     assert layer["path"] == "claude-code-cli" and layer["is_default"]
     assert layer["models"] == ["m-default", "m-a"]
-    assert layer["more"] == 0 and not layer["local_only"]
+    assert layer["more"] == 0 and not layer["no_machines"]
+    # A session with no person: the pool runs it, nobody's own account.
+    assert layer["platform"] and not layer["person"] and layer["is_agent_default"]
     # Untiered rows carry no tier; the catalog lists every enabled model.
     assert layer["tiers"] == {"m-a": None, "m-default": None}
     assert [m["model_id"] for m in layer["catalog"]] == ["m-a", "m-default"]
@@ -743,8 +748,39 @@ def test_build_delegation_roster_caps_and_tags(monkeypatch):
     cli, direct = layers
     assert len(cli["models"]) == 8 and cli["models"][0] == "m-default"
     assert cli["more"] == 3  # 11 enabled − 8 shown
-    assert direct["path"] == "direct-llm" and direct["local_only"]
+    assert direct["path"] == "direct-llm" and direct["no_machines"]
     assert not direct["is_default"]
+
+
+def test_build_delegation_roster_tags_who_runs_each_engine(monkeypatch):
+    """A person's session: the allowlist narrowed to the engines the
+    person holds (a resting account counts) or the pool serves, in the
+    person's order, each tagged with who; the person's resolved engine is
+    the default, the agent's own engine says so apart."""
+    from services.engines import engine_resolution as er, subscription_pool
+    _roster_env(monkeypatch, models=[{"model_id": "m-x", "enabled": True}], default_model="m-x",
+                paths=("claude-code-cli", "codex-cli", "direct-llm"))
+    monkeypatch.setattr(subscription_pool, "layer_platform_configured",
+                        lambda layer: layer == "claude-code-cli")
+    theirs = er.Resolution("codex-cli", "m-x", er.REASON_OWN,
+                           ("claude-code-cli", "codex-cli", "direct-llm"), ("codex-cli",), {"codex-cli": "m-x"})
+    monkeypatch.setattr(er, "resolve_many", lambda rows, sub: {"worker": theirs})
+    codex, cli = dynamic_context.build_delegation_roster(["worker"], "u-1")["worker"]
+    assert (cli["path"], cli["person"], cli["platform"], cli["is_default"], cli["is_agent_default"]) == (
+        "claude-code-cli", False, True, False, True)
+    assert (codex["path"], codex["person"], codex["platform"], codex["is_default"]) == (
+        "codex-cli", True, False, True)
+    line = dynamic_context._fmt_roster_layers([codex, cli])
+    assert line.startswith("codex-cli (default | person | models: m-x [default, t?]) · "
+                           "claude-code-cli (agent default | platform | models: m-x [default, t?])")
+    # Nobody runs anything: the whole allowlist, no who-tag, so the ids stay
+    # learnable and the spawn's refusal names the reason.
+    monkeypatch.setattr(subscription_pool, "layer_platform_configured", lambda layer: False)
+    monkeypatch.setattr(er, "resolve_many", lambda rows, sub: {"worker": er.Resolution(
+        "", "", er.REASON_NONE, ("claude-code-cli", "codex-cli", "direct-llm"), (), {})})
+    layers = dynamic_context.build_delegation_roster(["worker"], "u-1")["worker"]
+    assert [la["path"] for la in layers] == ["claude-code-cli", "codex-cli", "direct-llm"]
+    assert not any(la["person"] or la["platform"] for la in layers)
 
 
 def test_delegation_context_renders_roster(monkeypatch, temp_db):
@@ -755,9 +791,10 @@ def test_delegation_context_renders_roster(monkeypatch, temp_db):
     roster = dynamic_context.build_delegation_roster(["worker"])
     text = dynamic_context._delegation_mcp_context(
         "self-agent", ["worker"], delegation_roster=roster)
-    assert ("layers: claude-code-cli (default | models: "
+    assert ("layers: claude-code-cli (default | platform | models: "
             "m-default [default, t?], m-b [t?])") in text
     assert "Ignored with `continue_id`" in text
+    assert "`person` marks an engine the person in this chat can run" in text
     assert "**Model tiers**" in text and "t? untiered" in text
     # Without the pre-resolved roster the provider stays name-only (no I/O).
     text2 = dynamic_context._delegation_mcp_context("self-agent", ["worker"])
@@ -790,9 +827,14 @@ def test_schedules_context_renders_own_layers(monkeypatch, temp_db):
     text = dynamic_context._schedules_mcp_context(
         "self-agent", delegation_roster=roster,
         assigned_mcps=["schedules-mcp"])
-    assert ("Your layers: claude-code-cli (default | models: "
+    assert ("Your layers: claude-code-cli (default | platform | models: "
             "m-default [default, t?], m-b [t?])") in text
-    assert "edit_task" in text
+    assert "edit_task" in text and ("a model alone runs on the engine the task takes unpinned when "
+                                    "that engine offers it, else on the first engine of the agent's "
+                                    "own order that does, which is not always the line's order") in text
+    assert ("A model copied from a line runs on the `default` engine when that engine offers it, "
+            "else on the first engine of the agent's own order that does") in text
+    assert "`person` marks an engine" in text
     assert "**Model tiers**" in text
 
 
@@ -878,3 +920,93 @@ async def test_the_department_row_is_read_off_the_loop_before_the_provider_runs(
     text = "\n".join(block for _, block in out)
     assert "**Engineering** department" in text and "**Head**" in text
     assert "peer" in text
+
+
+# ---------------------------------------------------------------------------
+# The team line (team_line.py): who the agent serves, beside the department line
+# ---------------------------------------------------------------------------
+
+from services.mcp import team_line
+from storage import database as task_store
+
+TEAM_AGENT = "crew"
+
+
+def _team(rows: list[tuple[str, str, str]]) -> dict:
+    """People on TEAM_AGENT as (sub, name, role) rows, then the data read."""
+    from storage.agents import agent_store
+    if not agent_store.get_agent(TEAM_AGENT):
+        agent_store.create_agent(TEAM_AGENT, "Crew")
+    for sub, name, role in rows:
+        task_store.upsert_user(sub, f"{sub}@x.test", name, "member")
+        task_store.add_user_agent(sub, TEAM_AGENT, role, "test")
+    return team_line.data(TEAM_AGENT)
+
+
+FOUR = [("u-ang", "Angelos", "manager"), ("u-tha", "Thanos", "editor"),
+        ("u-mar", "Maria", "editor"), ("u-nik", "Nikos", "contributor")]
+
+
+def test_the_team_line_counts_by_role_and_names_the_persons_own_role(temp_db):
+    team = _team(FOUR)
+    assert team["directory_open"] is True
+    # A contributor reads the counts alone.
+    assert team_line.render(team, "u-nik", "contributor") == (
+        "This agent serves 4 people: 1 manager, 2 editors and 1 contributor. "
+        "You are talking with a contributor.")
+    # An editor with the directory open reads the names, grouped by role.
+    assert team_line.render(team, "u-tha", "editor") == (
+        "This agent serves 4 people: 1 manager, 2 editors and 1 contributor. "
+        "The manager is Angelos. The editors are Maria and Thanos. The contributor is Nikos. "
+        "You are talking with an editor.")
+    # A platform admin (assigned or not) reads the names and their own role.
+    assert team_line.render(team, "u-admin", "admin").endswith(
+        "The contributor is Nikos. You are talking with a platform admin.")
+
+
+def test_the_team_line_keeps_names_where_the_dashboard_hides_them(temp_db):
+    from storage import db_settings
+    from storage.sharing.share_store import SETTING_DIRECTORY
+    team = _team(FOUR)
+    # A session with no person (a task run carries a role) ends after the counts.
+    assert team_line.render(team, "", "manager") == (
+        "This agent serves 4 people: 1 manager, 2 editors and 1 contributor.")
+    # The directory closed to members: an editor reads the counts alone, an admin the names.
+    db_settings.set_platform_setting(SETTING_DIRECTORY, "0")
+    closed = team_line.data(TEAM_AGENT)
+    assert closed["directory_open"] is False
+    assert "Angelos" not in team_line.render(closed, "u-tha", "editor")
+    assert "The manager is Angelos." in team_line.render(closed, "u-admin", "admin")
+    # Past the cap the counts alone, whoever reads.
+    many = _team([(f"u-v{i}", f"Viewer {i}", "viewer") for i in range(10)])
+    assert len(many["people"]) == 14
+    line = team_line.render(many, "u-admin", "admin")
+    assert line.startswith("This agent serves 14 people: 1 manager, 2 editors, 1 contributor and 10 viewers.")
+    assert "The manager is" not in line and "The viewers are" not in line
+
+
+def test_the_team_line_on_an_empty_agent_and_a_long_name(temp_db):
+    from storage.agents import agent_store
+    agent_store.create_agent(TEAM_AGENT, "Crew")
+    assert team_line.render(team_line.data(TEAM_AGENT), "u-admin", "admin") == (
+        "No person is assigned to this agent yet. You are talking with a platform admin.")
+    team = _team([("u-long", "  A   very " + "long " * 12 + "name", "manager")])
+    (person,) = team["people"]
+    assert len(person["name"]) == team_line.NAME_CAP and "  " not in person["name"]
+    assert team_line.render(team, "u-long", "manager").startswith("This agent serves 1 person: 1 manager. The manager is A very long")
+    # Nothing read: nothing rendered.
+    assert team_line.render({}, "u-long", "manager") == ""
+    assert team_line.render(None, "u-long", "manager") == ""
+
+
+def test_the_delegation_block_carries_the_team_line_beside_the_department_line(monkeypatch, temp_db):
+    _roster_env(monkeypatch, models=[{"model_id": "m-default", "enabled": True}])
+    team = {"people": [{"sub": "u-1", "role": "manager", "name": "Ann"}], "directory_open": True}
+    text = dynamic_context._delegation_mcp_context(
+        "self-agent", ["worker"], team=team, user_sub="u-1", user_role="manager")
+    assert "This agent serves 1 person: 1 manager. The manager is Ann. You are talking with a manager." in text
+    # With no targets the line stands on its own in the block's place.
+    alone = dynamic_context._delegation_mcp_context("self-agent", [], team=team, user_sub="", user_role="")
+    assert alone == "This agent serves 1 person: 1 manager."
+    # Nothing read (a store failure): the block is the one it was.
+    assert "This agent serves" not in dynamic_context._delegation_mcp_context("self-agent", ["worker"], team={})

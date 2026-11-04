@@ -248,6 +248,13 @@ class CallControlMixin:
         state = self.state
         handle = getattr(self, "_transfer", None)
         await asyncio.sleep(0.5)
+        if state._line_closed:
+            # The person hung up first: nobody to move, and the end the agent
+            # asked for stands (the record counts it, no new turn opens).
+            logger.info("[%s] Transfer to %s skipped: the person hung up first",
+                        self.conn.peer_addr, loggable_label(str(target.get("label") or "")))
+            state._running = False
+            return True
         state._transfer_label = str(target.get("label") or target.get("number") or "")
         state._transfer_previous_outcome = state.call_outcome
         state._transfer_settled = False
@@ -293,7 +300,7 @@ class CallControlMixin:
         label = state._transfer_label
         if not task.done():
             task.cancel()
-            if self.conn.is_closed:
+            if self.conn.is_closed or state._line_closed:
                 logger.warning(
                     "[%s] Transfer to %s: no answer in "
                     "%.0fs and the line closed under it — "
@@ -303,11 +310,21 @@ class CallControlMixin:
                 self._transfer_done(label)
                 return True
             self._transfer_failed(f"no answer in {TRANSFER_SETTLE_S:.0f}s")
-        elif task.cancelled():
-            self._transfer_failed("the request was cancelled")
-        elif task.exception() is None:
+        elif not task.cancelled() and task.exception() is None:
             self._transfer_done(label)
             return True
+        elif state._line_closed:
+            # Refused once the person had hung up: the end the agent asked
+            # for stands, with no failure phrase and no new turn on a dead
+            # line. A move the PBX applied closes the leg too, so the
+            # success above is read first.
+            state.call_outcome = state._transfer_previous_outcome
+            state._running = False
+            logger.info("[%s] Transfer to %s not made: the person hung up first",
+                        self.conn.peer_addr, loggable_label(label))
+            return True
+        elif task.cancelled():
+            self._transfer_failed("the request was cancelled")
         else:
             self._transfer_failed(str(task.exception()))
         if not self.conn.is_closed:

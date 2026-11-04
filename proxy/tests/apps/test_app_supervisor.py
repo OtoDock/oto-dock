@@ -459,6 +459,42 @@ def test_smoke_runs_the_working_tree_on_scratch_data(agent_tree):
     asyncio.run(run())
 
 
+def test_the_start_probe_waits_out_a_server_that_binds_late(monkeypatch):
+    """A server still binding answers the probe with connect errors (anyio's
+    ``getpeername`` AttributeError among them); the probe retries inside its
+    window instead of failing the start."""
+    import httpx
+    answers = [AttributeError("'NoneType' object has no attribute 'getpeername'"),
+               httpx.ConnectError("refused"), ConnectionResetError(), 200]
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            got = answers.pop(0)
+            if isinstance(got, BaseException):
+                raise got
+            return httpx.Response(got)
+
+    async def _no_wait(_s):
+        return None
+
+    monkeypatch.setattr(app_supervisor.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(app_supervisor.asyncio, "sleep", _no_wait)
+    inst = app_supervisor.Instance.__new__(app_supervisor.Instance)
+    inst.proc = type("_P", (), {"returncode": None})()
+    inst.host_port = 1
+    assert asyncio.run(app_supervisor._health(inst)) is True
+    assert answers == []
+
+
 def test_free_port_is_a_loopback_port():
     port = app_supervisor._free_port()
     assert 1024 < port < 65536

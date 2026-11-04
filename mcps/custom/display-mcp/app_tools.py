@@ -510,8 +510,9 @@ APP_TOOLS: list[Tool] = [
             "scope: the files a release would take, the "
             "app.json with its buttons by slug, and the tasks those buttons point "
             "at — never the database, never node_modules. Send it with send_file, "
-            "or drop it in another agent's workspace and import_app it there. "
-            "The app-authoring skill's 'Blueprints' says more."
+            "or drop it in another agent's workspace and import_app it there: that "
+            "copy then follows this app, and its card offers each newer release of "
+            "it. The app-authoring skill's 'Blueprints' says more."
         ),
         inputSchema={
             "type": "object",
@@ -530,8 +531,10 @@ APP_TOOLS: list[Tool] = [
             "the folder lands at apps/<slug>/, the bundle's tasks are created for "
             "this scope and the buttons re-pointed at them, and release 1 WAITS FOR "
             "THE USER'S APPROVAL on the card — an import is never pre-approved, "
-            "say so. Refused when a button names an MCP this agent lacks (the "
-            "message names it: ask an admin to assign it, then import again)."
+            "say so. The copy follows the app it was exported from: when that app "
+            "releases again, the card here offers the update. Refused when a button "
+            "names an MCP this agent lacks (the message names it: ask an admin to "
+            "assign it, then import again)."
         ),
         inputSchema={
             "type": "object",

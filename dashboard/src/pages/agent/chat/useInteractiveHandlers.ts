@@ -132,6 +132,9 @@ export function useInteractiveHandlers({
     () => {
       if (queuedMessages.length === 0) return
       if (queuedMessages.some(q => q.queueId)) {
+        // The proxy takes back this person's own messages alone: a
+        // teammate's and a card's answer stay queued (input_queue.cancel_own).
+        if (queuedMessages.every(q => q.card)) return
         const queueChats = new Set(queuedMessages.map(q => q.queueChatId).filter(Boolean))
         const [only] = queueChats
         ws.cancelAllQueued((queueChats.size === 1 ? only : undefined) ?? chatId ?? undefined)

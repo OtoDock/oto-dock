@@ -5,8 +5,8 @@ import { errorText, errorName } from '../lib/http/apiJson'
 import Button from '../components/ui/Button'
 
 /**
- * System-browser leg of the native-app passkey sign-in. The Android app opens
- * this page via openAuthBrowser (the webview can't run WebAuthn); a successful
+ * System-browser leg of the native-app passkey sign-in. The apps open this
+ * page via openAuthBrowser (the webview can't run WebAuthn); a successful
  * ceremony deep-links the one-time handoff token back through the existing
  * OIDC-callback rails, and the app's webview exchanges it for its session.
  * The `h` parameter is the nonce the app's webview holds: the token is bound

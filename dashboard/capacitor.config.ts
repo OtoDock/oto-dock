@@ -5,10 +5,12 @@ const config: CapacitorConfig = {
   appName: 'OtoDock',
   webDir: 'dist',
 
-  // Server URL is set dynamically in MainActivity.load() from SharedPreferences.
-  // On first launch (no URL saved), the local setup.html page is loaded so the
-  // user can enter their server URL. allowNavigation is also set dynamically, to
-  // the server's exact host (no wildcard).
+  // The server URL is set at run time by each shell (Android's
+  // MainActivity.load() from SharedPreferences, the iOS ShellViewController
+  // from its installations store). On first launch (no server saved), the
+  // bundled setup.html page is loaded so the person can enter their server
+  // address. allowNavigation is also set at run time, to the server's exact
+  // host (no wildcard).
   server: {
     cleartext: false,
     allowNavigation: [],
@@ -19,6 +21,28 @@ const config: CapacitorConfig = {
     allowMixedContent: false,
     // Use Chrome-based WebView
     webContentsDebuggingEnabled: false,
+  },
+
+  ios: {
+    // The shell sets the web view's frame itself (ShellViewController): the
+    // scroll view adds no inset of its own.
+    contentInset: 'never',
+    allowsLinkPreview: false,
+    // The boot field, the web view's own background between two documents.
+    backgroundColor: '#1d4f80',
+    // The notification center's delegate is the app's own (PushBridge), set
+    // before the launch ends: a bridge must not take it at every switch.
+    handleApplicationNotifications: false,
+    // Only the plugins the iOS shell uses. The status bar plugin resizes the
+    // web view to the window on every rotation and holds the bridge; the
+    // splash plugin draws a launch view of its own: the shell owns both.
+    includePlugins: [
+      '@capacitor/browser',
+      '@capacitor/geolocation',
+      '@capacitor/push-notifications',
+      '@capacitor-community/text-to-speech',
+      '@capgo/capacitor-speech-recognition',
+    ],
   },
 
   // cap sync writes res/xml/config.xml from this; unset, it emits a wildcard
@@ -57,6 +81,12 @@ const config: CapacitorConfig = {
     StatusBar: {
       style: 'DARK',
       backgroundColor: '#1d4f80',
+    },
+    // iOS: what a push shows while the app is in front. A push arrives only
+    // for another installation, or while the socket was down (the active
+    // installation's notifications come as socket toasts), so it shows.
+    PushNotifications: {
+      presentationOptions: ['banner', 'list', 'sound'],
     },
   },
 }

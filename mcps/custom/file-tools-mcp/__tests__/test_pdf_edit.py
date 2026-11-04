@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pdf as pdf_mod
 import shared
+from formats.pdf.edit import ocr_raster_dpi
 
 
 async def _async_ident(p, writing=False, **kw):
@@ -36,6 +37,7 @@ def _bypass_platform(monkeypatch):
         pass
 
     monkeypatch.setattr(pdf_mod, "_push_preview", _noop_preview)
+    monkeypatch.setattr(shared, "_push_preview", _noop_preview)
 
 
 def _make_pdf(path: Path, texts_per_page: list[list[str]]):
@@ -116,7 +118,8 @@ def test_replace_text_not_found_is_reported(tmp_path):
     _make_pdf(f, [["nothing to see"]])
     out = _edit(f, [{"type": "replace_text", "find": "ghost", "replace": "x"}])
     assert "not found" in out
-    assert "PDF saved" in out  # continue-on-error: file still written
+    # Nothing matched changes nothing: no save, and the op says why.
+    assert out.startswith("Nothing saved:") and "Changed nothing:" in out
 
 
 def test_redact_by_find_removes_content(tmp_path):
@@ -133,7 +136,7 @@ def test_redact_requires_find_or_rect(tmp_path):
     f = tmp_path / "g.pdf"
     _make_pdf(f, [["text"]])
     out = _edit(f, [{"type": "redact"}])
-    assert "needs 'find'" in out
+    assert out.startswith("Nothing saved:") and "find" in out and "rect" in out
 
 
 def test_watermark_single_run_diagonal(tmp_path):
@@ -209,17 +212,17 @@ def test_ocr_raster_dpi_caps_at_source(tmp_path):
     doc = fitz.open(str(f))
     page = doc[0]
     # Auto (None) caps the 300 default at the ~150 dpi source raster.
-    assert abs(pdf_mod._ocr_raster_dpi(page, None) - 150) <= 2
+    assert abs(ocr_raster_dpi(page, None) - 150) <= 2
     # An explicit request below the source is honored as-is.
-    assert pdf_mod._ocr_raster_dpi(page, 100) == 100
+    assert ocr_raster_dpi(page, 100) == 100
     # Absurd requests clamp to the 600 ceiling (then the source cap).
-    assert pdf_mod._ocr_raster_dpi(page, 10_000) <= 600
+    assert ocr_raster_dpi(page, 10_000) <= 600
     doc.close()
     # A text-only page has no source raster — the default stays 300.
     t = tmp_path / "txt.pdf"
     _make_pdf(t, [["plain text"]])
     doc = fitz.open(str(t))
-    assert pdf_mod._ocr_raster_dpi(doc[0], None) == 300
+    assert ocr_raster_dpi(doc[0], None) == 300
     doc.close()
 
 

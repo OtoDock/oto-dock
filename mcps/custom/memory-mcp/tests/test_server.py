@@ -334,3 +334,31 @@ def test_call_tool_bare_filename_write_refusal(monkeypatch):
     assert "/memories/agent/n.md" in text
     assert "/memories/user/n.md" in text
     assert body is None
+
+
+# ---------------------------------------------------------------------------
+# The description carries the scopes, the default and the commands; the
+# rules live in the prompt's Memory section, the examples in the guide
+# ---------------------------------------------------------------------------
+
+def test_description_points_at_the_prompt_and_the_guide_not_the_rules(monkeypatch):
+    srv = _reload_with_env(monkeypatch, OTO_USER_SUB="user-1")
+    d = asyncio.run(srv.list_tools())[0].description
+    assert "The rules are in your prompt's Memory section." in d
+    assert "Worked examples: the skill `memory-guide`." in d
+    assert "share a personal topic with the agent, editors and managers" in d
+    for rule in ("Update existing topics", "date entries", "MEMORY.md", "Never store"):
+        assert rule not in d
+    assert len(d) < 700
+    # One scope: nothing to promote into.
+    srv = _reload_with_env(monkeypatch)
+    d = asyncio.run(srv.list_tools())[0].description
+    assert "share a personal topic" not in d
+
+
+def test_the_manifest_ships_the_guide_alone():
+    import json
+    from pathlib import Path
+    manifest = json.loads((Path(server.__file__).resolve().parent / "manifest.json").read_text())
+    assert [(s["id"], s["loading"]) for s in manifest["skills"]] == [("memory-guide", "on_demand")]
+    assert manifest["version"] == "2.1.0"

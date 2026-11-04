@@ -259,3 +259,115 @@ def test_get_chat_messages_since_applies_each_chats_floor(temp_db):
     rows = task_store.get_chat_messages_since({"since-a": 0, "since-b": b1})
     assert [r["id"] for r in rows] == [a1, a2, b2]
     assert task_store.get_chat_messages_since({}) == []
+
+
+class TestRunningBackground:
+    """A history rebuilt from rows reads every stored spawn as finished: the
+    frame names the background work of the chat that still runs, so a reload,
+    a reconnect or a history the server re-sends keeps its badges."""
+
+    def test_the_history_names_what_still_runs_and_only_then(self, temp_db, monkeypatch):
+        from core.events import bg_command_state
+        from core.session import session_state
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        cid = "chat-running-1"
+        task_store.create_chat(cid, "user-admin", slug, "auto", model="test-model",
+                               execution_path="claude-code-cli")
+        task_store.add_chat_message(cid, "user", "go", author_sub="user-admin")
+        reg = session_state.get_subagent_registry("s-running-1")
+        reg.chat_id = cid
+        reg.register_spawn("a1", "tuA1", label='"long reader" [a1]', description="long reader",
+                           background=True)
+        bgreg = bg_command_state.get_bg_command_registry("s-running-1")
+        bgreg.chat_id = cid
+        bgreg.register_spawn("b1", "tuB1", label="b1 — sleep", description="wait")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                frame = await _until(ws, "chat_history")
+                assert frame["running"] == {
+                    "agents": [{"id": "tuA1", "description": "long reader"}],
+                    "commands": [{"id": "tuB1", "description": "wait"}],
+                }
+                # A delta resume carries the list too.
+                ws.client_send({"type": "client_info", "platform": "web", "history_deltas": True})
+                ws.client_send({"type": "resume_chat", "chat_id": cid, "delta": True})
+                delta = await _until(ws, "chat_history_delta")
+                assert [a["id"] for a in delta["running"]["agents"]] == ["tuA1"]
+                reg.mark_done("a1")
+                bgreg.mark_done("b1")
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                assert "running" not in await _until(ws, "chat_history")
+                ws.client_send({"type": "close"})
+        try:
+            run_ws_scenario(scenario)
+        finally:
+            session_state._subagent_registries.pop("s-running-1", None)
+            bg_command_state._bg_command_registries.pop("s-running-1", None)
+
+
+class _LingeringPump:
+    """A pump whose producer finished (a self-wake turn a reload met as it
+    ended) or one on a severed stream."""
+
+    def __init__(self, sid: str) -> None:
+        import asyncio
+        self.session_id = sid
+        self.is_done = False
+        self.event_queue: asyncio.Queue = asyncio.Queue()
+        self.producer = asyncio.get_running_loop().create_future()
+        self.producer.set_result(None)
+        self._task = None
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class _ReapLayer:
+    def __init__(self, severed: bool, idle: float = 0.05, dead: bool = False) -> None:
+        self.severed, self.idle, self.dead = severed, idle, dead
+
+    def remote_stream_severed(self, sid: str) -> bool:
+        return self.severed
+
+    def session_idle_seconds(self, sid: str) -> float:
+        return self.idle
+
+    async def probe_session_process_dead(self, sid: str) -> bool:
+        return self.dead
+
+    async def prepare_resume(self, sid: str) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer_kw, ending", [
+    ({"severed": False}, False),                          # a wake turn ending: quiet
+    ({"severed": True}, True),                            # a severed stream
+    ({"severed": False, "idle": 10**6}, True),            # silent past the hard ceiling
+    ({"severed": False, "idle": 300, "dead": True}, True),   # stale, the process dead
+    ({"severed": False, "idle": 300, "dead": False}, False),  # stale, the process alive
+], ids=["finished", "severed", "hard-stale", "stale-dead", "stale-alive"])
+async def test_a_finished_pump_is_reaped_quietly_and_an_unusable_one_ends_lost(
+        monkeypatch, layer_kw, ending):
+    from types import SimpleNamespace
+
+    from core.events.stream_pump import _active_pumps
+    from storage import database as store
+    monkeypatch.setattr("core.concurrency.release_chat_slot", lambda sid: None)
+    touched: list[dict] = []
+    monkeypatch.setattr(store, "update_chat", lambda cid, **kw: touched.append(kw))
+    pump = _LingeringPump("s-reap")
+    _active_pumps["chat-reap"] = pump
+    try:
+        host = SimpleNamespace(layer=_ReapLayer(**layer_kw))
+        await resume.ChatResumeMixin._reap_wedged_pump(host, "chat-reap", False, {})
+        assert pump.aborted
+        assert (not pump.event_queue.empty()) is ending
+        assert not any("last_turn_aborted" in kw for kw in touched)
+    finally:
+        _active_pumps.pop("chat-reap", None)

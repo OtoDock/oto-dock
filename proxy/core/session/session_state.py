@@ -90,13 +90,6 @@ _permission_decisions: dict[str, bool] = {}  # request_id -> approved
 # interceptor pipe. resolve_session_permissions() walks this to deny them.
 _session_permission_requests: dict[str, set[str]] = {}  # session_id -> {request_id}
 _permission_request_sessions: dict[str, str] = {}  # request_id -> session_id (reverse)
-# Codex request_user_input questions block the SAME way (the held
-# item/tool/requestUserInput server-request), but resolve to an ANSWERS MAP, not
-# a bool. Separate registries; question request_ids are ALSO indexed in
-# _session_permission_requests above, so resolve_session_permissions() releases
-# them on abort/close (empty answers → the held request unwinds cleanly).
-_question_events: dict[str, asyncio.Event] = {}  # request_id -> event
-_question_answers: dict[str, dict] = {}  # request_id -> answers map
 # The prompts whose card a caller retires when their wait ends with no answer
 # (``watch_prompt``): request_id -> True once the wait ran out or an abort /
 # close released it. Only watched ids are recorded, and the caller always
@@ -239,8 +232,8 @@ class SubagentRegistry:
 
     __slots__ = (
         "spawned", "completed", "reviewed", "pending_stops",
-        "task_to_tuid", "labels", "workflow_tuids", "chat_id",
-        "_all_done_event",
+        "task_to_tuid", "labels", "descriptions", "workflow_tuids", "chat_id",
+        "last_seen", "owned_alive", "background", "_all_done_event",
     )
 
     def __init__(self) -> None:
@@ -257,20 +250,50 @@ class SubagentRegistry:
         # Codex subs). Composed by the registering layer; consumed by the
         # completion nudges. Empty → the nudge degrades to count-only.
         self.labels: dict[str, str] = {}
+        # task_id → the description a person reads (the badge's text when the
+        # page has no block for it); the label when the layer gives none.
+        self.descriptions: dict[str, str] = {}
         self.workflow_tuids: set[str] = set()  # tool_use_ids of active Workflow tools
-        self.chat_id: str = ""                 # set by the pump for hook-endpoint routing
+        # task_id → monotonic time of the agent's last sign of life (its spawn,
+        # a line of its own on stdout, a tool call's hook, a Codex thread
+        # event): the chat monitor stops waiting for an agent only after it
+        # was silent for the background-work ceiling.
+        self.last_seen: dict[str, float] = {}
+        # Commands a sub-agent started that the CLI's last
+        # ``background_tasks_changed`` snapshot still lists (their
+        # ``parent_task_id`` names the agent). The sub-agent handles them
+        # itself (the CLI starts it again under the same id when one ends,
+        # then wakes the main agent), so they are no badge and no gate: the
+        # monitor only keeps reading the session while one runs.
+        self.owned_alive: set[str] = set()
+        # The spawns that run in the background (Claude's ``is_backgrounded``,
+        # every agent a Codex supervisor hands over): the history's running
+        # list names these alone (a foreground agent ends inside its turn, a
+        # terminal's Task call is the tailer's).
+        self.background: set[str] = set()
+        # The chat the session serves (the pump binds it at each turn start,
+        # a monitor at its start): it names the chat, not the turn, so the
+        # per-turn reset keeps it and a completion read mid-turn or between
+        # turns still reaches the chat's viewers.
+        self.chat_id: str = ""
         self._all_done_event = asyncio.Event()
 
     def register_spawn(self, task_id: str, tool_use_id: str,
-                       label: str = "") -> None:
+                       label: str = "", description: str = "",
+                       background: bool = False) -> None:
         """Record a subagent spawn (CLI ``task_started``, local_agent only)."""
         if not task_id:
             return
         self.spawned.add(task_id)
+        if background:
+            self.background.add(task_id)
+        self.last_seen[task_id] = time.monotonic()
         if tool_use_id:
             self.task_to_tuid[task_id] = tool_use_id
         if label:
             self.labels[task_id] = label
+        if description or label:
+            self.descriptions[task_id] = description or label
         # Reconcile a SubagentStop that arrived before its task_started.
         if task_id in self.pending_stops:
             self.pending_stops.discard(task_id)
@@ -299,6 +322,39 @@ class SubagentRegistry:
 
     def mark_reviewed(self, task_ids) -> None:
         self.reviewed.update(t for t in task_ids if t in self.completed)
+
+    def note_alive(self, task_id: str) -> None:
+        """A sign of life from a still-running agent."""
+        if task_id in self.spawned and task_id not in self.completed:
+            self.last_seen[task_id] = time.monotonic()
+
+    def task_for_tuid(self, tool_use_id: str) -> str:
+        """The agent a spawning ``tool_use_id`` names ("" when unknown)."""
+        if not tool_use_id:
+            return ""
+        for task_id, tuid in self.task_to_tuid.items():
+            if tuid == tool_use_id:
+                return task_id
+        return ""
+
+    def silent_since(self, task_id: str, floor: float) -> float:
+        """When the agent last showed life, never earlier than ``floor`` (the
+        moment a watcher began: a turn that read its lines itself leaves no
+        stamp)."""
+        return max(self.last_seen.get(task_id, floor), floor)
+
+    def abandon(self, task_ids) -> list[str]:
+        """Stop waiting for still-running agents: they count as finished and
+        already reviewed, so no later cohort waits on them and no review
+        names them. Returns the ids that were pending."""
+        gone = [t for t in task_ids if t in self.spawned and t not in self.completed]
+        self.completed.update(gone)
+        self.reviewed.update(gone)
+        self._refresh()
+        return gone
+
+    def description_for(self, task_id: str) -> str:
+        return self.descriptions.get(task_id) or self.labels.get(task_id, "")
 
     @property
     def owed(self) -> set[str]:
@@ -356,9 +412,11 @@ class SubagentRegistry:
             t: u for t, u in self.task_to_tuid.items() if t in pending
         }
         self.labels = {t: l for t, l in self.labels.items() if t in pending}
+        self.descriptions = {t: d for t, d in self.descriptions.items() if t in pending}
+        self.last_seen = {t: v for t, v in self.last_seen.items() if t in pending}
+        self.background &= pending
         self.pending_stops.clear()          # a Stop with no task_started is stale across turns
         self.workflow_tuids.clear()
-        self.chat_id = ""
         self._refresh()                     # recompute all-done for the carried-over set
 
 
@@ -385,7 +443,7 @@ def reset_subagent_registry(session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pump callbacks (set by app.py at startup to avoid circular imports)
+# Pump callbacks (set by startup.py at boot to avoid circular imports)
 # ---------------------------------------------------------------------------
 
 _push_pump_event_fn = None   # (chat_id, event) -> bool
@@ -394,7 +452,7 @@ _inject_pump_event_fn = None  # (chat_id, common_event) -> bool
 
 
 def set_pump_callbacks(push_event_fn, queue_message_fn, inject_event_fn=None):
-    """Register pump access callbacks (called by app.py at startup)."""
+    """Register pump access callbacks (called by startup.py at boot)."""
     global _push_pump_event_fn, _queue_pump_message_fn, _inject_pump_event_fn
     _push_pump_event_fn = push_event_fn
     _queue_pump_message_fn = queue_message_fn
@@ -494,7 +552,7 @@ def resolve_bg_subagent(session_id: str, sub_tid: str, translator=None) -> bool:
     chat_id = reg.chat_id
     if chat_id:
         mark_subagent_done(chat_id, sub_tid)
-        push_pump_event(chat_id, {"type": wire.BG_AGENT_DONE, "tool_use_id": sub_tid})
+        _push_to_chat(chat_id, {"type": wire.BG_AGENT_DONE, "tool_use_id": sub_tid})
     if translator is not None:
         with contextlib.suppress(Exception):
             translator.subagent_end_event(sub_tid)
@@ -532,14 +590,44 @@ def resolve_bg_command(session_id: str, task_id: str, status: str = "completed")
     # it, so it must count toward the task producer's review-turn decision.
     if not reg.mark_done(task_id, surfaced=False):
         return False
-    tuid = reg.tuid_for(task_id)
-    chat_id = reg.chat_id
-    if chat_id:
-        mark_command_done(chat_id, tuid)
-        push_pump_event(chat_id, {
-            "type": wire.BG_COMMAND_DONE, "tool_use_id": tuid, "status": status,
-        })
+    if reg.chat_id:
+        clear_bg_command(reg.chat_id, reg.tuid_for(task_id), status)
     return True
+
+
+def clear_bg_command(chat_id: str, tool_use_id: str, status: str = "completed") -> None:
+    """One finished background command's badge, cleared on its chat: the
+    live state and the ``bg_command_done`` frame (``_push_to_chat``). The one
+    body for a resolve here and for a completion a translator already marked
+    in the registry (Codex's between-turns ``item/completed``)."""
+    mark_command_done(chat_id, tool_use_id)
+    _push_to_chat(chat_id, {
+        "type": wire.BG_COMMAND_DONE, "tool_use_id": tool_use_id, "status": status,
+    })
+
+
+def clear_ended_bg_commands(session_id: str, events: list) -> None:
+    """The badges of the background commands a between-turns translation
+    ended: no pump consumes those events, so each ``BG_COMMAND_END`` is
+    cleared on the session's chat here."""
+    from core.events.bg_command_state import peek_bg_command_registry
+    from core.events.common_events import BG_COMMAND_END
+    reg = peek_bg_command_registry(session_id)
+    if reg is None or not reg.chat_id:
+        return
+    for ev in events:
+        if ev.type == BG_COMMAND_END:
+            data = ev.data or {}
+            clear_bg_command(reg.chat_id, data.get("tool_use_id", ""),
+                             data.get("status", "completed"))
+
+
+def _push_to_chat(chat_id: str, event: dict) -> None:
+    """A background-work frame for a chat: to its pump while a turn runs,
+    else to every socket viewing the chat (a completion a monitor or a
+    drain reads between turns clears its badge live too)."""
+    if not push_pump_event(chat_id, event):
+        broadcast_chat_frame(chat_id, event)
 
 
 def resolve_bg_command_frame(session_id: str, data: dict) -> bool:
@@ -548,21 +636,13 @@ def resolve_bg_command_frame(session_id: str, data: dict) -> bool:
     tracked command, resolve it. Returns True only on the resolving transition.
     Lets the idle/stale stdout drains clear a bg command WITHOUT the per-turn
     translator (which is reset between turns)."""
-    if data.get("type") != "system":
-        return False
-    subtype = data.get("subtype", "")
+    # The CLI's frame vocabulary is the translator's, which imports this module.
+    from core.layers.cli.translator import terminal_task_status
+    status = terminal_task_status(data)
     task_id = data.get("task_id", "")
-    if not task_id:
+    if status is None or not task_id:
         return False
-    if subtype == "task_updated":
-        from core.events.bg_command_state import TERMINAL_STATUSES
-        status = (data.get("patch") or {}).get("status", "")
-        if status in TERMINAL_STATUSES:
-            return resolve_bg_command(session_id, task_id, status)
-        return False
-    if subtype == "task_notification":
-        return resolve_bg_command(session_id, task_id, "completed")
-    return False
+    return resolve_bg_command(session_id, task_id, status)
 
 
 def reconcile_background_snapshot(session_id: str, data: dict) -> bool:
@@ -577,13 +657,29 @@ def reconcile_background_snapshot(session_id: str, data: dict) -> bool:
     if (data.get("type") != "system"
             or data.get("subtype") != "background_tasks_changed"):
         return False
-    alive = {t.get("task_id") for t in (data.get("tasks") or [])
-             if isinstance(t, dict)}
+    tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
+    alive = {t.get("task_id") for t in tasks}
     reg = _subagent_registries.get(session_id)
     if reg is not None:
+        # A sub-agent's own command (``parent_task_id``), one still listed
+        # after the CLI forgot its parent (it drops the field once the agent
+        # is evicted, about 30 s after its end), and a finished agent the CLI
+        # starts again to read that command's end: all work the monitor reads
+        # on for, until the CLI's wake.
+        prev = reg.owned_alive
+        reg.owned_alive = {
+            t.get("task_id", "") for t in tasks
+            if t.get("parent_task_id") or t.get("task_id") in prev
+            or t.get("task_id") in reg.completed
+        }
         for task_id in list(reg.spawned - reg.completed):
-            if task_id not in alive:
-                reg.mark_done(task_id)
+            # The snapshot lands before the agent's SubagentStop hook, which
+            # then answers a duplicate: this is where its badge clears.
+            if task_id not in alive and reg.mark_done(task_id) and reg.chat_id:
+                tuid = reg.tuid_for(task_id)
+                if tuid:
+                    mark_subagent_done(reg.chat_id, tuid)
+                    _push_to_chat(reg.chat_id, {"type": wire.BG_AGENT_DONE, "tool_use_id": tuid})
     from core.events.bg_command_state import _bg_command_registries
     bgreg = _bg_command_registries.get(session_id)
     if bgreg is not None:
@@ -614,7 +710,7 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
         entry's ``session_id``, so a chat already re-warmed onto a NEW session
         is never touched) — a reconnect can't resurrect badges via
         ``live_state``;
-      * broadcasts a ``liveness_clear`` item to every dashboard notify queue —
+      * broadcasts a ``liveness_clear`` item to every live dashboard socket —
         the WS consumer emits the ``*_complete`` frames to sockets viewing an
         affected chat, clearing live badges without a reload;
       * drops both per-session registries so stale pending entries can't leak
@@ -644,12 +740,7 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
         "clear_session_liveness: session=%s reason=%s "
         "chats=%s", session_id[:8], reason or '-', sorted(chats)
     )
-    seen_queues: set[int] = set()
-    for queue in list(_dashboard_notify_queues.values()):
-        # One WS can be registered under several session ids — dedupe by queue.
-        if id(queue) in seen_queues:
-            continue
-        seen_queues.add(id(queue))
+    for queue in _viewer_queues():
         for cid in chats:
             with contextlib.suppress(Exception):
                 queue.put_nowait({
@@ -660,8 +751,25 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
                 })
 
 
-def broadcast_chat_frame(chat_id: str, frame: dict) -> None:
-    """Push a chat-scoped UI frame to every dashboard notify queue.
+def _viewer_queues() -> list:
+    """Every live dashboard socket's notify queue, once each: the session
+    sinks and every connection, a view-only one or a second tab on the same
+    chat included (only the last socket to warm a session holds its sink).
+    Each socket's handler keeps what is for the chat it views."""
+    from core.events.input_queue import _connections_by_user
+    queues: list = []
+    seen: set[int] = set()
+    conns = [c for group in list(_connections_by_user.values()) for c in list(group)]
+    for queue in [*_dashboard_notify_queues.values(), *(getattr(c, "notify_queue", None) for c in conns)]:
+        if queue is None or id(queue) in seen:
+            continue
+        seen.add(id(queue))
+        queues.append(queue)
+    return queues
+
+
+def broadcast_chat_frame(chat_id: str, frame: dict, *, skip: object = None) -> None:
+    """Push a chat-scoped UI frame to every live dashboard socket.
 
     Each socket's server-events handler forwards ``frame`` verbatim only when
     it is viewing ``chat_id`` — a chat-targeted sibling of the
@@ -669,15 +777,14 @@ def broadcast_chat_frame(chat_id: str, frame: dict) -> None:
     reach a live viewer INDEPENDENT of any delivery path (e.g. the terminal
     ``delegate_result`` badge frame when the wake itself lands on the
     pty/persistent/one-shot/none rungs, which carry no socket). Fire-and-
-    forget; sockets not viewing the chat drop it.
+    forget; sockets not viewing the chat drop it. ``skip`` is the one queue
+    left out: the socket that already sent the frame itself.
     """
     if not chat_id:
         return
-    seen: set[int] = set()
-    for queue in list(_dashboard_notify_queues.values()):
-        if id(queue) in seen:
+    for queue in _viewer_queues():
+        if queue is skip:
             continue
-        seen.add(id(queue))
         with contextlib.suppress(Exception):
             queue.put_nowait({
                 "type": wire.NOTIFY_CHAT_UI_FRAME,
@@ -761,7 +868,7 @@ def reap_task_sessions(now: datetime | None = None) -> int:
 
 
 async def reap_idle_task_sessions(interval_seconds: int = 300) -> None:
-    """Periodic backstop loop for ``reap_task_sessions`` (mounted in app.py).
+    """Periodic backstop loop for ``reap_task_sessions`` (mounted in startup.py).
 
     Runs the sweep immediately on start (clears any backlog left by older code
     that never reaped task sessions), then every ``interval_seconds``.
@@ -1684,18 +1791,19 @@ PROMPT_WAIT_S = 3 * 24 * 3600
 
 
 def has_pending_prompt(session_id: str) -> bool:
-    """Whether the session waits on a person: a permission card, a plan
-    review or a question. The reapers spare it meanwhile; the prompt's own
-    wait (``PROMPT_WAIT_S``) bounds that."""
+    """Whether the session waits on a person: a permission card or a plan
+    review (a question waits on nothing: its card is a block of the turn).
+    The reapers spare it meanwhile; the prompt's own wait (``PROMPT_WAIT_S``)
+    bounds that."""
     return any(
-        rid in _permission_events or rid in _question_events
+        rid in _permission_events
         for rid in _session_permission_requests.get(session_id, ())
     )
 
 
 def prompt_waits(request_id: str) -> bool:
     """Whether this prompt's wait is still open (its card can be answered)."""
-    return request_id in _permission_events or request_id in _question_events
+    return request_id in _permission_events
 
 
 async def wait_for_permission(
@@ -1774,7 +1882,7 @@ def resolve_permission(request_id: str, approved: bool) -> bool:
 def prompt_answered(request_id: str) -> bool:
     """Whether the prompt's wait was answered and its waiter has not left
     yet (an answer in that tick must change nothing more)."""
-    event = _permission_events.get(request_id) or _question_events.get(request_id)
+    event = _permission_events.get(request_id)
     return event is not None and event.is_set()
 
 
@@ -1789,86 +1897,20 @@ def get_permission_request_session(request_id: str) -> str | None:
     return _permission_request_sessions.get(request_id)
 
 
-async def wait_for_question(
-    request_id: str, session_id: str = "", timeout: float = PROMPT_WAIT_S,
-) -> dict:
-    """Block until the user answers a Codex ``request_user_input`` question.
-
-    Returns the answers MAP ``{<id>: {"answers": [...]}}`` (keyed by the verbatim
-    codex question id). On timeout / abort release, returns ``{}`` (empty answers)
-    so the held request unwinds and the turn continues rather than hanging.
-    ``session_id`` indexes it (shared with permissions) for abort/close release.
-    """
-    event = asyncio.Event()
-    _question_events[request_id] = event
-    if session_id:
-        _session_permission_requests.setdefault(session_id, set()).add(request_id)
-        _permission_request_sessions[request_id] = session_id
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-        return _question_answers.pop(request_id, {})
-    except asyncio.TimeoutError:
-        _note_no_answer(request_id)
-        return {}
-    finally:
-        _question_events.pop(request_id, None)
-        _question_answers.pop(request_id, None)
-        if session_id:
-            _permission_request_sessions.pop(request_id, None)
-            reqs = _session_permission_requests.get(session_id)
-            if reqs is not None:
-                reqs.discard(request_id)
-                if not reqs:
-                    _session_permission_requests.pop(session_id, None)
-
-
-def resolve_question(request_id: str, answers: dict) -> bool:
-    """Resolve a pending question with the user's answers. True if it existed.
-
-    The bool IS the "did a live waiter take this answer" signal — responder
-    paths need it: a False means the held server-request is gone (session
-    reaped / released), so the answer must be re-routed rather than dropped.
-    """
-    event = _question_events.get(request_id)
-    if event is None or event.is_set():
-        return False
-    _question_answers[request_id] = answers if isinstance(answers, dict) else {}
-    event.set()
-    return True
-
-
-def has_pending_question(session_id: str) -> bool:
-    """Whether this session holds an unanswered ``request_user_input``.
-
-    The question waiters are keyed by request_id; the session index
-    (``_session_permission_requests``, shared with permissions) is the only way
-    back from a session id. Idle reapers consult this: a turn blocked on a human
-    answer is byte-idle but not abandoned.
-    """
-    return any(
-        rid in _question_events
-        for rid in _session_permission_requests.get(session_id, ())
-    )
-
-
 def resolve_session_permissions(session_id: str, approved: bool = False) -> int:
-    """Release every pending permission/question request for a session (deny/empty).
+    """Release every pending permission request for a session (deny).
 
     Called on abort / session close / daemon death. Under the warm app-server
     model the daemon, its MCP subprocesses and the stdio interceptor all survive
     ``turn/interrupt`` — nothing drops the in-flight hook connection — so without
     an explicit release a pending wait hangs to its 7-day timeout and holds the
-    interceptor pipe. A held ``request_user_input`` question hangs the same way,
-    so release those too (empty answers). Returns the number of waiters released.
+    interceptor pipe. Returns the number of waiters released.
     """
     rids = list(_session_permission_requests.get(session_id, ()))
     released = 0
     for rid in rids:
         _note_no_answer(rid)
-        if rid in _question_events:
-            if resolve_question(rid, {}):
-                released += 1
-        elif resolve_permission(rid, approved):
+        if resolve_permission(rid, approved):
             released += 1
     _session_permission_requests.pop(session_id, None)
     if released:

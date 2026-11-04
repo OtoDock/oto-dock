@@ -8,6 +8,7 @@ rebinds ``config.AGENTS_DIR``.
 """
 
 import contextlib
+import logging
 from pathlib import Path
 
 from auth import roles
@@ -247,55 +248,75 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
     return "\n".join(lines) if lines else None
 
 
-# Memory injection: while a scope's topic files total ≤ the admin
-# `inline_budget_bytes` (memory_settings, default 8 KB) they inject in FULL;
-# past it the section degrades to the generated MEMORY.md index + the
-# `memory` tool's `view`. A hand-edited single file above the per-file cap
-# is skipped with a note (tool writes can't produce one).
-_MEMORY_INLINE_FILE_HARD_CAP = 64 * 1024
+# Memory injection: the graded fill. The scope's topics, newest date first,
+# inject in FULL while the running total stays within the admin
+# `inline_budget_bytes` (memory_settings, default 8 KB): a topic that fits
+# the room left is inlined, one that does not is listed with its index entry
+# (size, dates, sections) for the `memory` tool's `view`. A first fit, so the
+# freshest small topics load whole until the budget is spent; a topic over
+# the per-file cap (a hand edit) is always listed.
+_memory_log = logging.getLogger("otodock.prompts")
 
 
 def _render_memory_scope(root, *, virtual: str, budget: int,
-                         writable: bool = True) -> str:
-    """One scope's body: inline topics, index-only, or empty-state priming."""
-    from services.memory import memory_file
+                         writable: bool = True, label: str = "") -> str:
+    """One scope's body: the inlined topics, the listed ones, or empty-state
+    priming. ``label`` names the agent and the scope in the one warning a
+    failed index rewrite logs."""
+    from services.memory import memory_file, memory_index
 
-    topics = memory_file.iter_topic_files(root)
-    if not topics:
+    facts = memory_index.scope_facts(root, today=memory_index.today_utc())
+    if not facts:
         if writable:
             return (
                 f"_No memories saved yet. Create the first topic with the "
                 f"`memory` tool: `create {virtual}/<topic>.md`._"
             )
         return "_No memories saved yet._"
-    total = sum(p.stat().st_size for p in topics)
-    out: list[str] = []
-    if total <= budget:
-        for p in topics:
-            rel = p.relative_to(root).as_posix()
-            if p.stat().st_size > _MEMORY_INLINE_FILE_HARD_CAP:
-                out.append(f"### `{rel}`\n\n_(skipped — file over 64 KB; "
-                           f"read it with the `memory` tool)_")
-                continue
-            try:
-                content = p.read_text(encoding="utf-8", errors="replace").rstrip()
-            except OSError:
-                continue
-            out.append(f"### `{rel}`\n\n{content}")
-    else:
-        # Over budget → index only. Heal first so hand-edits are reflected.
+    # The on-disk index is healed at every prompt build (a hand edit, an
+    # index from an older builder), so `view MEMORY.md` and the Files UI
+    # carry what the prompt knows. A folder the proxy cannot write (a
+    # restore as another user, a full disk) keeps its old index, and the
+    # section still renders from the files: the rules never drop.
+    try:
         memory_file.heal_index_if_stale(root)
-        index_path = root / memory_file.INDEX_FILENAME
+    except (OSError, memory_file.MemoryOpError):
+        _memory_log.warning(
+            "memory: the index of %s was not rewritten; the prompt renders from the topic files",
+            label or root, exc_info=True,
+        )
+    order = sorted(
+        facts,
+        key=lambda f: (f.newest is None, -f.newest.toordinal() if f.newest else 0, f.rel),
+    )
+    out: list[str] = []
+    listed: list[memory_index.TopicFacts] = []
+    used = 0
+    for f in order:
+        if f.size > memory_file.TOPIC_HARD_CAP_BYTES or used + f.size > budget:
+            listed.append(f)
+            continue
         try:
-            index = index_path.read_text(encoding="utf-8", errors="replace").rstrip()
+            content = (root / f.rel).read_text(encoding="utf-8", errors="replace").rstrip()
         except OSError:
-            index = memory_file.build_index_content(root).rstrip()
-        out.append(index)
+            # Unreadable now (a permission, a file swapped mid-build): keep it
+            # visible with its index entry, so `view` can still be tried.
+            listed.append(f)
+            continue
+        out.append(f"### `{f.rel}`\n\n{content}")
+        used += f.size
+    if listed:
         out.append(
-            f"_(memory over the inline budget — index only; read a topic "
-            f'with `memory(command="view", path="{virtual}/<topic>")`)_'
+            "### Topics listed, not loaded\n\n"
+            + memory_index.render_capped(listed).rstrip()
+            + f'\n\n_(read one with `memory(command="view", path="{virtual}/<topic>")`, '
+            "or a section with `view_range`)_"
         )
     return "\n\n".join(out)
+
+
+def _kb(n: int) -> str:
+    return f"{n // 1024} KB" if n % 1024 == 0 else f"{n:,} bytes"
 
 
 def _render_memory_sections(model: str, agent_dir: Path, *,
@@ -342,6 +363,7 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         return None
 
     budget = int(settings.get("inline_budget_bytes") or 8192)
+    caps = memory_file.Caps.from_settings(settings)
 
     parts: list[str] = ["\n\n---\n\n# Memory\n"]
 
@@ -352,54 +374,63 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         default_scope = "agent"
     if default_scope == "agent" and not agent_enabled:
         default_scope = "user"
+    # The shared memory is the editor tier's to write (the memory API's
+    # rule): below it, the person's own scope is the default, never a
+    # scope the role cannot write.
+    agent_writable = roles.can_edit(role)
+    if not agent_writable and user_enabled:
+        default_scope = "user"
 
     scope_lines = []
     if agent_enabled:
         scope_lines.append(
-            "- `/memories/agent/` — shared with every user of this "
-            "agent: operational facts, conventions, workflows, shared "
-            "project state."
+            "- `/memories/agent/` is shared with every user of this agent."
         )
     if user_enabled and external:
         scope_lines.append(
-            "- `/memories/user/` — private to this caller: their "
-            "preferences, context, facts about them. Nothing else on this "
-            "line is remembered."
+            "- `/memories/user/` is private to this caller. Nothing else "
+            "on this line is remembered."
         )
     elif user_enabled:
-        scope_lines.append(
-            f"- `/memories/user/` — private to {username}: their "
-            "preferences, context, facts about them."
+        scope_lines.append(f"- `/memories/user/` is private to {username}.")
+    # The one scope rule, for a session that can write both scopes; a
+    # viewer or a contributor reads the shared memory and saves user-scope
+    # only.
+    if agent_enabled and user_enabled and agent_writable:
+        scope_rule = (
+            " About a person, their preferences, their situation: user "
+            "scope. About the work, the systems, the decisions, the traps: "
+            "agent scope. When a fact is both, the fact goes shared and the "
+            "preference personal. A process the team follows is knowledge, "
+            "not memory."
         )
+    elif agent_enabled and not agent_writable:
+        scope_rule = (
+            " Agent memory is read-only for your role: save user-scope "
+            "memories only." if user_enabled
+            else " Agent memory is read-only for your role."
+        )
+    else:
+        scope_rule = ""
     directive = (
-        "\nYou have persistent memory that survives across sessions — "
-        "markdown topic files you manage with the `memory` tool:\n"
+        "\nYou have persistent memory: markdown topic files you manage with "
+        "the `memory` tool.\n"
         + "\n".join(scope_lines)
-        + f"\n\nDefault scope for new memories: `/memories/{default_scope}/`."
-        " **Save the moment you learn something durable** — don't wait "
-        "for the end of the session: decisions, infrastructure facts, "
-        "conventions, preferences, corrections you receive, anything a "
-        "future session will need. When the user says \"remember "
-        "this\", save it.\n\n"
-        "**Maintain, don't accumulate**: the content below is your "
-        "current memory — update existing topics (`str_replace`) "
-        "instead of adding duplicates, merge related facts into one "
-        "topic, delete entries that turn out wrong, date entries "
-        "(YYYY-MM-DD), and supersede outdated facts (\"was X until "
-        "DATE; now Y\"). Prefer targeted edits — never rewrite a whole "
-        "topic from scratch when a small edit will do. Start each "
-        "topic file with a one-line `# heading` (it becomes its index "
-        "entry; `MEMORY.md` is auto-generated — never edit it). Never "
-        "store secrets, credentials, or tokens.\n"
+        + f"\nDefault for new memories: `/memories/{default_scope}/`.{scope_rule}\n\n"
+        "A memory is a fact, a rule, a decision or a pointer, dated "
+        "(YYYY-MM-DD), one to three lines. Not a log, a status or a "
+        "transcript, not anything your prompt already says. Save it the "
+        "moment you learn it, or when asked to remember something. Update "
+        "the existing entry instead of adding one. A changed fact is "
+        "replaced, with one line on what it was until when. A topic is one "
+        "subject: a `# heading`, a "
+        "one-sentence summary line, `##` sections. Keep it under "
+        f"{_kb(memory_file.TOPIC_SOFT_WARN_BYTES)}: the tool refuses growth "
+        f"past {_kb(caps.grow_cap)} and an edit that adds over "
+        f"{_kb(caps.entry_cap)}. Delete what no longer governs. `MEMORY.md` "
+        "is generated, never edit it. Never store secrets. This is the only "
+        "memory in play: the engine's own memory is off.\n"
     )
-    # The shared memory is the editor tier's to write (the memory API's
-    # rule); a viewer or a contributor reads it and saves user-scope only.
-    agent_writable = roles.can_edit(role)
-    if not agent_writable and agent_enabled:
-        directive += (
-            "\nAgent memory is read-only for your role — save "
-            "user-scope memories only.\n"
-        )
     parts.append(directive)
 
     if agent_enabled:
@@ -408,7 +439,7 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
             "\n## Agent memory (shared)\n\n"
             + _render_memory_scope(
                 root, virtual="/memories/agent", budget=budget,
-                writable=agent_writable,
+                writable=agent_writable, label=f"{model} (agent scope)",
             )
             + "\n"
         )
@@ -416,103 +447,49 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         root = Path(external_home) / layout.CONTEXT / "memory"
         parts.append(
             "\n## Caller memory (private to this caller)\n\n"
-            + _render_memory_scope(root, virtual="/memories/user", budget=budget)
+            + _render_memory_scope(
+                root, virtual="/memories/user", budget=budget,
+                label=f"{model} (caller scope)",
+            )
             + "\n"
         )
     elif user_enabled:
         root = memory_file.scope_root(agent_dir, "user", username)
         parts.append(
             f"\n## User memory ({username})\n\n"
-            + _render_memory_scope(root, virtual="/memories/user", budget=budget)
+            + _render_memory_scope(
+                root, virtual="/memories/user", budget=budget,
+                label=f"{model} (user scope, {username})",
+            )
             + "\n"
         )
     return "".join(parts)
 
 
-# Per-bulletin injection cap. Bulletins are prompt-level context — a short
-# team briefing, not a document dump.
-_BULLETIN_MAX_BYTES = 4 * 1024
-# Read-side soft warning. Bulletin edits are plain file writes (no tool
-# result to warn through, unlike memory's write-time soft limit), so the
-# injected section itself tells every attached agent when pruning is due —
-# any RW-attached agent can act on it.
-_BULLETIN_SOFT_WARN_BYTES = 3 * 1024
+def _has_delegation_tools(model: str, placement: PlacementCapabilities) -> bool:
+    """Whether the agent's sessions get the delegation MCP, where the
+    Notebook's two tools live (assigned to the agent, on for the platform)."""
+    with contextlib.suppress(Exception):
+        from services.mcp import mcp_registry
+        manifests = mcp_registry.get_agent_mcps(model, placement=placement) or []
+        return any(m.name == "delegation-mcp" for m in manifests)
+    return False
 
 
-def _read_bulletin(source_agent: str, sub_rel: str) -> str:
-    """The SOURCE-resident bulletin's text, capped at 4 KB and truncated on
-    a UTF-8 character boundary (decode drops a split trailing sequence).
-    '' when the file is missing/unreadable — injection then skips it."""
-    import config
-    path = config.get_agent_dir(source_agent) / layout.KNOWLEDGE / sub_rel
-    try:
-        if not path.is_file() or path.is_symlink():
-            return ""
-        data = path.read_bytes()
-    except OSError:
-        return ""
-    truncated = len(data) > _BULLETIN_MAX_BYTES
-    text = data[:_BULLETIN_MAX_BYTES].decode("utf-8", errors="ignore").strip()
-    if truncated and text:
-        text += ("\n\n_(bulletin truncated at 4 KB — anything below the cap "
-                 "never reaches agents; writers should prune older entries)_")
-    elif len(data) > _BULLETIN_SOFT_WARN_BYTES and text:
-        text += (f"\n\n_(this bulletin is {len(data) / 1024:.1f} KB of the "
-                 "4 KB injected cap — writers should prune older entries)_")
-    return text
-
-
-def _render_library_bulletins(agent_name: str) -> str | None:
-    """The ``# Library Bulletins`` prompt section — one subsection per
-    shared library this agent is ATTACHED to or is the SOURCE of, reading
-    the source-resident ``bulletin/<library name>.md`` only (writable
-    attachments may author the bulletin since 1.5 — those edits ARRIVE
-    here via the projector's normal mirror→source adoption, so the source
-    copy stays the single read point). Default-on convention: no flag,
-    missing file = no subsection."""
-    from storage.knowledge import db_knowledge_libraries
-    # Each entry names the library's source, its subdir, its name, whether
-    # it is the agent's own and whether it is writable.
-    entries: list[tuple[str, str, str, bool, bool]] = []
-    for a in db_knowledge_libraries.attachments_for_consumer(agent_name):
-        entries.append((a["source_agent"], a["subdir"] or "",
-                        a["name"] or "", False, bool(a.get("writable"))))
-    for lib in db_knowledge_libraries.libraries_of(agent_name):
-        entries.append((agent_name, lib["subdir"] or "",
-                        lib["name"] or "", True, False))
-    sections: list[str] = []
-    for source, subdir, name, own, writable in entries:
-        rel = db_knowledge_libraries.bulletin_rel(subdir, name)
-        if not rel:
-            continue
-        text = _read_bulletin(source, rel)
-        if not text:
-            continue
-        if own:
-            origin = "this agent's own library"
-            hint = f"\n_File: `{layout.V_KNOWLEDGE}/{rel}`._"
-        elif writable:
-            mount = (f"{layout.V_KNOWLEDGE}/shared/{source}/{subdir}/" if subdir
-                     else f"{layout.V_KNOWLEDGE}/shared/{source}/")
-            origin = f"from the **{source}** agent"
-            hint = (f"\n_Writable attachment — publish updates at "
-                    f"`{mount}bulletin/{name}.md`._")
-        else:
-            origin = f"from the **{source}** agent"
-            hint = ""
-        sections.append(f"## {name} ({origin}){hint}\n\n{text}")
-    if not sections:
+def _render_notebook(model: str, *, role: str, external: bool, read_only: bool,
+                     client_type: str, placement: PlacementCapabilities) -> str | None:
+    """The ``# Notebook`` section (``services/notebook/notebook_prompt.py``):
+    the latest entries of the agent's read set and when to post. Never for
+    an external caller. Whether the session may post is
+    ``posting.posting_refusal``, the floor the posting route applies."""
+    if external:
         return None
-    return (
-        "\n\n---\n\n# Library Bulletins\n\n"
-        "Each shared knowledge library carries a bulletin — a small runtime "
-        "broadcast file auto-loaded into the context of every agent attached "
-        "to that library, at every session start. Teams use it to pass "
-        "daily/weekly progress and \"what changed\" notes between agents "
-        "automatically; it is NOT a memory — keep durable facts in memory or "
-        "knowledge files, and keep the bulletin short (only its first 4 KB "
-        "is injected): prune superseded entries whenever you update it.\n\n"
-        + "\n\n".join(sections)
+    from services.notebook import notebook_prompt, posting
+    refusal = posting.posting_refusal(
+        model, role=role, read_only=read_only, client_type=client_type,
+    )
+    return notebook_prompt.render(
+        model, refusal=refusal, has_tools=_has_delegation_tools(model, placement),
     )
 
 
@@ -529,7 +506,9 @@ def build_agent_prompt(model: str, *,
                        skip_http_mcps: bool = False,
                        external: bool = False,
                        external_home: str = "",
-                       user_role: str | None = None) -> str | None:
+                       user_role: str | None = None,
+                       shared_chat: bool = False,
+                       read_only: bool = False) -> str | None:
     """Build the full system prompt for an agent.
 
     ``user_role`` is the person's effective role on the agent when the
@@ -546,6 +525,9 @@ def build_agent_prompt(model: str, *,
     own tree, mounted at /caller) makes the caller's memory the user scope
     and auto-loads the caller's context docs — the per-user shape, re-rooted.
 
+    ``read_only`` = a check's judge: its Notebook section says it
+    cannot post, as the posting route refuses it.
+
     Section order:
 
       1. Agent's own ``config/agent.md`` (the persona)
@@ -556,6 +538,7 @@ def build_agent_prompt(model: str, *,
       5b. ``# Skills`` — on-demand skill catalog (Direct-LLM sessions only)
       6. ``# MCP Dynamic Context`` — runtime-generated context per MCP
       7. ``# User Context (Personal)`` — ``users/{u}/context/*`` personal docs
+      7b. ``# Notebook`` — the read set's latest entries (``services/notebook/``)
       8. ``# Workspace`` — live directory tree (role-filtered)
       9. ``# Excluded MCPs`` — only when tools are unavailable
       10. ``# Repository Instructions`` — the instruction files of the
@@ -663,6 +646,7 @@ def build_agent_prompt(model: str, *,
         from services.mcp import mcp_registry
         catalog = mcp_registry.build_available_mcps_section(
             model, context=client_type or "",
+            shared_chat=shared_chat,
             placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
@@ -682,6 +666,7 @@ def build_agent_prompt(model: str, *,
         from services.mcp import mcp_registry
         skills = mcp_registry.get_skills_for_agent(
             model, context=client_type or "",
+            shared_chat=shared_chat,
             placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
@@ -711,6 +696,7 @@ def build_agent_prompt(model: str, *,
             from services.mcp import mcp_registry
             skill_catalog = mcp_registry.get_skill_catalog_for_agent(
                 model, context=client_type or "",
+                shared_chat=shared_chat,
                 placement=placement,
                 skip_http_mcps=skip_http_mcps,
                 external=external,
@@ -804,14 +790,16 @@ def build_agent_prompt(model: str, *,
         if memory_section:
             parts.append(memory_section)
 
-    # Shared-library bulletins — the SOURCE-resident
-    # ``<subtree>/bulletin/<library name>.md`` of every library this agent
-    # is attached to or shares, read server-side so personal-only consumers
-    # and agent-scope sessions get it too. Best-effort like memory.
+    # The Notebook — the latest entries of the agents one delegation edge
+    # away (and the agent's own), read server-side so every kind of session
+    # gets them. Best-effort like memory.
     with contextlib.suppress(Exception):
-        bulletin_section = _render_library_bulletins(model)
-        if bulletin_section:
-            parts.append(bulletin_section)
+        notebook_section = _render_notebook(
+            model, role=role, external=external, read_only=read_only,
+            client_type=client_type, placement=placement,
+        )
+        if notebook_section:
+            parts.append(notebook_section)
 
     # Workspace and user directory listing
     ws_listing = _scan_workspace(agent_dir, model, username=username, role=role,

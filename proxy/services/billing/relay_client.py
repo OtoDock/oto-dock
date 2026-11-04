@@ -40,14 +40,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
+import json
 import logging
 import ssl
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
 import psycopg
 
 import config
+
+if TYPE_CHECKING:
+    import httpx
 
 logger = logging.getLogger("otodock.relay-client")
 
@@ -75,15 +82,15 @@ class RelayError(RuntimeError):
 RELAY_ERROR_MESSAGES = {
     "license_invalid": (
         "This OtoDock license is not valid or has expired. "
-        "An admin can renew it in Setup, OtoDock."
+        "An admin can check it in Setup, OtoDock."
     ),
     "seat_exceeded": (
         "This plan has reached its user limit. "
-        "An admin can upgrade the OtoDock plan to add people."
+        "An admin can check the plan in Setup, OtoDock."
     ),
     "no_credit": (
         "The OtoDock credits are used up. "
-        "An admin can add credits in Setup, OtoDock."
+        "An admin can check them in Setup, OtoDock."
     ),
     "not_connected": (
         "This install is not connected to an OtoDock account. "
@@ -124,6 +131,19 @@ RELAY_ERROR_MESSAGES = {
     "provider_not_app": (
         "OtoDock's GitHub App is not available right now. Try again in a minute."
     ),
+    "bad_signature": (
+        "OtoDock could not confirm that this install sent the request. "
+        "Check this machine's clock first. It must be within five minutes of the real time. "
+        "If it is, ask OtoDock support to reset this install's events. "
+        "Events resume within an hour after that."
+    ),
+    "events_reset_needed": (
+        "OtoDock can no longer confirm events for this install. "
+        "Ask OtoDock support to reset them. Events resume within an hour after the reset."
+    ),
+    "rate_limited": (
+        "OtoDock is busy with this install's requests. Try again in a minute."
+    ),
 }
 
 # A refusal whose code has no sentence of its own.
@@ -145,7 +165,7 @@ RATE_LIMITED = "rate_limited"
 
 def relay_error_message(code: str, default: str = "") -> str:
     """Map a relay rejection code to a user-facing message."""
-    message = RELAY_ERROR_MESSAGES.get(code)
+    message = RELAY_ERROR_MESSAGES.get(code) if isinstance(code, str) else None
     if message:
         return message
     logger.warning("The OtoDock relay refused with a code that has no sentence: %r", code)
@@ -472,7 +492,24 @@ async def _relay_http_client():
     return state.client
 
 
-async def _relay_post(path: str, payload: dict) -> dict:
+def _refusal_code(resp: httpx.Response) -> str:
+    """A 4xx answer's machine code: its ``detail`` when that is a string. A
+    validation error's ``detail`` is a list, read as ``http_<status>``."""
+    code: Any = ""
+    with contextlib.suppress(Exception):
+        code = (resp.json() or {}).get("detail", "")
+    return code if isinstance(code, str) and code else f"http_{resp.status_code}"
+
+
+def install_signature(secret: str, timestamp: str, body: bytes) -> str:
+    """The install's own signature over a request it sends the relay: the
+    forward's scheme in reverse, ``v0=HMAC-SHA256(secret, "v0:{ts}:{body}")``."""
+    return "v0=" + hmac.new(
+        secret.encode(), f"v0:{timestamp}:".encode() + body, hashlib.sha256,
+    ).hexdigest()
+
+
+async def _relay_post(path: str, payload: dict, *, sign_with: str = "") -> dict:
     """POST ``payload`` to ``{OTODOCK_RELAY_BASE}{path}`` → parsed JSON.
 
     A 4xx ``{"detail": "<code>"}`` becomes ``RelayError(code)`` — the relay's
@@ -481,15 +518,25 @@ async def _relay_post(path: str, payload: dict) -> dict:
     network / timeout raise (httpx errors) so callers FAIL-OPEN rather than
     downgrade a paying customer on a transient outage. :func:`_require_relay`
     must gate the call first (guarantees a configured base).
+
+    ``sign_with``: the event forward secret. The body is serialised once and
+    signed over its exact bytes (``X-OtoDock-Install-Signature`` beside
+    ``X-OtoDock-Install-Timestamp``), which the relay checks within 300 s.
     """
     base = config.OTODOCK_RELAY_BASE.rstrip("/")
     client = await _relay_http_client()
-    resp = await client.post(f"{base}{path}", json=payload)
+    if sign_with:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        timestamp = str(int(time.time()))
+        resp = await client.post(f"{base}{path}", content=body, headers={
+            "Content-Type": "application/json",
+            "X-OtoDock-Install-Timestamp": timestamp,
+            "X-OtoDock-Install-Signature": install_signature(sign_with, timestamp, body),
+        })
+    else:
+        resp = await client.post(f"{base}{path}", json=payload)
     if 400 <= resp.status_code < 500:
-        code = ""
-        with contextlib.suppress(Exception):
-            code = (resp.json() or {}).get("detail", "")
-        raise RelayError(code or f"http_{resp.status_code}")
+        raise RelayError(_refusal_code(resp))
     resp.raise_for_status()  # 5xx → httpx.HTTPStatusError → caller fails open
     return resp.json()
 
@@ -668,10 +715,7 @@ def _relay_post_sync(path: str, payload: dict) -> dict:
             base, pinned_http.control_plane, timeout=_RELAY_TIMEOUT_SECONDS) as client:
         resp = client.post(f"{base}{path}", json=payload)
     if 400 <= resp.status_code < 500:
-        code = ""
-        with contextlib.suppress(Exception):
-            code = (resp.json() or {}).get("detail", "")
-        raise RelayError(code or f"http_{resp.status_code}")
+        raise RelayError(_refusal_code(resp))
     resp.raise_for_status()
     return resp.json()
 
@@ -830,26 +874,53 @@ async def oauth_revoke(*, provider_id: str, token: str) -> None:
 
 async def events_register(
     *, provider_id: str, events_url: str, enabled: bool = True,
-    rotate_secret: bool = False,
+    rotate_secret: bool = False, kinds: list[str] | None = None,
+    sign_with: str = "",
 ) -> dict:
     """Register/enable (or disable) hosted event forwarding for this install.
 
     The relay forwards vendor events for the (workspace, user) bindings it
     observed at OAuth exchange to ``events_url``, re-signed with the install's
-    forward secret. The response's ``forward_secret`` is non-null ONLY when
-    freshly minted or rotated — callers send ``rotate_secret=True`` whenever
-    no local secret exists (first registration / DB restore). Raises
-    ``RelayError('events_provider_unsupported')`` when the relay has no event
-    support for the provider (callers fall back to the manifest's own mode).
+    forward secret. The response's ``forward_secret`` is non-null when the
+    relay minted one (a rotation, a first registration, the first enabling
+    register after a staff reset): store it from any answer. ``kinds``: the
+    event names the install wants for the provider (omitted = every kind,
+    ``[]`` = the provider's always-forwarded kinds only). ``sign_with``: the
+    stored forward secret; the relay refuses an unsigned change once the
+    install has signed. Raises ``RelayError('events_provider_unsupported')``
+    when the relay has no event support for the provider (callers fall back
+    to the manifest's own mode).
     """
     _require_relay()
-    return await _relay_post("/v1/events/register", {
+    payload: dict[str, Any] = {
         **_relay_identity(),
         "provider_id": provider_id,
         "events_url": events_url,
         "enabled": enabled,
         "rotate_secret": rotate_secret,
-    })
+    }
+    if kinds is not None:
+        payload["kinds"] = kinds
+    return await _relay_post("/v1/events/register", payload, sign_with=sign_with)
+
+
+async def events_unbind(
+    *, provider_id: str, sign_with: str, scope_id: str = "", user_key: str = "",
+) -> dict:
+    """End this install's relay bindings for ``provider_id``: one exact
+    ``(scope_id, user_key)`` pair, or the whole provider when neither is
+    given (the GitHub App takes only that). Always signed with the forward
+    secret. ``{ok, removed}``; an older relay answers
+    ``RelayError('provider_unknown')``."""
+    _require_relay()
+    if not sign_with:
+        raise ValueError("an unbind is signed with the forward secret")
+    payload: dict[str, Any] = {**_relay_identity(), "provider_id": provider_id}
+    if scope_id:
+        payload["scope_id"] = scope_id
+    if user_key:
+        payload["user_key"] = user_key
+    return await _relay_post("/v1/events/unbind", payload, sign_with=sign_with)
 
 
 # ---------------------------------------------------------------------------

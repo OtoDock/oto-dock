@@ -16,15 +16,22 @@ import logging
 import re
 
 from auth import roles
-from storage.agents.schema import init_agents, init_departments, init_memory
+from storage.agents.schema import (
+    init_agents,
+    init_departments,
+    init_memory,
+    migrate_agents,
+)
 from storage.automation.schema import (
     init_notifications,
     init_push,
     init_tasks,
     init_triggers,
     init_webhooks,
+    migrate_automation,
 )
 from storage.billing.schema import init_execution_layers, init_usage
+from storage.cards.schema import init_cards
 from storage.chat.schema import init_chats, init_meetings, init_reply_reports
 from storage.checks.schema import init_checks
 from storage.files.schema import (
@@ -33,15 +40,18 @@ from storage.files.schema import (
     init_pinned_files,
     init_recover_bin,
 )
-from storage.identity.schema import init_identity
+from storage.identity.schema import init_identity, migrate_identity
 from storage.knowledge.schema import init_knowledge_libraries
-from storage.mcp.schema import init_community_requests, init_mcp, init_mcp_autoupdate
-from storage.move_schema import init_chat_moves, init_engine_switch_leftovers
-from storage.phone.schema import init_audio_telephony, init_phone_call_log
-from storage.schema_base import (
-    _drop_invalid_indexes,
-    _index_exists,
+from storage.mcp.schema import (
+    init_community_requests,
+    init_mcp,
+    init_mcp_autoupdate,
+    migrate_mcp,
 )
+from storage.move_schema import init_chat_moves, init_engine_switch_leftovers
+from storage.notebook.schema import init_notebook
+from storage.phone.schema import init_audio_telephony, init_phone_call_log
+from storage.schema_base import _drop_invalid_indexes, _index_exists
 from storage.sharing.schema import (
     DECISION_CHECK,
     GRANTEE_CHECK,
@@ -59,6 +69,9 @@ _ROLE_CHECKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("agents", "agents_default_for_new_users_role_check", "default_for_new_users_role",
      ("",) + tuple(reversed(roles.AGENT_ROLES))),
     ("shares", "shares_role_cap_check", "role_cap", roles.AGENT_ROLES),
+    ("dynamic_tasks", "dynamic_tasks_notify_audience_check", "notify_audience", roles.AGENT_ROLES),
+    ("triggers", "triggers_notify_audience_check", "notify_audience", roles.AGENT_ROLES),
+    ("notifications", "notifications_audience_check", "audience", roles.AGENT_ROLES),
 )
 
 # The named CHECKs of ``shares`` (SHARING.md) ``run_migrations`` keeps current
@@ -339,6 +352,9 @@ def init_pinned_apps(conn) -> None:
             -- removal, restored on re-attach).
             template_ref  TEXT NOT NULL DEFAULT '',
             template_state TEXT NOT NULL DEFAULT '',
+            from_template TEXT NOT NULL DEFAULT '',
+            from_version  TEXT NOT NULL DEFAULT '',
+            follows       TEXT NOT NULL DEFAULT '',
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL,
             UNIQUE (agent, username, slug),
@@ -471,6 +487,7 @@ def init_schema(conn) -> None:
     init_tasks(conn)
     init_identity(conn)
     init_chats(conn)
+    init_cards(conn)
     init_usage(conn)
     init_mcp(conn)
     init_agents(conn)
@@ -503,6 +520,7 @@ def init_schema(conn) -> None:
     init_knowledge_libraries(conn)
     init_checks(conn)
     init_reply_reports(conn)
+    init_notebook(conn)
     init_schema_meta(conn)
     logger.info("PostgreSQL schema initialized (all tables created)")
 
@@ -645,17 +663,16 @@ def record_platform_version(conn, running: str) -> None:
         )
 
 
-def migrate_database(conn, running: str, *, allow_newer: bool = False) -> None:
-    """The one guarded entry that migrates the database (the proxy's
-    startup; the standalone scheduler reaches the proxy over its internal
-    API): the version preflight, the schema, the migrations, the row. The
-    refusal is logged critical and raised."""
+def migrate_database(conn, running: str, *, allow_newer: bool = False, engines=()) -> None:
+    """The one guarded entry that migrates the database (the proxy's startup;
+    the scheduler goes through the proxy's API): the version preflight, the
+    schema, the migrations, the row; ``engines`` is ``migrate_agents``'s."""
     refusal = platform_version_preflight(conn, running, allow_newer=allow_newer)
     if refusal:
         logger.critical(refusal)
         raise RuntimeError(refusal)
     init_schema(conn)
-    run_migrations(conn)
+    run_migrations(conn, engines=engines)
     record_platform_version(conn, running)
 
 
@@ -777,7 +794,7 @@ def apscheduler_dow_to_standard(field: str) -> str:
     return ",".join(out)
 
 
-def run_migrations(conn) -> None:
+def run_migrations(conn, *, engines=()) -> None:
     """Post-launch schema migration hook.
 
     ``init_schema()`` is the single source of truth for the schema and all
@@ -796,10 +813,8 @@ def run_migrations(conn) -> None:
       ``SAVEPOINT name`` / ``ROLLBACK TO SAVEPOINT name`` / ``RELEASE SAVEPOINT
       name`` — never rely on ``try/except: pass`` alone.
 
-    The pre-launch transitional migrations that used to live here (ssh-server
-    → ssh-hosts rename, users invite-column drops, phone ambience column,
-    agent_remote_targets backfill) were removed once every existing install
-    converged — pre-launch DBs are hand-converged, not migrated forever.
+    The pre-launch transitional migrations that once lived here were removed
+    once every install converged (pre-launch DBs are hand-converged).
     """
     # 2026-07-10: dashboard soft-unpin for pinned apps (ADD COLUMN
     # IF NOT EXISTS is idempotent — no information_schema probe needed).
@@ -864,10 +879,9 @@ def run_migrations(conn) -> None:
     # 2026-09-18: what a link may do (APPS.md "External links"), one more
     # signed block; empty on every pre-existing row.
     conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS external TEXT NOT NULL DEFAULT ''")
-    # 2026-09-19: template-seeded apps (COMMUNITY-AGENTS-REGISTRY.md). Empty
-    # on every pre-existing row = the member's own app.
-    conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS template_ref TEXT NOT NULL DEFAULT ''")
-    conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS template_state TEXT NOT NULL DEFAULT ''")
+    # Template-seeded apps, a bundle's origin and (1.9.1) the source a copy follows; empty on old rows.
+    for column in ("template_ref", "template_state", "from_template", "from_version", "follows"):
+        conn.execute(f"ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS {column} TEXT NOT NULL DEFAULT ''")
     # 2026-09-17: checks (CHECKS.md). The checks attached to a chat (a JSON
     # list of refs, '' = none) and to a task; empty on every pre-existing
     # row. The three checks tables are new tables (init_checks).
@@ -1064,6 +1078,12 @@ def run_migrations(conn) -> None:
     # catalog (a no-op once the words are in), DROP+ADD inside a SAVEPOINT,
     # at startup before the pool serves a request — the "never ALTER ADD
     # CONSTRAINT" note on init_schema is about DDL on a busy pool.
+    migrate_automation(conn)
+    migrate_agents(conn, engines=engines)
+    migrate_identity(conn)
+    migrate_mcp(conn)
+    from storage.remote_schema import migrate_remote
+    migrate_remote(conn)
     for table, name, column, words in _ROLE_CHECKS:
         # A column a later block adds (shares.role_cap, with its CHECK inline)
         # is rewritten from its next boot on.
@@ -1099,26 +1119,6 @@ def run_migrations(conn) -> None:
     conn.execute(
         "ALTER TABLE knowledge_libraries "
         "ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''"
-    )
-    # 2026-08-16: per-task model + engine override. Empty on every
-    # pre-existing row = inherit the agent's default, which is exactly what
-    # those tasks did before the column existed.
-    conn.execute(
-        "ALTER TABLE dynamic_tasks "
-        "ADD COLUMN IF NOT EXISTS override_model TEXT DEFAULT ''"
-    )
-    conn.execute(
-        "ALTER TABLE dynamic_tasks "
-        "ADD COLUMN IF NOT EXISTS override_execution_path TEXT DEFAULT ''"
-    )
-    # 1.9.0: the machine a task's runs go to ('' = the agent's default).
-    conn.execute("ALTER TABLE dynamic_tasks ADD COLUMN IF NOT EXISTS target_machine TEXT DEFAULT ''")
-    # A task's permission mode (1.9): '' = Don't Ask (the unattended word, as
-    # every task ran before the column existed), or Auto (the engine's own
-    # review).
-    conn.execute(
-        "ALTER TABLE dynamic_tasks "
-        "ADD COLUMN IF NOT EXISTS permission_mode TEXT DEFAULT ''"
     )
     # Who started a chat's move (1.9.0): the agent's chain of its own moves
     # is counted by it. A table a pre-release build created lacks it.

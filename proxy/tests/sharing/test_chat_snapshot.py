@@ -130,6 +130,76 @@ def test_snapshot_keeps_text_and_artifacts_copies_files_and_drops_tools_by_defau
     assert client.get(f"/v1/agents/{AGENT}/files/shares/users/owner/{share['id']}/chat.json").status_code in (403, 404)
 
 
+def test_a_persons_photos_are_counted_never_copied():
+    chat_id = _chat()
+    meta = {"images": [{"name": "a.jpg", "path": "users/owner/workspace/uploads/photos/a.jpg"},
+                       {"name": "b.jpg", "path": "users/owner/workspace/uploads/photos/b.jpg"}]}
+    task_store.add_chat_message(chat_id, "user", "", event_data=json.dumps(meta))
+    task_store.add_chat_message(chat_id, "user", "and this file", event_data=json.dumps(
+        {"files": [{"name": "x.pdf", "path": "users/owner/workspace/uploads/files/x.pdf"}]}))
+    body = _share(chat_id)
+    share = share_store.get_share(body["share"]["id"])
+    doc = json.loads((config.AGENTS_DIR / share["snapshot_ref"] / "chat.json").read_text())
+    photo_only, with_file = doc["messages"][-2:]
+    # A message of photos alone keeps its place, with the count.
+    assert photo_only == {"role": "user", "content": "", "created_at": photo_only["created_at"],
+                          "author_sub": "", "attachments": {"photos": 2, "files": 0}}
+    assert with_file["content"] == "and this file"
+    assert with_file["attachments"] == {"photos": 0, "files": 1}
+    # The first row carried nothing: no count.
+    assert "attachments" not in doc["messages"][0]
+    assert not any("uploads" in rel for rel in doc["files"].values())
+
+
+def test_a_settings_card_stays_as_a_placeholder_with_and_without_tools():
+    """The copy keeps a setting's card as its label, never a value, whether
+    or not the tools are included."""
+    from ws import wire_events as wire
+    chat_id = _chat()
+    task_store.add_chat_message(chat_id, "event", event_type=wire.SETTINGS_CARD,
+                                event_data=json.dumps(wire.settings_card_block(
+                                    "user.general.wake-word", "Wake word", 1)))
+    for grantee, include_tools in ((OTHER, False), (EDITOR, True)):
+        body = _share(chat_id, grantee=grantee, include_tools=include_tools)
+        doc = chat_snapshot.load(share_store.get_share(body["share"]["id"]))
+        cards = [m for m in doc["messages"] if m.get("event_type") == wire.SETTINGS_CARD]
+        assert len(cards) == 1
+        # The artifact blocks' shape: the renderers read ``data.label``.
+        assert cards[0]["data"] == {"setting": "user.general.wake-word", "label": "Wake word", "title": ""}
+        assert "event_data" not in cards[0] and "value" not in json.dumps(cards[0])
+
+
+def test_an_action_card_stays_as_a_placeholder_naming_its_title():
+    """The copy keeps an action card as its title alone: no button, no
+    note, nothing a reader of the copy could press."""
+    from ws import wire_events as wire
+    chat_id = _chat()
+    task_store.add_chat_message(chat_id, "event", event_type=wire.ACTION_CARD,
+                                event_data=json.dumps(wire.action_card_block(
+                                    "card-1", "Move Alpha to Eng", "Places Alpha at the Team level.", "a note",
+                                    [{"id": "go", "label": "Move", "kind": "do"}], [])))
+    body = _share(chat_id, grantee=OTHER)
+    doc = chat_snapshot.load(share_store.get_share(body["share"]["id"]))
+    (card,) = [m for m in doc["messages"] if m.get("event_type") == wire.ACTION_CARD]
+    assert card["data"] == {"setting": "", "label": "", "title": "Move Alpha to Eng"}
+    assert "Move" not in json.dumps(card["data"]).replace("Move Alpha", "") and "note" not in card["data"]
+
+
+def test_a_list_card_stays_as_a_placeholder_naming_its_title_and_kind():
+    """The copy keeps a list card as its title and kind: no row of the list
+    (none was ever in the row), and never the person it was drawn for."""
+    from ws import wire_events as wire
+    chat_id = _chat()
+    task_store.add_chat_message(chat_id, "event", event_type=wire.LIST_CARD,
+                                event_data=json.dumps(wire.list_card_block(
+                                    "tasks", {"scope": "mine"}, "Your scheduled tasks", "user-admin")))
+    body = _share(chat_id, grantee=OTHER)
+    doc = chat_snapshot.load(share_store.get_share(body["share"]["id"]))
+    (card,) = [m for m in doc["messages"] if m.get("event_type") == wire.LIST_CARD]
+    assert card["data"] == {"setting": "", "label": "", "title": "Your scheduled tasks", "kind": "tasks"}
+    assert "user-admin" not in json.dumps(card) and "filters" not in card["data"]
+
+
 def test_include_tools_keeps_the_tool_blocks():
     chat_id = _chat()
     body = _share(chat_id, include_tools=True)
@@ -287,8 +357,9 @@ def test_chat_link_serves_the_snapshot_outside():
     assert page.status_code == 200 and '"kind": "chat"' in page.text
     snap = client.get(f"/s/{token}/snapshot").json()
     assert snap["title"] == "Plan review" and len(snap["messages"]) == 5
-    # An anonymous viewer gets the words, never an author's internal id.
-    assert all("author_sub" not in m for m in snap["messages"])
+    # An anonymous viewer gets the words, never an author's internal id nor
+    # a row's.
+    assert all("author_sub" not in m and "id" not in m for m in snap["messages"])
     assert client.get(f"/s/{token}/ui/tok-ui-1").status_code == 200
     assert client.get(f"/s/{token}/media/img-1").status_code == 200
     # A link never gets an app's routes for a chat.
@@ -316,3 +387,149 @@ def test_snapshot_copy_refuses_swapped_symlink(tmp_path):
             assert b"JWT_SECRET" not in p.read_bytes()
     # The other copies are intact.
     assert (root / doc["files"]["tok-ui-1"]).read_text() == "<div class='card'>chart</div>"
+
+
+# ───────────────────────── reporting a reply from the copy ──────────────────
+
+
+def _rows_of(chat_id: str) -> list[dict]:
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        return conn.execute("SELECT id, role, event_type FROM chat_messages WHERE chat_id = %s "
+                            "ORDER BY id", (chat_id,)).fetchall()
+
+
+def _reports() -> list[dict]:
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM reply_reports ORDER BY id").fetchall()
+
+
+@pytest.fixture
+def fired(monkeypatch):
+    from services.notifications import notification_manager as nm
+    calls: list[dict] = []
+
+    async def fake_fire(**kw):
+        # The share's own notice to its reader is not a report's.
+        if kw.get("source") == "report":
+            calls.append(kw)
+        return [{"id": "d"}]
+    monkeypatch.setattr(nm, "fire_notification", fake_fire)
+    return calls
+
+
+def test_the_copy_keeps_the_agents_row_ids_only():
+    chat_id = _chat()
+    rows = {(r["role"], r["event_type"] or ""): r["id"] for r in _rows_of(chat_id)}
+    share = share_store.get_share(_share(chat_id, include_tools=True)["share"]["id"])
+    doc = json.loads((config.AGENTS_DIR / share["snapshot_ref"] / "chat.json").read_text())
+    ids = {(m["role"], m.get("event_type", "")): m.get("id") for m in doc["messages"]}
+    assert ids[("user", "")] is None and ids[("event", "thinking")] is None
+    for kind in (("assistant", ""), ("event", "tool"), ("event", "ui"), ("event", "images"),
+                 ("event", "file")):
+        assert ids[kind] == rows[kind]
+
+
+def _report_from(share_id: str, message_id: int, reason: str = "harmful"):
+    return client.post(f"/v1/shares/{share_id}/reports",
+                       json={"message_id": message_id, "reason": reason, "note": ""})
+
+
+def test_a_reader_of_the_copy_reports_the_chats_reply(fired):
+    chat_id = _chat()
+    share_id = _share(chat_id)["share"]["id"]
+    rows = _rows_of(chat_id)
+    answer = next(r["id"] for r in rows if r["role"] == "assistant")
+    first = next(r["id"] for r in rows if r["role"] != "user")
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    r = _report_from(share_id, answer)
+    # The answer is the copy's own row; the stored report names the live
+    # reply's first row, which a copy made without tools does not carry.
+    assert r.status_code == 200 and r.json() == {"status": "reported", "message_id": answer}
+    [row] = _reports()
+    assert (row["reporter_sub"], row["chat_id"], row["message_id"]) == (OTHER, chat_id, first)
+    assert row["reply_text"] == "Here it is, with a chart." and row["chat_title"] == "Plan review"
+    assert fired[0]["href"] == f"/chat/{AGENT}/{chat_id}?message={first}"
+
+
+def test_the_copys_words_when_the_row_was_written_again(fired):
+    chat_id = _chat()
+    share_id = _share(chat_id)["share"]["id"]
+    answer = next(r["id"] for r in _rows_of(chat_id) if r["role"] == "assistant")
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE id = %s", (answer,))
+        conn.commit()
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    r = _report_from(share_id, answer)
+    assert r.status_code == 200 and r.json()["message_id"] == answer
+    [row] = _reports()
+    assert (row["chat_id"], row["message_id"], row["reply_text"]) == (
+        chat_id, answer, "Here it is, with a chart.")
+    assert fired[0]["href"] == f"/chat/{AGENT}/{chat_id}"
+
+
+def test_a_text_less_block_of_the_copy_is_described(fired):
+    chat_id = _chat()
+    share_id = _share(chat_id)["share"]["id"]
+    ui = next(r["id"] for r in _rows_of(chat_id) if r["event_type"] == "ui")
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE id = %s", (ui,))
+        conn.commit()
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    assert _report_from(share_id, ui).status_code == 200
+    # From that block to the next person's message: every part it showed.
+    assert _reports()[0]["reply_text"] == (
+        "Showed the app \u201cChart\u201d.\nShowed 2 images.\nShowed the file report.pdf.")
+
+
+def test_only_the_shares_readers_report_from_it_and_only_its_blocks(fired):
+    chat_id = _chat()
+    share_id = _share(chat_id)["share"]["id"]
+    rows = _rows_of(chat_id)
+    answer = next(r["id"] for r in rows if r["role"] == "assistant")
+    person = next(r["id"] for r in rows if r["role"] == "user")
+    _as(_user(EDITOR, agent_roles={AGENT: "editor"}))
+    assert _report_from(share_id, answer).status_code == 404
+    _as(UserContext(sub=OTHER, email="o@test.com", name=OTHER, role="member", is_api_key=True))
+    assert _report_from(share_id, answer).status_code == 403
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    r = _report_from(share_id, person)
+    assert r.status_code == 404 and r.json()["detail"] == "That message is not in this shared chat."
+    assert _report_from(share_id, answer, reason="nope").status_code == 422
+    _as(_user())
+    client.patch(f"/v1/shares/{share_id}", json={"revoke": True})
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    assert _report_from(share_id, answer).status_code == 404
+    assert not _reports() and not fired
+
+
+def test_a_copys_reply_whose_first_row_is_gone_keeps_the_whole_reply(fired):
+    chat_id = _chat()
+    share_id = _share(chat_id, include_tools=True)["share"]["id"]
+    tool = next(r["id"] for r in _rows_of(chat_id) if r["event_type"] == "tool")
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE id = %s", (tool,))
+        conn.commit()
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    assert _report_from(share_id, tool).status_code == 200
+    # The run the flag names starts at the tool; its text is the reply's,
+    # not "Used Read." alone.
+    [row] = _reports()
+    assert (row["message_id"], row["reply_text"]) == (tool, "Here it is, with a chart.")
+
+
+def test_a_copys_text_less_reply_is_described_part_by_part():
+    from api.agents.reply_reports import copy_reply_text
+    messages = [
+        {"role": "user", "content": "Q"},
+        {"id": 5, "role": "event", "event_type": "tool", "event_data": json.dumps({"name": "Bash"})},
+        {"role": "event", "event_type": "thinking", "event_data": json.dumps({"text": "x"})},
+        {"id": 7, "role": "event", "event_type": "images", "data": {"images": [{"token": "a"}]}},
+        {"role": "user", "content": "Next"},
+        {"id": 9, "role": "assistant", "content": "Not this one."},
+    ]
+    assert copy_reply_text(messages, 1) == "Used Bash.\nShowed an image."

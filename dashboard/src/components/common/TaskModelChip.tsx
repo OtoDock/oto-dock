@@ -13,6 +13,13 @@ export interface ModelRef {
 }
 
 
+// The tooltip's lead for an unpinned task, by the source the server tags:
+// a person's own task runs on the engine their chats take ('your engine').
+const UNPINNED_SOURCE_WORDS: Record<string, string> = {
+  'layer default': 'Engine default',
+  'your engine': 'Your engine',
+}
+
 /**
  * The model (and engine) a scheduled task will actually run on.
  *
@@ -44,7 +51,7 @@ export function TaskModelChip({ task }: { task: ModelRef }) {
       title={
         pinned
           ? `Pinned to ${task.effective_model}${layer ? ` on ${layer}` : ''} for this task only, ${tier}`
-          : `${source === 'layer default' ? 'Engine default' : 'Agent default'}: ${task.effective_model}, ${tier}`
+          : `${UNPINNED_SOURCE_WORDS[source] ?? 'Agent default'}: ${task.effective_model}, ${tier}`
       }
       className={`inline-flex items-center max-w-full overflow-hidden px-1.5 py-0.5 rounded-sm text-3xs font-medium font-mono ${
         pinned

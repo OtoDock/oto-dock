@@ -266,7 +266,7 @@ Write-Host "=== uv (Python version manager) ===" -ForegroundColor Yellow
 # PINNED to an exact version (uv is 0.x + fast-moving). Keep in sync with
 # VERSIONS.md (UV_VERSION). The Astral installer takes the version in the URL path.
 # An installed uv older than the pin is upgraded; a newer one is left alone.
-$UvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { '0.13.5' }
+$UvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { '0.13.7' }
 $uvHave = Get-ToolVersion 'uv'
 if ($uvHave -and ([version]$uvHave -ge [version]$UvVersion)) {
     Write-Host "[baseline] uv $uvHave present (pin $UvVersion)" -ForegroundColor Green
@@ -355,7 +355,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # PINNED — keep PnpmVersion in sync with VERSIONS.md (PNPM_VERSION).
     # --allow-scripts: pnpm 12's install step puts its native binary at the
     # bin path; npm 12 skips it by default and leaves a shim that needs Node.
-    $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '12.15.0' }
+    $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '12.16.1' }
     $pnpmHave = Get-ToolVersion 'pnpm'
     if ($pnpmHave -and ([version]$pnpmHave -ge [version]$PnpmVersion)) {
         Write-Host "[baseline]   pnpm $pnpmHave present (pin $PnpmVersion)" -ForegroundColor Green
@@ -375,8 +375,8 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # CODEX_VERSION). Mirrors install-baseline-tools.sh: the platform runs a
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
-    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.296' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.163.0' }
+    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.312' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.166.0' }
 
     function Install-PinnedCli {
         # Install OR upgrade an npm-global CLI to the EXACT pinned version.

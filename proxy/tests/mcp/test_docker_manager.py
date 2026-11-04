@@ -246,6 +246,32 @@ def test_run_compose_streaming_buffers_and_throttles(
     assert "Pulling" in progress_logs[0]
 
 
+def test_run_compose_streaming_keeps_the_latest_progress_while_it_runs(file_tools_manifest, tmp_path):
+    """The run's latest phase is the MCP's record while compose runs (the
+    update job reads it), and the record goes when the run ends."""
+    import threading
+
+    from services.mcp import compose_progress
+
+    gate = tmp_path / "go"
+    script = (f"echo 'aaaaaaaaaaaa Downloading 12.5MB' >&2; "
+              f"while [ ! -e {gate} ]; do sleep 0.05; done")
+    out: dict = {}
+    run = threading.Thread(target=lambda: out.setdefault("r", docker_manager._run_compose_streaming(
+        file_tools_manifest, ["bash", "-c", script], timeout=30)))
+    run.start()
+    seen = None
+    deadline = _time.monotonic() + bound(10)
+    while seen is None and _time.monotonic() < deadline:
+        seen = compose_progress.progress_of(file_tools_manifest.name)
+        _time.sleep(0.05)
+    gate.write_text("")
+    run.join(bound(10))
+    assert seen == {"phase": "downloading", "detail": "Downloading the new image, 12 MB so far."}
+    assert out["r"][0] == 0
+    assert compose_progress.progress_of(file_tools_manifest.name) is None
+
+
 def test_run_compose_streaming_timeout_kills_process(file_tools_manifest):
     """The watchdog preserves the old subprocess.run(timeout=) contract."""
     with pytest.raises(_subprocess.TimeoutExpired):
@@ -1270,3 +1296,25 @@ def test_a_context_past_the_cap_is_never_read(fake_docker_manifest, tmp_path, mo
     monkeypatch.setattr("builtins.open", _open)
     assert docker_manager._build_state(fake_docker_manifest) is None
     assert not [p for p in opened if p.endswith("model.bin")]
+
+
+def test_the_collabora_bind_reaches_the_native_compose(file_tools_manifest, tmp_path, monkeypatch):
+    """config.env's COLLABORA_BIND_IP reaches the file tools' .env, which
+    their compose reads for Collabora's published port: loopback unless
+    set."""
+    import config
+    monkeypatch.setattr(file_tools_manifest, "mcp_dir", tmp_path)
+    docker_manager._inject_mcp_env(file_tools_manifest)
+    assert _read_env(tmp_path / ".env")["COLLABORA_BIND_IP"] == "127.0.0.1"
+    monkeypatch.setattr(config, "COLLABORA_BIND_IP", "0.0.0.0")
+    docker_manager._inject_mcp_env(file_tools_manifest)
+    assert _read_env(tmp_path / ".env")["COLLABORA_BIND_IP"] == "0.0.0.0"
+
+
+@pytest.mark.parametrize("value, bound", [
+    ("", "127.0.0.1"), ("127.0.0.1", "127.0.0.1"), ("0.0.0.0", "0.0.0.0"), (" 192.168.1.10 ", "192.168.1.10"),
+    ("::1", "::1"), ("localhost", "127.0.0.1"), ("0.0.0.0:9981", "127.0.0.1"), ("x; rm", "127.0.0.1"),
+])
+def test_the_collabora_bind_is_an_address_or_loopback(value, bound):
+    import config
+    assert config.collabora_bind_ip_for(value) == bound

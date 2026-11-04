@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 
-import { computeModelGroups, pickSeedModel, visibleAgentPaths } from '@/lib/modelGroups'
+import { computeModelGroups, inPersonOrder, pickSeedModel, visibleAgentPaths } from '@/lib/modelGroups'
 
 // ─── Model-dropdown layer visibility (the chat page's engine rules) ─────────
 // Locked to the chat's engine while its session process is alive; a DEAD
@@ -63,6 +63,27 @@ describe('computeModelGroups', () => {
     expect(groups[0].models).toEqual([
       { value: 'claude-code-cli::claude-sonnet-5', label: 'Sonnet 5' },
     ])
+  })
+
+  it('a local-only engine offers only its local providers\' models', () => {
+    const layers = {
+      ...LAYERS,
+      'codex-cli': {
+        display_name: 'OpenAI Codex',
+        providers: [{ id: 'openai', kind: 'vendor' }, { id: 'ollama', kind: 'local' }],
+        models: [
+          { value: 'gpt-5', label: 'GPT-5', provider: 'openai' },
+          { value: 'qwen', label: 'Qwen', provider: 'ollama' },
+        ],
+      },
+    }
+    const groups = computeModelGroups({ ...base, layers, localOnly: ['codex-cli'] })!
+    expect(groups.find(g => g.layer === 'codex-cli')!.models.map(m => m.value))
+      .toEqual(['codex-cli::qwen'])
+    // Without the rule the vendor model is offered too; another engine is untouched.
+    expect(computeModelGroups({ ...base, layers })!.find(g => g.layer === 'codex-cli')!.models)
+      .toHaveLength(2)
+    expect(groups.find(g => g.layer === 'claude-code-cli')!.models).toHaveLength(1)
   })
 
   it('committed + alive: locked to the single chat layer', () => {
@@ -208,5 +229,42 @@ describe('pickSeedModel', () => {
     })!
     expect(pickSeedModel(g, bare, [''])).toEqual({ layer: 'engine-a', model: 'frontier-2' })
     expect(pickSeedModel([], bare, ['x'])).toBeNull()
+  })
+})
+
+// ─── The person's order: the server orders the engines by their use on the
+//     agent; the dropdown shows its groups as answered ───────────────────────
+
+describe('inPersonOrder', () => {
+  it('takes the server order, then any engine it does not name', () => {
+    expect(inPersonOrder(ALL, ['codex-cli', 'claude-code-cli'])).toEqual(['codex-cli', 'claude-code-cli', 'direct-llm'])
+  })
+
+  it('drops what the agent does not allow and a repeat', () => {
+    expect(inPersonOrder(['claude-code-cli', 'codex-cli'], ['acme-cli', 'codex-cli', 'codex-cli']))
+      .toEqual(['codex-cli', 'claude-code-cli'])
+  })
+
+  it('keeps the agent order when no order came', () => {
+    expect(inPersonOrder(ALL, undefined)).toEqual(ALL)
+    expect(inPersonOrder(ALL, [])).toEqual(ALL)
+  })
+
+  it('orders the groups, and a committed chat keeps its own engine first', () => {
+    const agentPaths = inPersonOrder(ALL, ['direct-llm', 'codex-cli', 'claude-code-cli'])
+    expect(layersOf({ ...base, agentPaths })).toEqual(['direct-llm', 'codex-cli', 'claude-code-cli'])
+    expect(layersOf({ ...base, agentPaths, chatActiveLayer: 'claude-code-cli', processAlive: false }))
+      .toEqual(['claude-code-cli', 'direct-llm', 'codex-cli'])
+  })
+
+  it('a model offered on two engines seeds on the person\'s first of them', () => {
+    const shared = {
+      'claude-code-cli': { display_name: 'Claude Code CLI', models: [{ value: 'sonnet', label: 'Sonnet' }] },
+      'direct-llm': { display_name: 'Direct LLM API', models: [{ value: 'sonnet', label: 'Sonnet' }] },
+    }
+    const groups = computeModelGroups({
+      ...base, layers: shared, agentPaths: inPersonOrder(['claude-code-cli', 'direct-llm'], ['direct-llm', 'claude-code-cli']),
+    })!
+    expect(pickSeedModel(groups, shared, ['sonnet'])).toEqual({ layer: 'direct-llm', model: 'sonnet' })
   })
 })

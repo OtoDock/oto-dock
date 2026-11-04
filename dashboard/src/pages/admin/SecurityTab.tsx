@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { apiFetch } from '../../api/auth'
 import {
   useBearerAllowlist,
+  useBearerPending,
   useAddBearerAllowlist,
   useRemoveBearerAllowlist,
-  useRestoreBearerAllowlist,
+  useRemoveAdminBearerRows,
 } from '../../api/oauth'
 import { toastError } from '../../lib/http/apiJson'
 import { usePlatformSettings, useSavePlatformSettings } from './PlatformPage.hooks'
@@ -17,6 +18,11 @@ import type { ForwardingWarning } from '../../components/admin/forwardingAdvice'
 import Button from '../../components/ui/Button'
 import { Input, Select } from '../../components/ui/Field'
 import { CARD } from '../../components/ui/classes'
+import { useDialogs } from '../../components/ui/dialogs'
+import AllowMcpHosts from '../../components/admin/AllowMcpHosts'
+
+// The `source` of a row an admin added (or one an older version seeded).
+const ROW_SOURCE_ADMIN = 'admin'
 
 // ---------------------------------------------------------------------------
 // Security tab
@@ -24,13 +30,27 @@ import { CARD } from '../../components/ui/classes'
 
 // OAuth Bearer Allowlist — moved here from the removed Service Accounts tab.
 // Controls which (provider, host) pairs may receive a user's OAuth token via
-// HTTP Authorization: Bearer injection; "Restore defaults" re-adds the
-// vendor-official hosts an admin may have deleted.
+// HTTP Authorization: Bearer injection. No row is predefined. A row an MCP's
+// manifest put there follows that MCP and has no Remove; the header button
+// removes every admin row and keeps the MCPs' rows.
 function BearerAllowlistSection() {
   const { data: entries, isLoading } = useBearerAllowlist()
+  const { data: pending } = useBearerPending()
   const addEntry = useAddBearerAllowlist()
   const removeEntry = useRemoveBearerAllowlist()
-  const restoreDefaults = useRestoreBearerAllowlist()
+  const removeAdminRows = useRemoveAdminBearerRows()
+  const dialogs = useDialogs()
+  const hasAdminRows = !!entries?.some((e) => !e.source || e.source === ROW_SOURCE_ADMIN)
+
+  const handleRemoveAdminRows = async () => {
+    if (!(await dialogs.confirm({
+      title: 'Remove the custom addresses?',
+      body: 'Custom addresses are removed. Addresses an MCP added stay.',
+      confirmLabel: 'Remove',
+      tone: 'danger',
+    }))) return
+    void removeAdminRows.mutateAsync().catch(toastError('The addresses were not removed'))
+  }
   const [provider, setProvider] = useState('')
   const [host, setHost] = useState('')
   const [error, setError] = useState('')
@@ -55,19 +75,26 @@ function BearerAllowlistSection() {
 
   return (
     <div className={`${CARD} p-4`}>
-      <div className="flex items-center justify-between mb-1">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
         <h3 className="text-sm font-semibold text-primary">OAuth Bearer Allowlist</h3>
-        <Button variant="secondary" size="xs"
-          onClick={() => { void restoreDefaults.mutateAsync().catch(toastError('The defaults were not restored')) }}
-          disabled={restoreDefaults.isPending}
-        >
-          {restoreDefaults.isPending ? 'Restoring…' : 'Restore defaults'}
-        </Button>
+        {hasAdminRows && (
+          <Button variant="secondary" size="xs"
+            onClick={() => { void handleRemoveAdminRows() }}
+            disabled={removeAdminRows.isPending}
+          >
+            {removeAdminRows.isPending ? 'Removing…' : 'Remove custom addresses'}
+          </Button>
+        )}
       </div>
       <p className="text-xs text-tertiary mb-4">
-        Controls which MCPs may receive a user's OAuth token. MCPs that use
-        OAuth need it to sign in.
+        The addresses that may receive a person&apos;s sign-in for an MCP. An MCP from the community
+        catalog adds its own and takes them away when it is turned off.
       </p>
+      {pending && pending.length > 0 && (
+        <div className="space-y-2 mb-4">
+          {pending.map((p) => <AllowMcpHosts key={p.mcp_name} pending={p} />)}
+        </div>
+      )}
 
       <div className="flex gap-2 mb-4 items-end">
         <div className="flex-1">
@@ -104,22 +131,28 @@ function BearerAllowlistSection() {
           {entries.map((e) => (
             <div
               key={e.id}
-              className="flex items-center justify-between py-2 text-sm"
+              className="flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 py-2 text-sm"
             >
-              <div className="font-mono text-primary">
+              <div className="min-w-0 break-all font-mono text-primary">
                 <span className="font-medium">{e.provider_id}</span>
                 <span className="mx-2 text-tertiary">→</span>
                 <span>{e.host_pattern}</span>
               </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-tertiary">{e.added_by}</span>
-                <button
-                  onClick={() => { void removeEntry.mutateAsync(e.id).catch(toastError('The entry was not removed')) }}
-                  disabled={removeEntry.isPending}
-                  className="text-sm text-status-danger-fg hover:underline"
-                >
-                  Remove
-                </button>
+              <div className="ml-auto flex shrink-0 items-center gap-3">
+                {e.source && e.source !== ROW_SOURCE_ADMIN ? (
+                  <span className="text-xs text-tertiary">Added by {e.source}</span>
+                ) : (
+                  <>
+                    <span className="text-xs text-tertiary" title={e.added_by}>Custom</span>
+                    <button
+                      onClick={() => { void removeEntry.mutateAsync(e.id).catch(toastError('The entry was not removed')) }}
+                      disabled={removeEntry.isPending}
+                      className="text-sm text-status-danger-fg hover:underline"
+                    >
+                      Remove
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           ))}

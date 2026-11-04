@@ -5,6 +5,9 @@ import AudioPlayer from '../media/AudioPlayer'
 import DisplayUrl from '../media/DisplayUrl'
 import DisplayFile from '../media/DisplayFile'
 import UiArtifact from '../media/UiArtifact'
+import SettingCard from '../SettingCard'
+import ActionCard from '../ActionCard'
+import ListCard from '../ListCard'
 
 /**
  * Renders a single display/file-tools artifact block (gallery/chart, video,
@@ -19,6 +22,12 @@ import UiArtifact from '../media/UiArtifact'
  */
 export default function ArtifactView({ block, agent, embedded, onArtifactInteraction }: { block: MessageBlock; agent?: string; embedded?: boolean; onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }> }) {
   switch (block.type) {
+    case 'setting':
+      return <SettingCard settingId={block.settingId} label={block.label} catalogVersion={block.catalogVersion} />
+    case 'card':
+      return <ActionCard cardId={block.cardId} title={block.title} text={block.text} note={block.note} buttons={block.buttons} options={block.options} />
+    case 'list':
+      return <ListCard kind={block.kind} filters={block.filters} title={block.title} agentName={agent} />
     case 'images':
       return <ImageGallery images={block.images} />
     case 'video':

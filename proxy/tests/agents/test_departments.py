@@ -271,6 +271,22 @@ class TestAssignmentFieldGate:
         assert r.status_code == 200
         assert agent_store.get_agent("gate-b")["department_id"] == ""
 
+    def test_a_lone_empty_department_clears_the_level_too(self, client):
+        dept = _mk_dept(client)
+        _mk_agent("gate-c")
+        level_id = dept["levels"][0]["id"]
+        r = client.patch(
+            "/v1/agents/gate-c",
+            json={"department_id": dept["id"], "department_level_id": level_id},
+            headers=ADMIN_H(),
+        )
+        assert r.status_code == 200, r.text
+        r = client.patch("/v1/agents/gate-c", json={"department_id": ""}, headers=ADMIN_H())
+        assert r.status_code == 200, r.text
+        from storage.agents import agent_store
+        row = agent_store.get_agent("gate-c")
+        assert row["department_id"] == "" and row["department_level_id"] == ""
+
     def test_admin_needs_no_manager_role(self, client):
         dept = _mk_dept(client)
         _mk_agent("gate-c")

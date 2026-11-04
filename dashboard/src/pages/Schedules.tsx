@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useTasks, useRunTaskNow, useDeleteTask, usePauseTask, useResumeTask } from '../api/tasks'
 import { useAgents } from '../api/agents'
 import { useAdminUsers } from '../api/runs'
-import { formatNextRun, describeSchedule, browserTimeZone } from '../lib/format'
+import { formatNextRun, describeSchedule, browserTimeZone, rawCron } from '../lib/format'
 import { TaskModelChip } from '../components/common/TaskModelChip'
 import TransferredFrom from '../components/TransferredFrom'
 import { errorText } from '../lib/http/apiJson'
@@ -138,8 +138,10 @@ export default function Schedules() {
                   </td>
                   <td className="px-4 py-3 text-secondary">{task.agent}</td>
                   <td className="px-4 py-3 text-xs text-secondary">
-                    <div>{describeSchedule(task, browserTz)}</div>
-                    {task.schedule && <div className="font-mono text-tertiary mt-0.5">{task.schedule}</div>}
+                    <div className={rawCron(task) ? 'font-mono' : undefined}>{describeSchedule(task, browserTz)}</div>
+                    {task.schedule && !rawCron(task) && (
+                      <div className="font-mono text-tertiary mt-0.5">{task.schedule}</div>
+                    )}
                     {task.interval_seconds != null && <div className="font-mono text-tertiary mt-0.5">interval {task.interval_seconds}s</div>}
                   </td>
                   <td className="px-4 py-3 text-secondary text-xs">{formatNextRun(task.next_run_time)}</td>
@@ -217,7 +219,7 @@ export default function Schedules() {
               </div>
             </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary">
-              <span className="min-w-0 break-words"><span className="text-tertiary">Schedule:</span> {describeSchedule(task, browserTz)}</span>
+              <span className="min-w-0 break-words"><span className="text-tertiary">Schedule:</span> <span className={rawCron(task) ? 'font-mono' : undefined}>{describeSchedule(task, browserTz)}</span></span>
               <span className="min-w-0 break-words"><span className="text-tertiary">Next:</span> {formatNextRun(task.next_run_time)}</span>
             </div>
             {(task.can_run || task.can_pause || task.can_resume || task.can_delete) && (

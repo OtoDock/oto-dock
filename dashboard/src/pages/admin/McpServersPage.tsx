@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAdminMcps, useCheckMcpUpdates, useMcpUpdateState, isUpdateOffer, McpServer } from '../../api/mcps'
+import { useAdminMcps, useCheckMcpUpdates, useMcpUpdateState, isUpdateOffer, McpServer, McpUpdateState } from '../../api/mcps'
+import { useBearerPending } from '../../api/oauth'
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
 import McpCategoryFilter from '../../components/McpCategoryFilter'
 import { formatRelativeTime } from '../../lib/format'
@@ -21,6 +22,8 @@ const CATEGORY_LABEL: Record<string, string> = { core: 'Core', custom: 'Custom',
 
 export default function McpServersPage() {
   const { data: allMcps, isLoading } = useAdminMcps()
+  // The addresses each MCP waits on for an admin's Allow: one read for every row.
+  const { data: bearerPending } = useBearerPending()
   const [showInstall, setShowInstall] = useState(false)
   const [showBrowse, setShowBrowse] = useState(false)
   const [query, setQuery] = useState('')
@@ -31,9 +34,31 @@ export default function McpServersPage() {
   const qc = useQueryClient()
   const { data: updateState } = useMcpUpdateState()
   const { data: checkData, refetch: checkUpdates, isFetching: checkingUpdates, dataUpdatedAt } = useCheckMcpUpdates()
+  // A check answers without the update jobs, so its copy carries the cached
+  // ones over (a running update survives a check, and a cached check copied
+  // again on mount). The ref lands each check once per mount.
+  const copiedCheckAt = useRef(0)
   useEffect(() => {
-    if (checkData) qc.setQueryData(['mcp-update-state'], checkData)
+    if (!checkData || dataUpdatedAt <= copiedCheckAt.current) return
+    copiedCheckAt.current = dataUpdatedAt
+    qc.setQueryData(['mcp-update-state'], (old: McpUpdateState | undefined) => ({
+      ...checkData, running: old?.running, finished: old?.finished,
+    }))
   }, [checkData, dataUpdatedAt, qc])
+  // An update that left `running` ended (here, in another tab or the weekly
+  // run): the list reads its new version, the update state its cleared
+  // offer, and the cached check goes.
+  const runningKey = Object.keys(updateState?.running ?? {}).sort().join('\n')
+  const runningBefore = useRef<string[]>([])
+  useEffect(() => {
+    const now = runningKey ? runningKey.split('\n') : []
+    const ended = runningBefore.current.some(n => !now.includes(n))
+    runningBefore.current = now
+    if (!ended) return
+    qc.invalidateQueries({ queryKey: ['admin-mcps'] })
+    qc.invalidateQueries({ queryKey: ['mcp-update-state'] })
+    qc.removeQueries({ queryKey: ['mcp-updates'] })
+  }, [runningKey, qc])
   const updates = updateState?.updates || {}
   const checkedAt = updateState?.checked_at || ''
 
@@ -157,7 +182,9 @@ export default function McpServersPage() {
           <div className="space-y-2">
             {grouped[cat].map(mcp => (
               <McpRow key={mcp.name} mcp={mcp} updateInfo={updates[mcp.name]}
-                autoUpdateEnabled={updateState?.auto_update_enabled ?? true} />
+                job={updateState?.running?.[mcp.name]} finished={updateState?.finished?.[mcp.name]}
+                autoUpdateEnabled={updateState?.auto_update_enabled ?? true}
+                waiting={bearerPending?.find(p => p.mcp_name === mcp.name)} />
             ))}
           </div>
         </div>

@@ -411,3 +411,10 @@ def test_duplex_config_automatic_language_starts_in_the_browser_language_and_det
     assert phone_config.assemble_duplex_session_config("user-auto", "xx")["language"] == "en"
     picked = phone_config.assemble_duplex_session_config("user-el", "de-DE")
     assert picked["language"] == "el-GR" and picked["language_detect"] is False
+
+
+def test_duplex_config_names_the_chat_and_the_speaker_for_the_usage_report(temp_db):
+    task_store.upsert_user("user-1", "u1@example.com", "U One", "member")
+    cfg = phone_config.assemble_duplex_session_config("user-1", "en-US", "chat-77")
+    assert (cfg["chat_id"], cfg["sub"]) == ("chat-77", "user-1")
+    assert phone_config.assemble_duplex_session_config("user-1")["chat_id"] == ""

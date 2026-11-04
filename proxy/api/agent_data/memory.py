@@ -35,7 +35,15 @@ Every successful mutation:
   3. publishes platform-write bookkeeping + live propagation — tombstone
      retire/record, ``file_author`` attribution, satellite fan-out, dashboard
      ``file_updated`` broadcast — mirroring the dashboard file API so tool
-     writes reach open satellites and Files-UI views mid-session.
+     writes reach open satellites and Files-UI views mid-session
+     (``services/memory/memory_publish``).
+
+A ``rename`` from ``/memories/user/`` to ``/memories/agent/`` is a
+PROMOTION (``services/memory/memory_promote``): editor and above, two
+attributed commits, both roots published; ``POST /promote`` is the same
+function behind a signed-in person's role, and the chat's "promote a
+memory" card (``api/cards/actions_team``) calls the function itself. The
+other direction is refused.
 
 Settings endpoints (admin / manager, dashboard cookies) and the danger-zone
 ``clear-all`` / ``clear-my-memory`` remain at the bottom.
@@ -46,7 +54,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-import time
 from pathlib import Path
 from typing import Any
 
@@ -56,8 +63,10 @@ import config
 from auth import roles
 from auth.providers import UserContext, acting_role_of, get_current_user, require_auth
 from core import layout
-from services.memory import memory_file
-from services.memory.memory_file import MemoryOpError, OpResult
+from core.session.visibility import SCOPE_AGENT, SCOPE_USER
+from services.memory import memory_file, memory_nudge, memory_promote, memory_publish
+from services.memory.memory_file import MemoryCapError, MemoryOpError, OpResult
+from services.memory.memory_promote import MemoryRoleError
 from storage import database as task_store
 from storage.agents import agent_store, memory_store
 
@@ -66,6 +75,35 @@ router = APIRouter(prefix="/v1/internal/memory")
 
 _AGENT_GONE = "This agent no longer exists."
 _NO_SUCH_SETTING = "That memory setting does not exist."
+_NOT_A_PERSON = "Only a person signed in can share a memory topic."
+_NOT_YOUR_TIER = (
+    "Only editors and managers can share a memory with everyone on this "
+    "agent. Your topic stays private."
+)
+_NOT_PERSONAL_PATH = "Only a topic under /memories/user/ can be shared."
+_NOT_SHARED_PATH = "A shared topic's new name must be under /memories/agent/."
+_NEW_PATH_SHAPE = "new_path must name a topic under /memories/agent/ or /memories/user/."
+_DEMOTION = (
+    "Error: rename cannot move a topic from the shared scope to a personal "
+    "one. Shared knowledge stays shared: copy what is personal into "
+    "/memories/user/ and delete it from the shared topic."
+)
+
+# The numeric settings and what the route accepts for each (an int that is
+# no bool, inside the range; None means no upper bound).
+_INT_MAX = 2**31 - 1   # the columns are INTEGER
+_SETTING_RANGES: dict[str, tuple[int, int]] = {
+    "inline_budget_bytes": (1, _INT_MAX),
+    "nudge_turns": (0, _INT_MAX),
+    "topic_grow_cap_bytes": memory_file.GROW_CAP_RANGE,
+    "entry_cap_bytes": memory_file.ENTRY_CAP_RANGE,
+}
+_SETTING_REFUSALS = {
+    "inline_budget_bytes": "The inline budget must be a whole number of bytes, at least 1.",
+    "nudge_turns": "The turns before a nudge must be a whole number.",
+    "topic_grow_cap_bytes": "The growth cap must be a whole number of bytes from 16,384 to 65,536.",
+    "entry_cap_bytes": "The entry cap must be a whole number of bytes from 256 to 65,536.",
+}
 
 
 _COMMANDS = {"view", "create", "str_replace", "insert", "delete", "rename"}
@@ -110,21 +148,27 @@ def _require_agent_match(user: UserContext, agent: str) -> None:
         raise HTTPException(403, "no access to this agent")
 
 
-def _scope_enabled(scope: str, agent: str) -> bool:
+def _scope_enabled(scope: str, settings: dict[str, Any], toggles: dict[str, Any]) -> bool:
     """Master AND per-agent toggle compose."""
-    settings = memory_store.get_settings()
-    toggles = memory_store.get_agent_toggles(agent)
-    if scope == "agent":
-        return bool(
-            settings.get("agent_memory_enabled")
-            and toggles.get("agent_memory_enabled")
+    key = f"{scope}_memory_enabled"
+    return bool(settings.get(key) and toggles.get(key))
+
+
+def _scope_unavailable(scope: str, *, external: bool, username: str | None) -> str:
+    """Why a scope the session lacks is not there (the tool's text)."""
+    if external and scope == SCOPE_AGENT:
+        return (
+            "Shared agent memory is not available on external routes "
+            "— caller memories live under /memories/user/."
         )
-    if scope == "user":
-        return bool(
-            settings.get("user_memory_enabled")
-            and toggles.get("user_memory_enabled")
+    if external and scope == SCOPE_USER:
+        return "This route keeps no per-caller memory."
+    if scope == SCOPE_USER and not username:
+        return (
+            "user-scope memory is not available in this session "
+            "(no user owner). Use /memories/agent/ instead."
         )
-    return False
+    return f"The {scope} memory scope is disabled for this agent."
 
 
 def _external_caller_home(agent: str, agent_dir: Path, claim: str) -> Path | None:
@@ -144,11 +188,6 @@ def _external_caller_home(agent: str, agent_dir: Path, claim: str) -> Path | Non
         return None
 
 
-def _is_external_tree(tree_rel: str) -> bool:
-    """Caller trees never sync, fan out or broadcast to the Files UI."""
-    return tree_rel.startswith("externals/")
-
-
 def _err(output: str, warnings: list[str] | None = None) -> dict[str, Any]:
     return {"output": output, "is_error": True, "warnings": warnings or []}
 
@@ -161,104 +200,23 @@ def _ok(result: OpResult) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Write propagation (mirrors the dashboard file API's publish pipeline)
-# ---------------------------------------------------------------------------
-
-def _tree_rel(agent_dir: Path, root: Path, rel: str) -> str | None:
-    """Agent-tree-relative posix path for a scope-relative memory path."""
-    try:
-        return (root / rel).resolve().relative_to(agent_dir.resolve()).as_posix()
-    except (OSError, ValueError):
-        return None
-
-
-async def _publish_changes(
-    agent_slug: str,
-    agent_dir: Path,
-    root: Path,
-    result: OpResult,
-    *,
-    writer_slug: str | None,
-    exclude_user_sub: str = "",
+def _log_outcome(
+    agent: str, scope: str, command: str, rel: str,
+    *, refusal: MemoryCapError | None = None, result: OpResult | None = None,
 ) -> None:
-    """Bookkeeping + live propagation for a successful mutation. Best-effort —
-    a satellite being offline or a broadcast failing never fails the op."""
-    try:
-        from services.notifications.notification_manager import broadcast_file_updated
-        from services.remote import workspace_fanout
-        from storage.files import file_author_store, file_tombstones_store
-
-        for rel in result.changed:
-            tree_rel = _tree_rel(agent_dir, root, rel)
-            if not tree_rel or _is_external_tree(tree_rel):
-                continue
-            await asyncio.to_thread(
-                file_tombstones_store.drop, agent_slug, tree_rel,
-            )
-            if writer_slug:
-                await asyncio.to_thread(
-                    file_author_store.record, agent_slug, tree_rel, writer_slug,
-                )
-            if workspace_fanout.has_fanout_candidates(
-                agent_slug, tree_rel, include_idle=True,
-            ):
-                try:
-                    content = (root / rel).read_bytes()
-                except OSError:
-                    content = None
-                if content is not None:
-                    await workspace_fanout.fan_out_write(
-                        agent_slug, tree_rel, content, include_idle=True,
-                    )
-            await broadcast_file_updated(
-                agent_slug, tree_rel, exclude_user_sub=exclude_user_sub,
-            )
-
-        now = time.time()
-        for rel in result.deleted:
-            tree_rel = _tree_rel(agent_dir, root, rel)
-            if not tree_rel or _is_external_tree(tree_rel):
-                continue
-            await asyncio.to_thread(
-                file_tombstones_store.record, agent_slug, tree_rel, now,
-                origin="memory",
-            )
-            await asyncio.to_thread(
-                file_author_store.clear, agent_slug, tree_rel,
-            )
-            await workspace_fanout.fan_out_delete(
-                agent_slug, tree_rel, include_idle=True,
-            )
-            await broadcast_file_updated(
-                agent_slug, tree_rel, exclude_user_sub=exclude_user_sub,
-            )
-    except Exception:  # noqa: BLE001  # propagation spans the db and satellites, the memory op already landed
-        logger.warning(
-            "memory write propagation failed for %s", agent_slug, exc_info=True,
+    """The size caps leave a trace an operator can count: a refusal and a
+    topic left over the soft target log at INFO with the agent, the scope,
+    the topic and the size (in the text)."""
+    if refusal is not None:
+        logger.info(
+            "memory: %s on %s refused (agent %s, %s scope): %s",
+            command, rel, agent, scope, refusal,
         )
-
-
-def _commit(
-    agent_dir: Path, scope: str, username: str | None,
-    result: OpResult, command: str, writer: str,
-) -> str | None:
-    """One attributed git commit covering every path the op touched."""
-    try:
-        from services.infra import git_writer
-        repo = memory_file.git_repo_root(agent_dir, scope, username)
-        repo.mkdir(parents=True, exist_ok=True)
-        git_writer.init_if_missing(repo)
-        root = memory_file.scope_root(agent_dir, scope, username)
-        paths: list[Path | str] = [root / rel for rel in (result.changed + result.deleted)]
-        if not paths:
-            return None
-        return git_writer.commit_paths(
-            repo, paths, f"memory: {command} ({scope} scope, by {writer})",
+    elif result is not None and result.over_target:
+        logger.info(
+            "memory: %s on %s (agent %s, %s scope) left it at %d bytes, over the target",
+            command, rel, agent, scope, result.over_target,
         )
-    except (ImportError, OSError, ValueError):
-        logger.warning("memory git commit failed", exc_info=True)
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -322,15 +280,18 @@ async def memory_op(
     # claim) is the user scope when the agent's mode has one and the route
     # gave the caller a tree — same toggles as a user's memory.
     external = u.is_external
+    settings = await asyncio.to_thread(memory_store.get_settings)
+    toggles = await asyncio.to_thread(memory_store.get_agent_toggles, agent)
+    caps = memory_file.Caps.from_settings(settings)
     scopes: dict[str, Path] = {}
-    if _scope_enabled("agent", agent) and not external:
+    if _scope_enabled("agent", settings, toggles) and not external:
         scopes["agent"] = memory_file.scope_root(agent_dir, "agent")
     if external:
         role = "external"
         caller_home = _external_caller_home(agent, agent_dir, u.external_claim)
-        if caller_home is not None and _scope_enabled("user", agent):
+        if caller_home is not None and _scope_enabled("user", settings, toggles):
             scopes["user"] = caller_home / "context" / "memory"
-    elif username and _scope_enabled("user", agent):
+    elif username and _scope_enabled("user", settings, toggles):
         scopes["user"] = memory_file.scope_root(agent_dir, "user", username)
     if not scopes:
         if external:
@@ -363,19 +324,7 @@ async def memory_op(
             return _ok(memory_file.view_root(scopes))
 
         if scope not in scopes:
-            if external and scope == "agent":
-                return _err(
-                    "Shared agent memory is not available on external routes "
-                    "— caller memories live under /memories/user/."
-                )
-            if external and scope == "user":
-                return _err("This route keeps no per-caller memory.")
-            if scope == "user" and not username:
-                return _err(
-                    "user-scope memory is not available in this session "
-                    "(no user owner). Use /memories/agent/ instead."
-                )
-            return _err(f"The {scope} memory scope is disabled for this agent.")
+            return _err(_scope_unavailable(scope, external=external, username=username))
 
         # Role gate: writes to agent scope need editor+ (or an agent-scope
         # service session); user scope is always the caller's own.
@@ -403,11 +352,13 @@ async def memory_op(
         elif command == "create":
             result = await asyncio.to_thread(
                 memory_file.op_create, root, rel, body.get("file_text") or "",
+                caps=caps,
             )
         elif command == "str_replace":
             result = await asyncio.to_thread(
                 memory_file.op_str_replace, root, rel,
                 body.get("old_str") or "", body.get("new_str") or "",
+                caps=caps,
             )
         elif command == "insert":
             insert_line = body.get("insert_line")
@@ -415,7 +366,7 @@ async def memory_op(
                 raise HTTPException(400, "insert_line (integer) required")
             result = await asyncio.to_thread(
                 memory_file.op_insert, root, rel, insert_line,
-                body.get("insert_text") or "",
+                body.get("insert_text") or "", caps=caps,
             )
         elif command == "delete":
             result = await asyncio.to_thread(memory_file.op_delete, root, rel)
@@ -424,31 +375,117 @@ async def memory_op(
             if not new_raw or not isinstance(new_raw, str):
                 raise HTTPException(400, "new_path required")
             new_scope, new_rel = memory_file.split_virtual_path(new_raw)
+            if not new_scope or not new_rel:
+                return _err(_NEW_PATH_SHAPE)
             if new_scope != scope:
-                return _err(
-                    "Error: rename cannot move a file across memory scopes "
-                    f"({scope} → {new_scope}). Create it in the target scope "
-                    "and delete the original instead."
-                )
+                # Across the scopes: a promotion, or nothing. The destination
+                # must be a scope this session has (an external caller or a
+                # session with no user never reaches the promotion).
+                if new_scope not in scopes:
+                    return _err(_scope_unavailable(
+                        new_scope, external=external, username=username,
+                    ))
+                if scope == SCOPE_AGENT:
+                    return _err(_DEMOTION)
+                new_rel = memory_file.validate_rel(new_rel, mutating=True)
+                try:
+                    result = await memory_promote.promote(
+                        agent, username or "", rel, role=role, user_sub=user_sub,
+                        dst_rel=new_rel, caps=caps,
+                    )
+                except MemoryRoleError as e:
+                    return _err(str(e))
+                except MemoryCapError as e:
+                    _log_outcome(agent, new_scope, command, new_rel, refusal=e)
+                    return _err(str(e))
+                _log_outcome(agent, new_scope, command, new_rel, result=result)
+                if u.session_id:
+                    memory_nudge.record_memory_call(u.session_id)
+                return _ok(result)
             new_rel = memory_file.validate_rel(new_rel, mutating=True)
             result = await asyncio.to_thread(
                 memory_file.op_rename, root, rel, new_rel,
             )
+    except MemoryCapError as e:
+        _log_outcome(agent, scope, command, rel, refusal=e)
+        return _err(str(e))
     except MemoryOpError as e:
         return _err(str(e))
 
     if result.changed or result.deleted:
+        _log_outcome(agent, scope, command, rel, result=result)
         if not external:
             # A caller's tree is not a git repo (no per-user context repo
             # there) — the memory index + tombstones are its history.
             writer = username or "agent-session"
             await asyncio.to_thread(
-                _commit, agent_dir, scope, username, result, command, writer,
+                memory_publish.commit, agent_dir, scope, username, result,
+                command, writer,
             )
-        await _publish_changes(
+        await memory_publish.publish_changes(
             agent, agent_dir, root, result,
             writer_slug=username, exclude_user_sub=user_sub,
         )
+        # A landed write is memory maintenance: the capture nudge starts
+        # over. A view, or a refused write, is not.
+        if u.session_id:
+            memory_nudge.record_memory_call(u.session_id)
+    return _ok(result)
+
+
+@router.post("/promote")
+async def promote_endpoint(
+    request: Request,
+    user: UserContext | None = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Share one of the person's own memory topics with the agent: the
+    promotion behind the person's role (editor and above on the agent).
+    Body ``{agent, path, new_path?}``: ``path`` under ``/memories/user/``,
+    ``new_path`` under ``/memories/agent/`` when the shared name differs.
+    Answers the ``/op`` shape; the role refusal is a 403."""
+    u = require_auth(user)
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    agent = body.get("agent") if isinstance(body.get("agent"), str) else ""
+    if not agent or not agent_store.agent_exists(agent):
+        raise HTTPException(404, _AGENT_GONE)
+    _require_agent_match(u, agent)
+    sub = u.acting_sub or ""
+    if not sub:
+        raise HTTPException(400, _NOT_A_PERSON)
+    username = await asyncio.to_thread(task_store.get_username_by_sub, sub)
+    if not username:
+        raise HTTPException(400, "Could not find your account. Sign out, sign in again and retry.")
+    role = await asyncio.to_thread(_resolve_effective_role, sub, agent)
+    raw_path = body.get("path")
+    new_raw = body.get("new_path")
+    if not raw_path or not isinstance(raw_path, str):
+        return _err("path required")
+    try:
+        scope, rel = memory_file.split_virtual_path(raw_path)
+        if scope != SCOPE_USER:
+            return _err(_NOT_PERSONAL_PATH)
+        rel = memory_file.validate_rel(rel, mutating=True)
+        dst_rel = rel
+        if new_raw and isinstance(new_raw, str):
+            new_scope, new_rel = memory_file.split_virtual_path(new_raw)
+            if new_scope != SCOPE_AGENT:
+                return _err(_NOT_SHARED_PATH)
+            dst_rel = memory_file.validate_rel(new_rel, mutating=True)
+        settings = await asyncio.to_thread(memory_store.get_settings)
+        result = await memory_promote.promote(
+            agent, username, rel, role=role, user_sub=sub, dst_rel=dst_rel,
+            caps=memory_file.Caps.from_settings(settings),
+        )
+    except MemoryRoleError:
+        raise HTTPException(403, _NOT_YOUR_TIER) from None
+    except MemoryCapError as e:
+        _log_outcome(agent, SCOPE_AGENT, "promote", rel, refusal=e)
+        return _err(str(e))
+    except MemoryOpError as e:
+        return _err(str(e))
+    _log_outcome(agent, SCOPE_AGENT, "promote", dst_rel, result=result)
     return _ok(result)
 
 
@@ -475,6 +512,12 @@ async def patch_settings_endpoint(
     if not u.is_admin:
         raise HTTPException(403, "Only an admin can change the memory settings.")
     body = await request.json()
+    for key, (low, high) in _SETTING_RANGES.items():
+        value = body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise HTTPException(400, _SETTING_REFUSALS[key])
     return await asyncio.to_thread(memory_store.update_settings, **body)
 
 
@@ -571,7 +614,7 @@ async def _clear_and_tombstone(
     )
     if rels:
         fake = OpResult(output="", deleted=rels)
-        await _publish_changes(
+        await memory_publish.publish_changes(
             agent_slug, agent_dir, root, fake, writer_slug=username,
         )
     return count

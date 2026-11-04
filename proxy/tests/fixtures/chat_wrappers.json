@@ -1,0 +1,130 @@
+{
+  "_comment": "The platform's wrappers around a chat row's text and what a reader shows of it. `input` is a stored user row (the interactive tailers keep the typed text whole); `stripped` is the text drawn for it, null when the row is not drawn at all (the typed copy of a worker's report, whose delegate_result row is the card). Read by the dashboard's lib/transcriptCleanup.ts (cleanUserMessageText, tests/transcriptCleanup.test.ts) and by the proxy's title stripper in storage/chat/chat_titles.py. The shapes: the delegation MCP's [DELEGATED_WORK] and [TASK_OUTPUT_DIR] blocks (mcps/custom/delegation-mcp/server.py), the result envelope (api/tasks/delegation.py _ON_COMPLETE_PROMPT) and the report-less first line (services/scheduler/lanes.missing_report_note), the Claude TUI's <pasted_content> tags around a typed paste and the [Image #N] marks it journals ahead of a paste whose photo paths it took in as images (the platform's attachments block behind the text is kept: the title alone drops it), the [Current time: …], viewer-focus, [Parallel activity — …] and concluded-meeting preludes, a leading <system-reminder> block, a slash-command record. Only a leading, closed wrapper is the platform's; a mention mid-text stays.",
+  "cases": [
+    {
+      "name": "the delegation wrapper ahead of a task",
+      "input": "[DELEGATED_WORK]\nDelegated by agent 'boss'. When you finish, your final message is delivered to that agent automatically as a report — write it as one: what you did, what you produced (with paths), and anything blocked. Do not send the caller a to-do list or questions to answer by delegation: it cannot delegate back to you and would have to re-open this lane just to reply. Put anything it must do on a single 'Blocked on:' line. Attach the files you produced with attach_result_files(paths) before your final message and name them in the report: the delegating agent receives copies in its inbox.\n[/DELEGATED_WORK]\n\nReview the plan, then report.",
+      "stripped": "Review the plan, then report."
+    },
+    {
+      "name": "the output folder wrapper alone",
+      "input": "[TASK_OUTPUT_DIR]\nSave any output files under out/ inside your own workspace folder (create it if it does not exist), and attach them to your result with attach_result_files.\n[/TASK_OUTPUT_DIR]\n\nWrite the report.",
+      "stripped": "Write the report."
+    },
+    {
+      "name": "both wrappers, the delegation one outside",
+      "input": "[DELEGATED_WORK]\nDelegated by agent 'boss'. When you finish, write a report.\n[/DELEGATED_WORK]\n\n[TASK_OUTPUT_DIR]\nSave any output files under out/ inside your own workspace folder (create it if it does not exist), and attach them to your result with attach_result_files.\n[/TASK_OUTPUT_DIR]\n\nWrite the report.",
+      "stripped": "Write the report."
+    },
+    {
+      "name": "the paste tags around the preludes and the wrapper",
+      "input": "<pasted_content id=\"4935\">\n[Current time: Thursday, October 01, 2026 02:29 (2:29 AM) UTC (UTC+00:00)]\n\n[Parallel activity — for awareness only, no action needed: sibling sessions: 'Inbox' (generating). Check one only if your work depends on it (peek_session / get_task_result).]\n\n[DELEGATED_WORK]\nDelegated by agent 'boss'. When you finish, write a report.\n[/DELEGATED_WORK]\n\nReview the plan.\n</pasted_content>",
+      "stripped": "Review the plan."
+    },
+    {
+      "name": "the parallel-activity prelude of a task's first prompt",
+      "input": "[Parallel activity — for awareness only, no action needed: background tasks running: 'Purple verify job' (dyn-0f203824). Check one only if your work depends on it (peek_session / get_task_result).]\n\nsummarise the inbox",
+      "stripped": "summarise the inbox"
+    },
+    {
+      "name": "the time prelude",
+      "input": "[Current time: Friday, July 17, 2026 02:00 (2:00 AM) UTC (UTC+00:00)]\n\nhello there",
+      "stripped": "hello there"
+    },
+    {
+      "name": "the time prelude and the viewer focus line",
+      "input": "[Current time: Thursday, October 01, 2026 02:00 (2:00 AM) UTC (UTC+00:00)]\n\n[The user is looking at the app \"Team Status\" (team-status) right now.]\n\nReply with the single word: tty2",
+      "stripped": "Reply with the single word: tty2"
+    },
+    {
+      "name": "a satellite single-lined the stamped prompt",
+      "input": "[Current time: Friday, October 09, 2026 06:00 (6:00 AM) UTC (UTC+00:00)] [Parallel activity — for awareness only, no action needed: sibling sessions: 'Inbox' (generating). Check one only if your work depends on it (peek_session / get_task_result).] count",
+      "stripped": "count"
+    },
+    {
+      "name": "a worker's report typed into a terminal",
+      "input": "[BACKGROUND_TASK_RESULT]\nTask 'cards' (id: dyn-7, worker chat: 4f3a2b1c-0000-4000-8000-000000000001) finished with status=completed.\n\nOutput:\nThe cards collapse and the tests pass.\n\nReview the result and respond to the user appropriately. If status is user_interrupted, the user stopped or redirected the worker and the worker has ALREADY served them directly in its own chat — this callback was deferred until that settled. The [User interjected] lines above are their instructions and the turns after them are the worker's replies; fold that into your plan instead of re-delegating or assuming the lane died.\n\nThis result is the worker's report and is final for its run. Do not answer it with another delegation just to acknowledge, confirm or thank — delegate again (continue_id) only when the user asked for more work or the worker is blocked on something only you can supply. Otherwise report to the user and let them decide what happens next.",
+      "stripped": null
+    },
+    {
+      "name": "a worker's report with the older one-paragraph tail, behind the parallel-activity line",
+      "input": "[Parallel activity — for awareness only, no action needed: background tasks running: 'Purple verify job' (dyn-0f203824). Check one only if your work depends on it (peek_session / get_task_result).]\n\n[BACKGROUND_TASK_RESULT]\nTask 'Purple verify job' (id: dyn-0f203824, worker chat: task-run-3878746e773f) finished with status=completed.\n\nOutput:\ndone\n\nReview the result and respond to the user appropriately. If status is user_interrupted, the user stopped or redirected the worker — any [User interjected] lines above are their instructions; adapt instead of assuming the lane died.",
+      "stripped": null
+    },
+    {
+      "name": "a worker's report with a check verdict and a files note after the tail",
+      "input": "[BACKGROUND_TASK_RESULT]\nTask 'cards' (id: dyn-7, worker chat: 4f3a2b1c-0000-4000-8000-000000000001) finished with status=failed.\n\nOutput:\nHalf way.\n\nReview the result and respond to the user appropriately.\n\nThis result is the worker's report and is final for its run.\n\n[Check style did not pass after 1 round(s): too long]\n\n[The worker attached 1 file, in this chat's workspace: inbox/worker/report.md]",
+      "stripped": null
+    },
+    {
+      "name": "a worker that ended without a report",
+      "input": "[The worker ended without a report: the model declined to continue. Its last message below is not the outcome. Continue the lane with delegate(continue_id=\"4f3a2b1c-0000-4000-8000-000000000001\") to get the report.]\n\n[BACKGROUND_TASK_RESULT]\nTask 'cards' (id: dyn-7, worker chat: 4f3a2b1c-0000-4000-8000-000000000001) finished with status=failed.\n\nOutput:\n⚠ Delegated task \"cards\" failed.",
+      "stripped": null
+    },
+    {
+      "name": "a worker's report behind the parallel line inside paste tags whose close carries an id",
+      "input": "<pasted_content id=\"5957\">\n[Parallel activity — for awareness only, no action needed: background tasks running: 'Board refresh' (app-0a1b2c3d-fill-000001). Check one only if your work depends on it (peek_session / get_task_result).]\n\n[BACKGROUND_TASK_RESULT]\nTask 'cards review' (id: dyn-8, worker chat: 4f3a2b1c-0000-4000-8000-000000000002) finished with status=completed.\n\nOutput:\nThe review is written.\n\nReview the result and respond to the user appropriately.\n\n[Files the worker attached, already in your workspace: projects/cards/review.md (2.1 KB).]\n</pasted_content id=\"5957\">",
+      "stripped": null
+    },
+    {
+      "name": "a task inside paste tags whose close carries an id",
+      "input": "<pasted_content id=\"812\">\n[DELEGATED_WORK]\nDelegated by agent 'boss'. When you finish, write a report.\n[/DELEGATED_WORK]\n\nReview the plan.\n</pasted_content id=\"812\">",
+      "stripped": "Review the plan."
+    },
+    {
+      "name": "image marks ahead of a paste around a prelude and the text",
+      "input": "[Image #1] [Image #2]\n\n<pasted_content id=\"217e\">\n[Current time: Monday, October 26, 2026 20:30 (8:30 PM) UTC (UTC+00:00)]\nWhich colours are these?\n</pasted_content id=\"217e\">\n",
+      "stripped": "Which colours are these?"
+    },
+    {
+      "name": "image marks ahead of a paste whose text ends in the attachments block",
+      "input": "[Image #1] [Image #2]\n\n<pasted_content id=\"217e\">\n[Current time: Monday, October 26, 2026 20:30 (8:30 PM) UTC (UTC+00:00)]\nWhich colours are these?\nThe user has attached 2 image(s). Read and analyze them using the Read tool:\n- \n- \n</pasted_content id=\"217e\">\n",
+      "stripped": "Which colours are these?\nThe user has attached 2 image(s). Read and analyze them using the Read tool:\n- \n-"
+    },
+    {
+      "name": "image marks alone are not drawn",
+      "input": "[Image #1] [Image #2]\n\n",
+      "stripped": null
+    },
+    {
+      "name": "a wrapper mentioned mid-text stays",
+      "input": "Fix it. [DELEGATED_WORK]x[/DELEGATED_WORK]",
+      "stripped": "Fix it. [DELEGATED_WORK]x[/DELEGATED_WORK]"
+    },
+    {
+      "name": "an unclosed wrapper stays",
+      "input": "[DELEGATED_WORK] a word I typed",
+      "stripped": "[DELEGATED_WORK] a word I typed"
+    },
+    {
+      "name": "a paste tag quoted mid-text stays",
+      "input": "the TUI wraps a paste in <pasted_content> tags, see </pasted_content>",
+      "stripped": "the TUI wraps a paste in <pasted_content> tags, see </pasted_content>"
+    },
+    {
+      "name": "a row that is only the wrapper is not drawn",
+      "input": "[DELEGATED_WORK]only[/DELEGATED_WORK]",
+      "stripped": null
+    },
+    {
+      "name": "a leading system-reminder block",
+      "input": "<system-reminder>\nYou are in a live spoken conversation. Keep replies short.\n</system-reminder>\n\nwhat is on my calendar today",
+      "stripped": "what is on my calendar today"
+    },
+    {
+      "name": "the concluded meeting's note behind the time prelude",
+      "input": "[Current time: Friday, October 09, 2026 06:00 (6:00 AM) UTC (UTC+00:00)]\n\n[Meeting \"q3 margins\" (mtg-0123456789ab) ended 2026-10-16 01:00 UTC after 3 turns, with Head, Alpha. Summary: keep 12 %. The person sees the whole meeting in this chat; you have only this note.]\n\nwhat did they decide?",
+      "stripped": "what did they decide?"
+    },
+    {
+      "name": "a Codex line single-lined with the wrapper after the stamp",
+      "input": "[Current time: Friday, October 09, 2026 06:00 (6:00 AM) UTC (UTC+00:00)] [DELEGATED_WORK] Delegated by agent 'boss'. Write a report. [/DELEGATED_WORK] count the files",
+      "stripped": "count the files"
+    },
+    {
+      "name": "a command record is not drawn",
+      "input": "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>",
+      "stripped": null
+    }
+  ]
+}

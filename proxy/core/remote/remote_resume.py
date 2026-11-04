@@ -24,6 +24,7 @@ from core.events.bg_command_state import reset_bg_command_registry
 from core.events.common_events import DONE, ERROR, TEXT, CommonEvent
 from core.execution_layer import RECONNECT_WAIT_S, MachineReach, ResumeVerdict
 from core.remote.remote_session_info import RemoteSessionInfo
+from core.remote.tunnel_state import session_port_moved, valid_port
 from core.session.session_state import (
     _record_session_use,
     clear_starting,
@@ -198,6 +199,8 @@ class RemoteResumeMixin(_Host):
             use_native_permissions=use_native_permissions,
             allow_full_fs=allow_full_fs,
             model=model,
+            # Taken back as it runs: its port is the one the machine serves.
+            tunnel_port=valid_port(self._cm.tunnel_port(machine_id)),
             used_mcps=set(used_mcps),
             resume_handle=resume_handle,
         )
@@ -254,6 +257,7 @@ class RemoteResumeMixin(_Host):
             execution_path=execution_path,
             event_queue=queue,
             use_native_permissions=use_native_permissions,
+            tunnel_port=valid_port(self._cm.tunnel_port(machine_id)),
         )
         info.current_send_command_id = command_id
         adapter = self._adapter(info)
@@ -335,7 +339,7 @@ class RemoteResumeMixin(_Host):
         info = self._sessions.get(session_id)
         if not info:
             return True
-        if info.cli_dead:
+        if info.cli_dead or session_port_moved(info, self._cm):
             return True
         return not self._cm.is_connected(info.machine_id)
 

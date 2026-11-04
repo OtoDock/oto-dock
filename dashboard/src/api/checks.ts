@@ -198,16 +198,26 @@ export function useSaveCheckSettings() {
   })
 }
 
+/** "a, b or c", "a, b and c". */
+function listWords(items: string[], last: 'or' | 'and'): string {
+  return items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} ${last} ${items[items.length - 1]}`
+}
+
 /** The condition in words, for lists and cards: a phrase that follows
- *  "runs" — "after every turn", "when it writes code; on a commit". */
+ *  "runs", "after every turn" or "when it writes code and the turn has a
+ *  commit". Every part the condition names must hold
+ *  (``services/checks/changed_set.condition_matches``), so the parts join
+ *  with "and", the entries of one part with "or". */
 export function conditionWords(c: CheckCondition | undefined): string {
   if (!c || Object.keys(c).length === 0) return 'when it writes any file or runs any action'
   if (c.always) return 'after every turn'
   const parts: string[] = []
-  if (c.kinds?.length) parts.push(`writes ${c.kinds.map((k) => CHECK_KINDS_WORDS[k] || k).join(', ')}`)
-  if (c.events?.length) parts.push(`on ${c.events.map((e) => (e.startsWith('tool:') ? `the tool ${e.slice(5)}` : `a ${e}`)).join(', ')}`)
-  if (c.places?.length) parts.push(`writes ${c.places.map((p) => CHECK_PLACES[p] || p).join(', ')}`)
-  if (c.globs?.length) parts.push(`under ${c.globs.join(', ')}`)
-  if (c.commands?.length) parts.push(`commands matching ${c.commands.join(' | ')}`)
-  return `when it ${parts.join('; ')}`
+  if (c.kinds?.length) parts.push(`it writes ${listWords(c.kinds.map((k) => CHECK_KINDS_WORDS[k] || k), 'or')}`)
+  if (c.events?.length) {
+    parts.push(`the turn has ${listWords(c.events.map((e) => (e.startsWith('tool:') ? `a call of the tool ${e.slice(5)}` : `a ${e}`)), 'or')}`)
+  }
+  if (c.places?.length) parts.push(`it writes ${listWords(c.places.map((p) => CHECK_PLACES[p] || p), 'or')}`)
+  if (c.globs?.length) parts.push(`a file matching ${listWords(c.globs, 'or')} changes`)
+  if (c.commands?.length) parts.push(`it runs a command matching ${listWords(c.commands, 'or')}`)
+  return `when ${listWords(parts, 'and')}`
 }

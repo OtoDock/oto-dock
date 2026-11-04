@@ -8,7 +8,9 @@ Covers append-only re-tail (offset cursor), the registry spawn→done feed, the
 pump-shaped tool/thinking/task_spawn event rows (pairing across batches, dedupe,
 truncation, skip sets) and the slash-command noise filter.
 """
+import base64
 import json
+import random
 
 import pytest
 
@@ -56,6 +58,7 @@ class _Captured(list):
     order: list
     sync: list       # each message row's sync_search flag
     rebuilds: list   # the chat ids whose search row was rebuilt, in order
+    data: list       # each message row's event_data ('{"note": true}' on a note)
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +68,7 @@ def _capture(monkeypatch):
     rows.order = []
     rows.sync = []
     rows.rebuilds = []
+    rows.data = []
     import storage.database as db
 
     def _add(chat_id, role, content="", event_type="", event_data="", author_sub="", **kw):
@@ -75,6 +79,7 @@ def _capture(monkeypatch):
             rows.append((role, content))
             rows.order.append((role, content))
             rows.sync.append(kw.get("sync_search", True))
+            rows.data.append(event_data)
     monkeypatch.setattr(db, "rebuild_chat_search", rows.rebuilds.append)
 
     monkeypatch.setattr(db, "add_chat_message", _add)
@@ -83,6 +88,7 @@ def _capture(monkeypatch):
     # the title test re-patches get_chat to assert the backfill.
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
     monkeypatch.setattr(db, "update_chat", lambda cid, **kw: None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset", lambda cid, title: True)
     # Fresh cursor + pairing + replay-guard state each test.
     T._offsets.clear()
     T._tool_events.clear()
@@ -364,8 +370,8 @@ def test_backfills_title_from_first_user_prompt(tmp_path, _capture, monkeypatch)
     import storage.database as db
     titles = []
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
-    monkeypatch.setattr(db, "update_chat",
-                        lambda cid, **kw: titles.append(kw.get("title")) if "title" in kw else None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: titles.append(title) or True)
     path = _write(
         tmp_path,
         _user("Refactor the auth module to use JWT and drop the old session cookies please"),
@@ -376,12 +382,65 @@ def test_backfills_title_from_first_user_prompt(tmp_path, _capture, monkeypatch)
     assert titles == ["Refactor the auth module to use…"]  # first 6 words + ellipsis
 
 
+def test_a_rename_between_the_read_and_the_write_is_kept(tmp_path, _capture, monkeypatch):
+    # The row read untitled, but a rename landed before the write: the
+    # conditional write refuses, so nothing is announced and no title set.
+    import storage.database as db
+    from services.notifications import notification_manager
+    sent = []
+    monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
+    monkeypatch.setattr(db, "set_chat_title_if_unset", lambda cid, title: False)
+    monkeypatch.setattr(notification_manager, "broadcast_chat_title", lambda *a, **k: sent.append(a))
+    out = T.tail_transcript("s-race", "c-race", _write(tmp_path, _user("a new prompt")))
+    assert out["title_set"] is False
+    assert sent == []
+
+
+def _titles_recorder(monkeypatch):
+    """The chat's title as the conditional write leaves it, and the frames sent."""
+    import storage.database as db
+    from services.notifications import notification_manager
+    titles: list = []
+    sent: list = []
+    monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": titles[-1] if titles else ""})
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: False if titles else (titles.append(title) or True))
+    monkeypatch.setattr(notification_manager, "broadcast_chat_title", lambda *a, **k: sent.append(a[2]))
+    return titles, sent
+
+
+_PHOTO_LINE = ('[Image #1] [Image #2]\n\n<pasted_content id="217e">\n[Current time: Monday, October 26, 2026 20:30 (8:30 PM) UTC (UTC+00:00)]\n'
+               "The user has attached 2 image(s). Read and analyze them using the Read tool:\n- \n- \n"
+               '</pasted_content id="217e">\n')
+
+
+def test_a_photo_alone_leaves_a_terminal_chat_for_its_next_message(tmp_path, _capture, monkeypatch):
+    # A photo alone typed into a live Claude terminal, as the TUI journals it:
+    # no backfill write, no frame; the next real message titles the chat.
+    titles, sent = _titles_recorder(monkeypatch)
+    p = tmp_path / "transcript.jsonl"
+    p.write_text(_user(_PHOTO_LINE))
+    assert T.tail_transcript("s-photo", "c-photo", str(p))["title_set"] is False
+    assert titles == [] and sent == []
+    with open(p, "a") as fh:
+        fh.write(_user("what colours are these?"))
+    assert T.tail_transcript("s-photo", "c-photo", str(p))["title_set"] is True
+    assert titles == sent == ["what colours are these?"]
+
+
+def test_a_photo_alone_and_a_message_in_one_batch_title_by_the_message(tmp_path, _capture, monkeypatch):
+    titles, _sent = _titles_recorder(monkeypatch)
+    path = _write(tmp_path, _user(_PHOTO_LINE), _user("what colours are these?"))
+    assert T.tail_transcript("s-photo2", "c-photo2", path)["title_set"] is True
+    assert titles == ["what colours are these?"]
+
+
 def test_does_not_overwrite_existing_title(tmp_path, _capture, monkeypatch):
     import storage.database as db
     titles = []
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": "Existing Title"})
-    monkeypatch.setattr(db, "update_chat",
-                        lambda cid, **kw: titles.append(kw.get("title")) if "title" in kw else None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: titles.append(title) or True)
     path = _write(tmp_path, _user("a new prompt"))
     out = T.tail_transcript("s-keep", "c-keep", path)
     assert out["title_set"] is False
@@ -395,8 +454,8 @@ def test_title_strips_injected_time_prelude(tmp_path, _capture, monkeypatch):
     import storage.database as db
     titles = []
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
-    monkeypatch.setattr(db, "update_chat",
-                        lambda cid, **kw: titles.append(kw.get("title")) if "title" in kw else None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: titles.append(title) or True)
     stamp = "[Current time: Tuesday, July 07, 2026 19:31 (7:31 PM) Europe/Athens (UTC+03:00)]\n\n"
     path = _write(tmp_path, _user(stamp + stamp + "Fix the flaky login test"))
     out = T.tail_transcript("s-stamp", "c-stamp", path)
@@ -410,8 +469,8 @@ def test_prelude_only_prompt_leaves_chat_untitled(tmp_path, _capture, monkeypatc
     import storage.database as db
     titles = []
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
-    monkeypatch.setattr(db, "update_chat",
-                        lambda cid, **kw: titles.append(kw.get("title")) if "title" in kw else None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: titles.append(title) or True)
     path = _write(tmp_path, _user(
         "[Current time: Tuesday, July 07, 2026 19:31 (7:31 PM) Europe/Athens (UTC+03:00)]"))
     out = T.tail_transcript("s-only", "c-only", path)
@@ -922,8 +981,8 @@ def test_noise_never_titles_the_chat(tmp_path, _capture, monkeypatch):
     import storage.database as db
     titles = []
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
-    monkeypatch.setattr(db, "update_chat",
-                        lambda cid, **kw: titles.append(kw.get("title")) if "title" in kw else None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: titles.append(title) or True)
     path = _write(
         tmp_path,
         _user("<command-name>/context</command-name>"),
@@ -985,8 +1044,8 @@ def test_task_notification_never_titles_the_chat(tmp_path, _capture, monkeypatch
     import storage.database as db
     titles = []
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": ""})
-    monkeypatch.setattr(db, "update_chat",
-                        lambda cid, **kw: titles.append(kw.get("title")) if "title" in kw else None)
+    monkeypatch.setattr(db, "set_chat_title_if_unset",
+                        lambda cid, title: titles.append(title) or True)
     path = _write(tmp_path, _user(_TASK_NOTIFICATION), _user("Fix the login test"))
     T.tail_transcript("sn9", "cn9", path)
     assert titles == ["Fix the login test"]
@@ -1460,3 +1519,322 @@ def test_a_batch_rebuilds_the_search_row_once(tmp_path, _capture):
     assert _capture.rebuilds == ["c9"]
     T.tail_transcript("s9", "c9", path)
     assert _capture.rebuilds == ["c9"]
+
+
+# ---------------------------------------------------------------------------
+# The platform's prompts typed into the terminal: their row is the card the
+# typing site wrote, the note made when the bytes went in; the journaled copy
+# (a multi-line paste, wrapped) is skipped, a person's own line never.
+# ---------------------------------------------------------------------------
+
+
+def test_a_platform_prompt_typed_and_noted_leaves_no_plain_row(tmp_path, _capture):
+    from core.session import transcript_tool_events as TE
+    typed = ("[BACKGROUND_TASK_RESULT]\nTask 'x' (id: dyn-1, worker chat: w) finished "
+             "with status=completed.\n\nOutput:\ndone")
+    TE.note_sent_prompt("c-plat", typed, owner="sid-plat")
+    journaled = f'<pasted_content id="7">\n{typed}\n</pasted_content>'
+    path = _write(
+        tmp_path,
+        _user(journaled),
+        _assistant_sr([{"type": "text", "text": "noted"}], "end_turn"),
+    )
+    stats = T.tail_transcript("s-plat", "c-plat", path)
+    assert _capture == [("assistant", "noted")]
+    assert stats["persisted"] == 1 and stats["last_signal"] == "end_turn"
+
+
+def test_a_persons_identical_line_after_a_dropped_note_keeps_its_row(tmp_path, _capture):
+    from core.session import transcript_tool_events as TE
+    TE.note_sent_prompt("c-drop", "go on", owner="sid-d")
+    assert TE.drop_sent_prompt("c-drop", "go on", owner="sid-d") is True
+    path = _write(tmp_path, _user("go on"))
+    assert T.tail_transcript("s-drop", "c-drop", path)["persisted"] == 1
+    assert _capture == [("user", "go on")]
+
+
+def test_two_queued_platform_prompts_give_two_cards_and_no_plain_row(tmp_path, _capture):
+    from core.session import transcript_tool_events as TE
+    TE.note_sent_prompt("c-two", "first wake", owner="sid-t")
+    TE.note_sent_prompt("c-two", "second wake", owner="sid-t")
+
+    def _answer(uuid: str, text: str) -> str:   # distinct ids: one row each
+        return _line({"type": "assistant", "uuid": uuid,
+                      "message": {"role": "assistant", "stop_reason": "end_turn",
+                                  "content": [{"type": "text", "text": text}]}})
+
+    path = _write(
+        tmp_path,
+        _user("first wake"),
+        _answer("a-one", "one"),
+        _user("second wake"),
+        _answer("a-two", "two"),
+    )
+    assert T.tail_transcript("s-two", "c-two", path)["persisted"] == 2
+    assert _capture == [("assistant", "one"), ("assistant", "two")]
+    # Both notes went with their lines: a third identical line is a person's.
+    p2 = tmp_path / "t3.jsonl"
+    p2.write_text(_user("first wake"))
+    assert T.tail_transcript("s-two2", "c-two", str(p2))["persisted"] == 1
+    assert ("user", "first wake") in _capture
+
+
+# ─── Progress notes (the words before a step, a narration block) ──────────
+
+_NOTE = json.dumps({"note": True})
+_NARRATION_SIGNATURE = (  # a narration block's signature, Claude Code 2.1.289 on T1
+    "CAQSmQYKEQgSGAI4AUIJbmFycmF0aW9uEgxaN6TWc44tRSdr50QaDCI+v2Ex5HWWFAK4siIwpoXu"
+    "uSC8N9/RoWnduz8CKFa/SHkUFca68F7rNvETcpnskhS8n8Rcxll49lxCjvIOKrUFCBC5byly6Wmy"
+    "R9ALgwuPvpcsBUo8ToohRc7unTN7PtATgwFjAAjpc5SW1CMvTJMGJyYv4fTaEC933ZcZA1B3nQEt"
+    "ZmJVZQvizlJdWPyZuV3Muen39Ja8qt5ISS8dW6mlnOnqnyrWx1ajtK0kAuJcdfHDpYtVYGN4lf2g"
+    "xqqXNLn4fJwRB38u3EG1f+3tpXDKtDxfhvncIs7z7u5YiNV/eYYReFwfx4Wf99guZnCP4UBqq/TU"
+    "u16gb3+bcygYosg7WIVf18uP8I/NELiJbTMrtzhcYWNQDzZCZr7N7BKNklVzXax06HQaubXTuuVN"
+    "5qOh7CWaPRaef/eI3r7Qu4AYa8+xYXPU8i1Z4k2AVPm2ikF4nsNQtK2PpbiMM6QrH0Bkoj3SVnlG"
+    "2Oc+UdpaowU+9yWeMgJvzIZZTaP7iStWNcZYQC7G1ob8t9APqKLFfN/WROpaNcakcsb2Tblvglyz"
+    "ZUmUO1HX9mtgjotbo5DzB6BRZTkpvCcZ01skKftCda79Y07tqmJsia6WEnNBPEvZwbQZpJu7vQc3"
+    "Oww6TYkkl/cz8fc98XWapUAmJp7JuS9jGOnUk+koW7jWNE6U/LDHdkeZxqhxVCNOkc8yzL4EzMli"
+    "i+G0GKiYp1OLM0h9u/6zNFCkO2SVs8/XjadXMOZ700tC1BEUcx108fuN6Us9u2rmiC2LmXZUxM7n"
+    "0GB/hBaqVAzW/Gfr/3zE0F0sxpcNRZaYkWF4VzF6BGn9Sv2Lq/24wLIibey4hIXN4UUpcASRDC1d"
+    "4EWLfOplYzPvzmRjb30a4wAdgmzZ7vkYsdv9w+0nilmxZn+lKkBcI3LndpLgEKu3Un2D1VOIvPGf"
+    "d7G+nix7Klghasnte0Xc9bD5IP+ex9lWzdoyEaG9Nmo00VQPpAlzrTFor4C/ScBqBgALpSHvKFB9"
+    "GAE="
+)
+
+
+def _msg_line(uuid: str, blocks: list, stop_reason, msg_id: str = "m1") -> str:
+    """One line of an API message as the CLI writes it once the message has
+    ended: its blocks and the message's stop reason."""
+    return _line({"type": "assistant", "uuid": uuid,
+                  "message": {"id": msg_id, "role": "assistant", "content": blocks,
+                              "stop_reason": stop_reason}})
+
+
+def _bash(tid: str) -> dict:
+    return {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": "ls"}}
+
+
+def _three_steps() -> list[str]:
+    """A preamble before each of two calls, then the answer."""
+    return [
+        _user("three steps please"),
+        _msg_line("p1", [{"type": "text", "text": "Listing the files first."}], "tool_use", "m1"),
+        _msg_line("c1", [_bash("t1")], "tool_use", "m1"),
+        _tool_result("t1", "a\nb"),
+        _msg_line("p2", [{"type": "text", "text": "Now the date."}], "tool_use", "m2"),
+        _msg_line("c2", [_bash("t2")], "tool_use", "m2"),
+        _tool_result("t2", "Thu"),
+        _msg_line("a3", [{"type": "text", "text": "Two files, and it is Thursday."}], "end_turn", "m3"),
+    ]
+
+
+def test_text_before_a_call_is_a_note_row(_capture):
+    stats = T.tail_lines("s-note", "c-note", _three_steps())
+    assert _capture == [("user", "three steps please"), ("assistant", "Listing the files first."),
+                        ("assistant", "Now the date."), ("assistant", "Two files, and it is Thursday.")]
+    # The pump's row: an assistant text whose event_data is {"note": true}.
+    assert _capture.data == ["", _NOTE, _NOTE, ""]
+    assert _capture.order == [
+        ("user", "three steps please"), ("assistant", "Listing the files first."), ("event", "tool"),
+        ("assistant", "Now the date."), ("event", "tool"), ("assistant", "Two files, and it is Thursday."),
+    ]
+    # The turn signal, the last message and the counters are as they were.
+    assert stats["last_signal"] == "end_turn" and stats["turn_complete"] is True
+    assert stats["last_message"] == "Two files, and it is Thursday."
+    assert stats["assistant_chars"] == len("Listing the files first.Now the date.Two files, and it is Thursday.")
+
+
+def test_a_preamble_read_apart_from_its_call_is_still_a_note(_capture):
+    # The satellite forwards on its own cadence: the text line can arrive
+    # alone, its call in the next batch. The line's own stop reason decides.
+    lines = _three_steps()
+    for cut in (lines[:2], lines[2:5], lines[5:]):
+        T.tail_lines("s-split", "c-split", cut)
+    assert _capture.data == ["", _NOTE, _NOTE, ""]
+
+
+def test_the_local_file_writes_the_same_note_rows(tmp_path, _capture):
+    path = _write(tmp_path, *_three_steps())
+    T.tail_transcript("s-file", "c-file", path)
+    assert _capture.data == ["", _NOTE, _NOTE, ""]
+
+
+@pytest.mark.parametrize("stop_reason", ["end_turn", "stop_sequence", "max_tokens", None])
+def test_any_other_stop_reason_keeps_the_text_plain(_capture, stop_reason):
+    T.tail_lines("s-plain", "c-plain", [
+        _msg_line("x1", [{"type": "text", "text": "An answer."}], stop_reason)])
+    assert _capture == [("assistant", "An answer.")]
+    assert _capture.data == [""]
+
+
+def test_an_interrupted_text_stays_plain_and_closes_the_turn(_capture):
+    # ESC mid-text: the line has no stop reason, the marker ends the turn.
+    stats = T.tail_lines("s-esc", "c-esc", [
+        _user("go"),
+        _msg_line("e1", [{"type": "text", "text": "Let me look at the"}], None),
+        _user("[Request interrupted by user]"),
+    ])
+    assert _capture == [("user", "go"), ("assistant", "Let me look at the")]
+    assert _capture.data == ["", ""]
+    assert stats["last_signal"] == "end_turn"
+
+
+def test_a_redelivered_preamble_persists_one_note(_capture):
+    line = _msg_line("r1", [{"type": "text", "text": "Checking."}], "tool_use")
+    T.tail_lines("s-dup", "c-dup", [line])
+    T.tail_lines("s-dup", "c-dup", [line])
+    assert _capture == [("assistant", "Checking.")]
+    assert _capture.data == [_NOTE]
+
+
+def test_a_note_before_a_question_comes_before_its_card(_capture):
+    # The page draws a note right before a question as text (it is what the
+    # person reads to answer); the rows only need the order.
+    T.tail_lines("s-q", "c-q", [
+        _msg_line("q1", [{"type": "text", "text": "One thing first."}], "tool_use"),
+        _msg_line("q2", [{"type": "tool_use", "id": "tq", "name": "AskUserQuestion",
+                          "input": {"questions": []}}], "tool_use"),
+    ])
+    assert _capture.order == [("assistant", "One thing first."), ("event", "question")]
+    assert _capture.data == [_NOTE]
+
+
+def _pb(number: int, payload: bytes) -> bytes:
+    """One length-delimited protobuf field (a one-byte length is enough here)."""
+    return bytes([number << 3 | 2]) + _uvarint(len(payload)) + payload
+
+
+def _uvarint(n: int) -> bytes:
+    out = b""
+    while True:
+        byte, n = n & 0x7F, n >> 7
+        out += bytes([byte | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def _signature(kind: bytes, *, extra: bytes = b"") -> str:
+    """A signature in the shape the CLI reads: field 2 > field 1 > field 8,
+    with other fields of each wire type around them."""
+    inner = b"\x08\x96\x01" + _pb(8, kind) + b"\x1d\x00\x00\x00\x00"
+    middle = b"\x09" + b"\x00" * 8 + _pb(1, inner)
+    return base64.b64encode(_pb(1, b"head") + _pb(2, middle) + extra).decode()
+
+
+def _thinking_line(uuid: str, text: str, signature=None) -> str:
+    block: dict = {"type": "thinking", "thinking": text}
+    if signature is not None:
+        block["signature"] = signature
+    return _msg_line(uuid, [block], "tool_use")
+
+
+def test_a_narration_block_is_a_note_not_a_thought(_capture):
+    words = "The write was blocked, so I will write it into the workspace instead."
+    stats = T.tail_lines("s-nar", "c-nar", [
+        _user("save it"),
+        _thinking_line("n1", words, _NARRATION_SIGNATURE),
+        _msg_line("n2", [_bash("tn")], "tool_use"),
+        _tool_result("tn", "ok"),
+        _msg_line("n3", [{"type": "text", "text": "Saved."}], "end_turn", "m2"),
+    ])
+    assert _capture == [("user", "save it"), ("assistant", words), ("assistant", "Saved.")]
+    assert _capture.data == ["", _NOTE, ""]
+    assert [e for e, _ in _capture.events] == ["tool"]  # no thinking row
+    # The batch's last message stays the answer's.
+    assert stats["last_message"] == "Saved."
+
+
+def test_a_built_narration_signature_with_other_fields_is_read(_capture):
+    T.tail_lines("s-nar2", "c-nar2", [_thinking_line("b1", "Between steps.", _signature(b"narration"))])
+    assert _capture == [("assistant", "Between steps.")] and _capture.data == [_NOTE]
+
+
+def _real_thinking_signature() -> str:
+    from tests.fixtures.characterization.golden_master import load_jsonl
+    for obj in load_jsonl("claude-transcript.jsonl"):
+        for block in (obj.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "thinking":
+                return block["signature"]
+    raise AssertionError("the recorded transcript holds a thinking block")
+
+
+@pytest.mark.parametrize("signature", [
+    "real-thinking", _signature(b"thinking"), _signature(b"summary"), None, "",
+    "@@@not base64@@@", base64.b64encode(b"\x12\x05\x0a").decode(),   # a length past the end
+    base64.b64encode(b"\x13" + _pb(8, b"narration")).decode(),           # a wire type the CLI refuses
+])
+def test_any_other_signature_keeps_the_thinking_row(_capture, signature):
+    if signature == "real-thinking":
+        signature = _real_thinking_signature()
+    T.tail_lines("s-th", "c-th", [_thinking_line("t1", "Let me think.", signature)])
+    assert _capture == []
+    assert _capture.events == [("thinking", {"type": "thinking", "content": "Let me think."})]
+
+
+def test_an_empty_narration_block_writes_nothing(_capture):
+    T.tail_lines("s-empty", "c-empty", [_thinking_line("z1", "  ", _NARRATION_SIGNATURE)])
+    assert _capture == [] and _capture.events == []
+
+
+def test_the_narration_reader_decodes_as_atob_does():
+    real = {"type": "thinking", "signature": _NARRATION_SIGNATURE}
+    assert T._is_narration(real)
+    # atob takes it unpadded and with whitespace inside, never url-safe.
+    assert T._is_narration({"signature": _NARRATION_SIGNATURE.rstrip("=")})
+    spaced = _NARRATION_SIGNATURE[:40] + " \n\t" + _NARRATION_SIGNATURE[40:]
+    assert T._is_narration({"signature": spaced})
+    assert "+" in _NARRATION_SIGNATURE and "/" in _NARRATION_SIGNATURE
+    urlsafe = _NARRATION_SIGNATURE.replace("+", "-").replace("/", "_")
+    assert not T._is_narration({"signature": urlsafe})
+    # Past the cap the walk is not tried.
+    big = _signature(b"narration", extra=_pb(3, b"x" * 13_000))
+    assert len(big) > T._SIGNATURE_MAX_CHARS
+    assert not T._is_narration({"signature": big})
+    assert T._is_narration({"signature": _signature(b"narration", extra=_pb(3, b"x" * 9_000))})
+
+
+def test_the_narration_reader_never_raises_on_noise():
+    rnd = random.Random(20261029)
+    for _ in range(3000):
+        raw = bytes(rnd.randrange(256) for _ in range(rnd.randrange(64)))
+        assert T._is_narration({"signature": base64.b64encode(raw).decode()}) is False
+        text = "".join(rnd.choice("AZaz09+/= \n-_!") for _ in range(rnd.randrange(40)))
+        assert T._is_narration({"signature": text}) in (True, False)
+
+
+def test_claude_code_2_1_312_records_write_nothing(_capture):
+    # The records Claude Code writes since 2.1.300: none is a row, none moves the turn.
+    stats = T.tail_lines("s-312", "c-312", [
+        _line({"type": "api-request", "id": "r1", "querySource": "repl_main_thread", "params": {}}),
+        _line({"type": "api-request-blob", "hash": "h1",
+               "message": {"role": "user", "content": "a message the request carried"}}),
+        _line({"type": "api-request-shape", "shapeHash": "s1", "shape": {"system": "x"}}),
+        _line({"type": "tools-used", "tools": ["Bash"]}),
+        _line({"type": "system", "subtype": "rewind_stand_in", "source_uuid": "u0",
+               "content": "", "level": "info"}),
+    ])
+    assert _capture == [] and _capture.events == []
+    assert stats["last_signal"] is None and stats["persisted"] == 0
+
+
+def test_the_2_1_312_keys_on_known_lines_change_nothing(_capture):
+    T.tail_lines("s-312k", "c-312k", [
+        _line({"type": "user", "uuid": "u1", "sandboxed": True,
+               "message": {"role": "user", "content": "go"}}),
+        _line({"type": "assistant", "uuid": "a1", "requestRef": "r1",
+               "message": {"id": "m1", "role": "assistant", "stop_reason": "tool_use",
+                           "content": [{"type": "text", "text": "Looking first."}]}}),
+    ])
+    assert _capture == [("user", "go"), ("assistant", "Looking first.")]
+    assert _capture.data == ["", _NOTE]
+
+
+def test_a_line_rewritten_with_its_stop_reason_keeps_its_first_row(_capture):
+    # A CLI that wrote the line before the message ended, then again with the
+    # stop reason: the claim keeps the first, plain (today's row, never two).
+    first = _line({"type": "assistant", "uuid": "w1", "message": {
+        "id": "m1", "role": "assistant", "stop_reason": None,
+        "content": [{"type": "text", "text": "Checking."}]}})
+    again = first.replace('"stop_reason": null', '"stop_reason": "tool_use"')
+    T.tail_lines("s-rw", "c-rw", [first])
+    T.tail_lines("s-rw", "c-rw", [again])
+    assert _capture == [("assistant", "Checking.")] and _capture.data == [""]

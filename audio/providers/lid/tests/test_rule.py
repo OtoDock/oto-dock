@@ -198,3 +198,59 @@ def test_the_words_switch_back_and_the_stability_window_starts_over():
         assert Event(R.FINAL, "en") not in r.reading(scores(en=0.8, el=0.1, de=0.1), t)
     assert r.reading(scores(en=0.8, el=0.1, de=0.1), 6.0) == [Event(R.FINAL, "en")]
     assert r.words_switch("el") == []                                  # final: nothing moves
+
+
+FOUR = ["en", "el", "de", "fr"]
+
+
+def test_a_third_candidate_never_opens_nor_switches_under_the_cap():
+    r = LanguageRule("en", FOUR, switch_at=LEAN, prior=0.0, max_candidates=2)
+    assert r.reading(scores(en=0.1, el=0.8, de=0.05, fr=0.05), 1.0) == [Event(R.OPEN, "el")]
+    assert r.reading(scores(en=0.1, el=0.05, de=0.8, fr=0.05), 1.5) == [Event(R.OPEN, "de"), Event(R.SWITCH, "de")]
+    # French leads at full strength: no stream, no switch, and never again.
+    assert r.reading(scores(en=0.02, el=0.02, de=0.02, fr=0.94), 2.0) == []
+    assert r.reading(scores(en=0.02, el=0.02, de=0.02, fr=0.94), 2.5) == []
+    assert r.current == "de"
+    # A candidate already counted may open again: it costs no slot.
+    assert r.reading(scores(en=0.1, el=0.8, de=0.05, fr=0.05), 3.0) == [Event(R.OPEN, "el"), Event(R.SWITCH, "el")]
+
+
+def test_the_cap_holds_at_the_take():
+    r = LanguageRule("en", FOUR, switch_at=SURE, prior=0.0, lean_at_take=True, max_candidates=2)
+    assert r.reading(scores(en=0.1, el=0.8, de=0.05, fr=0.05), 1.0) == [Event(R.OPEN, "el")]
+    assert r.reading(scores(en=0.1, el=0.05, de=0.8, fr=0.05), 1.5) == [Event(R.OPEN, "de")]
+    assert r.take(2.0, {"en": 0.02, "el": 0.02, "de": 0.02, "fr": 0.94}) == []
+    assert r.current == "en"
+
+
+def test_a_candidate_that_never_streamed_gives_its_slot_back():
+    r = LanguageRule("en", FOUR, switch_at=LEAN, prior=0.0, max_candidates=2)
+    assert r.reading(scores(en=0.1, el=0.8, de=0.05, fr=0.05), 1.0) == [Event(R.OPEN, "el")]
+    r.unavailable("el")
+    assert r.reading(scores(en=0.1, el=0.05, de=0.8, fr=0.05), 1.5) == [Event(R.OPEN, "de"), Event(R.SWITCH, "de")]
+    assert r.reading(scores(en=0.02, el=0.02, de=0.02, fr=0.94), 2.0) == [Event(R.OPEN, "fr"), Event(R.SWITCH, "fr")]
+
+
+def test_without_a_cap_every_candidate_opens():
+    r = LanguageRule("en", FOUR, switch_at=LEAN, prior=0.0)
+    r.reading(scores(en=0.1, el=0.8, de=0.05, fr=0.05), 1.0)
+    r.reading(scores(en=0.1, el=0.05, de=0.8, fr=0.05), 1.5)
+    assert r.reading(scores(en=0.02, el=0.02, de=0.02, fr=0.94), 2.0) == [Event(R.OPEN, "fr"), Event(R.SWITCH, "fr")]
+
+
+def test_a_decisive_refusal_finalises_the_shown_language_for_a_dictation():
+    r = dictation(reopen_refused=False)
+    assert r.reading(scores(en=0.1, el=0.8, de=0.1), 1.0) == [Event(R.OPEN, "el")]
+    assert r.reading(scores(en=0.1, el=0.8, de=0.1), 1.5) == [Event(R.SWITCH, "el")]
+    # At once, however soon after the open: the language cannot come back.
+    assert r.refused("el", decisive=True) == [Event(R.FINAL, "en")]
+    assert r.final == "en" and r.current == "en"
+    for t in (2.0, 3.0, 5.0):
+        assert r.reading(scores(en=0.1, el=0.8, de=0.1), t) == []
+    # A refusal that was not decisive keeps the door open.
+    r2 = dictation(reopen_refused=False)
+    r2.reading(scores(en=0.1, el=0.8, de=0.1), 1.0)
+    r2.reading(scores(en=0.1, el=0.8, de=0.1), 1.5)
+    assert r2.refused("el", decisive=False) == []
+    assert r2.reading(scores(en=0.1, el=0.8, de=0.1), 2.0) == [Event(R.SWITCH, "el")]
+

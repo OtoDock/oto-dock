@@ -65,8 +65,8 @@ export interface MapMenuAction {
 }
 
 /** The workspace context-menu idiom (FileContextMenu's exact styling) with
- * an optional header block: agent/department name + subtitle (operator
- * 2026-08-15: no description — the menu is for acting, not reading). */
+ * an optional header block: agent/department name + subtitle (no
+ * description: the menu is for acting, not reading). */
 export function MapMenu({ x, y, header, actions, onClose }: {
   x: number
   y: number

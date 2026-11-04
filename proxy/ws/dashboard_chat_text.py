@@ -5,32 +5,18 @@ adding a second import cycle to the one ``ws/dashboard.py`` already resolves by
 statement order.
 """
 
-import re
-
 import config
-
-# Injected prelude line(s): the `[Current time: ...]` stamp, the viewer
-# focus line and the parallel-activity line (``sibling_awareness``) — twin
-# of ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored exact shapes
-# only; a satellite single-lines a launch-argument prompt, so a prelude may
-# end in spaces instead of a line break).
-_TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
-    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]'
-    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
-)
 
 
 def interactive_prelude(text: str, *, user_tz: str | None, focus_line: str = "") -> str:
     """The ONE shape every prompt typed into a live TUI carries: the time
     stamp (the `-p` pump's per-turn injection, ``config.format_current_time``),
     then the viewer-focus line when an app is on the user's screen, each on
-    its own paragraph, then the text. Built here — beside the regex that
-    recognises it — for the cold first prompt on both delivery paths (the
-    launch argv and the PTY submit) and the live composer send, so the tailer's
-    duplicate-skip, the title strip and the dashboard's display matchers
-    meet one shape. A line the dashboard types straight into the PTY carries
+    its own paragraph, then the text. Built here for the cold first prompt on
+    both delivery paths (the launch argv and the PTY submit) and the live
+    composer send, so the tailer's duplicate-skip, the title strip
+    (``storage/chat/chat_titles.PRELUDE_RE``) and the dashboard's display
+    matchers meet one shape. A line the dashboard types straight into the PTY carries
     the browser's own stamp (``withInteractiveTime``), the same shape."""
     focus = f"{focus_line}\n\n" if focus_line else ""
     return f"[Current time: {config.format_current_time(user_tz)}]\n\n{focus}{text}"
@@ -50,16 +36,6 @@ async def live_model(model: str) -> str:
 # satellite resume; past it the send falls back to synthesizing its own warmup
 # rather than hanging the turn behind a stuck 90s MCP install.
 _REVIVAL_WAIT_S = 30.0
-
-# An app action's framed prompt header (``ws/artifact_interactions.
-# frame_text`` — title/label have had '"' replaced with "'"). Recognized by
-# the title chokepoints so an action-started chat names as "App — Label",
-# never the raw framing brackets. Twin in ``transcript_tailer``. The older
-# "mini-app" spelling still parses: transcripts written before the rename
-# replay through the same chokepoint.
-_APP_ACTION_HEADER_RE = re.compile(
-    r'^\[action from (?:mini-)?app "(.{1,200}?)" — (.{1,80}?)\]'
-)
 
 # Stop-and-send: rides the ENGINE prompt of the interrupted-then-drained
 # queued message only — the QUEUE_TURN event / DB user row keep the raw text
@@ -138,6 +114,12 @@ RECONNECTING_NOT_SENT = ("Not sent: the machine running this chat is reconnectin
 # the message above it was not delivered.
 MACHINE_BUSY_NOT_SENT = ("The machine running this chat is not answering. Your message "
                          "above was not delivered; send it again in a moment.")
+# The card a start ends with when the computer it runs on dropped off while
+# the start waited (a frozen or lost machine): with a person's message riding
+# the start (its first message, or one queued while it warmed), and without.
+MACHINE_GONE_NOT_SENT = ("The computer this chat runs on stopped answering. Your message "
+                         "above was not sent. Reconnect it, then send the message again.")
+MACHINE_GONE = "The computer this chat runs on stopped answering. Reconnect it, then try again."
 # The same, for a chat whose session files are on this server and could not
 # be read (a disk fault): nothing of the chat changes.
 SESSION_FILES_UNREAD_NOT_SENT = ("The files of this chat could not be read. Your message "

@@ -104,9 +104,9 @@ class TestManifest:
         for tool in ("generate_video", "generate_transition", "edit_video"):
             assert tap[tool]["save_path"] == {"mode": "write"}
 
-    def test_explicit_assignment_and_task_exclusion(self, manifest):
+    def test_explicit_assignment_and_meeting_exclusion(self, manifest):
         assert manifest["assignment_mode"] == "explicit"
-        assert manifest["exclude_from"] == ["task"]
+        assert manifest["exclude_from"] == ["meeting"]
 
     def test_costs_rules_shape(self, manifest):
         costs = manifest["costs"]

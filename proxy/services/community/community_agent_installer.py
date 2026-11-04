@@ -194,7 +194,7 @@ async def install_from_extracted_template(
           "created_requests": [{...}, ...],
           "ready_mcps": ["schedules-mcp", "notifications-mcp", ...],
           "seeded_tasks": 3,
-          "task_pins_dropped": ["The task 'digest' runs on the agent's usual model and engine. …"],
+          "task_pins_dropped": ["The task 'digest' runs with no model choice, on its person's own engine or the agent's default engine. …"],
           "seeded_triggers": 0,
           "seeded_notifications": 1,
           "seeded_apps": {"seeded": [...], "user": [...], "pending": [...], "failed": [...]},
@@ -265,7 +265,8 @@ async def install_from_extracted_template(
     # installer's account (claude-code-cli, then codex-cli, never direct-llm),
     # falling back to claude-code-cli, so the installed agent runs zero-config.
     # ``default_model`` stays empty (Auto) and ``default_effort`` empty (High).
-    from services.engines import subscription_pool
+    # The allowlist opens like a created agent's: every engine, the primary first.
+    from services.engines import engine_resolution, subscription_pool
     execution_path = await asyncio.to_thread(
         subscription_pool.default_execution_layer_for_creator,
         installer_user_sub or "",
@@ -276,6 +277,7 @@ async def install_from_extracted_template(
             target_slug, display_name.strip()[:80] or template.display_name,
             admin_only=False,
             execution_path=execution_path,
+            execution_paths=engine_resolution.every_engine(execution_path),
             default_model="",
             default_effort="",
             created_by=installer_user_sub or "",
@@ -1048,10 +1050,9 @@ def task_pin_problem(agent_slug: str, model: str | None, layer: str | None) -> s
     try:
         validate_spawn_overrides(agent_slug, layer or None, model)
     except HTTPException:
-        from storage.agents import agent_store
-        engine = _engine_name(layer or (agent_store.get_agent(agent_slug) or {}).get("execution_path", ""))
+        engine = _engine_name(layer or "")
         return (f"The model {model} is not turned on for {engine}." if engine
-                else f"The model {model} is not turned on for this agent.")
+                else f"The model {model} is not turned on for any engine this agent allows.")
     return None
 
 
@@ -1071,7 +1072,8 @@ def resolve_task_pins(
             continue
         problem = task_pin_problem(agent_slug, item.override_model, item.layer)
         if problem:
-            notes.append(f"The task '{item.slug}' runs on the agent's usual model and engine. {problem}")
+            notes.append(f"The task '{item.slug}' runs with no model choice, on its person's own engine "
+                         f"or the agent's default engine. {problem}")
             tasks.append(dataclasses.replace(item, override_model=None, layer=None))
         else:
             tasks.append(dataclasses.replace(
@@ -1189,6 +1191,7 @@ def _create_task_idempotent(
             community_template=template_slug,
             community_template_item_slug=item.slug,
             override_model=override_model, override_execution_path=override_layer,
+            notify_audience=item.audience or roles.EDITOR,
         )
         # Set enabled flag if needed (default in CREATE TABLE is TRUE; pause
         # via an UPDATE when default_state='paused').
@@ -1341,6 +1344,7 @@ def _seed_trigger_with_paired_task(
                 user_tz=user_tz,
                 community_template=template_slug,
                 community_template_item_slug=f"{item.slug}__task",
+                notify_audience=item.audience or roles.EDITOR,
             )
     except Exception:
         logger.exception("Failed to seed trigger-task %s for agent %s",
@@ -1357,6 +1361,7 @@ def _seed_trigger_with_paired_task(
             enabled=enabled,
             community_template=template_slug,
             community_template_item_slug=item.slug,
+            notify_audience=item.audience or roles.EDITOR,
         )
         return True
     except psycopg.errors.UniqueViolation:

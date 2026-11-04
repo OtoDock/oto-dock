@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from core import layout
 from core.execution_layer import AgentConfig, RemoteStartContext, RemoteStartPlan
 from core.permission_modes import LEGACY_MODES, cli_mode
+from core.remote.tunnel_state import valid_port
 from core.sandbox import session_config_dir as _scd
 
 logger = logging.getLogger("remote-layer")
@@ -183,6 +184,10 @@ class RemoteStartPayloadMixin(_Host):
                 target_os = (_caps.get("os") or "linux").lower()
             except (ValueError, TypeError):
                 sat_port = 0
+        # The live connection's port first: a heartbeat that reported the
+        # local link on a new port (satellite 0.5.168) reaches the row only
+        # through the off-loop caps lane.
+        sat_port = valid_port(self._cm.tunnel_port(config.execution_target)) or sat_port
         if not sat_port:
             raise RuntimeError(
                 f"Satellite {config.execution_target[:8]} has not reported "

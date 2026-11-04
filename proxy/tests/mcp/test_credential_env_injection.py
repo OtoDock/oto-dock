@@ -180,7 +180,7 @@ def patch_resolver(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         credential_resolver, "pick_account",
-        lambda mcp, agent, *, user_sub="": credential_resolver.AccountRef(
+        lambda mcp, agent, *, user_sub="", only_owner=None: credential_resolver.AccountRef(
             label="primary", owner_sub=user_sub,
         ),
     )

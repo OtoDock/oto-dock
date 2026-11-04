@@ -106,19 +106,22 @@ describe("the card's button", () => {
     expect(sendAgainAction([user('u1', 'go'), ended('a1', 'declined', [tool])], 'a1')).toBeNull()
   })
 
-  it('carries the saved attachments after an ending that lost the session, not after an error', () => {
-    const withFile = {
+  it('Resume carries no attachments after any ending; Send again carries them by their saved paths', () => {
+    const withAttachments = {
       id: 'u1', role: 'user', blocks: [
         { type: 'file_attachments', files: [{ name: 'r.pdf', path: 'users/me/r.pdf' }] },
+        { type: 'image_attachments', images: ['a.jpg'], paths: ['users/me/uploads/photos/a.jpg'] },
         { type: 'text', content: 'read this' },
       ],
     } as unknown as DisplayMessage
-    const lost = sendAgainAction([withFile, ended('a1', 'lost', [tool])], 'a1')
-    expect(lost?.kind).toBe('resume')
-    expect(lost?.files.map((f) => f.uploadedPath)).toEqual(['users/me/r.pdf'])
-    const error = sendAgainAction([withFile, ended('a1', 'error', [tool])], 'a1')
-    expect(error?.kind).toBe('resume')
-    expect(error?.files).toEqual([])
+    for (const reason of ['lost', 'exited', 'silent', 'error', 'restarted']) {
+      const resume = sendAgainAction([withAttachments, ended('a1', reason, [tool])], 'a1')
+      expect(resume).toEqual({ kind: 'resume', text: RESUME_TEXT, images: [], files: [] })
+    }
+    const again = sendAgainAction([withAttachments, ended('a1', 'stopped')], 'a1')
+    expect(again?.kind).toBe('again')
+    expect(again?.files.map((f) => f.uploadedPath)).toEqual(['users/me/r.pdf'])
+    expect(again?.images.map((i) => i.path)).toEqual(['users/me/uploads/photos/a.jpg'])
   })
 
   it("an earlier card's turn is its own", () => {
@@ -172,5 +175,29 @@ describe("Send again's prompt", () => {
       uploadedPath: 'users/me/workspace/uploads/report.pdf',
     }])
     expect(again?.images).toEqual([])
+  })
+})
+
+describe('photos that did not reach the agent', () => {
+  it("the notice reads the server's sentence", () => {
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.PHOTOS_NOT_ATTACHED}
+      message="The photo did not reach the agent. Attach it again to send it." />)
+    expect(screen.getByTestId('photos-not-attached'))
+      .toHaveTextContent('The photo did not reach the agent. Attach it again to send it.')
+  })
+
+  it('a reload draws it under the message, ahead of the reply', async () => {
+    const { dbMessagesToDisplay } = await import('@/lib/messageBlocks')
+    const row = (id: number, role: string, content: string, eventType = '', eventData = '') =>
+      ({ id, role, content, event_type: eventType, event_data: eventData, created_at: '2026-10-26T18:00:00Z' })
+    const msgs = dbMessagesToDisplay([
+      row(1, 'user', 'look', '', JSON.stringify({ images: [{ name: 'a.jpg', path: 'users/me/uploads/photos/a.jpg' }] })),
+      row(2, 'event', '', 'system', JSON.stringify({ type: 'system', subtype: 'photos_not_attached',
+        message: 'The photos did not reach the agent. Attach them again to send them.', count: 2 })),
+      row(3, 'assistant', 'I see one photo.'),
+    ], undefined)
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].blocks[0]).toMatchObject({ type: 'system', subtype: 'photos_not_attached' })
+    expect(msgs[1].blocks[1]).toMatchObject({ type: 'text', content: 'I see one photo.' })
   })
 })

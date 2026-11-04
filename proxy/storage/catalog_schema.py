@@ -6,9 +6,11 @@ document, its folder: each file the schema's ``x-otodock-documents`` names,
 parsed, under its path inside the folder, and every other file at the
 folder's top level as ``true`` (``template_document``). ``mcps/skill.schema.json``
 holds the front matter of a skill's SKILL.md, the mapping
-``services/mcp/skill_format.load_frontmatter`` reads. The platform's
+``services/mcp/skill_format.load_frontmatter`` reads.
+``mcps/department.schema.json`` holds a department set's ``department.json``
+(``services/community/community_department_sets.py``). The platform's
 template loader, the skill installers, the release gate's catalog lint and
-the catalogs' CI read the same two files, so a rule changes in one place.
+the catalogs' CI read the same files, so a rule changes in one place.
 
 A finding reads ``<file>: <field>: <clause>``: the failing rule's
 ``x-otodock-hint`` (``{value}`` replaced by the value found) for every kind
@@ -36,6 +38,7 @@ from typing import Any
 
 TEMPLATE_SCHEMA = "agent-template.schema.json"
 SKILL_SCHEMA = "skill.schema.json"
+SET_SCHEMA = "department.schema.json"
 # Every finding at once, up to this many: the author fixes them in one go.
 MAX_PROBLEMS = 20
 # The cap a release holds a file to; a manifest past it is no manifest.
@@ -144,6 +147,12 @@ def template_document(folder: Path, schema: dict[str, Any],
 def template_problems(document: dict[str, Any], schema: dict[str, Any]) -> list[str]:
     """Where a template's document breaks the template schema, as sentences."""
     return _problems(document, schema, label="")
+
+
+def set_problems(document: Any, schema: dict[str, Any]) -> list[str]:
+    """Where a department set's ``department.json`` breaks the set schema,
+    as sentences that start with the file's name."""
+    return _problems(document, schema, label="department.json")
 
 
 def skill_problems(front_matter: Any, schema: dict[str, Any], label: str) -> list[str]:

@@ -237,7 +237,9 @@ export default function InfoTip({ label, children }: {
           <path d="M12 8h.01" />
         </svg>
       </button>
-      <span role="status" className="sr-only">{open && announce ? children : null}</span>
+      {/* sr-only is absolute: pinned to the corner, or at its static position it
+          extends the page below a scroller that is not positioned (Setup). */}
+      <span role="status" className="sr-only top-0 left-0">{open && announce ? children : null}</span>
       {open && createPortal(
         <div
           id={tipId}

@@ -8,16 +8,13 @@ const searchMock = vi.fn(() => ({ data: null, isFetching: false }))
 const taskChatsMock = vi.fn<() => unknown[]>(() => [])
 const deleteMutateMock = vi.fn()
 const renameChatMutateMock = vi.fn()
-const renameTaskMutateMock = vi.fn()
 vi.mock('@/api/chats', async (importOriginal) => {
   const orig = await importOriginal<typeof import('@/api/chats')>()
   return {
     ...orig,
     useDeleteChat: () => ({ mutate: deleteMutateMock }),
     useRenameChat: () => ({ mutate: renameChatMutateMock }),
-    useRenameTask: () => ({ mutate: renameTaskMutateMock }),
     useSearchChats: (...args: unknown[]) => searchMock(...args as []),
-    useTaskChats: () => ({ data: taskChatsMock() }),
   }
 })
 
@@ -36,6 +33,7 @@ vi.mock('@/api/remoteMachines', async (importOriginal) => ({
 }))
 
 import ChatHistory from '@/components/chat/ChatHistory'
+import { ROW_TRAIL_HOVER_REVEAL } from '@/components/ui/classes'
 import type { Chat, TaskChat } from '@/api/chats'
 import { useChatStore } from '@/store/chatStore'
 
@@ -56,6 +54,7 @@ function renderHistory(over: Partial<Parameters<typeof ChatHistory>[0]> = {}) {
   return render(
     <ChatHistory
       chats={[chat('c1', 'Fix the tests')]}
+      taskChats={taskChatsMock() as TaskChat[]}
       activeChatId={null}
       agentName="dev"
       onSelect={() => {}}
@@ -73,7 +72,6 @@ beforeEach(() => {
   activeRowsMock.mockReturnValue([])
   deleteMutateMock.mockReset()
   renameChatMutateMock.mockReset()
-  renameTaskMutateMock.mockReset()
   useChatStore.setState({ byChat: {} })
 })
 
@@ -111,6 +109,20 @@ describe('ChatHistory — Task history view', () => {
     expect(screen.getByText(/prompt first line/)).toBeTruthy()
     // Run whose task row is gone (one-time cleanup): chat title stays.
     expect(screen.getByText('one-off prompt line')).toBeTruthy()
+  })
+
+  it("a run's generated title leads, the task's name under it", () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-9', '📦 Backup sweep for Monday',
+        { task_name: 'Nightly report', title_generated: true }),
+      taskChat('task-run-10', 'Nightly report', { task_name: 'Nightly report', title_generated: true }),
+    ])
+    renderHistory({ tasksMode: true })
+    const lead = screen.getByText('📦 Backup sweep for Monday')
+    expect(lead.closest('p')?.className).toContain('font-medium')
+    expect(screen.getByText(/^Nightly report · /)).toBeTruthy()
+    // A title equal to the name shows once, with no subtitle name.
+    expect(screen.getAllByText(/Nightly report/)).toHaveLength(2)
   })
 
   it('+ New Chat stays in task mode; clicking it exits to the chat view', () => {
@@ -190,7 +202,7 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
     expect(screen.getByText('Delete')).toBeTruthy()
   })
 
-  it('rename on a NAME-labeled row targets the task definition', () => {
+  it("rename on a NAME-labeled row edits that run's chat, never the task", () => {
     taskChatsMock.mockReturnValue([
       taskChat('task-run-12', 'run subtitle', {
         task_name: 'Nightly report', task_id: 't-9',
@@ -201,12 +213,24 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
     fireEvent.click(screen.getByTitle('Options'))
     fireEvent.click(screen.getByText('Rename'))
     const input = screen.getByTestId('rename-input') as HTMLInputElement
-    expect(input.value).toBe('Nightly report')  // prefilled from DATA
+    expect(input.value).toBe('Nightly report')  // prefilled from the label shown
     fireEvent.change(input, { target: { value: 'Weekly report' } })
     fireEvent.keyDown(input, { key: 'Enter' })
-    expect(renameTaskMutateMock).toHaveBeenCalledWith(
-      { taskId: 't-9', name: 'Weekly report' }, expect.anything())
-    expect(renameChatMutateMock).not.toHaveBeenCalled()
+    expect(renameChatMutateMock).toHaveBeenCalledWith(
+      { chatId: 'task-run-12', title: 'Weekly report' }, expect.anything())
+  })
+
+  it("rename on a generated row starts from the run's title", () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-14', '📦 Backup sweep', {
+        task_name: 'Nightly report', task_id: 't-9', title_generated: true,
+        can_rename: true, can_delete: true,
+      }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    expect((screen.getByTestId('rename-input') as HTMLInputElement).value).toBe('📦 Backup sweep')
   })
 
   it('rename on a TITLE-labeled row (definition gone) targets the run chat', () => {
@@ -224,7 +248,6 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(renameChatMutateMock).toHaveBeenCalledWith(
       { chatId: 'task-run-13', title: 'Named run' }, expect.anything())
-    expect(renameTaskMutateMock).not.toHaveBeenCalled()
   })
 
   it('blur CANCELS the edit — click-away must never save (mobile wipe guard)', () => {
@@ -349,27 +372,44 @@ describe('ChatHistory — the focus around the row menu', () => {
   })
 })
 
-describe("ChatHistory — the row's options button at desktop width", () => {
-  // jsdom computes no Tailwind, so the classes are the contract: display:
-  // none (`hidden`) would drop the button from the Tab order at md and up,
-  // a zero-width clipped wrapper keeps it there and gives the title the row.
+describe("ChatHistory — the row's options button", () => {
+  // jsdom computes no Tailwind, so the classes are the contract (their CSS is
+  // compiled in rowTrailHoverReveal.test.ts): display: none (`hidden`) would
+  // drop the button from the Tab order, a zero-width clipped wrapper keeps it
+  // there and gives the title the row, only where the device can hover.
   const tokens = (el: HTMLElement) => el.className.split(/\s+/).filter(Boolean)
 
   it('stays in the Tab order and takes no width until the row is hovered or focused', () => {
     renderHistory()
     const wrapper = screen.getByTestId('chat-row-menu')
     expect(tokens(wrapper).filter((t) => t === 'hidden' || t.endsWith(':hidden'))).toEqual([])
-    expect(tokens(wrapper)).toEqual(expect.arrayContaining([
-      'md:w-0', 'md:overflow-hidden',
-      'md:group-hover:w-auto', 'md:group-hover:overflow-visible',
-      'md:group-focus-within:w-auto', 'md:group-focus-within:overflow-visible',
-    ]))
+    expect(tokens(wrapper)).toEqual(['relative', ...ROW_TRAIL_HOVER_REVEAL.split(' ')])
     const kebab = screen.getByTitle('Options')
     expect(kebab.tagName).toBe('BUTTON')
     expect(kebab.getAttribute('tabindex')).toBeNull()
     expect(wrapper.contains(kebab)).toBe(true)
     // The title's column is the one that grows: the wrapper never claims a share.
     expect(screen.getByText('Fix the tests').closest('.min-w-0.flex-1')).toBeTruthy()
+  })
+
+  it('collapses by the hover gate, never by width: a touch tablet keeps it in sight', () => {
+    renderHistory()
+    const collapse = tokens(screen.getByTestId('chat-row-menu')).filter((t) => t.endsWith(':w-0'))
+    expect(collapse).toEqual(['[@media(hover:hover)]:w-0'])
+    expect(tokens(screen.getByTestId('chat-row-menu')).some((t) => t.startsWith('md:'))).toBe(false)
+  })
+
+  it("the open chat's row shows its button always", () => {
+    renderHistory({ activeChatId: 'c1' })
+    expect(tokens(screen.getByTestId('chat-row-menu'))).toEqual(['relative'])
+  })
+
+  it('the full-title header shows where the device cannot hover, at any width', () => {
+    renderHistory()
+    fireEvent.click(screen.getByTitle('Options'))
+    const header = screen.getAllByText('Fix the tests').find((el) => el.className.includes('break-words'))
+    expect(header?.className).toContain('[@media(hover:hover)]:hidden')
+    expect(header?.className).not.toContain('md:hidden')
   })
 
   it('an open menu pins the wrapper at its full width', () => {

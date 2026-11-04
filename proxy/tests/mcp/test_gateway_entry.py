@@ -172,7 +172,7 @@ def test_the_bearer_source_resolves_user_and_service_scope(monkeypatch, tmp_path
                                    "proposed_hosts": ["mcp.example.com"]})
     picks = {}
 
-    def _pick(mcp, agent, *, user_sub=""):
+    def _pick(mcp, agent, *, user_sub="", only_owner=None):
         picks["user_sub"] = user_sub
         return credential_resolver.AccountRef("acct", user_sub or "owner-sub")
     monkeypatch.setattr(credential_resolver, "pick_account", _pick)

@@ -59,10 +59,21 @@ into a screen you haven't seen yet (resolution and layout vary by machine).
 - **No display / locked / asleep:** a headless server, the login screen, or a
   locked session can't be captured or controlled until a user is logged in at
   the physical console.
-- **macOS permissions:** if screenshots are black or clicks do nothing, call
-  `mcp__computer__check_permissions` — the host app likely needs **Accessibility**
-  (input) and **Screen Recording** (capture) granted in System Settings →
-  Privacy & Security. Password fields may drop keystrokes while Secure Input is on.
+- **macOS permissions:** macOS must let the satellite's app (**OtoDock Satellite**
+  in System Settings → Privacy & Security) see the screen and control the mouse
+  and keyboard. Your first action makes macOS show both questions on the Mac's
+  screen. Until the user turns them on, an action macOS would block is refused
+  with a ⚠️ message naming the switch and the list it sits in. Pass it on to the
+  user as it is, and tell them to start a new chat on this machine afterwards. A chat
+  that is already open keeps the old answer. On macOS 27 the first screenshot also
+  shows a question about the system private window picker. It blocks nothing. A
+  command that reads Documents, Desktop or Downloads for the first time waits until
+  the user answers macOS's question for that folder on the Mac's screen. Tell them,
+  or ask them to turn on Full Disk Access for OtoDock Satellite once.
+  If screenshots are still black or clicks still do nothing, call
+  `mcp__computer__check_permissions`: it shows both permissions and the app
+  macOS asks on behalf of. Password fields may drop keystrokes while Secure
+  Input is on.
 - **Windows UAC / elevated windows:** a non-elevated agent can't click UAC
   prompts or windows of "Run as administrator" apps; you'll get a note when this
   is likely.

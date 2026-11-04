@@ -29,6 +29,28 @@ async def _async_ident(p, writing=False, **kw):
     return p
 
 
+async def _quiet(*a, **kw):
+    return None
+
+
+def _bypass(monkeypatch, module) -> None:
+    """Identity paths and silent hooks in the writer and in shared: a writer
+    calls them through its own import or, once on the shared batch, through
+    shared."""
+    import shared
+
+    for target in (module, shared):
+        if hasattr(target, "_resolve_path"):
+            monkeypatch.setattr(target, "_resolve_path", _async_ident)
+        for name in ("_push_preview", "_notify_file_written"):
+            if hasattr(target, name):
+                monkeypatch.setattr(target, name, _quiet)
+
+
+def _no_failures(msg: str) -> bool:
+    return "Errors" not in msg and "Failed:" not in msg
+
+
 # ---------------------------------------------------------------------------
 # Normalization + validation guard
 # ---------------------------------------------------------------------------
@@ -105,12 +127,7 @@ def _word(monkeypatch):
     pytest.importorskip("docx")
     import word as word_mod
 
-    async def _noop_preview(path, filename=None):
-        return None
-
-    monkeypatch.setattr(word_mod, "_resolve_path", _async_ident)
-    monkeypatch.setattr("shared._resolve_path", _async_ident)
-    monkeypatch.setattr(word_mod, "_push_preview", _noop_preview)
+    _bypass(monkeypatch, word_mod)
     return word_mod
 
 
@@ -127,7 +144,7 @@ def test_docx_equation_roundtrip(tmp_path, _word):
             ]},
         ],
     }))
-    assert "2 operations applied" in msg and "Errors" not in msg
+    assert "2 operations applied" in msg and _no_failures(msg)
     out = _word.read_docx(str(f))
     assert "$$" in out and "mc^{2}" in out.replace(" ", "")
     assert r"\frac" in out
@@ -139,6 +156,7 @@ def test_docx_bad_equation_fails_op_without_leftover_paragraph(tmp_path, _word):
     f = tmp_path / "bad.docx"
     msg = asyncio.run(_word.handle_write_docx({
         "path": str(f),
+        "best_effort": True,
         "operations": [
             {"type": "add_paragraph", "text": "before"},
             {"type": "add_equation", "latex": r"\notarealcmd{x}"},
@@ -216,11 +234,7 @@ def test_xlsx_equation_anchor_and_comment(tmp_path, monkeypatch):
 
     import excel as excel_mod
 
-    async def _noop_preview(path, filename=None):
-        return None
-
-    monkeypatch.setattr(excel_mod, "_resolve_path", _async_ident)
-    monkeypatch.setattr(excel_mod, "_push_preview", _noop_preview)
+    _bypass(monkeypatch, excel_mod)
 
     f = tmp_path / "eq.xlsx"
     msg = asyncio.run(excel_mod.handle_write_xlsx({
@@ -231,7 +245,7 @@ def test_xlsx_equation_anchor_and_comment(tmp_path, monkeypatch):
              "latex": r"soc_t = soc_{t-1} + \eta^c p_t^c \Delta t"},
         ],
     }))
-    assert "Errors" not in msg
+    assert _no_failures(msg)
     wb = openpyxl.load_workbook(str(f))
     ws = wb.active
     assert ws["B2"].comment and "LaTeX:" in ws["B2"].comment.text

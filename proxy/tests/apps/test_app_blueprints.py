@@ -190,6 +190,10 @@ def test_export_and_import_round_trip_lands_pending_with_tasks_by_slug(agent_tre
     assert dyn["user_tz"] == "Europe/Athens"
     row = task_store.get_app(out["app_id"])
     assert row["username"] == "alice" and row["deploy_state"] == "pending"
+    # The bundle names its source, which is on this install: the hook's import follows it.
+    from services.apps import app_follow
+    follow = app_follow.parse(row)
+    assert follow and follow["id"] == body["app_id"] and follow["slug"] == "board" and follow["release"] == 1
     assert not task_store.app_actions_approved(row)
     stored = json.loads((agent_tree / "users/alice/workspace/apps/myboard/app.json").read_text())
     assert stored["actions"][0]["task_id"] == new_task and "task" not in stored["actions"][0]
@@ -202,6 +206,43 @@ def test_export_and_import_round_trip_lands_pending_with_tasks_by_slug(agent_tre
     assert r.status_code == 200 and r.json()["status"] == "pending approval", r.text
     assert r.json()["tasks"]["report"] == new_task
     assert not task_store.app_actions_approved(task_store.get_app(row["id"]))
+
+
+def test_an_overlay_import_keeps_the_approval_the_data_folder_and_the_bound_task(agent_tree):
+    """The keywords a release another agent's app sends passes:
+    ``voids_approval=False`` keeps the standing approval of an unchanged
+    manifest, ``replace=False`` leaves ``data/`` alone, ``keep_tasks`` keeps
+    the task a button binds and seeds none for it, ``hold`` parks the
+    release."""
+    import shutil
+
+    from services.apps import app_follow
+    task_store.create_dynamic_task("task-bp-keep", AGENT, "Weekly report", "write it", "cli", "trigger",
+                                   None, None, None, 600, AGENT, scope="agent")
+    manifest = {"title": "Board", "actions": [
+        {"id": "report", "label": "Report", "type": "fire_task", "task_id": "task-bp-keep"}]}
+    root = _folder(agent_tree / "workspace" / "apps" / "board", manifest)
+    body = _hook("deploy", {"slug": "board", "visibility": "agent"}).json()
+    assert client.post(f"/v1/apps/{body['app_id']}/deploy/approve").status_code == 200
+    assert _hook("export", {"slug": "board", "visibility": "agent"}).status_code == 200
+    folder, bp = app_blueprints.read_bundle((agent_tree / "workspace/apps/board.otoapp").read_bytes())
+    (root / "data" / "sub").mkdir()
+    (root / "data" / "sub" / "keep.txt").write_text("kept")
+    (folder / "client" / "index.html").write_text("<p>v2</p>")
+    try:
+        out = asyncio.run(app_blueprints.import_folder(
+            AGENT, "", None, "board", folder, template_slug="bundle:board", tasks=bp["tasks"],
+            voids_approval=False, replace=False, hold=True, keep_tasks={"report": "task-bp-keep"}))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    assert out["status"] == "pending approval" and out["release"] == 2, out
+    row = task_store.get_app(body["app_id"])
+    assert task_store.app_actions_approved(row)
+    assert (root / "client" / "index.html").read_text() == "<p>v2</p>"
+    assert (root / "data" / "sub" / "keep.txt").read_text() == "kept"
+    assert (root / "data" / "app.db").read_bytes() == b"never travels"
+    assert json.loads((root / "app.json").read_text())["actions"][0]["task_id"] == "task-bp-keep"
+    assert app_follow._seeded_tasks(AGENT, "board") == set()
 
 
 def test_an_import_never_pulls_a_bundle_the_session_may_not_write_back(agent_tree, monkeypatch):

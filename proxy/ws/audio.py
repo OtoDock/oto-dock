@@ -75,6 +75,12 @@ _CLOSE_INTERNAL = 1011
 # at most 20 s).
 _VOICED_RMS = 300
 _PREROLL_S = 0.3
+# The Automatic pick's cost: every candidate stream replays the audio since
+# the first word and bills while it runs, so one dictation opens at most this
+# many distinct other languages, and a language the words refused decisively
+# stays closed for the dictation. Moves only with measured evidence over
+# recorded dictations.
+MAX_DICTATION_CANDIDATES = 2
 _STOP_SWITCH_WAIT_S = 4.0
 _STOP_FINAL_WAIT_S = 1.0
 _STOP_CATCH_UP_S = 1.5
@@ -178,6 +184,8 @@ class _LanguageSwitch:
         refused = self.streams.refused()
         if refused is not None:
             language, verdict = refused
+            # A decisive refusal finalises the dictation's language (no
+            # reopen): the settle closes the refused stream at once.
             for event in self.tracker.rule.refused(language, decisive=verdict.decisive):
                 self._event(event)
         called = self.streams.called_back()
@@ -245,6 +253,10 @@ class _LanguageSwitch:
                     await self.streams.force_endpoint()
             await self.streams.wait_switched(left(_STOP_SWITCH_WAIT_S))
             self.poll()
+        # A dictation that stopped before the rule decided ends in the
+        # language shown: the decision is logged like any other final.
+        if self.tracker.rule.final is None and self.streams.pending is None:
+            self._settle(self.streams.active)
         replace = self.take_replace()
         out: list[str] = []
         behind = self.streams.active_behind
@@ -293,7 +305,8 @@ def _language_switch(factory, default: str, sample_rate: int,
     # The stop reads a short dictation only where the words check the ear:
     # on a provider without word confidence a lone reading would switch an
     # accented "yes, send it".
-    rule = LanguageRule(default, candidates, switch_at=LEAN, lean_at_take=streams.words_compared)
+    rule = LanguageRule(default, candidates, switch_at=LEAN, lean_at_take=streams.words_compared,
+                        max_candidates=MAX_DICTATION_CANDIDATES, reopen_refused=False)
     tracker = LanguageTracker(identifier, rule, rate_in=sample_rate)
     return streams, _LanguageSwitch(streams, tracker, sample_rate)
 

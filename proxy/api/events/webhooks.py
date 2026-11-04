@@ -38,6 +38,9 @@ router = APIRouter()
 # deleted or disabled subscription a vendor keeps posting to) never counts,
 # nor does a delivered event: the relay forwards every vendor from one address.
 _COUNTED_REFUSALS = frozenset({400, 401, 408, 413})
+# A relay notice's 400 and 401 never count: every notice comes from the
+# relay's one address, and a refusal there must not block the next.
+_NOTICE_COUNTED = frozenset({408, 413})
 
 
 def _refusal(status: int, error: str, *, retry_after: int | None = None) -> Response:
@@ -71,7 +74,8 @@ async def _drain_small(request: Request, source: str) -> None:
         pass
 
 
-async def _receive(request: Request, dispatch, *, source: str, prepare=None) -> Response:
+async def _receive(request: Request, dispatch, *, source: str, prepare=None,
+                   counted: frozenset[int] = _COUNTED_REFUSALS) -> Response:
     """The receive steps every vendor and relay POST takes before the
     dispatcher: the per-address throttle (a distinct client only: behind an
     edge whose address every client shares, one bucket would let one sender
@@ -111,7 +115,7 @@ async def _receive(request: Request, dispatch, *, source: str, prepare=None) -> 
     else:
         status, body, headers = await dispatch(raw_body)
         response = _response(status, body, headers)
-    if status in _COUNTED_REFUSALS and not addr.shared:
+    if status in counted and not addr.shared:
         rate_limiter.record_attempt("webhook_receive_ip", key)
     return response
 
@@ -147,6 +151,32 @@ async def receive_relay_webhook(provider_id: str, request: Request) -> Response:
             return 500, {"error": "internal_error"}, {"content-type": "application/json"}
 
     return await _receive(request, dispatch, source=f"relay/{provider_id}")
+
+
+@router.post(
+    "/v1/webhooks/relay/{provider_id}/account-removed",
+    include_in_schema=False,
+)
+async def receive_relay_notice(provider_id: str, request: Request) -> Response:
+    """The relay's account-removed notice (``services/webhooks/relay_notices.py``):
+    a person removed OtoDock's app at the vendor. Auth = the relay's notice
+    signature over the verbatim body (X-OtoDock-Notice-* headers); the same
+    reverse-proxy forward-auth bypass requirement as the relay's forwards."""
+    from services.webhooks import relay_notices
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    async def dispatch(raw_body: bytes):
+        try:
+            return await relay_notices.receive(provider_id, raw_body, headers)
+        except Exception:
+            logger.exception("relay notice receiver raised unexpectedly for provider=%s", provider_id)
+            return 500, {"error": "internal_error"}, {"content-type": "application/json"}
+
+    async def prepare():
+        return None, relay_notices.BODY_CAP, None
+
+    return await _receive(request, dispatch, source=f"relay/{provider_id}/account-removed",
+                          prepare=prepare, counted=_NOTICE_COUNTED)
 
 
 @router.post(

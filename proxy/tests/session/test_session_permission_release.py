@@ -33,15 +33,11 @@ from core.session.session_state import (
     _permission_decisions,
     _permission_events,
     _permission_request_sessions,
-    _question_answers,
-    _question_events,
     _session_permission_requests,
     cleanup_session_permission_state,
     resolve_permission,
-    resolve_question,
     resolve_session_permissions,
     wait_for_permission,
-    wait_for_question,
 )
 
 
@@ -49,11 +45,11 @@ from core.session.session_state import (
 def _clean_state():
     """Each test starts with empty permission maps."""
     for m in (_permission_events, _permission_decisions, _session_permission_requests,
-              _permission_request_sessions, _question_events, _question_answers):
+              _permission_request_sessions):
         m.clear()
     yield
     for m in (_permission_events, _permission_decisions, _session_permission_requests,
-              _permission_request_sessions, _question_events, _question_answers):
+              _permission_request_sessions):
         m.clear()
 
 
@@ -191,67 +187,6 @@ async def test_timeout_denies():
     approved = await wait_for_permission("rid-t", "sess-T", timeout=0.05)
     assert approved is False
     assert _permission_events == {}
-    assert _session_permission_requests == {}
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# request_user_input question waiters (share the session index)
-# ─────────────────────────────────────────────────────────────────────────
-
-
-async def _spawn_question_waiter(request_id: str, session_id: str) -> asyncio.Task:
-    task = asyncio.create_task(wait_for_question(request_id, session_id, timeout=30.0))
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if request_id in _question_events:
-            break
-    return task
-
-
-@pytest.mark.asyncio
-async def test_question_resolves_with_answers_map():
-    task = await _spawn_question_waiter("q-1", "sess-A")
-    assert _session_permission_requests.get("sess-A") == {"q-1"}
-    answers = {"color": {"answers": ["Dark"]}}
-    assert resolve_question("q-1", answers) is True
-    assert await task == answers
-    # De-indexed on completion — no leak.
-    assert "q-1" not in _question_events
-    assert "q-1" not in _question_answers
-    assert "sess-A" not in _session_permission_requests
-
-
-@pytest.mark.asyncio
-async def test_question_release_on_abort_returns_empty():
-    """resolve_session_permissions releases a HELD question with empty answers so
-    the codex turn unwinds instead of hanging to its 7-day timeout."""
-    task = await _spawn_question_waiter("q-1", "sess-A")
-    released = resolve_session_permissions("sess-A", approved=False)
-    assert released == 1
-    assert await task == {}
-    assert _question_events == {}
-    assert "sess-A" not in _session_permission_requests
-
-
-@pytest.mark.asyncio
-async def test_mixed_permission_and_question_release_together():
-    """A session can hold BOTH a permission and a question at once (a Bash escape
-    while a question is pending) — one abort releases both from the shared index."""
-    perm = await _spawn_waiter("p-1", "sess-A")
-    ques = await _spawn_question_waiter("q-1", "sess-A")
-    assert _session_permission_requests["sess-A"] == {"p-1", "q-1"}
-    released = resolve_session_permissions("sess-A", approved=False)
-    assert released == 2
-    assert await perm is False       # permission → deny
-    assert await ques == {}          # question → empty answers
-    assert _session_permission_requests == {}
-
-
-@pytest.mark.asyncio
-async def test_question_timeout_returns_empty():
-    answers = await wait_for_question("q-t", "sess-T", timeout=0.05)
-    assert answers == {}
-    assert _question_events == {}
     assert _session_permission_requests == {}
 
 

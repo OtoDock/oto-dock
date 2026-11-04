@@ -1,47 +1,80 @@
 {
   "name": "agent-creator-mcp",
   "label": "Agent Creator",
-  "description": "Create new agents from a template folder. Author the template (persona, MCPs, skills, schedules, onboarding), validate it, then install it as a new agent on the platform.",
-  "version": "1.2.0",
+  "description": "Create new agents: search the community catalog first and propose a template, a department set or a move as a card the person clicks; or author a template folder (persona, MCPs, skills, schedules, onboarding), validate it, then install it as a new agent on the platform.",
+  "version": "1.3.2",
   "category": "core",
-
   "server": {
     "runtime": "python",
     "transport": "stdio",
     "command": "venv/bin/python",
-    "args": ["server.py"],
+    "args": [
+      "server.py"
+    ],
     "tool_timeout_sec": 600
   },
-
   "credentials": {
     "type": "none"
   },
-
   "config": [],
-
   "env": {},
   "agent_env": {},
-
-  "exclude_from": ["phone", "task", "meeting", "external"],
-
+  "exclude_from": [
+    "phone",
+    "task",
+    "meeting",
+    "external"
+  ],
   "skills": [
     {
       "id": "agent-creation",
       "file": "skills/agent-creation/SKILL.md",
       "description": "How to author an agent template folder and install it as a new agent: folder layout, manifest fields, persona rules, and the scaffold-validate-create flow.",
       "loading": "on_demand",
-      "default_exclude_from": ["phone", "task", "meeting"]
+      "default_exclude_from": [
+        "phone",
+        "task",
+        "meeting"
+      ]
     }
   ],
-
   "permissions": {
     "default_tier": "sensitive",
     "rules": [
-      {"tool": "list_building_blocks", "tier": "open"},
-      {"tool": "validate_agent_template", "tier": "standard"}
+      {
+        "tool": "search_community_agents",
+        "tier": "open"
+      },
+      {
+        "tool": "list_departments",
+        "tier": "open"
+      },
+      {
+        "tool": "check_card",
+        "tier": "open"
+      },
+      {
+        "tool": "list_building_blocks",
+        "tier": "open"
+      },
+      {
+        "tool": "propose_install",
+        "tier": "standard"
+      },
+      {
+        "tool": "propose_department_install",
+        "tier": "standard"
+      },
+      {
+        "tool": "propose_move",
+        "tier": "standard"
+      },
+      {
+        "tool": "validate_agent_template",
+        "tier": "standard"
+      }
     ]
   },
-
   "patched": false,
   "patch_note": null
 }

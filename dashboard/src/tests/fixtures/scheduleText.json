@@ -50,5 +50,11 @@
   {"name": "trigger", "task": {"task_type": "trigger", "effective_tz": "Europe/Athens"},
    "text": "On trigger", "with_zone": "On trigger"},
   {"name": "nothing", "task": {"effective_tz": "Europe/Athens"},
-   "text": "—", "with_zone": "—"}
+   "text": "—", "with_zone": "—"},
+  {"name": "every N hours on weekdays", "task": {"schedule": "0 */2 * * 1-5", "effective_tz": "Europe/Athens"},
+   "text": "Every 2 hours on weekdays", "with_zone": "Every 2 hours on weekdays"},
+  {"name": "every N minutes on weekdays", "task": {"schedule": "*/15 * * * 1-5", "effective_tz": "Etc/UTC"},
+   "text": "Every 15 minutes on weekdays", "with_zone": "Every 15 minutes on weekdays"},
+  {"name": "every N hours at a minute on weekdays", "task": {"schedule": "30 */3 * * 1-5", "effective_tz": "Etc/UTC"},
+   "text": "Every 3 hours at :30 on weekdays", "with_zone": "Every 3 hours at :30 on weekdays"}
 ]

@@ -22,6 +22,7 @@ from fastapi import WebSocket
 from auth import roles
 from core import placement
 from core.background import spawn
+from core.remote import tunnel_state
 
 logger = logging.getLogger("otodock.satellite")
 
@@ -290,10 +291,12 @@ _LOCAL_MODEL_CATALOG_MIN_VERSION = (0, 5, 117)
 # gates by the prompt rules only (today's behaviour), so the proxy only warns
 # and auto-update brings the satellite here at its next reconnect.
 _CODEX_HOOKS_FLOOR_MIN_VERSION = (0, 5, 118)
-# The satellite's post-turn stdout forwarder keeps running up to the
-# background-work ceiling instead of stopping after ten minutes, so a
-# background command's completion frame reaches the proxy however long the
-# command takes; the remote reaper's background-command leash relies on it.
+# The remote reaper's background-command leash. The satellite's post-turn
+# stdout forwarder runs for the ``drain_bg_s`` the proxy sends with
+# ``stop_turn`` (the background-work ceiling) from 0.5.167; a 0.5.120 to
+# 0.5.166 satellite still stops at ten minutes, where its command keeps the
+# session (reaping it would end the command) and its end is read at the next
+# turn.
 _LONG_BG_DRAIN_MIN_VERSION = (0, 5, 120)
 # Minimum SATELLITE_VERSION with hook parity (proxy docs/architecture/HOOKS.md):
 # the Claude writer names the ``Stop`` hook, the Codex writer names ``Stop``
@@ -491,6 +494,14 @@ class SatelliteConnection:
     # heartbeat queues behind a pull is still alive.
     bulk_credit: _BulkCredit = field(default_factory=_BulkCredit)
     last_transfer_at: float = 0.0
+    # The machine's local link (the loopback tunnel its sessions call the
+    # platform through), as satellite 0.5.168 reports it at auth and in each
+    # heartbeat (``core/remote/tunnel_state.py``). An older satellite reports
+    # nothing and keeps these defaults. ``tunnel_down_since`` is monotonic.
+    tunnel_ok: bool = True
+    tunnel_rebinds: int = 0
+    tunnel_error: str = ""
+    tunnel_down_since: float | None = None
 
     async def enqueue_send(self, msg: dict, *, bulk: bool = False) -> None:
         """Queue a message for the writer task. Drops oldest on overflow.
@@ -1044,10 +1055,22 @@ class SatelliteConnectionManager(
             old = self._connections.get(machine_id)
             if old:
                 logger.warning(
-                    "Satellite %s: duplicate connection, closing old", machine_id[:8]
+                    "Satellite %s: duplicate connection, closing old (silent for %.0f s)",
+                    machine_id[:8], time.monotonic() - _last_contact(old),
                 )
                 with contextlib.suppress(Exception):
                     await old.ws.close(code=4002, reason="Replaced by new connection")
+                # The old socket's tunnel streams can never be answered: the
+                # satellite failed its side of them when that socket went, and
+                # a reply would reach the new connection under a stream id it
+                # no longer knows. Until the sweep they would count against
+                # the machine's stream cap (deregister, which cancels them on
+                # a drop, is a no-op once the entry is replaced).
+                try:
+                    from core.remote.satellite_http_tunnel import get_dispatcher
+                    await get_dispatcher().cancel_machine_streams(self, machine_id)
+                except Exception:
+                    logger.exception("tunnel stream cleanup failed for %s", machine_id[:8])
                 # Stop the old writer now — its handler's deregister is a
                 # no-op once we replace the dict entry (identity guard), so
                 # nobody else will cancel it.
@@ -1061,6 +1084,7 @@ class SatelliteConnectionManager(
                 capabilities=capabilities,
                 satellite_version=satellite_version,
             )
+            tunnel_state.seed(conn, capabilities)
             if old:
                 # Duplicate-connection replacement: carry the old connection's
                 # in-flight session queues straight onto the new one (the
@@ -1373,6 +1397,30 @@ class SatelliteConnectionManager(
 
     # --- Connection queries ---
 
+    def tunnel_ok(self, machine_id: str) -> bool:
+        """False while the machine reports its local link down (satellite
+        0.5.168+); True for an older satellite and a machine not connected."""
+        conn = self._connections.get(machine_id)
+        return True if conn is None else bool(getattr(conn, "tunnel_ok", True))
+
+    def tunnel_port(self, machine_id: str) -> int:
+        """The port the machine's local link listens on now (0 when not
+        connected or never reported): the next sessions' ``PROXY_URL``."""
+        conn = self._connections.get(machine_id)
+        if conn is None:
+            return 0
+        return tunnel_state.valid_port((conn.capabilities or {}).get("local_tunnel_port"))
+
+    def _retire_moved_port_sessions(self, machine_id: str) -> None:
+        """Close the idle sessions on a machine started on a local link port it
+        no longer serves (the remote layer's eviction path: each resumes at its
+        next message). Loop-side and cheap: a scan of the remote sessions."""
+        from core.session.session_manager import _get_remote_layer
+        layer = _get_remote_layer()
+        if layer.moved_port_idle_sessions(machine_id):
+            spawn(layer.retire_moved_port_sessions(machine_id),
+                  name="retire_moved_port_sessions", owner="satellite_connection")
+
     def is_connected(self, machine_id: str) -> bool:
         return machine_id in self._connections
 
@@ -1612,10 +1660,13 @@ class SatelliteConnectionManager(
         return self._satellite_at_least(machine_id, _CODEX_ATTENDED_FLOOR_MIN_VERSION)
 
     def satellite_supports_long_bg_drain(self, machine_id: str) -> bool:
-        """True if the connected satellite forwards post-turn stdout up to
-        the background-work ceiling (SATELLITE_VERSION 0.5.120). When False
-        the remote reaper keeps today's behaviour for background commands
-        (subagents are still spared: their Stop hook is not stdout)."""
+        """True from SATELLITE_VERSION 0.5.120, the reaper's background-command
+        leash (see ``_LONG_BG_DRAIN_MIN_VERSION``): from 0.5.167 the satellite
+        forwards post-turn stdout for the ``drain_bg_s`` the proxy sends (the
+        background-work ceiling), from 0.5.120 to 0.5.166 for ten minutes, the
+        session kept for its command meanwhile. When False the remote reaper
+        spares a session for its subagents alone (their Stop hook is not
+        stdout)."""
         return self._satellite_at_least(machine_id, _LONG_BG_DRAIN_MIN_VERSION)
 
     def expect_update_ack(self, machine_id: str) -> asyncio.Future:
@@ -1917,7 +1968,7 @@ class SatelliteConnectionManager(
                 # absent = a fresh spawn whose pty_open is on its way.
                 "attach": bool(result.get("attach")),
             })
-        except otodock_session.OtodockSessionError as e:
+        except (otodock_session.OtodockSessionError, tunnel_state.TunnelDown) as e:
             await self.send_fire_and_forget(machine_id, {
                 "type": "local_session_error",
                 "request_id": request_id,
@@ -2152,6 +2203,11 @@ class SatelliteConnectionManager(
             _active = msg.get("active_sessions")
             if isinstance(_active, int):
                 conn.reported_sessions = _active
+            # The local link (0.5.168): a changed port, a link down or back.
+            # A snapshot through the caps lane, as for cli_status.
+            if tunnel_state.apply(conn, msg):
+                self._request_persist(machine_id, "caps", dict(conn.capabilities))
+            self._retire_moved_port_sessions(machine_id)
             # ``online`` + ``last_seen`` → the persister, coalesced to one
             # write per machine per HEARTBEAT_PERSIST_INTERVAL_S (or at
             # once on a transition). NEVER a synchronous commit here: this
@@ -2542,7 +2598,7 @@ def _seconds_since_iso(iso: str | None) -> float | None:
     return max(0.0, delta)
 
 
-# Module-level singleton (initialized in app.py lifespan)
+# Module-level singleton (first asked for in startup.py's lifespan)
 _connection_manager: SatelliteConnectionManager | None = None
 
 

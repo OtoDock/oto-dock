@@ -44,6 +44,7 @@ from core.sandbox import pty_relay
 from core.sandbox.pty_relay import PtyProcess
 from core.session import session_kind
 from core.session.transcript_tailer import leaves_turn_open
+from core.session.transcript_tool_events import drop_sent_prompts, note_sent_prompt
 from core.terminal_queries import (
     MOUSE_RE as _MOUSE_RE,
     strip_clipboard_writes as _strip_clipboard_writes,
@@ -955,9 +956,12 @@ class InteractiveSession:
         self.write_input(data)
         return True
 
-    def write_input(self, data: bytes) -> None:
+    def write_input(self, data: bytes) -> bool:
+        """Write ``data`` to the PTY (or its readiness buffer). False when
+        nothing was written: a dead PTY, a local ``otodock`` terminal holding
+        the input, or bytes that were all terminal auto-responses."""
         if not self.alive:
-            return
+            return False
         # dual-control: while a local `otodock` terminal is the active
         # controller (otodock_attached), the dashboard is a DETACHED (evicted)
         # viewer — DROP its input so the two never fight over the one PTY. This is
@@ -966,14 +970,14 @@ class InteractiveSession:
         # otodock terminal drives the PTY satellite-side (session.write), never
         # through this proxy method, so it is unaffected.
         if self.otodock_attached:
-            return
+            return False
         # Drop the mirror xterm's terminal auto-responses FIRST (see
         # core.terminal_queries.TERMINAL_REPLY_RE): they aren't user input,
         # must not reach the PTY, and must not cancel the pending cold-submit
         # Enter (the Windows-remote first-prompt-never-submits bug).
         data = _strip_terminal_replies(data)
         if not data:
-            return
+            return False
         self._note_activity()
         # Composer-dirty tracking (injection gate): only the residue that would
         # also cancel the cold submit counts as typing — mouse reports are
@@ -1009,7 +1013,7 @@ class InteractiveSession:
             # TUI not ready yet — buffer; _mark_ready flushes it. Prevents the
             # first prompt from being sent before the CLI can accept input.
             self._input_buffer.append(data)
-            return
+            return True
         # Real user input after the cold start → cancel the pending cold-submit
         # Enter (the user is driving now). But mouse-tracking reports (pointer
         # move/click the xterm forwards) are NOT message input — they must reach
@@ -1034,6 +1038,7 @@ class InteractiveSession:
                 self._persist_undelivered_input(self._cold_flush_pending)
             self._clear_cold_flush()
         self._emit_to_pty(data)
+        return True
 
     def interrupt_turn(self) -> bool:
         """Dashboard Stop on an interactive chat: press ESC in the TUI — the
@@ -1050,8 +1055,10 @@ class InteractiveSession:
         logger.info("interactive %s: dashboard abort sent ESC", self.session_id[:8])
         return True
 
-    def submit_prompt(self, text: str, *, settle: bool = False) -> None:
-        """Deliver a COMPLETE prompt to the TUI and submit it.
+    def submit_prompt(self, text: str, *, settle: bool = False) -> bool:
+        """Deliver a COMPLETE prompt to the TUI and submit it. False when the
+        bytes went nowhere (the PTY gone, a local terminal holding the input):
+        the caller's note of the typed text comes back then.
 
         Single-line text is a plain line-submit (text + CR). MULTI-LINE text (a
         multi-line task prompt) is sent as a **bracketed paste** (``ESC[200~ …
@@ -1075,15 +1082,15 @@ class InteractiveSession:
         else:
             data = raw + b"\r"
         if not settle:
-            self.write_input(data)
-            return
+            return self.write_input(data)
         if not self.alive or self.otodock_attached:
-            return
+            return False
         self._note_activity()
         if not self._ready:
             self._input_buffer.append(data)
-            return
+            return True
         self._emit_to_pty(data, deferred_submit=True)
+        return True
 
     def _emit_to_pty(self, data: bytes, deferred_submit: bool = False) -> None:
         """Write to the PTY, ensuring a line-submit actually submits.
@@ -1418,14 +1425,23 @@ class InteractiveSession:
         if cb in self._turn_end_waiters:
             cast("list[TurnCompleteCb]", self._turn_end_waiters).remove(cb)
 
-    @staticmethod
-    def _note_injected(item: dict) -> None:
-        """The prompt is in the terminal: tell whoever queued it."""
-        hook = item.get("on_injected")
-        if hook is None:
+    def _note_injected(self, item: dict, *, cancelled: bool = False) -> None:
+        """The prompt is in the terminal: note it for the tailer when its row
+        exists (``note``: the item's row is its queuer's, the owner this
+        session), then tell whoever queued it. An item cancelled while the
+        satellite typed it (``cancelled``) gets no hook, its round is gone;
+        one whose row that hook would have written gets no note either, so
+        the tailer's plain row stays the one record of what the agent was
+        told."""
+        cb = item.get("on_injected")
+        if cancelled and cb is not None:
+            return
+        if item.get("note") and self.chat_id:
+            note_sent_prompt(self.chat_id, item["text"], owner=self.session_id)
+        if cancelled or cb is None:
             return
         try:
-            hook()
+            cb()
         except Exception:
             logger.exception("interactive: on_injected hook failed [%s]", item.get("source", "?"))
 
@@ -1838,23 +1854,30 @@ class InteractiveSession:
             item = self._prompt_queue.popleft()
             self._last_held_reason = None
             steered_live = self._turn_open
-            # The injected prompt opens a turn NOW (no-op transition for a
-            # mid-turn steer — the turn is already open) — the tailer confirms
-            # within a poll, but the flag must flip synchronously so a second
-            # queued item can't ride the stale-idle window.
-            self._set_turn_open(True)
             raw = item.get("raw")
             if raw:
                 # A person's composer send held for a dialog: typed as the
                 # page sent it (its bracketed paste, then the warm Enter, in a
                 # session whose earlier prompts were only typed keys too).
                 self._submitted_once = True
-                self.write_input(raw)
+                written = self.write_input(raw)
             else:
                 # settle=True: the trailing Enter waits for the paste echo to
                 # settle (large delegate results were landing in the composer
                 # with the fixed-gap Enter swallowed mid-ingest → never sent).
-                self.submit_prompt(item["text"], settle=True)
+                written = self.submit_prompt(item["text"], settle=True)
+            if not written:
+                # The PTY went away, or a local terminal took the input,
+                # between the gate and the write: the item waits at the head
+                # (the close hands the queue back, the satellite path takes
+                # it) and the turn stays as it was.
+                self._prompt_queue.appendleft(item)
+                return
+            # The injected prompt opens a turn NOW (no-op transition for a
+            # mid-turn steer — the turn is already open) — the tailer confirms
+            # within a poll, but the flag must flip synchronously so a second
+            # queued item can't ride the stale-idle window.
+            self._set_turn_open(True)
             logger.info(
                 "interactive %s: %s server prompt [%s] (%d left)",
                 self.session_id[:8],
@@ -1944,8 +1967,9 @@ class InteractiveSession:
                 self.session_id[:8], item.get("source", "?"),
                 "" if queued else " cancelled in flight", len(self._prompt_queue),
             )
-            if queued:
-                self._note_injected(item)
+            # The satellite typed it either way; a cancelled item's round is
+            # gone, and with it the row its hook would have written.
+            self._note_injected(item, cancelled=not queued)
         else:
             logger.info(
                 "interactive %s: satellite injection declined (%s)",
@@ -2351,13 +2375,9 @@ class InteractiveSession:
                 label = await run_db(notification_manager.agent_label, self.agent_name)
                 if compacted:
                     title = f"{label} compacted the conversation"
-                    body = "Context compacted — session ready"
-                elif question:
-                    title = f"{label} needs your input"
-                    body = "Waiting for your answer"
+                    body = "Context compacted. The session is ready."
                 else:
-                    title = f"{label} finished"
-                    body = "Response ready"
+                    title, body = notification_manager.turn_end_words(label, asked=question)
                 await notification_manager.fire_ephemeral(
                     self.user_sub,
                     title=title,
@@ -2404,7 +2424,8 @@ class InteractiveSession:
                 # frame as ``db_message_id`` — the dashboard's stable key for
                 # PiP replay dedupe + X-dismiss memory. Type-gated here so
                 # blocking prompts never pay the DB thread hop.
-                if item.get("event_type") in REPLAYABLE_ARTIFACT_EVENT_TYPES:
+                if (item.get("event_type") in REPLAYABLE_ARTIFACT_EVENT_TYPES
+                        or item.get("event_type") in CARD_ITEMS):
                     row_id = await asyncio.to_thread(
                         persist_drained_artifact, self.chat_id, item
                     )
@@ -2513,6 +2534,12 @@ class InteractiveSession:
             logger.exception(
                 "interactive %s: final transcript tail failed", self.session_id[:8]
             )
+        # The notes this session made for prompts it typed and the journal
+        # never gave back: the final tail above was the last chance (a
+        # forwarded batch still in flight finishes first).
+        if self.chat_id:
+            async with self._transcript_lock:
+                drop_sent_prompts(self.chat_id, owner=self.session_id)
 
         # Release concurrency + permission/security/broker state + tailer cursor.
         from core.session.session_state import (
@@ -2643,6 +2670,36 @@ async def _load_chat_row(chat_id: str) -> dict:
         return {}
 
 
+def settings_card_from_perm_item(item: dict) -> dict:
+    """The settings card's event for a drained item (the pump's twin builds
+    the same block)."""
+    return wire.settings_card_block(
+        item.get("setting", ""), item.get("label", ""), int(item.get("catalog_version") or 0))
+
+
+def action_card_from_perm_item(item: dict) -> dict:
+    """The action card's event for a drained item (services/cards)."""
+    return wire.action_card_block(
+        str(item.get("card_id") or ""), str(item.get("title") or ""), str(item.get("text") or ""),
+        str(item.get("note") or ""), list(item.get("buttons") or []), list(item.get("options") or []))
+
+
+def list_card_from_perm_item(item: dict) -> dict:
+    """The list card's event for a drained item (services/cards)."""
+    return wire.list_card_block(
+        str(item.get("kind") or ""), dict(item.get("filters") or {}), str(item.get("title") or ""),
+        str(item.get("person") or ""))
+
+
+# The card items of the permission queue and the block each becomes: the
+# drainer persists them like a final artifact and sends them as windows.
+CARD_ITEMS = {
+    wire.ITEM_SETTINGS_CARD: settings_card_from_perm_item,
+    wire.ITEM_ACTION_CARD: action_card_from_perm_item,
+    wire.ITEM_LIST_CARD: list_card_from_perm_item,
+}
+
+
 def persist_drained_artifact(chat_id: str, item: dict) -> int | None:
     """Persist one drained display/file-tools artifact as a pump-shaped
     chat_messages event row — the interactive twin of the headless pump's
@@ -2658,10 +2715,13 @@ def persist_drained_artifact(chat_id: str, item: dict) -> int | None:
         artifact_event_from_perm_item,
     )
 
-    if not chat_id or item.get("event_type") not in REPLAYABLE_ARTIFACT_EVENT_TYPES:
+    et = item.get("event_type")
+    if not chat_id or (et not in REPLAYABLE_ARTIFACT_EVENT_TYPES and et not in CARD_ITEMS):
         return None
     try:
-        event = artifact_event_from_perm_item(item)
+        # A card persists like a final artifact: the rich view behind the
+        # terminal and the history show it.
+        event = CARD_ITEMS[et](item) if et in CARD_ITEMS else artifact_event_from_perm_item(item)
         if event is None:
             return None
         # The WOPI token rides the live frame only; a replayed card mints its own.
@@ -2822,7 +2882,7 @@ async def _register_session(
             )
             for wake in wakes:
                 session.queue_prompt(wake, "delegate_result_replay",
-                                     chat_id=session.chat_id)
+                                     chat_id=session.chat_id, note=True)
             if wakes:
                 logger.info(
                     "interactive %s: queued %d pending delegate wake(s) for "

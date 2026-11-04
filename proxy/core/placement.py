@@ -123,22 +123,40 @@ REFUSED_SENTENCE = ("This chat is on a machine you can't use. Pick one of your o
                     "from the Runs on menu.")
 
 
+def admits_every_role(machine: dict | None, agent_default: str | None) -> bool:
+    """Whether an admin machine lets a person below the owner tier run a
+    session of this agent there: its admin turned on "Every role of its
+    agents runs here" (``remote_machines.all_roles_run_here``) and the
+    machine is the agent's own default place (``agent_default``, the
+    agent's ``execution_target``). A personal machine, another agent's
+    machine or no row: never."""
+    if not machine_is_admin_paired(machine):
+        return False
+    row = cast("dict", machine)
+    return (bool(row.get("all_roles_run_here")) and bool(row.get("id"))
+            and machine_of(agent_default) == row.get("id"))
+
+
 def may_run_on(machine: dict | None, *, run_sub: str | None, run_can_manage: bool,
-               user_paired_allowed: bool) -> bool:
+               user_paired_allowed: bool, agent_default: str | None = "") -> bool:
     """The placement guard: whether a session of this person may run on the
     machine row ``machine`` (the caller passes ``None`` for no row: a
     deleted machine, never the sandbox, which is always allowed and never
     asked). A person's own paired machine, only theirs and only while the
     platform allows personal machines; an admin machine for a run with no
-    person (a task, a call, a meeting) or a person at the owner tier there
-    (``run_can_manage``, the caller's ``roles.can_manage``): the machine has
-    no sandbox, so a role below it never runs there. Every spawn on a
-    machine passes it (``remote_session_start.placement_refuses``), and the
-    config builder asks it first (``config_builder._placement_refusal``)."""
+    person (a task, a call, a meeting), a person at the owner tier there
+    (``run_can_manage``, the caller's ``roles.can_manage``), or any person
+    when its admin let every role of its agents run there and it is this
+    agent's default (``admits_every_role``; ``agent_default`` is the agent's
+    ``execution_target``, empty refuses as before): the machine has no
+    sandbox, so a role below the owner tier runs there only by that choice.
+    Every spawn on a machine passes it
+    (``remote_session_start.placement_refuses``), and the config builder
+    asks it first (``config_builder._placement_refusal``)."""
     if not machine:
         return False
     if machine_is_admin_paired(machine):
-        return not run_sub or run_can_manage
+        return not run_sub or run_can_manage or admits_every_role(machine, agent_default)
     return (bool(run_sub) and user_paired_allowed
             and (machine.get("registered_by") or "") == run_sub)
 

@@ -51,7 +51,7 @@ from typing import cast
 import psycopg
 
 from core import placement
-from core.execution_layer import SubscriptionHandle
+from core.execution_layer import AUTH_LOCAL, SubscriptionHandle
 from services.billing import pool_caps as _pool_caps
 from services.engines import subscription_windows as _windows
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
@@ -208,6 +208,14 @@ DRIFT_RATIO = 3.0
 # ratio can't flip straight back. In-memory: a restart just re-arms one move.
 _SCOPE_REBALANCE_COOLDOWN_S = 45 * 60
 _scope_rebalance_last: dict[str, float] = {}  # scope_key → monotonic ts
+
+
+def account_resting(sub_id: str) -> bool:
+    """Is the account resting as a whole right now (a usage limit or a
+    throttle on the account, not a model family's own window)? The
+    per-person engine resolution leaves such an account out while another
+    engine resolves (``services/engines/engine_resolution.py``)."""
+    return _is_throttled(sub_id)
 
 
 def _is_throttled(sub_id: str) -> bool:
@@ -498,6 +506,9 @@ def looks_like_limit_error(message: str) -> bool:
 # restore admin-subscription pooling for users, add 'oauth' here — nothing else
 # in the resolver changes.
 _USER_BORROWABLE_AUTH_TYPES = frozenset({"api_key", "relay", "local_endpoint"})
+#: The rows an engine an agent restricts to local models may take
+#: (``agents.local_only_engines``): the self-hosted servers' alone.
+_LOCAL_AUTH_TYPES = frozenset({AUTH_LOCAL})
 
 # Auth types whose per-turn cost is an ACTIVITY estimate, not money: a
 # subscription's flat fee (oauth) or a local model (local_endpoint). The chat
@@ -530,6 +541,9 @@ class NoSubscriptionError(Exception):
                 "Connect your account in your User Settings.",
         "pool_cap": "The subscription cap on this pool is reached. It clears as the "
                     "accounts' windows reset; change the cap on the Usage page.",
+        "local_only": "This agent allows only local models on this engine. Ask an "
+                      "administrator to add a local model server in Setup, AI "
+                      "Engines, or pick another engine.",
     }
 
     def __init__(self, reason: str, message: str = ""):
@@ -897,6 +911,7 @@ def acquire_subscription(
     sticky_scope: str = "",
     model: str = "",
     enforce_caps: bool = True,
+    allowed_auth: frozenset[str] | None = None,
 ) -> SubscriptionHandle | None:
     """Select and acquire a subscription for a new session. Off the loop
     (``asyncio.to_thread``): the queued seat releases are flushed first so
@@ -929,11 +944,21 @@ def acquire_subscription(
     rebind and the scope rebalance) passes ``False``: a cap never moves or
     strands a running session.
 
+    ``allowed_auth``: a caller's narrowing of the rows BOTH branches may take
+    (the local-only rule: an agent that allows only local models on the
+    engine passes the local rows' type, ``resolve_subscription_env``); the
+    pool branch keeps its borrowable filter underneath. When the narrowing
+    leaves nothing, ``NoSubscriptionError("local_only")`` is raised for BOTH
+    scopes, as a cap is: an agent-scope spawn that acquired nothing would
+    otherwise start on whatever credential file its scope dir still holds.
+
     Returns None when nothing is available (caller surfaces the block; see
     ``user_scope_block_reason`` for the user-facing reason).
     """
     flush_binding_writes()
     user_sub = user_sub or None  # treat "" as agent-scope; never match owner_sub='' infra
+    borrowable = (_USER_BORROWABLE_AUTH_TYPES if allowed_auth is None
+                  else _USER_BORROWABLE_AUTH_TYPES & allowed_auth)
 
     drop_oauth = False
     cap = _cap_status(layer, user_sub) if enforce_caps else None
@@ -958,8 +983,8 @@ def acquire_subscription(
         personal = subscription_store.list_personal(layer, user_sub, provider or None)
         if drop_oauth:
             personal = _rows_without_login(personal)
-        handle = _select_sticky(sticky_scope, personal, allowed_auth=None, model=model) \
-            or _select(personal, allowed_auth=None, model=model)
+        handle = _select_sticky(sticky_scope, personal, allowed_auth=allowed_auth, model=model) \
+            or _select(personal, allowed_auth=allowed_auth, model=model)
         if not handle:
             # 2. Platform fallback, gated by the per-user Platform Auth toggle
             if not subscription_store.get_user_allow_platform_auth(user_sub):
@@ -968,8 +993,8 @@ def acquire_subscription(
                 # 3. Borrow ONLY admin API-type credentials — never an admin OAuth sub
                 platform = subscription_store.list_platform_pool(layer, provider or None)
                 handle = _select_sticky(sticky_scope, platform,
-                                        allowed_auth=_USER_BORROWABLE_AUTH_TYPES, model=model) \
-                    or _select(platform, allowed_auth=_USER_BORROWABLE_AUTH_TYPES, model=model)
+                                        allowed_auth=borrowable, model=model) \
+                    or _select(platform, allowed_auth=borrowable, model=model)
                 if handle:
                     # Defense-in-depth: a user-scope handle must never be an OAuth subscription.
                     assert handle.auth_type in _USER_BORROWABLE_AUTH_TYPES, (
@@ -982,10 +1007,15 @@ def acquire_subscription(
         platform = subscription_store.list_platform_pool(layer, provider or None)
         if drop_oauth:
             platform = _rows_without_login(platform)
-        handle = _select_sticky(sticky_scope, platform, allowed_auth=None, model=model) \
-            or _select(platform, allowed_auth=None, model=model)
+        handle = _select_sticky(sticky_scope, platform, allowed_auth=allowed_auth, model=model) \
+            or _select(platform, allowed_auth=allowed_auth, model=model)
 
     if handle is None:
+        if allowed_auth is not None:
+            logger.info("Pool: no row of %s on layer=%s for the %s scope: the agent allows "
+                        "only local models there", sorted(allowed_auth), layer,
+                        "user" if user_sub else "platform")
+            raise NoSubscriptionError("local_only")
         if drop_oauth:
             # ``continue`` with nothing to continue on: say so, rather than
             # the generic "connect an account" classification (only a reached
@@ -2111,12 +2141,18 @@ def resolve_subscription_env(
         if len(caps.providers or ()) > 1 and model else ""
     )
 
-    # 2. Acquire a subscription from the pool.
+    # 2. Acquire a subscription from the pool. An agent that allows only
+    # local models on this engine (``agents.local_only_engines``) takes the
+    # self-hosted servers' rows alone, whatever the model's provider says:
+    # the backstop of the model rule (engine_resolution, resolve_agent_model).
+    from storage.agents.agent_store import _get_local_only_engines
     file_delivery = caps.auth.credential_file is not None
     sub_handle = acquire_subscription(
         execution_path, user_sub, provider=resolved_provider,
         sticky_scope=sticky_scope if file_delivery else "",
         model=model,
+        allowed_auth=(_LOCAL_AUTH_TYPES
+                      if execution_path in _get_local_only_engines(agent_info) else None),
     )
     if not sub_handle:
         return "", {}

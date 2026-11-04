@@ -104,10 +104,17 @@ export const MODE_SUMMARY: Record<VisibilityMode, string> = {
 
 /** Per-option helper text inside the grouped radio. */
 export const MODE_OPTION_HINT: Record<VisibilityMode, string> = {
-  personal_shared: 'each person has a private space, plus a shared team space',
-  shared_personal: 'work lives in one shared space, and each person also keeps personal files',
-  personal_only: 'fully private for each person: no shared space, own chats and memory',
-  shared_only: 'one shared workspace and one shared chat history for everyone, with no personal space',
+  personal_shared: 'Each person has a private space, plus a shared team space. It suits project work whose finals are handed over.',
+  shared_personal: 'Work lives in one shared space, and each person also keeps personal files. It suits a department’s desk.',
+  personal_only: 'Everything is private to each person, with no shared space. It suits a whole team working privately, or one person.',
+  shared_only: 'Everyone shares one workspace and one chat history, with no personal space. It suits a desk the team runs together.',
+}
+
+/** The sentence under a ticked agent on the admin's Users page when the
+ *  agent works personal-first: what the new person will and will not see. */
+export const PERSONAL_FIRST_HINT: Partial<Record<VisibilityMode, string>> = {
+  personal_shared: 'They will see the shared space and their own, not yours.',
+  personal_only: 'They will see their own space only, not yours.',
 }
 
 /**

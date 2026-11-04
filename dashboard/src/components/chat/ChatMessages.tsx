@@ -1,9 +1,11 @@
 import { useState, useEffect, useImperativeHandle, useLayoutEffect, useRef, useCallback, useMemo, type Ref } from 'react'
+import { Link } from 'react-router-dom'
 import { SoundIcon } from './SoundIcon'
 import { ReportReplyButton } from './ReportReplyButton'
+import { reportableReply } from '../../api/replyReports'
 
 import type { ChatMessagesHandle, DisplayMessage, MessageBlock } from './types'
-import { continuesAbove, delegateCardOf, finishedBubble, isAgentReply, nudgeNote, openTurnBubbles, pairBgCommandBlocks, REPORT_MISSING_BADGE, sendAgainKind, supersededUiBlocks, uiTitlesByPath } from '../../lib/messageBlocks'
+import { CARD_KIND, continuesAbove, delegateCardOf, finishedBubble, isAgentReply, nudgeNote, openTurnBubbles, pairBgCommandBlocks, REPORT_MISSING_BADGE, sendAgainKind, storedRowId, supersededUiBlocks, uiTitlesByPath } from '../../lib/messageBlocks'
 import { asksPerson, deriveActivityRuns, isNote, noteAsides, turnBusy, WORKING_GRACE_MS, type ActivityRun } from '../../lib/activityGroups'
 import { useActivityDisplay } from '../../hooks/useActivityDisplay'
 import type { OlderPage } from '../../hooks/useChatMessages'
@@ -11,9 +13,11 @@ import BlockRenderer from './ChatBlockRenderer'
 import ActivityGroup from './ActivityGroup'
 import DelegateCard from './DelegateCard'
 import { useDelegateCards } from '../../hooks/useDelegateCards'
+import { noteChatAtBottom } from '../../lib/device/storeReview'
 import ErrorBoundary from '../ErrorBoundary'
 import type { QueuedMessage } from '../../store/types'
-import { QUEUE_WAITING } from '../../api/wireEvents'
+import { QUEUE_WAITING, WAKE_SOURCE } from '../../api/wireEvents'
+import { CARD_WORDS } from '../../lib/kinds/card'
 import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
 import { useSearch } from '../../contexts/useSearch'
 
@@ -265,6 +269,12 @@ export default function ChatMessages({
   // from the content's bottom: what lands above it fades in.
   const oldEdgeRef = useRef<number | null>(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
+  // The store review ask waits for the end of a reply (lib/device/storeReview):
+  // the button shows from 100 px above the end.
+  useEffect(() => {
+    noteChatAtBottom(chatId, !showScrollBtn)
+    return () => noteChatAtBottom(chatId, false)
+  }, [chatId, showScrollBtn])
   const { query: searchQuery, currentMatch } = useSearch()
   const streamingRef = useRef(streaming)
   useLayoutEffect(() => { streamingRef.current = streaming })
@@ -310,10 +320,12 @@ export default function ChatMessages({
   const asidesByMsg = useMemo(() => {
     const map = new Map<string, Set<number>>()
     for (const msg of messages) {
-      map.set(msg.id, noteAsides(msg.blocks, { meeting: msg.badge === 'meeting', finished: finishedBubble(msg) }))
+      // A terminal chat's bubbles carry no closing metadata: one outside the open turn is over.
+      const finished = finishedBubble(msg) || !openBubbles.has(msg.id)
+      map.set(msg.id, noteAsides(msg.blocks, { meeting: msg.badge === 'meeting', finished }))
     }
     return map
-  }, [messages])
+  }, [messages, openBubbles])
   const activityRunsByMsg = useMemo(() => {
     const map = new Map<string, { byStart: Map<number, ActivityRun>; grouped: Set<number> }>()
     if (activityDisplay !== 'compact') return map
@@ -677,11 +689,18 @@ export default function ChatMessages({
     <div
       ref={containerRef}
       onScroll={handleScroll}
-      className="h-full overflow-y-auto flex flex-col-reverse px-4"
+      className="h-full overflow-y-auto flex flex-col-reverse px-1"
     >
       {/* Single child wrapper — column-reverse anchors this to the visual bottom.
-          scrollTop=0 = newest messages visible. No scrollIntoView needed. */}
-      <div ref={contentRef} className="max-w-4xl mx-auto w-full space-y-6 pt-14 pb-4">
+          scrollTop=0 = newest messages visible. No scrollIntoView needed.
+          Clipped across, never the scroller itself: a message wider than
+          the pane (a long unbroken path) must not make the page scroll
+          sideways, and a clipped scroller could still be scrolled there by
+          a focus or a find. The side padding lives inside the clip, so what
+          overhangs a message (a queued message's cancel button, a focus
+          ring) stays in view on every engine, Safari's included (it has no
+          clip margin); the width takes it in, so the column keeps 56rem. */}
+      <div ref={contentRef} className="max-w-[57.5rem] mx-auto w-full px-3 space-y-6 pt-14 pb-4 overflow-x-clip">
         {/* Lazy scroll-back trigger (visual top = oldest loaded). The observer
             fires onLoadOlder as it nears the viewport; older rows prepend with no
             jump (column-reverse is bottom-anchored). */}
@@ -697,14 +716,19 @@ export default function ChatMessages({
           const hasText = msg.blocks.some(b => b.type === 'text')
 
           if (msg.role === 'user' && !msg.agentSlug) {
+            // A message of photos alone has nothing to copy.
+            const copyText = extractPlainText(msg.blocks)
             return (
               // Per-message crash isolation: one corrupt block must not
               // unmount the whole app (blank page) — see ErrorBoundary.
               <ErrorBoundary key={msg.id} variant="inline" label="This message">
-              <div className="flex flex-col items-end group/msg" data-msg-id={msg.id}>
-                {/* Timestamp above bubble */}
+              {/* The scroll margin keeps its first line clear of the floating
+                  top bar when a fold scrolls it into view (Show less). */}
+              <div className="flex flex-col items-end group/msg scroll-mt-16" data-msg-id={msg.id}>
+                {/* Timestamp above bubble, and the caption of a message a card sent */}
                 <span className="text-2xs text-tertiary mb-1 mr-1">
                   {formatMessageTime(msg.createdAt)}
+                  {msg.fromCard && <span className="ml-2 text-2xs text-tertiary" data-testid="message-from-card">{CARD_WORDS.fromCard}</span>}
                 </span>
                 {/* Bubble */}
                 <div
@@ -741,9 +765,9 @@ export default function ChatMessages({
                   </div>
                 </div>
                 {/* Copy below bubble, right-aligned */}
-                {hasText && (
+                {copyText.trim().length > 0 && (
                   <div className="mt-1 mr-1 transition-opacity duration-150 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/msg:opacity-100 focus-within:opacity-100">
-                    <CopyMessageButton text={extractPlainText(msg.blocks)} />
+                    <CopyMessageButton text={copyText} />
                   </div>
                 )}
               </div>
@@ -754,6 +778,12 @@ export default function ChatMessages({
           // Assistant message — full width, no bubble
           const meta = msg.blocks.find((b): b is Extract<MessageBlock, {type:'metadata'}> => b.type === 'metadata')
           const hasContent = msg.blocks.some(b => b.type !== 'metadata')
+          // Report: the same complete-reply guard as the sound icon, an
+          // agent's reply (never a person's message shown as one), a chat
+          // that exists; a reply with no text once it is stored (its stored
+          // row cannot be found by its words).
+          const reportable = (!!meta || !streaming) && isAgentReply(msg) && !!chatId
+            && (hasText || (storedRowId(msg.id) !== null && reportableReply(msg.blocks)))
           const asides = asidesByMsg.get(msg.id) ?? new Set<number>()
           // Fold each background command's Bash tool block into its bgcommand
           // pill (one expandable card per command instead of two stacked ones).
@@ -767,13 +797,32 @@ export default function ChatMessages({
 
           // Subtle separator between consecutive assistant messages; a reply
           // that goes on from the bubble above joins it instead (no header,
-          // no separator), still its own bubble with its own footer.
+          // no separator), still its own bubble with its own footer. A card
+          // above draws none: it sits on the person's side.
           const prevMsg = msgIdx > 0 ? messages[msgIdx - 1] : undefined
           const continues = !!msg.continuation && continuesAbove(prevMsg, msg)
-          const showSeparator = !continues && prevMsg && (prevMsg.role === 'assistant' || prevMsg.agentSlug)
+          const showSeparator = !continues && prevMsg && !delegateCardOf(prevMsg)
+            && (prevMsg.role === 'assistant' || !!prevMsg.agentSlug)
 
-          // Header: avatar + agent name + badge + timestamp
-          const header = (
+          const card = delegateCardOf(msg)
+          const cardKey = card ? (cardKeys.get(msg.id) ?? card.key) : ''
+          // Header: avatar + agent name + badge + timestamp; a wake card's
+          // names the platform's own prompt, a result card's its task.
+          const header = card?.kind === CARD_KIND.WAKE ? (
+            <>
+              <span className="flex items-center justify-center w-6 h-6 rounded-full bg-surface-muted text-secondary shrink-0" aria-hidden="true">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </span>
+              <span className="text-sm font-semibold text-primary truncate min-w-0" data-testid="wake-card-label">
+                {card.source === WAKE_SOURCE.MOVE ? 'Continued after the move' : 'Scheduled wake'}
+              </span>
+              <span className="text-2xs text-tertiary whitespace-nowrap shrink-0">
+                {formatMessageTime(msg.createdAt)}
+              </span>
+            </>
+          ) : (
             <>
               <span
                 className={`flex items-center justify-center w-6 h-6 rounded-full text-on-solid text-xs font-semibold shrink-0 ${avatarBg ? '' : 'bg-accent-agent-fill'}`}
@@ -781,9 +830,12 @@ export default function ChatMessages({
               >
                 {initial}
               </span>
-              <span className="text-sm font-semibold text-primary">{displayName}</span>
+              {/* A card's header shares a phone's 85 % with the badge and the
+                  time: the name gives way, the badge and the time stay whole,
+                  the task's name waits for a wider screen. */}
+              <span className="text-sm font-semibold text-primary truncate min-w-0">{displayName}</span>
               {msg.badge && (
-                <span className={`px-1.5 py-0.5 rounded-sm text-3xs font-medium ${
+                <span className={`px-1.5 py-0.5 rounded-sm text-3xs font-medium whitespace-nowrap shrink-0 ${
                   msg.badge === REPORT_MISSING_BADGE
                     ? 'bg-status-warning-bg text-status-warning-fg'
                     : 'bg-accent-agent-bg text-accent-agent-fg'
@@ -791,13 +843,27 @@ export default function ChatMessages({
                   {msg.badge}
                 </span>
               )}
-              <span className="text-2xs text-tertiary">
+              {card?.kind === CARD_KIND.RESULT && card.taskName && (
+                <span className="hidden sm:inline text-xs text-secondary truncate min-w-0" data-testid="delegate-card-task">
+                  {card.taskName}
+                </span>
+              )}
+              <span className="text-2xs text-tertiary whitespace-nowrap shrink-0">
                 {formatMessageTime(msg.createdAt)}
               </span>
             </>
           )
-          const card = delegateCardOf(msg)
-          const cardKey = card ? (cardKeys.get(msg.id) ?? card.key) : ''
+          // The worker's chat, outside the toggle (a click opens the lane,
+          // never the card).
+          const cardActions = card?.kind === CARD_KIND.RESULT && card.workerChatId && msg.agentSlug ? (
+            <Link
+              to={`/chat/${msg.agentSlug}/${card.workerChatId}`}
+              className="shrink-0 px-1.5 py-0.5 rounded-sm text-3xs font-medium text-accent-agent-fg hover:bg-surface-hover transition-colors"
+              title="Open the worker lane chat"
+            >
+              Open lane
+            </Link>
+          ) : undefined
 
           const body = (
             <>
@@ -887,7 +953,7 @@ export default function ChatMessages({
               )}
 
               {/* Footer: copy + badges, all left-aligned */}
-              {(hasText || meta) && (
+              {(hasText || meta || reportable) && (
                 <div className="flex items-center gap-2 mt-2 text-2xs">
                   {meta && (
                     <>
@@ -912,17 +978,14 @@ export default function ChatMessages({
                       )}
                     </>
                   )}
-                  {hasText && (
+                  {(hasText || reportable) && (
                     <div className="flex items-center gap-1 transition-opacity duration-150 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/msg:opacity-100 focus-within:opacity-100">
-                      <CopyMessageButton text={extractPlainText(msg.blocks, asides)} />
+                      {hasText && <CopyMessageButton text={extractPlainText(msg.blocks, asides)} />}
                       {/* Sound icon only once the message is complete — `meta` is
                           the completion signal; `!streaming` covers older rows
                           (never read half-streamed text). */}
-                      {(!!meta || !streaming) && <SoundIcon text={extractPlainText(msg.blocks, asides)} />}
-                      {/* Report: the same complete-reply guard, an agent's
-                          reply (never a person's message shown as one), a
-                          chat that exists. */}
-                      {(!!meta || !streaming) && isAgentReply(msg) && chatId && (
+                      {hasText && (!!meta || !streaming) && <SoundIcon text={extractPlainText(msg.blocks, asides)} />}
+                      {reportable && chatId && (
                         <ReportReplyButton chatId={chatId} messages={messages} index={msgIdx} />
                       )}
                     </div>
@@ -934,29 +997,35 @@ export default function ChatMessages({
 
           return (
             <ErrorBoundary key={msg.id} variant="inline" label="This message">
-            <div className={continues ? 'group/msg -mt-3' : 'group/msg'} data-msg-id={msg.id}
-                 data-continuation={continues || undefined}
-                 style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-              {showSeparator && (
-                <div className="border-t border-subtle mb-6" />
-              )}
-              {card ? (
-                <DelegateCard
-                  card={card}
-                  blocks={msg.blocks}
-                  open={openCards.has(cardKey)}
-                  onToggle={() => onToggleCard(cardKey)}
-                  header={header}
-                >
-                  {body}
-                </DelegateCard>
-              ) : (
-                <>
-                  {!continues && <div className="flex items-center gap-2 mb-3">{header}</div>}
-                  {body}
-                </>
-              )}
-            </div>
+            {card ? (
+              // A message to the agent from another agent or the platform:
+              // on the person's side, at the person's width, its own surface.
+              <div className="flex flex-col items-end group/msg" data-msg-id={msg.id}
+                   style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+                <div className="max-w-[85%] min-w-0">
+                  <DelegateCard
+                    card={card}
+                    blocks={msg.blocks}
+                    open={openCards.has(cardKey)}
+                    onToggle={() => onToggleCard(cardKey)}
+                    header={header}
+                    actions={cardActions}
+                  >
+                    {body}
+                  </DelegateCard>
+                </div>
+              </div>
+            ) : (
+              <div className={continues ? 'group/msg -mt-3' : 'group/msg'} data-msg-id={msg.id}
+                   data-continuation={continues || undefined}
+                   style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+                {showSeparator && (
+                  <div className="border-t border-subtle mb-6" />
+                )}
+                {!continues && <div className="flex items-center gap-2 mb-3">{header}</div>}
+                {body}
+              </div>
+            )}
             </ErrorBoundary>
           )
         })}
@@ -995,9 +1064,11 @@ export default function ChatMessages({
                           : 'The machine running this chat is reconnecting. Your message goes out when it is back.'}
                     </p>
                   )}
-                  {onCancelQueued && (mayCancelQueued?.(item) ?? true) && (
+                  {item.card && <span className="ml-2 text-xs text-secondary" data-testid="queued-from-card">{CARD_WORDS.fromCard}</span>}
+                  {onCancelQueued && !item.card && (mayCancelQueued?.(item) ?? true) && (
                     // Shown on a touch screen (no hover there), on hover
-                    // with a mouse; a 32 px target.
+                    // with a mouse; a 32 px target. A card's answer is not
+                    // taken back: its chip has no cancel.
                     <button
                       onClick={() => onCancelQueued(i)}
                       aria-label="Cancel queued message"

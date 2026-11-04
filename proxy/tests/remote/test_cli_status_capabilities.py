@@ -138,11 +138,71 @@ def test_list_machines_carries_cli_pins_per_machine(monkeypatch):
     monkeypatch.setattr(remote_store, "get_all_remote_machines", lambda: [{
         "id": "m1", "name": "box", "status": "online", "last_seen": None,
         "capabilities": '{"installed_clis": ["claude-code"]}',
-        "device_grants": "[]", "registered_by": "u",
+        "device_grants": "[]", "registered_by": "u", "satellite_version": "0.5.164",
+    }, {
+        "id": "m2", "name": "old", "status": "online", "last_seen": None,
+        "capabilities": "{}", "device_grants": "[]", "registered_by": "u",
+        "satellite_version": "0.5.163",
     }])
 
     resp = TestClient(_app()).get("/v1/admin/remote-machines")
     assert resp.status_code == 200
-    (m,) = resp.json()["machines"]
+    m, old = resp.json()["machines"]
     assert m["cli_pins"] == {"claude": "9.9.9", "codex": "8.8.8"}
     assert m["capabilities"]["installed_clis"] == ["claude-code"]
+    # A satellite before 0.5.164 is shown the CLIs it was sent (it keeps
+    # them until it updates): its Plan spawn predates the prompt tool, its
+    # Codex terminal the provider guard.
+    assert old["cli_pins"] == {"claude": "2.1.296", "codex": "0.163.0"}
+
+
+@pytest.mark.parametrize("satellite_version,pin,want", [
+    ("0.5.164", "2.1.312", "2.1.312"),
+    ("0.5.170", "2.1.312", "2.1.312"),
+    ("0.5.163", "2.1.312", "2.1.296"),
+    ("0.4.999", "2.1.312", "2.1.296"),
+    ("", "2.1.312", "2.1.296"),
+    ("0.5.163", "2.1.290", "2.1.290"),
+    ("0.5.163", "", ""),
+])
+def test_a_satellite_before_the_plan_prompt_spawn_keeps_the_older_claude_code(
+        monkeypatch, satellite_version, pin, want):
+    """Claude Code past 2.1.296 asks for a call the hook allowed in a Plan
+    chat, which only a 0.5.164 satellite's spawn answers: an older satellite
+    is sent 2.1.296 (never a higher pin than the platform's, an empty pin
+    stays empty, no version reads as old)."""
+    import config as app_config
+    from core.session.session_manager import get_layer_by_path
+    monkeypatch.setattr(app_config, "PINNED_CLAUDE_CODE_VERSION", pin)
+    assert get_layer_by_path("claude-code-cli").pinned_cli_version_for(satellite_version) == want
+
+
+@pytest.mark.parametrize("satellite_version,pin,want", [
+    ("0.5.164", "0.166.0", "0.166.0"),
+    ("0.5.163", "0.166.0", "0.163.0"),
+    ("", "0.166.0", "0.163.0"),
+    ("0.5.163", "0.160.0", "0.160.0"),
+    ("0.5.163", "", ""),
+])
+def test_a_satellite_before_the_provider_guard_keeps_the_older_codex(
+        monkeypatch, satellite_version, pin, want):
+    """Codex 0.166 refuses a terminal resume across a model provider change,
+    which only a 0.5.164 satellite's terminal turns into a fresh start: an
+    older satellite is sent 0.163.0 until it updates."""
+    import config as app_config
+    from core.session.session_manager import get_layer_by_path
+    monkeypatch.setattr(app_config, "PINNED_CODEX_VERSION", pin)
+    assert get_layer_by_path("codex-cli").pinned_cli_version_for(satellite_version) == want
+
+
+def test_the_handshake_sends_the_capped_pins_and_the_update_push_none(monkeypatch):
+    import config as app_config
+    from ws import satellite as sat_ws
+    monkeypatch.setattr(app_config, "PINNED_CLAUDE_CODE_VERSION", "2.1.312")
+    monkeypatch.setattr(app_config, "PINNED_CODEX_VERSION", "0.166.0")
+    machine = {"allow_full_fs": False, "device_grants": "[]"}
+    old = sat_ws._auth_ok(machine, satellite_version="0.5.163")["cli_pins"]
+    new = sat_ws._auth_ok(machine, satellite_version="0.5.164")["cli_pins"]
+    assert old == {"claude_code": "2.1.296", "codex": "0.163.0"}
+    assert new == {"claude_code": "2.1.312", "codex": "0.166.0"}
+    assert sat_ws._auth_ok(machine, cli_pins={}, satellite_version="0.5.163")["cli_pins"] == {}

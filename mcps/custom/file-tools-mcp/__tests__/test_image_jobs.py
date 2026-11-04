@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import images
+import shared
 
 pytest.importorskip("PIL")
 
@@ -44,12 +45,15 @@ def rig(monkeypatch, tmp_path):
 def _slow_op(monkeypatch, events: list, seconds: float = 0.3):
     """An operation that holds its thread for a while, recording its span."""
 
-    def _slow(job, op):
+    from catalog import Catalog, KeySpec, OpSpec
+
+    def _slow(job, ctx, op):
         events.append(("slow-start", op.get("tag")))
         time.sleep(seconds)
         events.append(("slow-end", op.get("tag")))
 
-    monkeypatch.setitem(images._HANDLERS, "slow", _slow)
+    slow = OpSpec("slow", _slow, (KeySpec("tag", ("str",)),), "BASIC", examples=({"op": "slow"},))
+    monkeypatch.setattr(images, "CATALOG", Catalog("edit_image", [*images.CATALOG.ops.values(), slow]))
 
 
 def test_an_edit_leaves_the_loop_free(rig, monkeypatch):
@@ -78,7 +82,7 @@ def test_two_edits_of_one_file_apply_one_after_the_other(rig):
         return await asyncio.gather(images.handle_edit_image(dict(border)),
                                     images.handle_edit_image(dict(border)))
 
-    sizes = sorted(out.split("(")[1].split(",")[0] for out in asyncio.run(main()))
+    sizes = sorted(out.split("Size: ")[1].split(" ")[0] for out in asyncio.run(main()))
     assert sizes == ["50x40", "60x50"]  # whichever ran first, the other saw its border
     assert Image.open(rig).size == (60, 50)  # both borders: no edit was lost
 
@@ -135,11 +139,13 @@ def test_a_paste_whose_image_cannot_be_found_names_that_operation(rig, monkeypat
         return p
 
     monkeypatch.setattr(images, "_resolve_path", _resolve)
+    monkeypatch.setattr(shared, "_resolve_path", _resolve)
     out = asyncio.run(images.handle_edit_image({"path": str(rig), "operations": [
         {"type": "flip"},
         {"type": "paste_image", "image_path": "/elsewhere/logo.png"},
     ]}))
-    assert out == "Error in operation 'paste_image': this session may not read /elsewhere/logo.png"
+    assert out.startswith("Nothing saved:") and "1 of 2 operations are not valid" in out
+    assert "op #1 paste_image: this session may not read /elsewhere/logo.png" in out
     # Looked up before the edit started, in op order.
     assert seen == [str(rig), "/elsewhere/logo.png"]
 
@@ -148,7 +154,8 @@ def test_a_paste_without_its_image_path_fails_at_its_turn(rig):
     out = asyncio.run(images.handle_edit_image({"path": str(rig), "operations": [
         {"type": "paste_image", "path": str(rig)},
     ]}))
-    assert out == "Error in operation 'paste_image': 'image_path'"
+    # Refused before any work: the key it needs is missing, the one it got unknown.
+    assert out.startswith("Nothing saved:") and "op #0 paste_image" in out and "image_path" in out
 
 
 def test_the_background_model_is_built_once_whatever_thread_asks(monkeypatch):

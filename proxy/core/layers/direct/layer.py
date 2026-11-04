@@ -234,10 +234,11 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
             "skill": ("Skill",),
             "discovery": ("tool_search",),
         },
-        question_tool_holds_turn=False,       # no question tool
     ),
     model_policy=ModelPolicy(
-        default_model="claude-sonnet-5-5",    # tier 3 — the first usable tier for real work
+        # tier 3: the operator's call (calls included), kept below GPT-6.1
+        # Sol (tier 2, the same price) until decided again
+        default_model="claude-sonnet-5-5",
         model_filter_policy="all",            # every provider filtered to active subscriptions
         pricing_editable=True,                # BYO keys are metered per model
     ),
@@ -442,6 +443,20 @@ def audience_gate(ctx, external: bool) -> tuple[str, str]:
     return role, scope
 
 
+def excluded_server_keys(names) -> set[str]:
+    """The ``mcpServers`` keys of the MCPs a session's builder left out, from
+    their manifest names (``AgentConfig.excluded_mcps``): the manager's own
+    rebuild knows the phone and external facts alone, so a task's, a
+    meeting's and a ``shared_chat`` session's exclusions reach the pool by
+    key. A name with no manifest is its own key."""
+    from services.mcp import mcp_registry as mcp_reg
+    keys: set[str] = set()
+    for name in names:
+        manifest = mcp_reg.get_manifest(name)
+        keys.add((manifest.server_name or manifest.name) if manifest else name)
+    return keys
+
+
 class DirectLLMExecutionLayer(ExecutionLayer):
     """Execution layer wrapping the Direct Anthropic API path.
 
@@ -579,6 +594,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             call_ask_back=bool(extra.get(ASK_BACK_ENV)),
             user_role=user_role,
             scope=scope,
+            excluded_mcps=excluded_server_keys(config.excluded_mcps) or None,
         )
         # The builtin file tools resolve against this session's mount table
         # (the same decisions the MCP subprocesses get from bwrap).

@@ -593,11 +593,10 @@ def test_every_declared_native_tool_name_maps_into_its_role():
                 assert tool_roles.role_of(canonical) == role, (path, role, native, canonical)
 
 
-def test_question_tool_holds_turn_only_with_a_question_tool():
+def test_nonblocking_question_tools_are_question_tools():
     for path, layer in get_all_layers().items():
         b = layer.capabilities.behaviour
-        if b.question_tool_holds_turn:
-            assert b.tools.get(tool_roles.QUESTION), path
+        assert set(b.nonblocking_question_tools) <= set(b.tools.get(tool_roles.QUESTION, ())), path
 
 
 def test_provider_entries_declare_their_kind_and_paths():
@@ -754,7 +753,7 @@ def test_to_dict_carries_the_phase_2_facts():
         assert "installed_name" in d["runtime"], path
         assert isinstance(d["behaviour"]["tools"], dict), path
         assert all(isinstance(v, list) for v in d["behaviour"]["tools"].values()), path
-        assert "question_tool_holds_turn" in d["behaviour"], path
+        assert "nonblocking_question_tools" in d["behaviour"], path
         for entry in d["providers"]:
             assert {"kind", "relay_path", "api_path"} <= set(entry), (path, entry)
 

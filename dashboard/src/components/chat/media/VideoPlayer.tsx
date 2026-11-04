@@ -250,12 +250,11 @@ export default function VideoPlayer({
     return () => document.removeEventListener('fullscreenchange', onFsChange)
   }, [])
 
-  // Fullscreen side-effects: native edge-to-edge + immersive (Android app),
-  // Android/web Back closes fullscreen (not the app), and an initial landscape
-  // rotation for wide videos on mobile — a CUE, not a pin: the physical
-  // orientation is followed afterwards (natively in the app, via
-  // startOrientationFollow on the web) so the user can turn the phone back to
-  // portrait while staying fullscreen. All guards no-op on desktop / plain web.
+  // Fullscreen side-effects: native edge-to-edge + immersive in the apps (the
+  // screen turns with the phone there), Android/web Back closes fullscreen
+  // (not the app), and on the mobile web an initial landscape lock for wide
+  // videos, a CUE, not a pin: startOrientationFollow follows the physical
+  // orientation afterwards.
   useEffect(() => {
     if (!fs) return
     const w: Window & { __otodockVideoFullscreenActive?: boolean; __otodockVideoFullscreenClose?: () => void } = window

@@ -336,6 +336,35 @@ def test_background_subagent_registered_supervised_and_resolved():
     asyncio.run(run())
 
 
+def test_a_long_background_subagent_is_supervised_until_its_terminal():
+    # A supervisor waits as long as the thread lives (no fixed bound may clear
+    # a research agent's badge or run its review while it works); each event
+    # stamps the agent alive for the chat monitor's silence rule.
+    async def run():
+        session = _make_session([])
+        reg = get_subagent_registry("s1")
+        reg.reset()
+        reg.register_spawn(SUB, SUB, label="bg task")
+        reg.last_seen[SUB] = 0.0
+        q: asyncio.Queue = asyncio.Queue()
+        session._thread_consumers[SUB] = q
+        try:
+            sup = asyncio.create_task(session._supervise_bg_subagent(SUB))
+            for _ in range(3):
+                q.put_nowait(("item/completed", {"threadId": SUB}))
+            await asyncio.sleep(0.05)
+            assert not sup.done() and reg.has_pending
+            assert reg.last_seen[SUB] > 0.0
+            q.put_nowait(("turn/completed", {"threadId": SUB}))
+            await asyncio.wait_for(sup, timeout=5)
+            assert SUB in reg.completed
+        finally:
+            await session._teardown_bg(reason="test")
+            _subagent_registries.pop("s1", None)
+
+    asyncio.run(run())
+
+
 def test_registry_reset_preserves_pending_bg_subagent():
     # CLI parity: a follow-up turn's reset must NOT wipe a still-running bg agent
     # (else the monitor never sees it finish — the "lost nudge while bg runs" bug).

@@ -286,6 +286,129 @@ def test_orphans_deleted_referenced_and_young_kept(temp_db, monkeypatch):
     assert stats["orphans_deleted"] == 2
 
 
+def _mk_companion(transcript: Path) -> Path:
+    """Claude's ``<id>/`` folder beside a transcript (subagents, tool results)."""
+    d = transcript.with_suffix("")
+    (d / "subagents").mkdir(parents=True)
+    (d / "subagents" / "agent-1.jsonl").write_text("z" * 300)
+    return d
+
+
+def _age_tree(d: Path, days: float) -> None:
+    for f in [d, *d.rglob("*")]:
+        _age_file(f, days)
+
+
+def test_an_orphans_folder_goes_with_it(temp_db, monkeypatch):
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    home = _home("a1", "alice")
+    orphan = _mk_claude(home, _uuid())
+    folder = _mk_companion(orphan)
+    _age_file(orphan, 10)
+    _age_tree(folder, 10)
+
+    stats = _sweep(days=30)
+
+    assert not orphan.exists() and not folder.exists()
+    assert stats["orphans_deleted"] == 1 and stats["orphan_bytes"] == 500
+    assert stats["errors"] == 0
+
+
+def test_a_referenced_transcript_keeps_its_folder(temp_db, monkeypatch):
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    sid = _uuid()
+    temp_db.create_chat("ref", "user-admin", "a1")
+    temp_db.update_chat("ref", session_id=sid)
+    kept = _mk_claude(_home("a1", "alice"), sid)
+    folder = _mk_companion(kept)
+    _age_file(kept, 10)
+    _age_tree(folder, 10)
+
+    _sweep(days=30)
+
+    assert kept.exists() and folder.exists()
+
+
+def test_a_folder_left_by_an_older_sweep_ages_out_alone(temp_db, monkeypatch):
+    """A folder whose transcript is already gone: aged and unreferenced it
+    goes, young or referenced it stays."""
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    home = _home("a1", "alice")
+    projects = home / ".claude" / "projects" / "-users-alice"
+    projects.mkdir(parents=True)
+    old_lone, young_lone, ref_lone = (projects / _uuid() for _ in range(3))
+    for d in (old_lone, young_lone, ref_lone):
+        (d / "tool-results").mkdir(parents=True)
+        (d / "tool-results" / "r.txt").write_text("q" * 50)
+    _age_tree(old_lone, 10)
+    _age_tree(ref_lone, 10)
+    temp_db.create_chat("ref", "user-admin", "a1")
+    temp_db.update_chat("ref", session_id=ref_lone.name)
+
+    stats = _sweep(days=30)
+
+    assert not old_lone.exists()
+    assert young_lone.exists() and ref_lone.exists()
+    assert stats["orphans_deleted"] == 1 and stats["orphan_bytes"] == 50
+
+
+def test_a_link_in_place_of_a_folder_is_left_and_its_target_kept(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    home = _home("a1", "alice")
+    outside = tmp_path / "outside"
+    (outside / "keep").mkdir(parents=True)
+    (outside / "keep" / "precious.txt").write_text("p")
+    orphan = _mk_claude(home, _uuid())
+    orphan.with_suffix("").symlink_to(outside / "keep")
+    _age_file(orphan, 10)
+    # A project folder that is itself a link: nothing behind it is removed.
+    linked = home / ".claude" / "projects" / "-linked"
+    linked.symlink_to(outside)
+    planted = outside / f"{_uuid()}.jsonl"
+    planted.write_text("x")
+    _age_file(planted, 10)
+
+    stats = _sweep(days=30)
+
+    assert not orphan.exists()
+    assert (outside / "keep" / "precious.txt").exists() and planted.exists()
+    assert stats["errors"] == 0
+
+
+def test_an_aged_chat_removes_its_folder_with_its_file(temp_db, monkeypatch):
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    sid = _uuid()
+    temp_db.create_chat("c1", "user-admin", "a1")
+    temp_db.update_chat("c1", session_id=sid)
+    _backdate_chat("c1", 60)
+    cf = _mk_claude(_home("a1", "alice"), sid)
+    folder = _mk_companion(cf)
+
+    stats = _sweep(days=30)
+
+    assert not cf.exists() and not folder.exists()
+    assert stats["session_files_deleted"] == 1 and stats["bytes_freed"] == 500
+
+
+def test_a_dry_run_counts_the_folder_and_removes_nothing(temp_db, monkeypatch):
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    orphan = _mk_claude(_home("a1", "alice"), _uuid())
+    folder = _mk_companion(orphan)
+    _age_file(orphan, 10)
+    _age_tree(folder, 10)
+
+    stats = _sweep(days=30, dry_run=True)
+
+    assert orphan.exists() and folder.exists()
+    assert stats["orphans_deleted"] == 1 and stats["orphan_bytes"] == 500
+
+
 # ---------------------------------------------------------------------------
 # Pass C — codex junk
 # ---------------------------------------------------------------------------
@@ -949,3 +1072,37 @@ def test_storage_usage_shows_what_the_machines_held_at_the_last_sweep(temp_db):
     temp_db.set_platform_setting("session_retention_last_sweep",
                                  json.dumps({"ran_at": "x", "remote_session_files_bytes": None}))
     assert retention.compute_storage_usage()["remote_session_files_bytes"] is None
+
+
+# ---------------------------------------------------------------------------
+# Reply reports: a year after they were filed
+# ---------------------------------------------------------------------------
+
+def _report_filed(chat_id: str, message_id: int, days_ago: int) -> int:
+    from storage import db_reply_reports
+    from storage.pg import get_conn
+    report_id = db_reply_reports.add("user-admin", chat_id, message_id, agent="a1",
+                                     reason="harmful", note="", reply_text="text")
+    with get_conn() as conn:
+        conn.execute("UPDATE reply_reports SET created_at = now() - make_interval(days => %s) "
+                     "WHERE id = %s", (days_ago, report_id))
+        conn.commit()
+    return report_id
+
+
+def _report_ids() -> list[int]:
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        return [r["id"] for r in conn.execute("SELECT id FROM reply_reports ORDER BY id").fetchall()]
+
+
+def test_a_report_goes_a_year_after_it_was_filed(temp_db, monkeypatch):
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    from storage import db_reply_reports
+    temp_db.create_chat("rep-c1", "user-admin", "a1")
+    old = _report_filed("rep-c1", 101, db_reply_reports.KEEP_DAYS + 1)
+    kept = _report_filed("rep-c1", 102, db_reply_reports.KEEP_DAYS - 1)
+    stats = _sweep(enabled=False, dry_run=True)
+    assert stats["reply_reports_deleted"] == 1 and _report_ids() == [old, kept]
+    stats = _sweep(enabled=False)
+    assert stats["reply_reports_deleted"] == 1 and _report_ids() == [kept]

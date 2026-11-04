@@ -20,7 +20,7 @@
     (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches)
   html.classList.toggle('dark', dark)
 
-  // The Android app injects its channel at document start, before any script.
+  // The apps inject their channel at document start, before any script.
   var app = window.OtoDockNative !== undefined
   html.setAttribute('data-boot', app ? 'app' : 'web')
   // An app older than the boot screen paints the strips behind the bars

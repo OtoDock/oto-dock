@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.1/mcps/department.schema.json",
+  "title": "OtoDock department set",
+  "description": "The catalog rules for a department set (OtoDock is a fair source project): one department.json in its own catalog folder, naming the agent templates of the department with their level, the delegation wiring, the head's shared library, the briefing schedules and the bindings between the members' apps. Installing a set creates the department, installs or adopts every member and places it, shares the library and leaves the schedules paused. The platform's set loader (services/community/community_department_sets.py, through storage/catalog_schema.py) refuses a set that breaks these rules and adds the ones a schema cannot state: a template named once, every member's level named in levels, the library's source and a schedule's or a binding's members among the members. The catalog's generator checks what needs the templates beside the set: that each member exists, that a schedule names a task its template ships, that a binding names an app and a binding the from-app declares. Unknown keys are allowed: a catalog is additive. A field read with a default takes null and is read as absent.",
+  "$comment": "x-otodock-first-release: the platform release that first ships this schema and reads the registry's departments key (an older platform lists the templates alone). x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",
+  "x-otodock-first-release": "1.9.1",
+  "type": "object",
+  "required": ["slug", "name", "version", "levels", "members"],
+  "additionalProperties": true,
+  "properties": {
+    "$schema": {
+      "type": ["string", "null"],
+      "description": "The schema this file follows, for an editor. Ignored by the platform."
+    },
+    "schema_version": {
+      "type": ["string", "integer", "null"],
+      "description": "The set format; \"1\". Read by no platform release."
+    },
+    "slug": {
+      "$ref": "#/$defs/slug",
+      "description": "The set's identity. In the catalog it equals the folder name. Never an installed agent's slug."
+    },
+    "name": {
+      "$ref": "#/$defs/departmentName",
+      "description": "The department's default name on the install dialog, and the library's name when the set shares one. A person may rename it at the install."
+    },
+    "description": {
+      "type": ["string", "null"],
+      "description": "One or two sentences for the set's card."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "x-otodock-hint": "invalid version {value} (MAJOR.MINOR.PATCH)",
+      "description": "The set's release. The installed department records it."
+    },
+    "color": {
+      "type": ["string", "null"],
+      "pattern": "^(#[0-9A-Fa-f]{6})?$",
+      "x-otodock-hint": "invalid color {value} (must be #RRGGBB)",
+      "not": {"type": "string", "pattern": "\\n"},
+      "description": "The card's accent; absent, the head member's."
+    },
+    "category": {"type": ["string", "null"], "description": "The catalog's grouping."},
+    "tags": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Lowercase search words."},
+    "author": {"type": ["string", "null"]},
+    "author_url": {"type": ["string", "null"]},
+    "license": {"type": ["string", "null"], "description": "An SPDX identifier (the catalog's entries are Apache-2.0)."},
+    "platform_min_version": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+",
+      "x-otodock-hint": "invalid release {value} (MAJOR.MINOR.PATCH)",
+      "description": "The oldest platform release that installs the set. A set needs 1.9.1 at least: an older platform never lists it."
+    },
+    "deprecated": {"type": ["boolean", "null"], "description": "A frozen entry kept for older installs; the catalog marks it."},
+    "deprecation_note": {"type": ["string", "null"], "description": "What to install instead."},
+    "mode": {
+      "enum": ["off", "down", "down_across", "both", null],
+      "description": "The delegation mode the department is created with (the platform's words). Absent or null means down."
+    },
+    "reach": {
+      "enum": ["adjacent", "subtree", null],
+      "description": "How many levels a wired link spans. Absent or null means adjacent."
+    },
+    "levels": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/nonEmptyString"},
+      "x-otodock-hint": "must name 1 to 8 levels, each once, the top level first",
+      "description": "The department's levels, the top level first."
+    },
+    "members": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 24,
+      "items": {"$ref": "#/$defs/member"},
+      "x-otodock-hint": "must name 1 to 24 members",
+      "description": "The agent templates of the department, each at a level. The platform installs them in this order."
+    },
+    "library": {
+      "type": ["object", "null"],
+      "required": ["source"],
+      "additionalProperties": true,
+      "properties": {
+        "source": {"$ref": "#/$defs/slug", "description": "The member whose knowledge folder becomes the library (the head, as a rule)."},
+        "subdir": {
+          "type": ["string", "null"],
+          "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))[^\\n]*$",
+          "x-otodock-hint": "invalid folder {value} (a path under knowledge/, no leading slash, no ..)",
+          "description": "The folder under the source's knowledge/ that is shared, '' or absent for the whole folder. Made when missing."
+        },
+        "writable": {"type": ["boolean", "null"], "description": "Whether the other members may write into the library. Absent or null means read only."}
+      },
+      "description": "The library the install shares from one member to every other member, named after the department."
+    },
+    "schedules": {
+      "type": ["array", "null"],
+      "items": {"$ref": "#/$defs/schedule"},
+      "description": "The briefing schedules among the members' tasks: named so the install can list them and prove they are paused. The templates seed them."
+    },
+    "bindings": {
+      "type": ["array", "null"],
+      "items": {"$ref": "#/$defs/binding"},
+      "description": "The bindings between the members' apps, named so the catalog can prove each exists. The apps keep naming the members' default slugs."
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {"type": "string", "pattern": "\\S", "x-otodock-hint": "must not be empty"},
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,38}[a-z0-9]$",
+      "not": {"type": "string", "pattern": "\\n"},
+      "x-otodock-hint": "invalid slug {value} (3 to 40 lowercase letters, digits and dashes, starting with a letter and ending with a letter or a digit)"
+    },
+    "departmentName": {
+      "type": "string",
+      "pattern": "^(?![ \\t])(?!.*[ \\t]$)[^/\\\\:*?\"<>|\\n]{1,64}$",
+      "x-otodock-hint": "invalid name {value} (1 to 64 characters, none of / \\ : * ? \" < > |, no space at either end)"
+    },
+    "member": {
+      "type": "object",
+      "required": ["template", "level"],
+      "additionalProperties": true,
+      "properties": {
+        "template": {"$ref": "#/$defs/slug", "description": "The template's slug in this catalog."},
+        "level": {"$ref": "#/$defs/nonEmptyString", "description": "One of the set's levels."}
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["member", "task"],
+      "additionalProperties": true,
+      "properties": {
+        "member": {"$ref": "#/$defs/slug", "description": "A member's template."},
+        "task": {"$ref": "#/$defs/nonEmptyString", "description": "The slug of an agent-scope task that template ships."}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "required": ["from", "app", "to", "to_app"],
+      "additionalProperties": true,
+      "properties": {
+        "from": {"$ref": "#/$defs/slug", "description": "The member whose app calls the other."},
+        "app": {"$ref": "#/$defs/nonEmptyString", "description": "That member's app, by its slug."},
+        "to": {"$ref": "#/$defs/slug", "description": "The member whose app is called."},
+        "to_app": {"$ref": "#/$defs/nonEmptyString", "description": "That member's app, by its slug."}
+      }
+    }
+  }
+}

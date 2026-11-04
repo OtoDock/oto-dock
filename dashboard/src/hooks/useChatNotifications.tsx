@@ -8,6 +8,7 @@ import { useNotifications } from './useNotifications'
 import { useNotificationSound } from './useNotificationSound'
 import { usePushSubscription } from './usePushSubscription'
 import { useAgents } from '../api/agents'
+import { isAlarm } from '../lib/status/notificationSeverity'
 import { INBOX_KEY, useAcceptShare, useDeclineShare, useHideShare, useShareInbox, type ShareInboxItem } from '../api/shares'
 import type {
   NotificationCountFrame, NotificationFrame, NotificationSilentFrame, ShareInboxFrame,
@@ -58,7 +59,7 @@ export function useChatNotifications() {
   // Auto-stop the danger alarm once no danger toasts remain (covers every
   // dismiss path).
   useEffect(() => {
-    const hasDanger = notif.toasts.some(t => t.delivery.severity === 'danger')
+    const hasDanger = notif.toasts.some(t => isAlarm(t.delivery.severity))
     if (!hasDanger) stopDangerAlarm()
   }, [notif.toasts, stopDangerAlarm])
 

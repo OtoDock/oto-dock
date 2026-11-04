@@ -1,7 +1,7 @@
 # `mcps/_shared` — reusable Docker-MCP building blocks
 
-Shared, **MCP-agnostic** components mounted into individual Docker-MCP images at
-build time. Single source of truth — edit here, every consumer rebuilds against it.
+Shared, **MCP-agnostic** components. Each consumer keeps its own copy in its folder, byte for byte the same as
+the one here. Edit the copy here first, then every consumer's copy.
 
 ## `stream_sidecar.py` — session-lifecycle sidecar
 
@@ -16,18 +16,23 @@ the MCP behind it. It adds the session lifecycle the OtoDock layer needs:
   leaks the server's per-session state, e.g. a browser context);
 - exposes **`POST /internal/close-session {"session_id"}`** so the OtoDock proxy
   (`proxy/services/infra/browser_session.py`) tears a session down the instant it kills
-  the agent session.
+  the agent session;
+- exposes **`GET /internal/sessions?except_prefix=<p>`** → `{"open": n}`, the
+  sessions whose OtoDock id does not start with `<p>` (camoufox's health checker
+  leaves its own sessions out this way to tell when the browser is idle). No
+  session ids leave the container.
 
-Everything else **streams straight through** (transparent proxy) with no
-read-timeout, so long browser actions and the long-lived server→client SSE `GET`
-both pass untouched. An idle SSE stream gets periodic keepalive comments.
+Everything else **streams straight through** (transparent proxy): the
+long-lived server→client SSE `GET` has no read timeout, a request/response call
+is bounded by `OTO_MCP_CALL_TIMEOUT_S`. An idle SSE stream gets periodic
+keepalive comments, and every write to an attached client refreshes its session,
+so a quiet client that stays connected is never idle-GC'd. A request whose
+session the server no longer knows (a 404 upstream) drops it from the map.
 
-It deliberately does **not** try to keep a session alive across a client GET drop
-or a think-gap: `@playwright/mcp@0.0.55` evicts an idle isolated session on its
-own (~10s, verified directly against the server with no sidecar in path), so a
-re-`initialize` on the next call is unavoidable either way — and it's sub-second
-given the proxy streaming fix. (A stream "broker" that keeps sessions alive
-across drops was evaluated and rejected as not worth the complexity.)
+It deliberately does **not** keep a session alive on a client's behalf: a
+session lives while its client holds the standalone `GET` and answers the
+server's heartbeat pings (a ping every 3 s from the session's first tool call,
+the session closed when one goes unanswered for 5 s).
 
 ### Env contract
 
@@ -37,38 +42,17 @@ across drops was evaluated and rejected as not worth the complexity.)
 | `ROUTER_PORT` | `8931` | the public port the sidecar listens on |
 | `SESSION_IDLE_S` | `600` | idle-GC: tear down a session idle this long |
 | `SSE_KEEPALIVE_S` | `20` | client-SSE idle keepalive-comment interval |
-| `OTO_MCP_SUPPRESS_SERVER_REQUESTS` | `0` | **temporary workaround** (see below) — strip the client's `roots` capability + reject the standalone SSE `GET` so a buggy MCP can't issue server→client requests (`roots/list`, `ping`) it then fails to correlate |
-
-### Temporary workaround: `OTO_MCP_SUPPRESS_SERVER_REQUESTS`
-
-Some streamable-HTTP MCP *server* builds issue server→client JSON-RPC requests
-(`roots/list` when the client advertises the `roots` capability — claude-code
-does — and periodic `ping`) but **fail to correlate the client's POSTed response**
-back to the pending request. The server then blocks every first tool call until
-its 60s server-request timeout fires, so a `browser_navigate` "hangs ~60s then
-times out with a blank page."
-
-This is confirmed on **`@playwright/mcp@0.0.55`** (the version `camoufox` pins for
-patched-Firefox connect compatibility) — reproduced driving the MCP *directly*
-(no sidecar, no satellite tunnel). `@playwright/mcp@0.0.68` fixes it but is **not
-camoufox-compatible** (hard-pinned to an npm playwright *alpha* that can't be
-matched to camoufox 0.4.11's PyPI playwright). So until camoufox can move to a
-fixed, connect-compatible build, set `OTO_MCP_SUPPRESS_SERVER_REQUESTS=1` for that
-MCP. The sidecar then prevents the server from ever issuing those requests by
-(a) stripping `capabilities.roots` from `initialize`, and (b) rejecting the
-optional standalone SSE `GET` with `405` (spec-allowed — a compliant client
-receives results on its POST responses instead). A browser MCP needs neither.
-
-**To remove:** once the MCP runs a build that correlates server→client responses
-correctly, unset the flag in that MCP's compose env and confirm a
-`browser_navigate` returns sub-second. The gated code in `stream_sidecar.py` is
-self-contained and can then be deleted.
+| `OTO_MCP_CALL_TIMEOUT_S` | `90` | read limit of a request/response call (a wedged tool call answers 502) |
+| `SCREENSHOTS_DIR` | `/screenshots` | the shared screenshots folder the GC pass keeps small (nothing happens when it does not exist) |
+| `SCREENSHOTS_MAX_AGE_S` | `2400` | a screenshot older than this is removed |
+| `SCREENSHOTS_MAX_COUNT` | `200` | past the newest this many, a screenshot older than the grace is removed |
+| `SCREENSHOTS_GRACE_S` | `180` | the count limit never removes a screenshot younger than this |
 
 ### How to use it (vendored copy)
 
 Consumer MCPs are **self-contained**: vendor a copy of `stream_sidecar.py` into
-the MCP's own folder (kept in sync with this reference copy) and copy it in the
-MCP's `Dockerfile`:
+the MCP's own folder, byte for byte the same as this reference copy (the
+community catalog's `camoufox/stream_sidecar.py`), and copy it in the MCP's `Dockerfile`:
 
 ```dockerfile
 RUN pip install --no-cache-dir aiohttp
@@ -89,7 +73,8 @@ The first consumer is the community catalog's `camoufox`.
 ### Tests
 
 Unit tests for the pure session-map logic (open/refresh, the oto↔mcp mapping, the
-oto-reuse remap guard) live in the proxy's test suite rather than in this tree:
+oto-reuse remap guard, the attached-stream refresh, the session count, one GC
+pass) live in the proxy's test suite rather than in this tree:
 **`proxy/tests/mcp/test_stream_sidecar.py`** (it points its import back here).
 aiohttp is imported lazily, so it runs with no deps:
 

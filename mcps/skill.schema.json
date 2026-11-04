@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.0/mcps/skill.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.1/mcps/skill.schema.json",
   "title": "OtoDock skill front matter",
   "description": "The catalog rules for the front matter of an Agent Skill's SKILL.md (OtoDock is a fair source project): the YAML mapping between the two --- fences that open the file, cut by the rule of services/mcp/skill_format.py (the engines' own). It applies to the skills of a skill package (the community skills catalog) and to the skills an MCP package bundles. At install the platform keeps only name, description, license, compatibility and metadata and drops every other key, so a key an engine would read as a permission never reaches it; other keys are allowed here because they are dropped, not refused. A flat skill file without front matter is legal in an MCP package (the platform writes one when it serves the skill); a skill package's SKILL.md carries one.",
   "$comment": "Custom annotation keywords, ignored by validators. x-otodock-first-release: the platform release that first ships this schema. x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",

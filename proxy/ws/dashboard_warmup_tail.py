@@ -17,6 +17,7 @@ time, never bound here.
 import asyncio
 import contextlib
 import functools
+import json
 import logging
 import time
 import uuid
@@ -25,11 +26,13 @@ from typing import TYPE_CHECKING, cast
 
 import psycopg
 
+import config
 from core import execution_mode, placement
 from core.events import chat_writer, input_queue
+from core.events.common_events import carries_prompt, photos_not_attached
 from core.execution_layer import ExecutionLayer, MachineReach, ResumeVerdict
 from core.sandbox.session_config_dir import AgentStateRefused
-from core.session import interactive_session, warmup_registry
+from core.session import interactive_session, visibility as _vis, warmup_registry
 from core.session.history_seed import consume_pending_seed_digest
 from core.session.resume_probe import ResumeUndecided, settle_resume
 from core.session.session_state import clear_session_liveness, get_session_mode
@@ -41,7 +44,12 @@ from storage import database as task_store, remote_store
 # its helpers are imported inside the functions that call them: this
 # module imports first too (tests/core/test_import_layers.py).
 from ws import wire_events as wire
-from ws.dashboard_chat_text import MACHINE_BUSY_NOT_SENT, SESSION_FILES_UNREAD_NOT_SENT
+from ws.dashboard_chat_text import (
+    MACHINE_BUSY_NOT_SENT,
+    MACHINE_GONE,
+    MACHINE_GONE_NOT_SENT,
+    SESSION_FILES_UNREAD_NOT_SENT,
+)
 
 if TYPE_CHECKING:
     from ws.dashboard import _SpawnResult
@@ -238,7 +246,9 @@ class WarmupTail(_Host):
                 run.seed_reason_claimed = _pre_claim_reason
         # A reseeded prompt's digest is multi-line → keep it off Codex's launch
         # argv (Windows cmdline limit + structure loss); it's pasted via the PTY.
-        run.argv_first_prompt = "" if run.seed_digest else w.msg.get("text", "")
+        # So is a first message with attachments: their Read paths are lines.
+        attached = bool(w.msg.get("images") or w.msg.get("files"))
+        run.argv_first_prompt = "" if (run.seed_digest or attached) else w.msg.get("text", "")
 
     async def _tail_start(self, w: _TailArgs, run: _TailRun) -> None:
         """The spawn: an existing chat resumes its session or starts fresh, a
@@ -663,20 +673,63 @@ class WarmupTail(_Host):
             # for true unavailability; a satellite that ran the command and
             # returned an error surfaces as "Satellite command error: ...".
             emsg = str(e)
+            gone = "not connected" in emsg or "command timeout" in emsg
             if isinstance(e, AgentStateRefused):
                 fail_reason = wire.REASON_BELOW_EDITOR
             else:
-                fail_reason = (
-                    "target_unavailable"
-                    if ("not connected" in emsg or "command timeout" in emsg)
-                    else "session_error"
-                )
+                fail_reason = "target_unavailable" if gone else "session_error"
+            if gone:
+                logger.info("WS dashboard warmup: the machine dropped off chat=%s: %s", w.wcid, emsg)
+                # The connection layer's own words name the machine by its
+                # id: the person reads what happened and what to do, and
+                # "your message" only when one rides the start.
+                waiting = carries_prompt(w.msg) or bool(input_queue.peek(w.wcid))
+                emsg = MACHINE_GONE_NOT_SENT if waiting else MACHINE_GONE
             await warmup_registry.emit(w.wcid, {
                 "type": wire.WARMUP_FAILED,
                 "chat_id": w.wcid,
                 "error": emsg,
                 "reason": fail_reason,
             })
+
+    async def _first_prompt_with_attachments(self, w: _TailArgs) -> str | None:
+        """A terminal's first prompt: the person's text with the Read paths of
+        its photos and files, the ones the warm-up saved read back (and pushed
+        to the session's machine) as a typed send's are. Photos that could not
+        be read back, or that this person may not save (refused again here),
+        go without: the rest is submitted, the notice row follows the person's
+        (written at the warm-up, before any reply) and, while the page views
+        the chat, its frame counts the warm-up's drops too. None when there is
+        no text and nothing reached the agent: nothing is typed (the warm-up
+        wrote no row) and the page is told why."""
+        from ws.dashboard_chat_support import AttachmentsRefused
+        text = w.msg.get("text", "")
+        images, files = w.msg.get("images") or [], w.msg.get("files") or []
+        if not images and not files:
+            return text
+        process = functools.partial(
+            self._process_attachments, agent=w.w_agent, agent_dir=config.get_agent_dir(w.w_agent),
+            is_agent_scoped=_vis.is_shared_only(w.w_agent), username=self.user.get("username") or "",
+            is_direct_llm=False)
+        try:
+            cli_text, _imgs, image_meta, valid_files = await process(text, images, files)
+        except AttachmentsRefused:
+            image_meta = []
+            cli_text, _imgs, _meta, valid_files = await process(text, [], files)
+        viewed = self.chat_id == w.wcid and not self._ws_gone
+        if not (text or image_meta or valid_files):
+            if viewed:
+                await self._refuse_input(wire.NOTHING_REACHED_THE_AGENT)
+            return None
+        if dropped := photos_not_attached(images, image_meta):
+            await chat_writer.submit(w.wcid, functools.partial(
+                task_store.add_chat_message, w.wcid, "event", "", event_type=wire.SYSTEM,
+                event_data=json.dumps(wire.photos_not_attached_block(dropped)),
+            ), label="photos_not_attached")
+        told = dropped + int(w.msg.get("_photos_dropped") or 0)
+        if told and viewed:
+            await self._send({**wire.photos_not_attached_block(told), "chat_id": w.wcid})
+        return cli_text
 
     async def _tail_first_turn(self, w: _TailArgs, run: _TailRun) -> None:
         """After the spawn: the deferred mode/model re-applied, then the first
@@ -695,10 +748,13 @@ class WarmupTail(_Host):
         # chats / reloading mid-warmup. Codex fresh spawns delivered it via
         # the launch argv instead (auto-runs) — skip those (double-send).
         if res.interactive:
-            first_text = w.msg.get("text", "")
-            if first_text and not res.first_prompt_in_argv:
+            if carries_prompt(w.msg) and not res.first_prompt_in_argv:
                 isess = interactive_session.get(res.session_id)
-                if isess is not None and isess.alive:
+                # The photos and files ride as Read paths, as a typed send's
+                # do (pty_attachments); None: nothing of it reached the agent.
+                first_text = (await self._first_prompt_with_attachments(w)
+                              if isess is not None and isess.alive else None)
+                if isess is not None and first_text is not None:
                     # Stamp the time and the viewer-focus line at delivery
                     # (parity with the -p pump's injection; the client
                     # sends the text RAW so a declined-to-headless kick
@@ -744,9 +800,9 @@ class WarmupTail(_Host):
         # no-ops — the flag is already cleared). A genuine -p chat reseeds in
         # _start_new_stream (seed_digest is '' here).
         kick_text = w.msg.get("text", "")
-        if run.seed_digest and kick_text:
+        if run.seed_digest and carries_prompt(w.msg):
             kick_text = f"{run.seed_digest}\n\n{kick_text}"
-        if not kick_text:
+        if not carries_prompt(w.msg):
             # No first turn: what was sent while it got ready goes now.
             self._drop_warmup_mark(w.wcid)
             if input_queue.peek(w.wcid):
@@ -773,4 +829,5 @@ class WarmupTail(_Host):
                 "images": w.msg.get("images", []),
                 "files": w.msg.get("files", []),
                 "focus_line": w.msg.get("_focus_line", ""),
+                "_photos_dropped": w.msg.get("_photos_dropped", 0),
             })

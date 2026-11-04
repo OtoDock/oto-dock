@@ -24,7 +24,7 @@ import yaml
 
 import config
 from core.config import deployment
-from services.mcp import mcp_manifest_types as _mt
+from services.mcp import compose_progress, mcp_manifest_types as _mt
 
 logger = logging.getLogger("otodock.docker-manager")
 
@@ -185,8 +185,9 @@ def _run_compose_streaming(
     that swallowed pull/build progress entirely, so a fresh install read as a
     hang. stderr (compose writes progress AND errors there) is buffered in
     full for the callers' overlap/permission checks; progress-shaped lines log
-    at INFO throttled to ~one per 5s. stdout is discarded — no caller of the
-    long ops reads it.
+    at INFO throttled to ~one per 5s, and the latest one is the MCP's record
+    in ``compose_progress`` while the run lasts. stdout is discarded — no
+    caller of the long ops reads it.
 
     The run is its own process group, read through a poll on the descriptor
     (a child that keeps the pipe open never blocks the reader). At
@@ -206,6 +207,7 @@ def _run_compose_streaming(
         )
         run = _LiveRun(proc)
         _live_groups[proc.pid] = run
+    tracker = compose_progress.Tracker(manifest.name)
     assert proc.stderr is not None
     fd = proc.stderr.fileno()
     sel = selectors.DefaultSelector()
@@ -239,12 +241,14 @@ def _run_compose_streaming(
                 if not run.containers and _CONTAINER_STEP_RE.search(raw):
                     run.containers = True
                 stripped = raw.decode("utf-8", "replace").strip()
+                tracker.feed(stripped)
                 if stripped and _PROGRESS_RE.search(stripped) and last_byte - last_log >= 5.0:
                     logger.info("%s: %s", manifest.name, stripped[:200])
                     last_log = last_byte
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=_TERM_GRACE_S)
     finally:
+        tracker.close()
         sel.close()
         proc.stderr.close()
         with _live_lock:

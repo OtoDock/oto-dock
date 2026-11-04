@@ -4,6 +4,7 @@ import { useFcmPush } from '../hooks/useFcmPush'
 import { useWakeWord } from '../hooks/useWakeWord'
 import { useBuildWatch } from '../hooks/useBuildWatch'
 import { useOpenAppToast } from '../hooks/useOpenAppToast'
+import { useStoreReview } from '../hooks/storeReview/useStoreReview'
 import WakeDiagBadge from './WakeDiagBadge'
 import LoginPage from '../pages/LoginPage'
 import SetupWizard from '../pages/SetupWizard'
@@ -30,6 +31,10 @@ export default function RequireAuth() {
   // An agent's request to show one of its apps that the current page could
   // not handle itself becomes a notice with an Open button, route-independent.
   const openAppToast = useOpenAppToast(navigate, !!user)
+
+  // The apps' store review ask, route-independent too; never past the
+  // forced password and second-factor screens, never in a browser.
+  useStoreReview(user && !user.must_change_password && !user.must_enroll_2fa ? user.sub : null)
 
   // The boot screen stays over the placeholders (data-boot-wait) and leaves
   // at the first real screen: the wizard, the login page, the redirect

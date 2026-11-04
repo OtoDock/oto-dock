@@ -1,6 +1,8 @@
 import { apiFetch } from './auth'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiJson } from '../lib/http/apiJson'
+import type { AgentRole } from '../lib/permissions'
+import { NOTIFICATION_SEVERITIES, type NotificationSeverity } from '../lib/status/notificationSeverity'
 
 export interface Trigger {
   /** Set on a row the offboarding transfer moved: the first creator's sub,
@@ -38,6 +40,8 @@ export interface Trigger {
   notify_body: string | null
   notify_target_scope: string | null
   notify_target: string | null
+  // Who an agent-scope notify tells. Optional: absent on an older proxy.
+  notify_audience?: AgentRole
   debounce_seconds: number
   enabled: boolean
   fired_count: number
@@ -58,8 +62,8 @@ export interface Trigger {
 }
 
 /** A trigger notification's severities (the notify block's select). */
-export const NOTIFY_SEVERITIES = ['info', 'success', 'warning', 'danger'] as const
-export type NotifySeverity = (typeof NOTIFY_SEVERITIES)[number]
+export const NOTIFY_SEVERITIES = NOTIFICATION_SEVERITIES
+export type NotifySeverity = NotificationSeverity
 
 export interface NotifyConfig {
   enabled?: boolean
@@ -68,6 +72,7 @@ export interface NotifyConfig {
   body?: string
   target_scope?: 'user' | 'agent' | 'global'
   target?: string
+  audience?: AgentRole
 }
 
 export interface CreateTriggerRequest {
@@ -101,6 +106,7 @@ export interface EditTriggerRequest {
   notify_body?: string | null
   notify_target_scope?: string | null
   notify_target?: string | null
+  notify_audience?: AgentRole
   debounce_seconds?: number
   event_filter?: Record<string, unknown> | null
   // The vendor subscription, bindable after creation ('' unbinds).

@@ -495,26 +495,34 @@ async def test_an_outbound_call_binds_from_the_originate_response_in_either_orde
     conn = _Conn()
     mgr.expect_originate("7", "aid1", "uuid-1")
     mgr._on_originate("7", "aid1", "Success", "1760000000.77", _LOCAL1, "4")
+    assert mgr.outbound_call("7", "uuid-1") is None      # no media leg yet
     assert mgr.bind_outbound("7", "uuid-1", conn) is True
     assert mgr.outbound_bound("7", "uuid-1") and mgr.call_channel("7", "1760000000.77") == _LOCAL1
+    # The transfer's Redirect target, under the call's audio uuid.
+    assert mgr.outbound_call("7", "uuid-1") == ("1760000000.77", _LOCAL1)
+    assert mgr.outbound_call("8", "uuid-1") is None
     mgr._on_dtmf("7", "1760000000.77", "1", 80)
     mgr._on_dtmf("7", "1760000000.78", "9", 80)       # the ;2 leg: unmatched
     assert conn.got == [("1", 80)] and made[0].unmatched_events == 1
     mgr.unbind_outbound("7", "uuid-1")
     mgr._on_dtmf("7", "1760000000.77", "2", 80)
     assert conn.got == [("1", 80)] and not mgr.outbound_bound("7", "uuid-1")
+    assert mgr.outbound_call("7", "uuid-1") is None
 
     # The media leg arrives first: held, then bound when the event lands.
     conn = _Conn()
     mgr.expect_originate("7", "aid2", "uuid-2")
     assert mgr.bind_outbound("7", "uuid-2", conn) is False
+    assert mgr.outbound_call("7", "uuid-2") is None
     mgr._on_dtmf("7", "1760000001.10", "5", 80)       # nothing bound yet
     mgr._on_originate("7", "aid2", "Success", "1760000001.10", _LOCAL1, "4")
     assert mgr.outbound_bound("7", "uuid-2")
+    assert mgr.outbound_call("7", "uuid-2") == ("1760000001.10", _LOCAL1)
     mgr._on_dtmf("7", "1760000001.10", "5", 80)
     assert conn.got == [("5", 80)]
-    mgr.unbind_outbound("7", "uuid-2")
     await mgr.stop()
+    assert mgr.outbound_call("7", "uuid-2") is None
+    mgr.unbind_outbound("7", "uuid-2")                 # no-op after stop
 
 
 async def test_an_originate_that_failed_or_was_not_ours_binds_nothing(monkeypatch):

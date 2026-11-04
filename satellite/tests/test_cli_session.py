@@ -71,11 +71,14 @@ class TestWriteCliHooks:
         assert settings["syncClaudeAiSkills"] is False
         assert settings["syncClaudeAiPlugins"] is False
         assert settings["disableClaudeAiConnectors"] is True
+        assert settings["useAutoModeDuringPlan"] is False
         # Every built-in plugin but the four the platform keeps (Claude Code
         # 2.1.287+) is off by name, as the proxy builder writes them.
         from satellite.sessions.cli_session import DISABLED_BUILTIN_PLUGINS
         assert settings["enabledPlugins"] == {p: False for p in DISABLED_BUILTIN_PLUGINS}
         assert "cc-plugin-plugin-authoring@builtin" in DISABLED_BUILTIN_PLUGINS
+        assert "cc-plugin-easel@builtin" in DISABLED_BUILTIN_PLUGINS
+        assert "cc-plugin-claude-platform@builtin" in DISABLED_BUILTIN_PLUGINS
 
     def test_hook_paths_point_to_dir(self, tmp_path):
         _write_cli_hooks(tmp_path)
@@ -303,10 +306,12 @@ async def _capture_start_cmd(session):
 
     async def capture_exec(*args, **kwargs):
         captured["cmd"] = args
+        captured["env"] = kwargs.get("env") or {}
         return mock_proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=capture_exec):
         await session.start()
+    session._captured_env = captured["env"]
     return captured["cmd"]
 
 
@@ -321,7 +326,17 @@ class TestCLISessionFlagParity:
         assert "--permission-mode" in cmd
         assert cmd[cmd.index("--permission-mode") + 1] == "plan"
         assert "--dangerously-skip-permissions" not in cmd
-        assert "--permission-prompt-tool" not in cmd
+        # Claude Code 2.1.299+ asks for a call the hook allowed in plan
+        # mode; the proxy answers that ask from the gate's record.
+        assert cmd[cmd.index("--permission-prompt-tool") + 1] == "stdio"
+
+    @pytest.mark.asyncio
+    async def test_the_advisor_tool_is_off(self, tmp_agent_dir, cli_config, sat_config):
+        """Claude Code's advisor is a model call the platform can neither
+        meter nor show (mirrors the proxy env builder)."""
+        session = CLISession("sess-adv", tmp_agent_dir, cli_config, sat_config)
+        await _capture_start_cmd(session)
+        assert session._captured_env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
 
     @pytest.mark.asyncio
     async def test_native_permissions_uses_mode(self, tmp_agent_dir, cli_config, sat_config):
@@ -611,6 +626,42 @@ class TestCLISessionOneReader:
             await nxt
         await second.aclose()
         assert forwarded == []
+
+
+class TestCLISessionDrainBound:
+    """The post-turn forwarder runs as long as the proxy waits for the
+    background work (``drain_bg_s``, its background-work ceiling, 0.5.167):
+    before, it stopped after ten minutes, so a research sub-agent's lines,
+    its end and the CLI's own wake turn never reached the proxy. A proxy
+    that names no bound keeps ten minutes (it reads nothing longer)."""
+
+    def test_the_proxys_bound_is_kept(self, tmp_agent_dir, cli_config, sat_config):
+        session = CLISession("sess-b", tmp_agent_dir, cli_config, sat_config)
+        session.request_stop_turn(drain_bg=True, drain_bg_s=7200)
+        assert session._drain_bg and session._drain_bg_s == 7200.0
+
+    @pytest.mark.parametrize("bound", [None, 0, -5, "7200"])
+    def test_no_usable_bound_keeps_ten_minutes(self, tmp_agent_dir, cli_config, sat_config, bound):
+        session = CLISession("sess-b", tmp_agent_dir, cli_config, sat_config)
+        session.request_stop_turn(drain_bg=True, drain_bg_s=bound)
+        assert session._drain_bg_s == 600.0
+
+    @pytest.mark.asyncio
+    async def test_the_drain_ends_at_its_bound(self, tmp_agent_dir, cli_config, sat_config):
+        session = CLISession("sess-b", tmp_agent_dir, cli_config, sat_config)
+        session.proc = _FakeProc([])
+
+        async def quiet() -> bytes:
+            await asyncio.sleep(0.02)
+            return b"\n"
+
+        session.proc.stdout.readline = AsyncMock(side_effect=quiet)
+        session.request_stop_turn(drain_bg=True, drain_bg_s=0.1)
+
+        async def forward(ev):
+            pass
+
+        await asyncio.wait_for(session._bg_drain_loop(forward), timeout=5)
 
 
 class TestCLISessionPermissionAnswer:

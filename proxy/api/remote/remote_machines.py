@@ -55,6 +55,9 @@ def _merge_live_status(machine: dict) -> dict:
     machine["status"] = live["state"]
     machine["last_heartbeat_age_s"] = live["last_heartbeat_age_s"]
     machine["reachable"] = live["reachable"]
+    machine["link_ok"] = live["link_ok"]
+    machine["link_down_s"] = live["link_down_s"]
+    machine["link_error"] = live["link_error"]
     if live["last_seen_iso"]:
         machine["last_seen"] = live["last_seen_iso"]
     return machine
@@ -65,13 +68,16 @@ router = APIRouter()
 router.include_router(_chat_placement.router)
 
 
-def _cli_pins_by_binary() -> dict[str, str]:
+def _cli_pins_by_binary(satellite_version: str = "") -> dict[str, str]:
     """``{binary: pinned version}`` for every engine with a CLI — the machine
     cards judge ``capabilities.cli_status`` (keyed by binary name) against
-    these. Read at call time, never frozen at import."""
+    these: the pin the machine's satellite was sent (``_cli_pins`` in the
+    satellite socket), so a machine kept on an older CLI until its satellite
+    updates is not shown out of step. Read at call time, never frozen at
+    import."""
     from core.session.session_manager import get_all_layers
     return {
-        layer.capabilities.runtime.binary: layer.pinned_cli_version()
+        layer.capabilities.runtime.binary: layer.pinned_cli_version_for(satellite_version)
         for layer in get_all_layers().values()
         if layer.capabilities.runtime.binary
     }
@@ -629,6 +635,17 @@ class SetBrowserUnattendedRequest(BaseModel):
     enabled: bool
 
 
+class SetAllRolesRequest(BaseModel):
+    # "Every role of its agents runs here" (``placement.admits_every_role``).
+    enabled: bool
+
+
+class SetBrowserProfileRequest(BaseModel):
+    # "Browser profile": the profile that has the Playwright Extension, as
+    # the browser names it ("" = the one profile that has it).
+    profile: str = ""
+
+
 class ExchangeTokenRequest(BaseModel):
     machine_id: str
     pairing_token: str
@@ -720,7 +737,6 @@ async def list_machines(user: UserContext | None = Depends(get_current_user)):
     # Per-machine (not top-level): the dashboard's useRemoteMachines hook
     # returns data.machines and would drop an envelope key. Lets the cards
     # judge capabilities.cli_status against the platform's pinned versions.
-    cli_pins = _cli_pins_by_binary()
     for m in machines:
         try:
             m["capabilities"] = json.loads(m.get("capabilities", "{}") or "{}")
@@ -730,7 +746,7 @@ async def list_machines(user: UserContext | None = Depends(get_current_user)):
         # dashboard receives string[].
         m["device_grants"] = sorted(placement.parse_device_grants(m.get("device_grants")))
         _shape_browser_fields(m)
-        m["cli_pins"] = cli_pins
+        m["cli_pins"] = _cli_pins_by_binary(str(m.get("satellite_version") or ""))
         _merge_live_status(m)
     return {"machines": machines}
 
@@ -761,7 +777,7 @@ async def get_machine(
     machine["device_grants"] = sorted(placement.parse_device_grants(machine.get("device_grants")))
     _shape_browser_fields(machine)
     machine["assigned_agents"] = assigned_agents
-    machine["cli_pins"] = _cli_pins_by_binary()
+    machine["cli_pins"] = _cli_pins_by_binary(str(machine.get("satellite_version") or ""))
     _merge_live_status(machine)
     return machine
 
@@ -973,6 +989,37 @@ async def admin_set_allow_full_fs(
         raise HTTPException(status_code=404, detail="Machine not found")
     await _push_policy_update(machine_id)
     return {"ok": True, "allow_full_fs": body.enabled}
+
+
+# --- every role of an admin machine's agents (admin scope) ---
+
+
+@router.put("/v1/admin/remote-machines/{machine_id}/all-roles")
+async def admin_set_all_roles(
+    machine_id: str,
+    body: SetAllRolesRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Whether every role of the agents whose default place is this ADMIN
+    machine runs there (``{enabled}``); off, a role below the owner tier runs
+    on the platform host. A personal machine is its owner's (403). Nothing
+    live: each session's next start reads it."""
+    u = require_admin(user)
+
+    def _job() -> dict:
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
+            raise HTTPException(status_code=404, detail="Machine not found")
+        if not placement.machine_is_admin_paired(machine):
+            raise HTTPException(status_code=403, detail=(
+                "This setting is for the machines an admin paired for the platform. "
+                "A person's own computer runs only their chats."))
+        remote_store.set_all_roles_run_here(machine_id, body.enabled)
+        logger.info("Every role of its agents runs on %s: %s (by %s)", machine_id[:8],
+                    "on" if body.enabled else "off", (u.sub or "")[:16])
+        return {"ok": True, "all_roles_run_here": bool(body.enabled)}
+
+    return await run_db(_job)
 
 
 # --- per-machine concurrent-session override (admin scope) ---
@@ -1251,6 +1298,46 @@ def _apply_browser_unattended(machine: dict, enabled: bool) -> dict:
     return {"ok": True, "browser_unattended": bool(enabled)}
 
 
+def _apply_browser_profile(machine: dict, raw: str) -> dict:
+    """The machine's ``Browser profile``: trimmed, one line, at most
+    ``BROWSER_PROFILE_MAX`` characters; a name needs ``own`` (a clear does
+    not)."""
+    profile = (raw or "").strip()
+    if len(profile) > remote_store.BROWSER_PROFILE_MAX or any(ord(c) < 32 or ord(c) == 127 for c in profile):
+        raise HTTPException(status_code=422, detail=(
+            f"A profile name fits on one line, {remote_store.BROWSER_PROFILE_MAX} characters at most."))
+    if profile and remote_store._parse_browser_mode(machine.get("browser_mode")) != "own":
+        raise HTTPException(status_code=422, detail="Turn on \"Use my own browser\" first.")
+    remote_store.set_browser_profile(machine["id"], profile)
+    return {"ok": True, "browser_profile": profile}
+
+
+@router.put("/v1/admin/remote-machines/{machine_id}/browser-profile")
+async def admin_set_browser_profile(
+    machine_id: str,
+    body: SetBrowserProfileRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """The ``Browser profile`` of an ADMIN-paired machine (``{profile}``)."""
+    def _job() -> dict:
+        return _apply_browser_profile(_browser_machine_for_admin(machine_id, user), body.profile)
+
+    return await run_db(_job)
+
+
+@router.put("/v1/users/me/remote-machines/{machine_id}/browser-profile")
+async def user_set_browser_profile(
+    machine_id: str,
+    body: SetBrowserProfileRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Owner-scoped twin of the admin route."""
+    def _job() -> dict:
+        return _apply_browser_profile(_browser_machine_for_owner(machine_id, user), body.profile)
+
+    return await run_db(_job)
+
+
 @router.put("/v1/admin/remote-machines/{machine_id}/browser-mode")
 async def admin_set_browser_mode(
     machine_id: str,
@@ -1365,12 +1452,13 @@ async def user_clear_browser_token(
 
 
 def _shape_browser_fields(machine: dict) -> None:
-    """Public shape of the two own-browser columns on a machine row: the mode
+    """Public shape of the own-browser columns on a machine row: the mode
     normalised, the token reduced to a presence flag (the ciphertext never
-    leaves the store)."""
+    leaves the store), the unattended permission and the profile."""
     machine["browser_mode"] = remote_store._parse_browser_mode(machine.get("browser_mode"))
     machine["browser_extension_token_set"] = bool(machine.get("browser_extension_token_set"))
     machine["browser_unattended"] = bool(machine.get("browser_unattended"))
+    machine["browser_profile"] = str(machine.get("browser_profile") or "")
 
 
 async def _push_policy_update(machine_id: str) -> None:

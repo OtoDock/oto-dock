@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("satellite")
 
+# How long the post-turn stdout drain forwards when the proxy names no bound
+# (a proxy before 1.9.1 reads a sub-agent's lines for ten minutes at most; a
+# command's end it reads at any time, at the next turn).
+DEFAULT_BG_DRAIN_S = 600.0
+
 # A turn's reader checks its stop flag every second (``_read_stdout_until_stop``).
 _READER_HANDOFF_S = 10.0
 # The inputs of the CLI's open ``can_use_tool`` requests kept for their
@@ -53,6 +58,11 @@ DISABLED_BUILTIN_PLUGINS = (
     "cc-plugin-mermaid@builtin",
     "cc-plugin-responsive-mode@builtin",
     "cc-plugin-tips@builtin",
+    # 2.1.306: charts drawn in the transcript, a chart tool and charts under
+    # MCP results. 2.1.312: the developer docs of platform.claude.com as an
+    # HTTP MCP server, with a claude-api skill. Both dark behind remote flags.
+    "cc-plugin-easel@builtin",
+    "cc-plugin-claude-platform@builtin",
 )
 
 
@@ -93,6 +103,11 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
         # would load as MCP servers too and act on the pool owner's account;
         # off (mirrors the proxy builder).
         "disableClaudeAiConnectors": True,
+        # Plan keeps Claude Code's plain plan semantics, not its auto mode's
+        # reviewer: a call it does not read as read-only becomes its ask,
+        # which the proxy answers from the gate's record (mirrors the proxy
+        # builder, which carries the rationale).
+        "useAutoModeDuringPlan": False,
         # Built-in-tool deny list, shipped by the proxy (single source of truth:
         # core/layers/cli/config_dir.DISALLOWED_BUILTIN_TOOLS alone: a session's own
         # denials ride the gate over the tunnel, since this file is the scope's and
@@ -219,6 +234,10 @@ class CLISession:
         # post-turn) reaches the proxy. Cancelled when the next turn starts (it
         # reclaims stdout — single reader).
         self._drain_bg: bool = False
+        # How long the drain forwards: the proxy's background-work ceiling
+        # (``drain_bg_s``, a 1.9.1 proxy); an older proxy never reads the
+        # forwarded lines while only sub-agents run, so it keeps ten minutes.
+        self._drain_bg_s: float = DEFAULT_BG_DRAIN_S
         self._bg_drain_task: asyncio.Task | None = None
         # True from the prompt's stdin write until the turn's read loop
         # exits: the window a steer may write into (a user frame between
@@ -342,7 +361,11 @@ class CLISession:
         if self.config.get("use_native_permissions"):
             cmd += ["--permission-mode", cli_word or permission_mode]
         elif permission_mode == "plan":
-            cmd += ["--permission-mode", "plan"]
+            # Mirrors the local CLI layer: Claude Code 2.1.299+ asks for a
+            # call the hook allowed in plan mode, so the prompt tool carries
+            # that ask, and the proxy answers it from the gate's record. It
+            # also exposes ExitPlanMode and AskUserQuestion in Plan.
+            cmd += ["--permission-mode", "plan", "--permission-prompt-tool", "stdio"]
         else:
             cmd += (["--permission-mode", "auto"] if cli_word == "auto"
                     else ["--dangerously-skip-permissions"])
@@ -354,8 +377,8 @@ class CLISession:
             # heredoc writing a file, a wide ``rm -rf``) and, in auto, after
             # its reviewer's decline limit, which the proxy answers like a
             # card or refuses (core/session/engine_prompts). Not added to
-            # the plan/native branches (a real prompt could route to stdio,
-            # which nothing answers).
+            # the native branch (a real prompt could route to stdio, which
+            # nothing answers).
             cmd += ["--permission-prompt-tool", "stdio"]
         if mcp_config is not None:
             cmd += ["--mcp-config", str(mcp_file)]
@@ -408,6 +431,9 @@ class CLISession:
         # CC 2.1.233 removed Todo/Task tools on newer models; the dashboard
         # todo checklist depends on their frames. Mirrors proxy env_builder.
         env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1"
+        # The advisor tool is a model call the platform can neither meter nor
+        # show. Mirrors proxy env_builder.
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
         env.pop("CLAUDECODE", None)
         # Force UTF-8 IO — Windows console default is cp1252 and breaks
         # tool-result JSON parse on non-ASCII content.
@@ -665,19 +691,24 @@ class CLISession:
             if decoded:
                 yield decoded
 
-    def request_stop_turn(self, drain_bg: bool = False) -> None:
+    def request_stop_turn(self, drain_bg: bool = False,
+                          drain_bg_s: float | None = None) -> None:
         """Signal the current send_message() loop to exit gracefully. ``drain_bg``
-        (set by the proxy when a backgrounded command is still pending) arms a
-        post-turn stdout drainer once this turn's loop exits."""
+        (set by the proxy when background work is still pending) arms a
+        post-turn stdout drainer once this turn's loop exits, forwarding for
+        ``drain_bg_s`` seconds (ten minutes when the proxy sends none)."""
         self._drain_bg = drain_bg
+        self._drain_bg_s = (float(drain_bg_s) if isinstance(drain_bg_s, (int, float))
+                            and drain_bg_s > 0 else DEFAULT_BG_DRAIN_S)
         self.stop_turn_event.set()
 
     def start_bg_drain(self, forward) -> None:
         """If the last stop_turn requested it (``drain_bg``), start a post-turn
         stdout drainer that forwards each NDJSON event via ``await forward(ev)``
-        until the next turn cancels it (or EOF / a 10-min ceiling). This is how a
-        backgrounded command's completion frame — claude emits it idle, after the
-        turn — reaches the proxy's bg-command monitor on the remote path."""
+        until the next turn cancels it (or EOF / the proxy's bound). This is how
+        a backgrounded command's completion frame and a background sub-agent's
+        own lines — claude emits them idle, after the turn — reach the proxy's
+        monitors on the remote path."""
         if not self._drain_bg or self._bg_drain_task is not None:
             return
         self._bg_drain_task = asyncio.create_task(self._bg_drain_loop(forward))
@@ -692,11 +723,11 @@ class CLISession:
 
     async def _bg_drain_loop(self, forward) -> None:
         """Read + forward stdout frames post-turn until cancelled, EOF, or the
-        ceiling. No idle exit — a sleeping bg command emits nothing for a while,
+        bound. No idle exit — a sleeping bg command emits nothing for a while,
         then its task_updated{completed}."""
         if self.proc is None or self.proc.stdout is None:
             return
-        deadline = asyncio.get_running_loop().time() + 600.0
+        deadline = asyncio.get_running_loop().time() + self._drain_bg_s
         try:
             while asyncio.get_running_loop().time() < deadline:
                 if self.proc.returncode is not None:

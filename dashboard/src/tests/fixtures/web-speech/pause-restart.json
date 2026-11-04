@@ -1,0 +1,58 @@
+{
+ "source": "The recognizer's own end on a pause while the mic is held: a fresh one starts after the delay and the dictation goes on.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "before the pause."
+    }
+   ]
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 150
+  },
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "after it."
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "before the pause.",
+   "after it."
+  ],
+  "replaces": [],
+  "interims": [],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 2
+ }
+}

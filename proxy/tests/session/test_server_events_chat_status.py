@@ -249,3 +249,58 @@ async def test_every_server_turn_names_its_cause_on_the_viewed_chat(temp_db, mon
     assert _causes(conn) == [wire.CAUSE_KICK]
     assert {wire.CAUSE_BG_REVIEW, wire.CAUSE_DELEGATE_RESULT, wire.CAUSE_WAKE,
             wire.CAUSE_KICK} == wire.SERVER_TURN_CAUSES
+
+
+@pytest.mark.asyncio
+async def test_a_continuations_wake_sends_its_card_to_the_viewer_before_the_turn(temp_db, monkeypatch):
+    """The dashboard-socket rung of a scheduled wake: the row, then the
+    frame to the socket viewing the chat, then the wake turn; the same frame
+    to every other viewer of the chat through their queues (this socket's
+    queue skipped, or it would draw the card twice); a socket on another
+    chat sends itself no frame and still broadcasts."""
+    import json
+
+    from core.session import session_state
+    temp_db.create_chat("sc-wake", "user-admin", "a1")
+    order: list[str] = []
+    broadcast: list[tuple] = []
+    monkeypatch.setattr(session_state, "broadcast_chat_frame",
+                        lambda cid, frame, skip=None: broadcast.append((cid, frame, skip)))
+
+    class _Viewer(_Conn):
+        chat_id = "sc-wake"
+        session_id = "sess-wake"
+        layer = object()
+        notify_queue = object()
+
+        async def _run_server_turn_or_keep(self, prompt, **target):
+            order.append("turn")
+
+        async def _send(self, data):
+            order.append(data["type"])
+            await super()._send(data)
+
+    notification = {
+        "type": "continuation_prompt", "chat_id": "sc-wake", "session_id": "sess-wake",
+        "task_id": "dyn-1", "task_name": "watch", "prompt": "Check the log.",
+    }
+    conn = _Viewer()
+    await conn._handle_server_notification(dict(notification))
+    frame = next(f for f in conn.sent if f["type"] == "schedule_wake")
+    assert frame == {"type": "schedule_wake", "chat_id": "sc-wake",
+                     "prompt": "Check the log.", "task_id": "dyn-1"}
+    assert order == ["schedule_wake", "turn"]
+    assert broadcast == [("sc-wake", frame, conn.notify_queue)]
+    rows = [m for m in temp_db.get_chat_messages("sc-wake") if m.get("event_type") == "schedule_wake"]
+    assert json.loads(rows[-1]["event_data"]) == {"prompt": "Check the log.", "task_id": "dyn-1"}
+
+    class _Elsewhere(_Viewer):
+        chat_id = "sc-other"
+
+        async def _resolve_layer_for_chat_async(self, chat_id):
+            return object()
+
+    other = _Elsewhere()
+    await other._handle_server_notification(dict(notification))
+    assert [f["type"] for f in other.sent] == []
+    assert broadcast[-1] == ("sc-wake", frame, other.notify_queue)

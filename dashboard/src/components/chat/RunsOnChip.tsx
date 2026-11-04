@@ -23,7 +23,7 @@ import { useEffect, useState, type CSSProperties, type KeyboardEvent, type React
 import { createPortal } from 'react-dom'
 
 import {
-  leavesOffline, moveMemoryOf, useAgentRunTargets, useChatTargets, useMoveChat,
+  accountsStayFor, leavesOffline, moveMemoryOf, useAgentRunTargets, useChatTargets, useMoveChat,
   type ChatTargets, type MoveProgress, type RunTarget,
 } from '../../api/remoteMachines'
 import { MOVE_PHASE } from '../../api/wireEvents'
@@ -167,6 +167,10 @@ export default function RunsOnChip({ chatId, agentName, disabledReason, onMoved,
   return <ChatPill key={chatId} chatId={chatId} disabledReason={disabledReason} onMoved={onMoved} />
 }
 
+// The place menus open from the bar right over the message box: above it,
+// where they fit, so the words being typed stay in view.
+const PLACE_MENU = { align: 'right', prefer: 'above' } as const
+
 /** A new chat: where it will start for this person, and the menu to pick
  *  another of the places its new chats may start. */
 function NewChatPill({ agentName, engine, picked, disabledReason, onPick }: {
@@ -177,7 +181,7 @@ function NewChatPill({ agentName, engine, picked, disabledReason, onPick }: {
   onPick?: (target: string, isDefault: boolean) => void
 }) {
   const { data } = useAgentRunTargets(agentName, undefined, undefined, engine || undefined)
-  const { open, buttonRef, panelRef, style, portalRoot, toggle, close, onKeyDown } = usePortalMenu({ align: 'right' })
+  const { open, buttonRef, panelRef, style, portalRoot, toggle, close, onKeyDown } = usePortalMenu(PLACE_MENU)
   // A pick the menu no longer offers (the computer was removed, or personal
   // computers were turned off) is dropped: the chat starts at the default.
   const stale = !!(picked && data && !data.targets.some((t) => t.target === picked && t.pickable))
@@ -282,7 +286,7 @@ function NotePanel({ panelRef, style, onKeyDown, lines }: {
 
 /** A pill with no menu: its title on hover, its note on a click or a tap. */
 function PlaceNote({ lines, className, children }: { lines: string[]; className: string; children: ReactNode }) {
-  const { open, buttonRef, panelRef, style, portalRoot, toggle, onKeyDown } = usePortalMenu({ align: 'right' })
+  const { open, buttonRef, panelRef, style, portalRoot, toggle, onKeyDown } = usePortalMenu(PLACE_MENU)
   const shown = lines.filter(Boolean)
   const title = shown.join('. ')
   return (
@@ -395,7 +399,7 @@ export function ChatTargetsMenu({ chatId, data, disabled, title, ariaLabel, note
   onMoved?: () => void
   children: ReactNode
 }) {
-  const { open, buttonRef, panelRef, style, portalRoot, toggle, close, onKeyDown } = usePortalMenu({ align: 'right' })
+  const { open, buttonRef, panelRef, style, portalRoot, toggle, close, onKeyDown } = usePortalMenu(PLACE_MENU)
   const move = useMoveChat()
   const [picked, setPicked] = useState<RunTarget | null>(null)
   const busy = disabled || move.isPending || !!data.moving
@@ -448,6 +452,7 @@ export function ChatTargetsMenu({ chatId, data, disabled, title, ariaLabel, note
           fromTarget={data.current.target}
           fromLabel={data.current.label}
           fromOffline={leavesOffline(data)}
+          accountsStay={accountsStayFor(data, picked.target)}
           onConfirm={confirm}
           onCancel={() => setPicked(null)}
         />

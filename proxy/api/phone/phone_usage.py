@@ -139,6 +139,64 @@ async def report_relisten_usage(req: RelistenUsage, authorization: str | None = 
         _record_relisten, req.agent or "", req.provider, seconds, req.session_id or None)
 
 
+class DuplexUsage(BaseModel):
+    """A spoken conversation's speech at its end: the chat it ran on, the
+    person who spoke (the bridge's ``sub``, carried in the session config),
+    the stream's seconds and the second listen's apart."""
+
+    chat_id: str = ""
+    sub: str = ""
+    provider: str = ""
+    stream_seconds: float = 0.0
+    relisten_seconds: float = 0.0
+    session_id: str = ""
+
+
+DUPLEX_SOURCE = "audio-stt-duplex"
+DUPLEX_RELISTEN_SOURCE = "audio-stt-duplex-relisten"
+
+
+def _record_duplex(chat_id: str, sub: str, provider_name: str, stream_s: float, relisten_s: float,
+                   session_id: str | None) -> dict:
+    """The speaker's rows, the agent read from the chat (an agent-scope or a
+    task chat's owner is not the person who spoke, so the owner is never
+    billed): a chat deleted before the report records nothing."""
+    from audio.providers.registry import get_provider_class
+
+    from services.media import audio_service
+    try:
+        cls = get_provider_class("stt", provider_name)
+    except KeyError:
+        return {"recorded": False}
+    chat = task_store.get_chat(chat_id)
+    if chat is None:
+        logger.info("duplex usage not recorded: chat %s is gone (%.1f s streamed, %.1f s listened again)",
+                    chat_id, stream_s, relisten_s)
+        return {"recorded": False}
+    agent = str(chat.get("agent") or "")
+    rows = [(DUPLEX_SOURCE, stream_s)] + ([(DUPLEX_RELISTEN_SOURCE, relisten_s)] if relisten_s > 0 else [])
+    for source, seconds in rows:
+        if seconds > 0:
+            audio_service.record_audio_usage(
+                sub, source, provider_name, cls, seconds=seconds,
+                agent=agent, scope="user", source_id=session_id,
+            )
+    return {"recorded": True}
+
+
+@router.post("/v1/phone/usage/duplex")
+async def report_duplex_usage(req: DuplexUsage, authorization: str | None = Header(None)):
+    """Record one spoken conversation's speech seconds under the person who
+    spoke: the stream's, and the second listen's as a row of its own."""
+    _require_master_key(authorization)
+    stream_s = max(0.0, min(float(req.stream_seconds), _RELISTEN_MAX_S))
+    relisten_s = max(0.0, min(float(req.relisten_seconds), _RELISTEN_MAX_S))
+    if not req.chat_id or not req.sub or not req.provider or not (stream_s or relisten_s):
+        return {"recorded": False}
+    return await asyncio.to_thread(
+        _record_duplex, req.chat_id, req.sub, req.provider, stream_s, relisten_s, req.session_id or None)
+
+
 # ---------------------------------------------------------------------------
 # Call-outcome reporting (admin call log)
 # ---------------------------------------------------------------------------

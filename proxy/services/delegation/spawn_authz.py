@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import NoReturn
 
 import psycopg
 from fastapi import HTTPException
@@ -134,12 +135,19 @@ def authorize_spawn(
     source_agent: str | None = None,
     surface: str = "task",
     x_agent_name: str | None = None,
+    continuing: bool = False,
 ) -> SpawnAuthz:
     """Authorize one delegated-worker spawn; raises HTTPException on denial.
 
     Order matters: platform kill-switch first, then target/roster/access,
     then scope clamping to the target's mode, then identity + role for the
     FINAL scope, and the per-creator cap last — all before any row exists.
+
+    ``continuing``: a ``continue_id`` call. A cap of 0 still refuses it, but
+    the count is the caller's (``check_spawn_cap``) once it knows whether
+    the continue starts work: a follow-up the worker takes into its running
+    turn, or one that waits behind that turn on the same chat, adds no
+    parallel worker and never counts.
     """
     # 0. External principals (phone callers who are not platform users) never
     #    delegate — a worker would run with the agent's full rights. The
@@ -251,21 +259,10 @@ def authorize_spawn(
 
     # 7. Per-creator cap — policy "no" beats the RAM-gate veto, so this runs
     #    before any task/chat/run row exists.
-    cap = _max_parallel_spawns()
-    if cap == 0:
-        raise HTTPException(
-            status_code=403,
-            detail="Delegation is limited to 0 parallel workers on this platform "
-                   "(MAX_PARALLEL_SPAWNS for delegation-mcp).",
-        )
-    active = task_store.count_active_delegate_runs(created_by)
-    if active + 1 > cap:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Delegation limit reached: {active} worker(s) already "
-                   f"active (max {cap}). Wait for one to finish, or ask an "
-                   "admin to raise MAX_PARALLEL_SPAWNS for delegation-mcp.",
-        )
+    if not continuing:
+        check_spawn_cap(created_by)
+    elif _max_parallel_spawns() == 0:
+        _refuse_zero_cap()
 
     return SpawnAuthz(
         created_by=created_by,
@@ -277,8 +274,40 @@ def authorize_spawn(
     )
 
 
+def _refuse_zero_cap() -> NoReturn:
+    raise HTTPException(
+        status_code=403,
+        detail="Delegation is limited to 0 parallel workers on this platform "
+               "(MAX_PARALLEL_SPAWNS for delegation-mcp).",
+    )
+
+
+def check_spawn_cap(created_by: str, *, follow_up: bool = False) -> None:
+    """The per-creator cap on live delegated workers (step 7 of
+    ``authorize_spawn``): 403 when one more would pass
+    ``MAX_PARALLEL_SPAWNS``. ``follow_up``: a follow-up to a working worker
+    that counts after all (it neither steers the turn nor waits behind it),
+    told so instead of being told follow-ups do not count. Synchronous: the
+    DB executor."""
+    cap = _max_parallel_spawns()
+    if cap == 0:
+        _refuse_zero_cap()
+    active = task_store.count_active_delegate_runs(created_by)
+    if active + 1 > cap:
+        why = ("This follow-up counts: the worker is starting or ending a turn, or "
+               "another follow-up already waits for it. Send it again in a moment."
+               if follow_up else
+               "A follow-up to a worker in the middle of a turn does not count.")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Delegation limit reached: {active} worker(s) already "
+                   f"active (max {cap}). Wait for one to finish, or ask an "
+                   f"admin to raise MAX_PARALLEL_SPAWNS for delegation-mcp. {why}",
+        )
+
+
 def validate_spawn_overrides(
-    target_agent: str, layer: str | None, model: str | None,
+    target_agent: str, layer: str | None, model: str | None, *, user_sub: str = "",
 ) -> None:
     """Reject a spawn override outside the target agent's configured
     envelope — a clear 400, never a silent downgrade. The layer, model and
@@ -286,7 +315,10 @@ def validate_spawn_overrides(
     worker's runs is allowed only when the delegating person may run there
     (one of their own machines, or an admin machine for a platform admin),
     validated by ``chat_targets.resolve_work_machine`` after the scope clamp
-    (``api/tasks/delegation.spawn_delegate``)."""
+    (``api/tasks/delegation.spawn_delegate``). A model without its layer is
+    judged where the runner runs it (``engine_resolution.engine_for_model``:
+    the engine the roster marked default for ``user_sub``, else the agent's
+    own, else the first allowed engine that offers the model)."""
     if not (layer or model):
         return
     info = agent_store.get_agent(target_agent) or {}
@@ -302,8 +334,26 @@ def validate_spawn_overrides(
                 f"Execution layer '{layer}' is not enabled for agent "
                 f"'{target_agent}' (enabled: {', '.join(allowed) or 'none'}).",
             )
+    if model and not layer:
+        from services.engines import engine_resolution
+        first = ""
+        try:
+            if user_sub:
+                first = engine_resolution.resolve_session_engine(target_agent, user_sub).execution_path
+            first = first or str(info.get("execution_path") or "")
+            # A registry error must not brick spawns (as below).
+            exec_path = engine_resolution.engine_for_model(info, model, first=first)
+        except (ImportError, psycopg.Error):
+            return
+        if not exec_path:
+            raise HTTPException(
+                400,
+                f"Model '{model}' is not available on any execution layer "
+                f"agent '{target_agent}' allows.",
+            )
+        return
     if model:
-        exec_path = layer or info.get("execution_path", "")
+        exec_path = layer or ""
         # Same source of truth as the dashboard's cross-layer model guard
         # (ws/dashboard._model_allowed_for_path): a registry error must not
         # brick spawns — this guards cross-layer poison, not the registry.

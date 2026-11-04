@@ -10,11 +10,89 @@ template carries everything the new agent starts life with: who it is, which
 tools it gets, what it knows, what it runs on a schedule, and how it onboards
 its users.
 
-This requires the `agent-creator-mcp` tools (`list_building_blocks`,
+This requires the `agent-creator-mcp` tools (`search_community_agents`,
+`list_departments`, `propose_install`, `propose_department_install`,
+`propose_move`, `check_card`, `list_building_blocks`,
 `validate_agent_template`, `create_agent`). They are only present in a chat
 session driven by a platform **creator** or **admin** — if you can't see them,
 you can't create agents in this session, and you should say so rather than
 improvising.
+
+## The community first
+
+Before writing anything, `search_community_agents` with a few words about
+the job. The catalog holds ready agent templates and **department sets**
+(several agents installed as one department, each at its level, the
+head's library shared, the schedules paused). When one fits, propose it:
+`propose_install` for a template (optionally into a department at a
+level, from `list_departments`), `propose_department_install` for a set
+(with the department's name: a boat's, a team's). Each draws a **card in
+the chat**; the person presses its button and the platform installs with
+their own role. Nothing is installed by the call: say so, and read
+`check_card` only when the person says they pressed it. A template's apps
+wait for approval on their cards and its checks are offered.
+
+Write a new agent from a folder only when nothing in the catalog fits or
+the person declines what fits. An existing agent moves into a department
+through `propose_move` (an admin, or a creator who manages the agent,
+presses it). Propose a department or several agents only when the person
+asks to automate a company function, a department or several projects
+with different people: an idea, a research task or one job gets one agent.
+
+## Company patterns
+
+Three shapes cover most companies. Each lists its steps in order: the
+cards the setup agent draws for the person to press, and the tools it
+calls itself. Every card runs with the person's own role. The agent only
+proposes.
+
+**A head agent with project agents.** One head agent (Shared + personal:
+the shared workspace is its desk) holds the company method in a knowledge
+library and gives each project its own agent. Each project agent is
+Personal + shared with its own people (a contributor from the field,
+editors in the office, the manager). Their drafts stay personal, finals
+are handed to the team's workspace, and the project app is a copy that
+follows the head's app. The head reads the project agents' Notebook
+entries. Siblings do not delegate to each other. The steps, in order:
+
+1. The `create_department` card with `mode: "down"` and two levels
+   (Head, Team).
+2. `list_departments` for the department's id and its levels' ids. The
+   card's outcome does not give them.
+3. Each project agent: `create_agent` (a tool, it installs the agent at
+   once) or the `propose_install` card. Write each project persona so the
+   agent draws the `hand_files` card when work is final, and never moves
+   or copies a document itself.
+4. The `move_agent` card for the head to the Head level, then one for each
+   project agent to the Team level.
+5. The head's method shared as a library. The head shares its own folder
+   with `share_knowledge_folder` (an admin or a creator in the chat), or
+   the person does it at Agent Settings → Configuration → Shared Knowledge.
+   `attach_library` refuses a folder that is not shared yet.
+6. The `attach_library` card of that library to each project agent
+   (read-only).
+7. The `share_app` card of the project app.
+
+Then `hand_files` in daily work, and the copy's follow card when the
+head's app releases again.
+
+**A department of one function.** Several agents of one function
+(accounting, legal) in one department at their levels. The mode decides
+who hands work to whom: `down` for a head and a team, `down_across` when
+peers share work. The head's library is attached to the rest, and the
+routines run as agent-scope tasks with an audience. The steps:
+`create_department`, `list_departments` for the ids, the agents,
+`move_agent` for each one, the library shared, `attach_library`, then
+the schedules through the tasks tool.
+
+**A single agent for a single job.** An idea, a research task, one job,
+or one person's assistant: one agent, Personal only or Personal + shared,
+no department. Most requests are this one.
+
+A multi-agent setup is proposed only when the person asks to automate a
+company function, a department or several projects with different people.
+Which mode fits which team, and where each artifact lives, is the platform
+skill's company page ("Setting a team up").
 
 ## The flow
 
@@ -205,8 +283,8 @@ Optional, and worth a deliberate choice:
 
 | Field | Meaning |
 |---|---|
-| `default_scope` | `"user"` (default) or `"agent"` — whose workspace and chats the agent works in. |
-| `collaborative` | Default `true`. `false` + `default_scope: "user"` = **personal-only** (every user gets private chats and their own workspace). `false` + `default_scope: "agent"` = **shared-only** (one shared space for the whole team — service agents). |
+| `default_scope` | `"user"` (default) or `"agent"` — whose workspace and chats the agent works in. `"user"` for a team whose members work alone and hand finals over. `"agent"` for a department's desk, where the shared workspace is home. Content still decides per file, memory and app. |
+| `collaborative` | Default `true`. `false` + `default_scope: "user"` = **personal-only** (every user gets private chats and their own workspace, and a whole team can work privately there). `false` + `default_scope: "agent"` = **shared-only** (one shared space for the whole team — service agents). |
 | `core_mcps` | Default `"all"`: the platform's core toolkit is added automatically on top of `mcps.json`. `"none"`: the agent gets only what `mcps.json` lists — for narrow single-purpose agents. |
 | `category` | `productivity` / `infrastructure` / `creative` / `research` / `customer-support` / `experimental`. |
 | `tags` | Lowercase, searchable. |
@@ -310,16 +388,28 @@ an older platform installs the task without these):
   own notification with the results), `"auto"` (a plain "task complete"
   notice) or `"none"`. A digest people read wants `manual`; a silent
   housekeeping job wants `none`.
+- `audience` (platform 1.9.1 and later: an older platform ignores it), for an
+  agent-scope task or trigger: who is told, the lowest role on the agent its
+  notifications reach. Leave it out and editors and managers are told.
+  `"viewer"` tells everyone who uses the agent, `"contributor"` everyone but
+  viewers, `"manager"` managers only. Platform admins are always told. A task
+  whose prompt reports to the whole team needs `"viewer"`.
 - `override_model` (a model id such as `claude-fable-5-1`) and `layer` (an
   engine id such as `claude-code-cli`) — the one exception to "never pin a
   model": a task that needs a stronger or a cheaper model than the agent's
   own work (a cheap default agent with one judgement-heavy weekly brief).
-  The installed agent must be able to run the pair: a layer holds only when
-  it is the engine the install enabled, so prefer a model pin alone (it runs
-  on the agent's engine). `list_building_blocks` lists this install's
-  engines, which one an install picks and the model ids each takes. A pin
-  the agent cannot run is dropped at install, the task runs on the agent's
-  default, and `create_agent` lists it.
+  The installed agent must be able to run the pair. An installed agent
+  allows every engine, so a `layer` holds whenever the model is turned on
+  for that engine on this install. A model pin alone holds when any engine
+  this install turns the model on for is allowed, and it runs on the engine
+  the task would take unpinned (its person's own engine, else the agent's
+  default) when that engine offers it, else on the first engine of the
+  agent's own order that does, so name the `layer` when
+  the same model is on two engines and the engine matters.
+  `list_building_blocks` lists this install's engines, which one an install
+  picks and the model ids each takes. A pin the agent cannot run is dropped
+  at install, the task runs with no model choice (on its person's own engine
+  or the agent's default engine), and `create_agent` lists it.
 
 `triggers.json` is the same shape without a schedule (fired by webhook, so
 default them paused — the upstream system needs the URL first).

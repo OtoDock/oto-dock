@@ -1,13 +1,12 @@
 """The permission authority's question branch (core-seams phase 2), keyed on
-the ``question`` role and the engine's ``question_tool_holds_turn``:
+the ``question`` role and the engine's ``nonblocking_question_tools``:
 
-* an interactive TUI with a human present parks the turn and lets the
-  tool run (both engines);
-* an engine whose question tool holds the turn open for the platform's
-  answers (Codex, headless) is allowed;
-* everything else — Claude headless, an autonomous interactive task on
-  either engine, a session whose engine is unknown — gets the card and a
-  deny-and-inform that names the tool.
+* an interactive TUI with a human present lets the tool run (both engines),
+  parking the turn for a tool whose dialog holds it (not Codex's async one);
+* everything else — headless on either engine (Codex's two tools as
+  Claude's one), an autonomous interactive task, a session whose engine is
+  unknown — gets the card and a deny-and-inform that names the tool, so the
+  turn ends and the person's next message is the answer.
 
 Also: the security-context fail-closed deny now precedes the branch.
 """
@@ -54,11 +53,20 @@ async def test_claude_headless_gets_the_card_and_a_deny_that_names_the_tool(sess
 
 
 @pytest.mark.asyncio
-async def test_codex_headless_is_allowed_because_its_tool_holds_the_turn(session, monkeypatch):
+@pytest.mark.parametrize("tool,questions", [
+    ("request_user_input", [{"id": "colour", "header": "Colour", "question": "Which colour?",
+                             "options": [{"label": "Green", "description": "calm"}]}]),
+    ("request_user_input_async", [{"title": "Which colour?", "options": ["Green", "Blue"]}]),
+])
+async def test_codex_headless_gets_claudes_card_and_deny_for_both_its_tools(
+        session, monkeypatch, tool, questions):
     _bind(monkeypatch, "codex-cli")
-    out = await permission.decide_tool_permission(session, "request_user_input", {"questions": []})
-    assert out == {"decision": "allow"}
-    assert session_state.get_permission_queue(session).empty()
+    out = await permission.decide_tool_permission(session, tool, {"questions": questions})
+    assert out == {"decision": "deny", "reason": permission.question_shown_reason(tool)}
+    assert "next message" in out["reason"] and tool in out["reason"]
+    queued = session_state.get_permission_queue(session).get_nowait()
+    assert queued == {"event_type": "question", "tool_name": tool,
+                      "tool_input": {"questions": questions}}
 
 
 @pytest.mark.asyncio
@@ -67,6 +75,38 @@ async def test_an_interactive_human_parks_and_runs_the_tool(session, monkeypatch
     parked = _bind(monkeypatch, path, interactive=True)
     out = await permission.decide_tool_permission(session, tool, {"questions": []})
     assert out == {"decision": "allow"} and parked == [tool]
+
+
+@pytest.mark.asyncio
+async def test_codexs_async_question_runs_in_its_terminal_without_a_park(session, monkeypatch):
+    # Its picker holds no turn: parking would hold the composer's sends.
+    parked = _bind(monkeypatch, "codex-cli", interactive=True)
+    out = await permission.decide_tool_permission(
+        session, "request_user_input_async", {"questions": [{"title": "Which colour?"}]})
+    assert out == {"decision": "allow"} and parked == []
+    assert session_state.get_permission_queue(session).empty()
+
+
+@pytest.mark.asyncio
+async def test_a_question_the_hook_did_not_see_shows_the_card_and_is_answered_at_once(
+        session, monkeypatch):
+    # A satellite whose gate skipped the turn: Codex's server request.
+    _bind(monkeypatch, "codex-cli")
+    monkeypatch.setattr(permission.routing, "resolve_hook_route",
+                        lambda sid: permission.routing.HookRoute(queue_session_id=sid))
+    questions = [{"id": "colour", "header": "Colour", "question": "Which colour?",
+                  "options": [{"label": "Green", "description": "calm"}]}]
+    answers = await permission.ask_user_question(session, questions, tool_name="request_user_input")
+    assert answers == {"colour": {"answers": [permission.question_shown_reason("request_user_input")]}}
+    queued = session_state.get_permission_queue(session).get_nowait()
+    assert queued["event_type"] == "question" and queued["tool_input"] == {"questions": questions}
+
+
+@pytest.mark.asyncio
+async def test_an_unattended_question_the_hook_did_not_see_gets_no_card(session, monkeypatch):
+    _bind(monkeypatch, "codex-cli", client_type="task")
+    assert await permission.ask_user_question(session, [{"id": "q"}], tool_name="request_user_input") == {}
+    assert session_state.get_permission_queue(session).empty()
 
 
 @pytest.mark.asyncio

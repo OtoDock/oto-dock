@@ -220,7 +220,8 @@ async def list_verdicts(agent: str, chat_id: str = "", check: str = "", limit: i
     _agent_exists(agent)
     scope_sub = None if u.can_manage_agent(agent) else u.sub
     rows = await asyncio.to_thread(db_checks.list_verdicts, agent, user_sub=scope_sub,
-                                   chat_id=chat_id, check_name=check, limit=limit, before=before[:64])
+                                   chat_id=chat_id, check_name=check, limit=limit, before=before[:64],
+                                   agent_scope=u.sees_agent_automations(agent))
     return {"verdicts": rows}
 
 

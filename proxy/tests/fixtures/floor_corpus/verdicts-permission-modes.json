@@ -22,7 +22,7 @@
   "{\"effects\": [[\"activity\", \"s\"], [\"park\", \"ExitPlanMode\"]], \"queued\": [], \"result\": {\"decision\": \"defer\"}}",
   "{\"effects\": [[\"activity\", \"s\"], [\"park\", \"request_user_input\"]], \"queued\": [], \"result\": {\"decision\": \"allow\"}}",
   "{\"effects\": [[\"activity\", \"s\"]], \"queued\": [], \"result\": {\"decision\": \"deny\", \"reason\": \"a judge reads, it does not write — report the finding instead\"}}",
-  "{\"effects\": [[\"activity\", \"s\"]], \"queued\": [], \"result\": {\"decision\": \"deny\"}}",
+  "{\"effects\": [[\"activity\", \"s\"]], \"queued\": [], \"result\": {\"decision\": \"deny\", \"reason\": \"Plan mode only reads. This call would change something or run a command that is not read-only. It can run once the plan is approved.\"}}",
   "{\"effects\": [[\"activity\", \"s\"]], \"queued\": [[\"s\", {\"event_type\": \"permission_prompt\", \"request_id\": \"<id>\", \"tool_input\": {\"content\": \"x\", \"file_path\": \"/workspace/x.md\"}, \"tool_name\": \"Write\"}]], \"result\": {\"decision\": \"allow\"}}",
   "{\"effects\": [[\"activity\", \"s\"]], \"queued\": [[\"s\", {\"event_type\": \"permission_prompt\", \"request_id\": \"<id>\", \"tool_input\": {\"content\": \"x\", \"file_path\": \"/tmp/.claude/plans/p.md\"}, \"tool_name\": \"Write\"}]], \"result\": {\"decision\": \"allow\"}}",
   "{\"effects\": [[\"activity\", \"s\"]], \"queued\": [[\"s\", {\"event_type\": \"permission_prompt\", \"request_id\": \"<id>\", \"tool_input\": {\"file_path\": \"/workspace/x.md\", \"new_string\": \"b\", \"old_string\": \"a\"}, \"tool_name\": \"Edit\"}]], \"result\": {\"decision\": \"allow\"}}",

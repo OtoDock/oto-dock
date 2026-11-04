@@ -39,8 +39,10 @@ def _idle_session_has_pending_work(
     if get_subagent_registry(sid).has_pending:
         return True
     # A running background COMMAND completes on the satellite's forwarded
-    # stdout; only a satellite that keeps forwarding past ten minutes can
-    # resolve it, so the leg is opt-in per satellite version.
+    # stdout, so the leg is opt-in per satellite version (0.5.120): from
+    # 0.5.167 the satellite forwards as long as the proxy's bound, before it
+    # for ten minutes, and the session is kept so the next turn's stale drain
+    # reads the command's end.
     if bg_commands:
         from core.session.background_leash import pending_background
         return pending_background(sid)[0] > 0

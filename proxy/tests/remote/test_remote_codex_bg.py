@@ -270,9 +270,11 @@ def queued_reviews(monkeypatch):
 
 @pytest.mark.parametrize("items,plan", [
     ([("agentMessage", "Here is the plan."), ("plan", "1. Add --version")], "1. Add --version"),
-    ([("agentMessage", "- Add --version\n- Add a CLI test")], "- Add --version\n- Add a CLI test"),
+    # A plan-mode turn answered in prose has no `plan` item: a plain turn,
+    # never its last message drawn as a plan.
+    ([("agentMessage", "- Add --version\n- Add a CLI test")], None),
 ])
-def test_a_remote_plan_turn_queues_a_plan_review(queued_reviews, items, plan):
+def test_a_remote_plan_turn_queues_a_plan_review_only_for_a_plan_item(queued_reviews, items, plan):
     tr = CodexEventTranslator(model="gpt-5.5")
     layer, info = _make_layer_info(tr)
     info.mode = "plan"  # read-only plan mode
@@ -282,8 +284,69 @@ def test_a_remote_plan_turn_queues_a_plan_review(queued_reviews, items, plan):
          "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
         {"type": "_turn_ended", "command_id": ""},
     ])
-    assert queued_reviews == [(info.session_id, plan, None)]
+    assert queued_reviews == ([(info.session_id, plan, None)] if plan else [])
     assert not [e for e in events if e.type == PLAN_MODE]
+
+
+@pytest.mark.parametrize("items,plan", [
+    ([("agentMessage", "Here is the plan."), ("plan", "1. Add --version")], "1. Add --version"),
+    ([("agentMessage", "- Add --version\n- Add a CLI test")], None),
+])
+def test_a_local_plan_turn_queues_a_plan_review_only_for_a_plan_item(monkeypatch, items, plan):
+    """The local layer's twin of the remote rule."""
+    from core.layers.codex import layer as codex_layer
+    queued: list = []
+
+    async def _queue(session_id, text, plans_dir):
+        queued.append((session_id, text))
+
+    class _Session:
+        plan_mode = True
+        thread_id = MAIN
+        translator = None
+        model = "gpt-5.5"
+        config_dir = ""
+
+        async def send_message(self, prompt, *, inject_time=False, task=False):
+            for kind, text in items:
+                yield CodexEvent(type="item/completed",
+                                 data={"threadId": MAIN, "item": {"type": kind, "text": text, "id": kind}})
+            yield CodexEvent(type="turn/completed",
+                             data={"threadId": MAIN, "turn": {"status": "completed"}})
+
+    async def _get(session_id):
+        return _Session()
+    monkeypatch.setattr(codex_layer, "queue_plan_review", _queue)
+    monkeypatch.setattr(codex_layer, "get_codex_session", _get)
+
+    async def run():
+        return [ev async for ev in codex_layer.CodexCLIExecutionLayer()._send_turn("s-local", "plan it")]
+    asyncio.run(run())
+    assert queued == ([("s-local", plan)] if plan else [])
+
+
+@pytest.mark.parametrize("version,warns", [("0.5.165", True), ("", True), ("0.5.166", False)])
+def test_a_plan_turn_on_a_satellite_below_0_5_166_says_it_runs_plain(
+        queued_reviews, caplog, version, warns):
+    """An older satellite sends the plan mode in a key Codex drops: the turn
+    is a plain one there, which the log says at the turn's start."""
+    import logging
+
+    from core.remote.satellite_connection import SatelliteConnection
+    tr = CodexEventTranslator(model="gpt-5.5")
+    layer, info = _make_layer_info(tr)
+    if version:
+        layer._cm._connections["m1"] = SatelliteConnection(
+            machine_id="m1", ws=None, satellite_version=version)
+    info.mode = "plan"
+    with caplog.at_level(logging.WARNING, logger="remote-layer"):
+        _drain_codex_turn(info, layer, [
+            {"method": "turn/completed",
+             "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
+            {"type": "_turn_ended", "command_id": ""},
+        ])
+    said = [r.getMessage() for r in caplog.records if "older than 0.5.166" in r.getMessage()]
+    assert len(said) == (1 if warns else 0)
 
 
 def test_remote_default_mode_queues_no_plan_review(queued_reviews):
@@ -477,6 +540,42 @@ def test_router_oob_resolves_tracked_bg_command_completion():
 
     try:
         asyncio.run(run())
+    finally:
+        _bg_command_registries.pop("s1", None)
+
+
+def test_router_oob_completion_clears_the_terminal_s_badge(monkeypatch):
+    # The remote twin of the local router: a terminal's exit between turns
+    # clears its own badge through the chat's viewers (no pump is attached).
+    from core.session import session_state
+    monkeypatch.setattr(session_state, "_push_pump_event_fn", lambda cid, ev: False)
+    viewer: asyncio.Queue = asyncio.Queue()
+    monkeypatch.setitem(session_state._dashboard_notify_queues, "s-viewer", viewer)
+
+    async def run():
+        tr = _bg_cmd_tr()
+        _swept_bg_candidate(tr)
+        get_bg_command_registry("s1").chat_id = "chat-remote"
+        layer, info = _make_layer_info(tr)
+        router = asyncio.create_task(_adapter()._route_notifications(info))
+        try:
+            info.event_queue.put_nowait(_ev(
+                "item/completed", MAIN, type="commandExecution", id="i1",
+                command="sleep 40", status="completed", exitCode=0,
+                aggregatedOutput="done"))
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if not viewer.empty():
+                    break
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await router
+
+    try:
+        asyncio.run(run())
+        assert viewer.get_nowait() == {"type": "chat_ui_frame", "chat_id": "chat-remote", "frame": {
+            "type": "bg_command_done", "tool_use_id": "i1", "status": "completed"}}
     finally:
         _bg_command_registries.pop("s1", None)
 

@@ -24,11 +24,13 @@ from datetime import datetime, timezone
 
 import psycopg
 
+from auth import roles
 from core import layout, placement
 from core.session import session_kind
 from core.session.visibility import is_phone_chat_owner, is_shared_chat_owner
 from services.apps import app_supervisor
 from storage import database as task_store
+from storage.automation import notification_severity
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.apps")
@@ -383,6 +385,15 @@ def _members_and_admins(agent: str) -> list[str]:
     return sorted(set(agent_audience(agent, fan_out=True)))
 
 
+def _editors_and_admins(agent: str) -> list[str]:
+    """Who sees what the agent does on its own behalf (its runs, trigger
+    fires, verdicts): the editor tier and every admin. A socket subscribes
+    to any (agent, feed) pair without an app (``handle_subscription``), so
+    the floor is on the delta's targets."""
+    from services.notifications.notification_manager import agent_audience
+    return sorted(set(agent_audience(agent, fan_out=True, floor=roles.EDITOR)))
+
+
 def _chat_targets(chat: dict) -> list[str]:
     """Who sees a chat's rows: its owner, or (synthetic owners) the agent's
     users; phone chats belong to the agent's members."""
@@ -472,7 +483,7 @@ def trigger_fired(trigger: dict | None, error: str | None) -> None:
     if (trigger.get("scope") or "agent") == "user":
         users = [trigger.get("created_by") or ""]
     else:
-        users = _members_and_admins(agent)
+        users = _editors_and_admins(agent)
     emit(users, agent, "trigger_fires", {
         "id": trigger.get("id") or "", "name": trigger.get("name") or "",
         "last_fired_at": datetime.now(timezone.utc).isoformat(),
@@ -494,7 +505,7 @@ def _on_run_finished(run_id: str, status: str) -> None:
     if (run.get("scope") or "agent") == "user":
         users = [run.get("created_by") or ""]
     else:
-        users = _members_and_admins(agent)
+        users = _editors_and_admins(agent)
     delta = {
         "id": run.get("task_id") or "",
         # The handlers' dispatch skips an app handler's own run (APPS.md
@@ -520,9 +531,11 @@ def _on_run_finished(run_id: str, status: str) -> None:
 
 
 def _task_visible(task: dict, user) -> bool:
+    """A task or trigger row in the viewer's slice: their own, or the
+    agent's own at the editor tier (an app's own identity included)."""
     if (task.get("scope") or "user") == "user":
         return (task.get("created_by") or "") == user.sub or user.is_admin
-    return True
+    return user.sees_agent_automations(task.get("agent") or "")
 
 
 def snapshot(feed: str, agent: str, user) -> list[dict]:
@@ -535,7 +548,10 @@ def snapshot(feed: str, agent: str, user) -> list[dict]:
     if feed == "sessions":
         from core.session.visibility import chat_history_owner
         owner = chat_history_owner(agent, user.sub)
-        rows = [session_row(c) for c in task_store.list_chats(owner, agent=agent, limit=100)]
+        # A shared pool's delegated workers are the agent's own work.
+        hide = owner != user.sub and not user.sees_agent_automations(agent)
+        rows = [session_row(c) for c in task_store.list_chats(owner, agent=agent, limit=100,
+                                                              hide_agent_runs=hide)]
         return rows
     if feed == "tasks":
         # Imported here: the runner and the trigger manager import this
@@ -595,7 +611,8 @@ def snapshot(feed: str, agent: str, user) -> list[dict]:
     if feed == "check_verdicts":
         from storage.checks import db_checks
         scope_sub = None if user.can_manage_agent(agent) else user.sub
-        return [verdict_row(v) for v in db_checks.list_verdicts(agent, user_sub=scope_sub, limit=100)]
+        return [verdict_row(v) for v in db_checks.list_verdicts(
+            agent, user_sub=scope_sub, limit=100, agent_scope=user.sees_agent_automations(agent))]
     if feed == "checks":
         return checks_snapshot(agent, user)
     raise KeyError(feed)
@@ -628,7 +645,8 @@ def checks_snapshot(agent: str, user) -> list[dict]:
     for it in items:
         # The listing is by name; a private check may share a name with
         # the agent's, so the owner decides which rows count.
-        recent = db_checks.list_verdicts(agent, user_sub=scope_sub, check_name=it.name, limit=10)
+        recent = db_checks.list_verdicts(agent, user_sub=scope_sub, check_name=it.name, limit=10,
+                                         agent_scope=user.sees_agent_automations(agent))
         last = next((v for v in recent if (v.get("owner") or "") == it.owner), None)
         out.append(check_row(it, last))
     return out
@@ -685,8 +703,8 @@ def verdict_row(v: dict) -> dict:
 
 def verdict_landed(v: dict, agent: str, user_sub: str) -> None:
     """A check's verdict (CHECKS.md): the ``check_verdicts`` feed of the
-    person judged, or of the agent's members for an agent-scope session."""
-    users = [user_sub] if user_sub else _members_and_admins(agent)
+    person judged, or of the agent's editor tier for an agent-scope session."""
+    users = [user_sub] if user_sub else _editors_and_admins(agent)
     emit(users, agent, "check_verdicts", verdict_row(v), shared=not user_sub)
     # The ``checks`` feed's row of that check gains the verdict as its last.
     owner = v.get("owner") or ""
@@ -766,11 +784,13 @@ def run_method(method: str, agent: str, row: dict, user, args, *,
         run = task_store.get_run(run_id) if run_id else None
         if not run or (run.get("agent") or "") != agent:
             raise ValueError("run not found")
-        if (run.get("scope") or "agent") == "user" and run.get("created_by") != user.sub \
-                and not user.is_admin:
+        personal = (run.get("scope") or "agent") == "user"
+        if personal and run.get("created_by") != user.sub and not user.is_admin:
             raise PermissionError("not your run")
         if not user.can_access_agent(agent):
             raise PermissionError("not your agent")
+        if not personal and not user.sees_agent_automations(agent):
+            raise PermissionError("not your run")
         return {"id": run_id, "status": run.get("status") or "",
                 "output_text": (run.get("output_text") or "")[:32_000],
                 "error_message": run.get("error_message") or "",
@@ -778,9 +798,7 @@ def run_method(method: str, agent: str, row: dict, user, args, *,
     if method == "notifications.create":
         title = str(args.get("title") or "").strip()[:200]
         body = str(args.get("body") or "").strip()[:2000]
-        severity = str(args.get("severity") or "info")
-        if severity not in ("info", "success", "warning", "danger"):
-            severity = "info"
+        severity = notification_severity.normalize(args.get("severity"))
         if not title:
             raise ValueError("title is required")
         from storage.automation import notification_store

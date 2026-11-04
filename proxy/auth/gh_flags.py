@@ -1,4 +1,4 @@
-"""gh's flags by command, read from gh's own help (gh 2.103.2): the ones
+"""gh's flags by command, read from gh's own help (gh 2.103.3): the ones
 that take a value and the ones that do not. The judge of a gh command
 (``auth/github_reach.judge_gh``) skips a value-taking flag's value, so a
 value is never read as the command's argument, and refuses a flag it does

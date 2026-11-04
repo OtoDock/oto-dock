@@ -16,6 +16,11 @@ class TestMatches:
         out = "You've hit your session limit · resets 3pm"
         assert _limit_notice(out) == out
 
+    def test_claude_five_hour_limit(self):
+        # 2.1.312 names the 5-hour window "5-hour limit".
+        out = "You've hit your 5-hour limit · resets 3pm"
+        assert _limit_notice(out) == out
+
     def test_claude_typographic_apostrophe(self):
         assert _limit_notice("You’ve hit your usage limit · resets 10am") is not None
 

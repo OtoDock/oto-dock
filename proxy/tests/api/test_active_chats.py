@@ -178,6 +178,20 @@ def test_task_row_titled_by_task_name(temp_db, _as):
     assert rows[orphan]["title"] == "one-off prompt line"
 
 
+def test_a_task_row_with_its_own_title_keeps_it(temp_db, _as):
+    """A run chat the title model titled (or a person renamed) leads with that
+    title in the strip as in the sidebar's task history."""
+    task_store.create_dynamic_task(
+        "dyn-digest", AGENT, "Nightly digest", "p", "cli", "scheduled",
+        "0 9 * * *", None, None, 3600, "user-alice", scope="user")
+    generated = _mk_task_run_chat("user-alice", scope="user", created_by="user-alice",
+                                  task_id="dyn-digest", title="📦 Backup sweep")
+    task_store.update_chat(generated, title_generated=True)
+    _as(_user(), pump=[generated])
+    rows = {r["id"]: r for r in client.get("/v1/chats/active").json()["chats"]}
+    assert rows[generated]["title"] == "📦 Backup sweep"
+
+
 def test_task_row_hidden_when_history_would_be_empty(temp_db, _as):
     """A task row routes to the per-agent Task History, which scopes user runs
     to their creator with NO admin bypass (the admin audit page is the full-view
@@ -416,15 +430,155 @@ def test_persist_first_prompt_broadcasts_inside_not_title_guard(temp_db, monkeyp
 
     async def scenario():
         # Awaited: the row + conditional title land as one chat-lane job.
-        await ctrl._persist_first_prompt(cid, "deploy the fix")
+        await ctrl._persist_first_prompt(cid, {"text": "deploy the fix"})
         assert task_store.get_chat(cid)["title"] == "deploy the fix"
         assert calls == [(("user-alice", cid, "deploy the fix"), {"agent": AGENT})]
 
         # Cold re-send of an already-titled chat re-runs the persist — the
         # broadcast must stay INSIDE the not-title guard (no rename churn).
-        await ctrl._persist_first_prompt(cid, "a different prompt")
+        await ctrl._persist_first_prompt(cid, {"text": "a different prompt"})
         assert task_store.get_chat(cid)["title"] == "deploy the fix"
         assert len(calls) == 1
+    asyncio.run(scenario())
+
+
+def test_a_first_prompt_nobody_typed_leaves_the_chat_untitled(temp_db, monkeypatch):
+    # The warm-up path: a first message with nothing a person wrote (a photo
+    # alone, a wrapper alone) writes no "New Chat"; the next real message
+    # titles the chat.
+    from ws.dashboard_chat import ChatController
+
+    calls = _title_broadcast_recorder(monkeypatch)
+    ctrl = object.__new__(ChatController)
+    ctrl.user_sub = "user-alice"
+    ctrl.notify_connection_id = "conn-test"
+    ctrl.agent_name = AGENT
+    ctrl.chat_id = ""
+    ctrl.user = {"username": "alice"}
+    cid = _mk_chat("user-alice")
+
+    async def scenario():
+        await ctrl._persist_first_prompt(cid, {"text": "[DELEGATED_WORK]only[/DELEGATED_WORK]"})
+        assert (task_store.get_chat(cid)["title"] or "") == ""
+        assert calls == []
+        await ctrl._persist_first_prompt(cid, {"text": "deploy the fix"})
+        assert task_store.get_chat(cid)["title"] == "deploy the fix"
+    asyncio.run(scenario())
+
+
+def test_a_send_nobody_typed_leaves_the_chat_for_the_next_message(temp_db, monkeypatch):
+    # The idle send's title: a message with nothing a person wrote sends no
+    # title_updated and writes nothing; the next real message titles the chat.
+    from core.events.common_events import DONE, TEXT, CommonEvent
+    from tests.fixtures.ws_dashboard_harness import (
+        FakeExecutionLayer,
+        dashboard_connection,
+        drain_startup,
+        make_test_agent,
+        run_ws_scenario,
+        session_cookie,
+        set_username,
+        stub_dashboard_seams,
+        warm_new_chat,
+    )
+
+    layer = FakeExecutionLayer()
+    layer.turn_events = [CommonEvent(type=TEXT, data={"content": "ok"}),
+                         CommonEvent(type=DONE, data={})]
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent()
+    set_username("user-admin", "admin")
+    _title_broadcast_recorder(monkeypatch)
+
+    async def turn(ws, chat_id, text) -> list:
+        ws.client_send({"type": "chat", "text": text, "chat_id": chat_id})
+        titles = []
+        while True:
+            frame = await ws.next_frame()
+            if frame.get("type") == "title_updated":
+                titles.append(frame["title"])
+            if frame.get("type") == "turn_complete":
+                return titles
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await warm_new_chat(ws, layer, slug)
+            assert await turn(ws, chat_id, "[DELEGATED_WORK]only[/DELEGATED_WORK]") == []
+            assert (task_store.get_chat(chat_id)["title"] or "") == ""
+            assert await turn(ws, chat_id, "deploy the fix") == ["deploy the fix"]
+            assert task_store.get_chat(chat_id)["title"] == "deploy the fix"
+            ws.client_send({"type": "close"})
+    run_ws_scenario(scenario)
+
+
+def test_persist_first_prompt_leaves_refused_photos_to_the_kick(temp_db, monkeypatch):
+    # A photo this person may not save: the row is written without it and
+    # the frame keeps it, so the kick refuses with the reason; a message of
+    # such photos alone writes no empty row.
+    from storage.agents import agent_store
+    from ws.dashboard_chat import ChatController
+    from ws.dashboard_chat_support import AttachmentsRefused
+
+    _title_broadcast_recorder(monkeypatch)
+    ctrl = object.__new__(ChatController)
+    ctrl.user_sub = "user-alice"
+    ctrl.notify_connection_id = "conn-test"
+    ctrl.agent_name = AGENT
+    ctrl.chat_id = ""
+    ctrl.user = {"username": "alice"}
+    calls: list = []
+
+    async def _refuse(*a, **k):
+        calls.append(k.get("push"))
+        raise AttachmentsRefused("no")
+
+    monkeypatch.setattr(ctrl, "_process_attachments", _refuse, raising=False)
+    monkeypatch.setattr(agent_store, "agent_exists", lambda _a: True)
+    photo = {"data": "data:image/png;base64,AA==", "name": "a.png"}
+    cid = _mk_chat("user-alice")
+
+    async def scenario():
+        msg = {"text": "look", "images": [photo]}
+        await ctrl._persist_first_prompt(cid, msg)
+        assert calls == [False]  # saved without a push: no session yet
+        rows = task_store.get_chat_messages(cid)
+        assert [(r["role"], r["content"], r["event_data"] or "") for r in rows] == [("user", "look", "")]
+        assert msg == {"text": "look", "images": [photo]}
+
+        await ctrl._persist_first_prompt(cid, {"images": [photo]})
+        assert len(task_store.get_chat_messages(cid)) == 1
+    asyncio.run(scenario())
+
+
+def test_persist_first_prompt_writes_no_row_for_files_alone_that_all_failed(temp_db, monkeypatch):
+    # Files alone, none readable any more (Send again on a files-only card
+    # after the session is gone, the file deleted since): no empty row, the
+    # frame untouched, so the kick finds the same and refuses the message.
+    from storage.agents import agent_store
+    from ws.dashboard_chat import ChatController
+
+    _title_broadcast_recorder(monkeypatch)
+    ctrl = object.__new__(ChatController)
+    ctrl.user_sub = "user-alice"
+    ctrl.notify_connection_id = "conn-test"
+    ctrl.agent_name = AGENT
+    ctrl.chat_id = ""
+    ctrl.user = {"username": "alice"}
+
+    async def _nothing_survived(*a, **k):
+        return "", [], [], []
+
+    monkeypatch.setattr(ctrl, "_process_attachments", _nothing_survived, raising=False)
+    monkeypatch.setattr(agent_store, "agent_exists", lambda _a: True)
+    gone = {"path": "users/alice/workspace/uploads/files/gone.pdf", "name": "gone.pdf"}
+    cid = _mk_chat("user-alice")
+
+    async def scenario():
+        msg = {"text": "", "files": [gone]}
+        await ctrl._persist_first_prompt(cid, msg)
+        assert task_store.get_chat_messages(cid) == []
+        assert msg == {"text": "", "files": [gone]}
     asyncio.run(scenario())
 
 

@@ -33,3 +33,15 @@ const STATE_WORDS: Record<MachineState, string> = {
 export function machineStateWord(state: string | null | undefined): string {
   return STATE_WORDS[state as MachineState] ?? STATE_WORDS[MACHINE_STATE.DISCONNECTED]
 }
+
+/** The machine's local link is down (its sessions cannot reach OtoDock):
+ *  what its row says, or null while the link answers. Under a minute the
+ *  satellite is still restoring it; past a minute a restart is the cure. */
+export function machineLinkNotice(
+  linkOk: boolean | undefined, downS: number | null | undefined,
+): string | null {
+  if (linkOk !== false) return null
+  return (downS ?? 0) < 60
+    ? 'Its sessions cannot reach OtoDock. The satellite is restoring the link.'
+    : 'Its sessions cannot reach OtoDock. Restart the satellite on that machine.'
+}

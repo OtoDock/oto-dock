@@ -599,6 +599,9 @@ class TestEnsurePersistentClaudeDir:
         # The account's claude.ai connectors (Claude Docs, Google Drive) would
         # load as MCP servers and act on the pool owner's account.
         assert data["disableClaudeAiConnectors"] is True
+        # Plan keeps the CLI's plain plan semantics, not its auto mode's
+        # reviewer (the satellite twin writes the same).
+        assert data["useAutoModeDuringPlan"] is False
         # Hooks must remain alongside sandbox config
         assert "PreToolUse" in data["hooks"]
         assert "PostToolUse" in data["hooks"]
@@ -716,8 +719,11 @@ class TestDisallowedBuiltinsConstant:
         # the session): every built-in but the four the platform keeps is
         # switched off by name; 2.1.281 ignores the ids it does not know.
         assert settings["enabledPlugins"] == {p: False for p in DISABLED_BUILTIN_PLUGINS}
+        # 2.1.312 adds the chart mod and the platform docs mod (an HTTP MCP
+        # server and a skill); 2.1.296 ignores ids it does not know.
         for off in ("cc-plugin-plugin-authoring@builtin", "cc-plugin-you-should-know@builtin",
-                    "cc-plugin-claude-test@builtin", "cc-plugin-mods-guide@builtin"):
+                    "cc-plugin-claude-test@builtin", "cc-plugin-mods-guide@builtin",
+                    "cc-plugin-easel@builtin", "cc-plugin-claude-platform@builtin"):
             assert off in DISABLED_BUILTIN_PLUGINS
         # The four the platform keeps on are never in the disable map.
         for keep in ("cc-plugin-agents-md", "cc-plugin-diff", "cc-plugin-telemetry", "cc-plugin-sec-default"):
@@ -1126,6 +1132,27 @@ class TestNetnsPreflight:
         with pytest.raises(RuntimeError, match="pasta"):
             _sandbox_mod.netns_preflight()
 
+    def test_the_shim_starts_through_sh_so_a_confined_pasta_may_exec_it(self, tmp_path):
+        """Ubuntu 26.04 confines pasta with an AppArmor profile that lets it
+        start programs whose file lives under /bin or /usr/bin: the shim's
+        python3 is a venv's (and env there resolves into /usr/lib), so pasta
+        is handed /bin/sh first, which execs python3 (a fake pasta on PATH
+        prints the argv it was given)."""
+        import subprocess
+        import sys
+        fake = tmp_path / "pasta"
+        fake.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+        fake.chmod(0o755)
+        env = {**os.environ, "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"}
+        out = subprocess.run([sys.executable, str(_sandbox_mod._NETNS_LAUNCHER), "--", "/bin/true"],
+                             capture_output=True, text=True, env=env, timeout=30)
+        assert out.returncode == 0, out.stderr
+        argv = out.stdout.splitlines()
+        i = argv.index("--")
+        assert argv[i + 1:i + 6] == ["/bin/sh", "-c", 'exec "$0" "$@"', sys.executable, "-c"]
+        assert argv[-1] == "/bin/true"
+        assert argv[:argv.index("-t")] == ["--quiet", "--config-net", "--no-map-gw"]
+
     def test_loopback_resolver_detection(self, monkeypatch, tmp_path):
         resolv = tmp_path / "resolv.conf"
         resolv.write_text("nameserver 127.0.0.53\noptions edns0\n")
@@ -1386,7 +1413,14 @@ class TestNetnsPreflight:
         monkeypatch.setattr(_sandbox_mod.os.path, "realpath", lambda p: p)
         assert _sandbox_mod._pasta_version() == (
             "pasta (package passt 0.0~git20230309.7c7625d-1)", "2023_03_09")
+        # trixie's package prints nothing at all; a native Debian 13 host
+        # takes it, since it is above the floor.
+        answers.update({"--version": "", "-W": "0.0~git20250503.587980c-2+deb13u1"})
+        assert _sandbox_mod._pasta_version() == (
+            "pasta (package passt 0.0~git20250503.587980c-2+deb13u1)", "2025_05_03")
         monkeypatch.setattr(_sandbox_mod.shutil, "which", lambda tool: "/usr/local/bin/pasta")
+        assert _sandbox_mod._pasta_version() == ("", "")
+        answers["--version"] = "pasta unknown version\nCopyright Red Hat\n"
         assert _sandbox_mod._pasta_version() == ("pasta unknown version", "")
 
     def test_run_probe_reports_the_exit_and_bounds_the_wait(self):
@@ -2214,3 +2248,12 @@ class TestEnginesResolveTheMcpMounts:
             await get_layer_by_path(path)._start_session_impl("sess-x", cfg)
         assert [(m.host, m.sandbox, m.mode) for m in seen["mcp_sandbox_mounts"]] == [
             (f"{mcp_dir}/data", "/opt/demo", "ro")]
+
+
+def test_the_session_env_turns_the_advisor_tool_off():
+    """Claude Code's advisor tool is a second model call its result frame
+    does not count: off on every local spawn (the satellite twins set it
+    too)."""
+    from core.sandbox.env_builder import build_session_env
+    env = build_session_env("sess-advisor", "personal-assistant")
+    assert env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"

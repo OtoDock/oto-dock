@@ -1,9 +1,10 @@
 """Discovery of a hosted MCP server's authorization server
 (``services/oauth/mcp_authorization.py``): the well-known order and the
 challenge fallback, the resource check by document kind, the issuer check,
-https only, endpoints on the issuer's origin, PKCE S256, the private-address
-refusal, the override's limits, the cache and ``forget``, the token
-requests' shapes, the identity and scope helpers.
+https only, the server endpoints on the issuer's origin and the consent page
+on any public one, PKCE S256, the private-address refusal, the override's
+limits, the cache and ``forget``, the token requests' shapes, the identity
+and scope helpers.
 """
 
 from __future__ import annotations
@@ -197,11 +198,104 @@ class TestServerMetadata:
             await ma.discover(RESOURCE)
 
     @pytest.mark.asyncio
-    async def test_endpoint_on_another_origin_refused(self, vendor):
+    @pytest.mark.parametrize("key", ["token_endpoint", "registration_endpoint", "revocation_endpoint"])
+    async def test_a_server_endpoint_on_another_origin_refused(self, vendor, key):
         _standard(vendor)
-        vendor.routes[AS_META] = (200, _as_doc(token_endpoint="https://api.example.com/token"), {})
-        with pytest.raises(ma.AuthorizationError, match="token_endpoint sits on another origin"):
+        vendor.routes[AS_META] = (200, _as_doc(**{key: "https://api.example.com/x"}), {})
+        with pytest.raises(ma.AuthorizationError,
+                           match=rf"mcp.example.com's {key} sits on another origin \(api.example.com\)"):
             await ma.discover(RESOURCE)
+
+    @pytest.mark.asyncio
+    async def test_the_consent_page_may_sit_on_another_public_origin(self, vendor):
+        _standard(vendor)
+        vendor.routes[AS_META] = (200, _as_doc(authorization_endpoint="https://login.example.org/authorize"), {})
+        server = await ma.discover(RESOURCE)
+        assert server.authorization_endpoint == "https://login.example.org/authorize"
+        assert server.token_endpoint == f"{ISSUER}/token"
+        url = ma.build_authorize_url(server.authorization_endpoint, client_id="c", redirect_uri="https://i/cb",
+                                     scope="", state="s", code_challenge="x", resource=server.resource)
+        assert url.startswith("https://login.example.org/authorize?")
+        # discovery never fetched the consent page
+        assert not [r for r in vendor.requests if r.url.host == "login.example.org"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("host,resolved", [
+        ("login.example.org", "10.0.0.7"),
+        ("login.example.org", "127.0.0.1"),
+        ("login.example.org", "169.254.169.254"),
+        ("login.example.org", "::ffff:192.168.1.4"),
+        ("10.1.2.3", None),
+        ("localhost", None),
+        ("sso.localhost", None),
+        ("router.local", None),
+        ("nas.home.arpa", None),
+        ("sso.corp.internal", None),
+        ("localhost.", None),
+        ("sso.test", None),
+        ("login.example", None),
+        ("x.invalid", None),
+        ("abcdefghijklmnop.onion", None),
+        ("router.lan", None),
+        ("nas.home", None),
+        ("sso.corp", None),
+    ])
+    async def test_a_consent_page_off_the_issuer_on_a_private_address_refused(
+            self, vendor, monkeypatch, host, resolved):
+        _standard(vendor)
+        monkeypatch.setattr(ma, "_resolve_addresses",
+                            lambda h: [resolved] if resolved and h == host else
+                            ([h] if h == "10.1.2.3" else ([] if h != "mcp.example.com" else ["8.8.8.8"])))
+        vendor.routes[AS_META] = (200, _as_doc(authorization_endpoint=f"https://{host}/authorize"), {})
+        with pytest.raises(ma.AuthorizationError, match="authorization_endpoint is on a private address"):
+            await ma.discover(RESOURCE)
+
+    @pytest.mark.asyncio
+    async def test_a_private_mcps_consent_page_may_sit_on_another_private_host(self, vendor, monkeypatch):
+        _standard(vendor)
+        monkeypatch.setattr(ma, "_resolve_addresses", lambda host: ["10.0.0.5"])
+        vendor.routes[AS_META] = (200, _as_doc(authorization_endpoint="https://login.lan.example/authorize"), {})
+        server = await ma.discover(RESOURCE)
+        assert server.authorization_endpoint == "https://login.lan.example/authorize"
+
+    @pytest.mark.asyncio
+    async def test_a_consent_page_over_http_refused(self, vendor):
+        _standard(vendor)
+        vendor.routes[AS_META] = (200, _as_doc(authorization_endpoint="http://login.example.org/authorize"), {})
+        with pytest.raises(ma.AuthorizationError, match="not an https URL"):
+            await ma.discover(RESOURCE)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["authorization_endpoint", "token_endpoint"])
+    async def test_a_user_name_in_an_endpoint_refused(self, vendor, key):
+        _standard(vendor)
+        vendor.routes[AS_META] = (200, _as_doc(**{key: "https://mcp.example.com@evil.example/x"}), {})
+        with pytest.raises(ma.AuthorizationError, match="carries a user name"):
+            await ma.discover(RESOURCE)
+
+    @pytest.mark.asyncio
+    async def test_a_postiz_shaped_server(self, vendor):
+        """Postiz's API and issuer are one host, its sign-in page another."""
+        resource, issuer = "https://api.postiz.com/mcp", "https://api.postiz.com"
+        vendor.routes[f"{issuer}/.well-known/oauth-protected-resource/mcp"] = (
+            200, {"resource": resource, "authorization_servers": [issuer]}, {})
+        vendor.routes[f"{issuer}/.well-known/oauth-authorization-server"] = (200, _as_doc(
+            issuer=issuer, authorization_endpoint="https://platform.postiz.com/oauth/authorize",
+            token_endpoint=f"{issuer}/oauth/token", registration_endpoint=f"{issuer}/oauth/register",
+            revocation_endpoint=""), {})
+        server = await ma.discover(resource)
+        assert server.issuer == issuer
+        assert server.authorization_endpoint == "https://platform.postiz.com/oauth/authorize"
+        assert server.token_endpoint == f"{issuer}/oauth/token"
+        assert server.registration_endpoint == f"{issuer}/oauth/register"
+        # the same document with its token endpoint on the sign-in page's host
+        ma.clear_caches()
+        vendor.routes[f"{issuer}/.well-known/oauth-authorization-server"] = (200, _as_doc(
+            issuer=issuer, authorization_endpoint="https://platform.postiz.com/oauth/authorize",
+            token_endpoint="https://platform.postiz.com/oauth/token"), {})
+        with pytest.raises(ma.AuthorizationError,
+                           match=r"api.postiz.com's token_endpoint sits on another origin \(platform.postiz.com\)"):
+            await ma.discover(resource)
 
     @pytest.mark.asyncio
     async def test_http_endpoint_refused(self, vendor):

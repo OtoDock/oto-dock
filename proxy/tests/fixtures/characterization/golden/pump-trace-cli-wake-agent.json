@@ -76,21 +76,6 @@
    {}
   ],
   [
-   "bg_command_start",
-   {
-    "command": "",
-    "description": "Sleep 12 seconds then print SUB_DONE",
-    "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ"
-   }
-  ],
-  [
-   "bg_command_end",
-   {
-    "status": "completed",
-    "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ"
-   }
-  ],
-  [
    "text",
    {
     "content": "\n\n"
@@ -169,18 +154,6 @@
     "type": "metadata"
    },
    "event_type": "metadata",
-   "role": "event"
-  },
-  {
-   "author_sub": "",
-   "content": "",
-   "event_data": {
-    "command": "",
-    "description": "Sleep 12 seconds then print SUB_DONE",
-    "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-    "type": "bg_command_spawn"
-   },
-   "event_type": "bg_command_spawn",
    "role": "event"
   },
   {
@@ -1339,321 +1312,7 @@
    "step": "event:done"
   },
   {
-   "blocks": [
-    {
-     "command": "",
-     "description": "Sleep 12 seconds then print SUB_DONE",
-     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-     "type": "bg_command_spawn"
-    }
-   ],
-   "frames": [
-    {
-     "event": {
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "bg_command_spawn"
-     },
-     "pump_type": "ws_event"
-    }
-   ],
-   "live": {
-    "active_agents": [
-     {
-      "active": true,
-      "background": true,
-      "description": "Run sleep and echo command",
-      "subagent_type": "claude",
-      "tool_input": {
-       "description": "Run sleep and echo command",
-       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
-       "run_in_background": true,
-       "subagent_type": "claude"
-      },
-      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
-      "type": "agent"
-     }
-    ],
-    "active_commands": [
-     {
-      "active": true,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
-    "active_delegates": [],
-    "active_tools": [],
-    "goal": null,
-    "live_blocks": [
-     {
-      "active": true,
-      "background": true,
-      "description": "Run sleep and echo command",
-      "subagent_type": "claude",
-      "tool_input": {
-       "description": "Run sleep and echo command",
-       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
-       "run_in_background": true,
-       "subagent_type": "claude"
-      },
-      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
-      "type": "agent"
-     },
-     {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": true,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
-    "meeting_agent": null,
-    "meeting_participants": [],
-    "pending_permission": null,
-    "session_id": "sid-pw-agent",
-    "streaming": true,
-    "thinking_active": false,
-    "thinking_text": "",
-    "thinking_tokens": 0,
-    "todos": [],
-    "workflows": {}
-   },
-   "state": {
-    "abort_requested": false,
-    "accepts_in_flight": 0,
-    "active_tools": [],
-    "cache": [
-     34660,
-     3150
-    ],
-    "completed": false,
-    "context": [
-     19228,
-     1000000
-    ],
-    "cost_delta": 0.022237,
-    "cumulative_cost": 0.022237,
-    "done": false,
-    "engine_prompts": [],
-    "gc_snapshots_pending": false,
-    "goal": null,
-    "has_pending_prompt": false,
-    "last_ending": null,
-    "last_error": "",
-    "last_session_cost": 0.022237,
-    "leftover": [],
-    "llm_cost_delta": 0.022237,
-    "mcp_cost_by_key": {},
-    "meeting_agent": null,
-    "pending_permission": null,
-    "pending_previews": [],
-    "pending_text": [],
-    "permission_active": null,
-    "permission_buffer": [],
-    "pinged": [],
-    "plan_filename": "",
-    "queue_closed": true,
-    "recovery_eligible": null,
-    "registry": {
-     "completed": [
-      "a7b9545497cef9e06"
-     ],
-     "has_pending": false,
-     "spawned": [
-      "a7b9545497cef9e06"
-     ]
-    },
-    "retried": [],
-    "session_mode": "auto",
-    "steer_saved_ranges": [],
-    "thinking_text": "",
-    "title_armed": true,
-    "todos": [],
-    "tokens": [
-     4,
-     165
-    ],
-    "tool_seen": 1,
-    "viewers": [
-     [
-      true,
-      false,
-      0
-     ]
-    ],
-    "workflows_forwarded": []
-   },
-   "step": "event:bg_command_start"
-  },
-  {
-   "blocks": [
-    {
-     "command": "",
-     "description": "Sleep 12 seconds then print SUB_DONE",
-     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-     "type": "bg_command_spawn"
-    }
-   ],
-   "frames": [
-    {
-     "event": {
-      "status": "completed",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "bg_command_done"
-     },
-     "pump_type": "ws_event"
-    }
-   ],
-   "live": {
-    "active_agents": [
-     {
-      "active": true,
-      "background": true,
-      "description": "Run sleep and echo command",
-      "subagent_type": "claude",
-      "tool_input": {
-       "description": "Run sleep and echo command",
-       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
-       "run_in_background": true,
-       "subagent_type": "claude"
-      },
-      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
-      "type": "agent"
-     }
-    ],
-    "active_commands": [
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
-    "active_delegates": [],
-    "active_tools": [],
-    "goal": null,
-    "live_blocks": [
-     {
-      "active": true,
-      "background": true,
-      "description": "Run sleep and echo command",
-      "subagent_type": "claude",
-      "tool_input": {
-       "description": "Run sleep and echo command",
-       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
-       "run_in_background": true,
-       "subagent_type": "claude"
-      },
-      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
-      "type": "agent"
-     },
-     {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
-    "meeting_agent": null,
-    "meeting_participants": [],
-    "pending_permission": null,
-    "session_id": "sid-pw-agent",
-    "streaming": true,
-    "thinking_active": false,
-    "thinking_text": "",
-    "thinking_tokens": 0,
-    "todos": [],
-    "workflows": {}
-   },
-   "state": {
-    "abort_requested": false,
-    "accepts_in_flight": 0,
-    "active_tools": [],
-    "cache": [
-     34660,
-     3150
-    ],
-    "completed": false,
-    "context": [
-     19228,
-     1000000
-    ],
-    "cost_delta": 0.022237,
-    "cumulative_cost": 0.022237,
-    "done": false,
-    "engine_prompts": [],
-    "gc_snapshots_pending": false,
-    "goal": null,
-    "has_pending_prompt": false,
-    "last_ending": null,
-    "last_error": "",
-    "last_session_cost": 0.022237,
-    "leftover": [],
-    "llm_cost_delta": 0.022237,
-    "mcp_cost_by_key": {},
-    "meeting_agent": null,
-    "pending_permission": null,
-    "pending_previews": [],
-    "pending_text": [],
-    "permission_active": null,
-    "permission_buffer": [],
-    "pinged": [],
-    "plan_filename": "",
-    "queue_closed": true,
-    "recovery_eligible": null,
-    "registry": {
-     "completed": [
-      "a7b9545497cef9e06"
-     ],
-     "has_pending": false,
-     "spawned": [
-      "a7b9545497cef9e06"
-     ]
-    },
-    "retried": [],
-    "session_mode": "auto",
-    "steer_saved_ranges": [],
-    "thinking_text": "",
-    "title_armed": true,
-    "todos": [],
-    "tokens": [
-     4,
-     165
-    ],
-    "tool_seen": 1,
-    "viewers": [
-     [
-      true,
-      false,
-      0
-     ]
-    ],
-    "workflows_forwarded": []
-   },
-   "step": "event:bg_command_end"
-  },
-  {
-   "blocks": [
-    {
-     "command": "",
-     "description": "Sleep 12 seconds then print SUB_DONE",
-     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-     "type": "bg_command_spawn"
-    }
-   ],
+   "blocks": [],
    "frames": [
     {
      "event": {
@@ -1680,15 +1339,7 @@
       "type": "agent"
      }
     ],
-    "active_commands": [
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
+    "active_commands": [],
     "active_delegates": [],
     "active_tools": [],
     "goal": null,
@@ -1708,18 +1359,7 @@
       "type": "agent"
      },
      {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     },
-     {
-      "content": "\n\n",
+      "content": "SPAWNED\n\n\n\n",
       "type": "text"
      }
     ],
@@ -1804,14 +1444,7 @@
    "step": "event:text"
   },
   {
-   "blocks": [
-    {
-     "command": "",
-     "description": "Sleep 12 seconds then print SUB_DONE",
-     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-     "type": "bg_command_spawn"
-    }
-   ],
+   "blocks": [],
    "frames": [
     {
      "event": {
@@ -1838,15 +1471,7 @@
       "type": "agent"
      }
     ],
-    "active_commands": [
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
+    "active_commands": [],
     "active_delegates": [],
     "active_tools": [],
     "goal": null,
@@ -1866,18 +1491,7 @@
       "type": "agent"
      },
      {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     },
-     {
-      "content": "\n\nThe",
+      "content": "SPAWNED\n\n\n\nThe",
       "type": "text"
      }
     ],
@@ -1963,14 +1577,7 @@
    "step": "event:text"
   },
   {
-   "blocks": [
-    {
-     "command": "",
-     "description": "Sleep 12 seconds then print SUB_DONE",
-     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-     "type": "bg_command_spawn"
-    }
-   ],
+   "blocks": [],
    "frames": [
     {
      "event": {
@@ -1997,15 +1604,7 @@
       "type": "agent"
      }
     ],
-    "active_commands": [
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
+    "active_commands": [],
     "active_delegates": [],
     "active_tools": [],
     "goal": null,
@@ -2025,18 +1624,7 @@
       "type": "agent"
      },
      {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     },
-     {
-      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+      "content": "SPAWNED\n\n\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
       "type": "text"
      }
     ],
@@ -2125,12 +1713,6 @@
   {
    "blocks": [
     {
-     "command": "",
-     "description": "Sleep 12 seconds then print SUB_DONE",
-     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-     "type": "bg_command_spawn"
-    },
-    {
      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
      "type": "text"
     },
@@ -2181,15 +1763,7 @@
       "type": "agent"
      }
     ],
-    "active_commands": [
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
+    "active_commands": [],
     "active_delegates": [],
     "active_tools": [],
     "goal": null,
@@ -2209,18 +1783,7 @@
       "type": "agent"
      },
      {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     },
-     {
-      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+      "content": "SPAWNED\n\n\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
       "type": "text"
      }
     ],
@@ -2326,15 +1889,7 @@
       "type": "agent"
      }
     ],
-    "active_commands": [
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     }
-    ],
+    "active_commands": [],
     "active_delegates": [],
     "active_tools": [],
     "goal": null,
@@ -2354,18 +1909,7 @@
       "type": "agent"
      },
      {
-      "content": "SPAWNED\n\n",
-      "type": "text"
-     },
-     {
-      "active": false,
-      "command": "",
-      "description": "Sleep 12 seconds then print SUB_DONE",
-      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
-      "type": "command"
-     },
-     {
-      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.\n\n",
+      "content": "SPAWNED\n\n\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.\n\n",
       "type": "text"
      }
     ],

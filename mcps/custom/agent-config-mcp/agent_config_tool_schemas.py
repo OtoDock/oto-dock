@@ -15,19 +15,22 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "get_agent_config": {
         "description": (
             "Inspect this agent's current settings (display name, description, "
-            "color, default model, execution layers, community-template "
-            "provenance). Read-only."
+            "color, default model, the engines it may run on and the ones "
+            "limited to local models, community-template provenance). "
+            "Read-only."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "list_available_models": {
         "description": (
-            "List the models available on the platform's enabled execution "
-            "layers, grouped by layer and ranked by capability tier (1 frontier "
-            "… 4 fast; untiered), each with what it is good at. Use it to "
-            "choose a default by tier, and before `update_default_model` for "
-            "the valid model IDs."
+            "List the models available on the platform's engines, grouped by "
+            "engine and ranked by capability tier (1 frontier … 4 fast; "
+            "untiered), each with what it is good at. Engines resolve per "
+            "person: each engine says whether this agent allows it and whether "
+            "the person in this session can run it here. Use it to choose a "
+            "default by tier, and before `update_default_model` for the valid "
+            "model IDs."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
@@ -106,16 +109,26 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     # validates every PATCH — and the description points at the listing tool.
     "update_execution_layers": {
         "description": (
-            "Set which execution layers this agent can use. Must be a non-"
-            "empty subset of the platform's engines: {engines}. The "
-            "current default layer is preserved at position 0 if it survives "
-            "the change; otherwise the new layers[0] becomes the default."
+            "Set the engines this agent may run on: a non-empty subset of the "
+            "platform's engines, {engines}. Engines resolve per person: each "
+            "person's chats and tasks run on their own engine among these, so "
+            "ticking an engine never lends anyone's account. "
+            "`local_only_layers` names the engines of the list on which the "
+            "agent runs local models only (possible on {local_engines}); "
+            "omit it to leave that setting as it is. The current default "
+            "engine is preserved at position 0 if it survives the change; "
+            "otherwise the new layers[0] becomes the default, which the "
+            "platform must hold a subscription for."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layers": {
                     "type": "array", "minItems": 1,
+                    "items": {"type": "string"},
+                },
+                "local_only_layers": {
+                    "type": "array",
                     "items": {"type": "string"},
                 },
             },
@@ -126,8 +139,13 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "update_default_layer": {
         "description": (
-            "Set the default execution layer (one of the platform's engines: "
-            "{engines}). Must already be in this agent's execution_paths list."
+            "Set the agent's default engine (one of the platform's engines: "
+            "{engines}): the engine its own tasks, calls and meetings run on, "
+            "and a person's first engine while they have no chats. It stays a "
+            "preference: each person's sessions take the allowed engine they "
+            "use most. Must already be in "
+            "this agent's execution_paths list, and the platform must hold a "
+            "subscription for it."
         ),
         "inputSchema": {
             "type": "object",
@@ -141,10 +159,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "update_default_scope": {
         "description": (
-            "Set this agent's `default_scope` — `user` for personal-leaning "
-            "agents (tasks / notifications / memories default to the user), "
-            "`agent` for operational agents where most work is shared across "
-            "all users of this agent. (For the full mode, prefer "
+            "Set this agent's `default_scope`: `user` when its people work in "
+            "their own space and hand finals over (tasks, notifications and "
+            "memories default to the person), `agent` for the team's shared desk, "
+            "where most work is shared across all users of this agent. Content "
+            "still decides per file, memory and app. (For the full mode, prefer "
             "`set_visibility_mode`.) If this makes the agent Shared only while "
             "people hold the viewer or contributor role, it is refused: a manager "
             "confirms that switch in the agent's settings."
@@ -181,11 +200,13 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "set_visibility_mode": {
         "description": (
             "Set this agent's visibility mode — how it relates to users. One of: "
-            "`personal_shared` (each person private + a shared team space), "
-            "`shared_personal` (one shared space + personal files too), "
-            "`personal_only` (fully private per person, NO shared space), "
-            "`shared_only` (ONE shared workspace + ONE shared chat history for "
-            "everyone, no personal space). Changing modes never deletes folders. "
+            "`personal_shared` (each person private + a shared team space: project "
+            "work whose finals are handed over), `shared_personal` (one shared "
+            "space + personal files too: a department's desk), `personal_only` "
+            "(fully private per person, NO shared space: a whole team working "
+            "privately, or one person), `shared_only` (ONE shared workspace + ONE "
+            "shared chat history for everyone, no personal space: a desk the team "
+            "runs together). Changing modes never deletes folders. "
             "Shared only takes the editor role or above to chat, so switching to it "
             "while people hold the viewer or contributor role is refused here: a "
             "manager confirms, in the agent's settings, the people whose assignment "
@@ -342,8 +363,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "description": (
                         "The library's display name, e.g. 'Brand Guidelines' "
-                        "— how people pick it out in the dashboard, and the "
-                        "name of its bulletin file. REQUIRED when "
+                        "— how people pick it out in the dashboard. "
+                        "REQUIRED when "
                         "enable=true, ignored when un-sharing. Re-share with "
                         "a different name to rename it. Never part of the "
                         "mirror path (consumers read "

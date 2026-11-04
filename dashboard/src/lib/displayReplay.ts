@@ -18,6 +18,9 @@ import { WIRE, type PersistedEvent } from '@/api/wireEvents'
 // every loaded row is newer than the last prompt, so all of it qualifies.
 //
 // On top of that:
+//   - a card (a settings card, an action card or a list card: each persisted
+//     under its own kind, never an artifact's) comes back like one: the
+//     person can still change the setting, press the button or read the list;
 //   - a document push is skipped: it opens in the chat's document pane;
 //   - a kind with an identity (lib/kinds/artifact.ts: a ui by path) dedupes
 //     on it, latest wins — the same in-place replace identity the live
@@ -46,7 +49,8 @@ export function replayableDisplayEvents(
   const out: ReplayArtifact[] = []
   for (let i = lastUserIdx + 1; i < messages.length; i++) {
     const m = messages[i]
-    if (m.role !== 'event' || !REPLAYABLE_ARTIFACT_EVENT_TYPES.has(m.event_type) || !m.event_data) continue
+    if (m.role !== 'event' || !m.event_data) continue
+    if (!REPLAYABLE_ARTIFACT_EVENT_TYPES.has(m.event_type) && m.event_type !== WIRE.SETTINGS_CARD && m.event_type !== WIRE.ACTION_CARD && m.event_type !== WIRE.LIST_CARD) continue
     // A document opens in the chat's document pane, never as a window.
     if (m.event_type === WIRE.DOCUMENT_PREVIEW) continue
     let evt: PersistedEvent

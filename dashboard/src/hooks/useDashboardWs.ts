@@ -8,9 +8,10 @@
  */
 import { useRef, useState, useCallback, useEffect, useMemo, useLayoutEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import type { ActiveChat, Chat } from '../api/chats'
+import type { ActiveChat, ChatList } from '../api/chats'
 
 import { useChatStore, getActiveChatIds } from '@/store/chatStore'
+import { cardKey } from '@/api/cards'
 import { toQueuedMessage } from '@/store/types'
 import { useInstallStore } from '@/store/installStore'
 import { useTransferStore } from '@/store/transferStore'
@@ -505,6 +506,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.DELEGATE_RESULT:
             cb.onDelegateResult?.(msg)
             break
+          case WIRE.SCHEDULE_WAKE:
+            cb.onScheduleWake?.(msg)
+            break
           case WIRE.BG_AGENT_DONE:
             cb.onBgAgentDone?.(msg)
             break
@@ -785,7 +789,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               mcp: msg.mcp,
               phase: msg.phase,
               pct: msg.pct,
-              message: msg.message || '',
+              message: msg.message || '', files_total: msg.files_total,
             })
             break
           case WIRE.INSTALL_HEARTBEAT:
@@ -950,6 +954,16 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             if (msg.chat_id) {
               const st = useChatStore.getState()
               const held = msg.queue_ids?.length ? st.findQueuedChat(msg.queue_ids[0]) : null
+              // A card's answer that left unsent opened its card again: the
+              // card reads its state anew and offers its buttons.
+              const cleared = new Set(msg.queue_ids ?? [])
+              for (const slice of Object.values(st.byChat)) {
+                for (const m of slice.queuedMessages) {
+                  if (m.card && m.queueId && cleared.has(m.queueId)) {
+                    void queryClient.invalidateQueries({ queryKey: cardKey(m.card.card_id) })
+                  }
+                }
+              }
               st.clearQueuedMessages(msg.chat_id, msg.queue_ids)
               if (msg.returned && (msg.text || msg.images?.length || msg.files?.length)) {
                 returnToComposer(held ?? msg.chat_id, msg, cb)
@@ -1078,6 +1092,15 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.QUESTION:
             cb.onQuestion?.(msg)
             break
+          case WIRE.SETTINGS_CARD:
+            cb.onSettingsCard?.(msg)
+            break
+          case WIRE.ACTION_CARD:
+            cb.onActionCard?.(msg)
+            break
+          case WIRE.LIST_CARD:
+            cb.onListCard?.(msg)
+            break
           case WIRE.TOOL_RESULT:
             cb.onToolResult?.(msg)
             break
@@ -1133,14 +1156,16 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // Orchestrator stamp (project adoption / first delegation): patch
             // the cached chat rows so the sidebar accent + Dock gate flip
             // immediately instead of on the chats poll.
-            queryClient.setQueriesData<Chat[]>({ queryKey: ['chats'] }, (old) =>
-              old?.map((c) => (c.id === msg.chat_id
+            queryClient.setQueriesData<ChatList>({ queryKey: ['chats'] }, (old) => old && {
+              ...old,
+              chats: old.chats.map((c) => (c.id === msg.chat_id
                 ? {
                     ...c,
                     ...(msg.delegate_role ? { delegate_role: msg.delegate_role } : {}),
                     ...(msg.project_id ? { project_id: msg.project_id } : {}),
                   }
-                : c)))
+                : c)),
+            })
             if (msg.chat_id) {
               queryClient.invalidateQueries({ queryKey: ['chat-project', msg.chat_id] })
             }
@@ -1265,7 +1290,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         if (target) msg.target = target
       }
       let id: string | undefined
-      if (prompt?.text) {
+      // A message of photos or files alone is a message.
+      if (prompt && (prompt.text || prompt.images?.length || prompt.files?.length)) {
         msg.text = prompt.text
         if (prompt.images?.length) msg.images = prompt.images.map(wireImage)
         if (prompt.files?.length) msg.files = prompt.files

@@ -406,9 +406,10 @@ async def admin_delete_user(
     except Exception:
         logger.exception("App servers of user %s did not stop cleanly (continuing)", sub)
     # Best-effort vendor DELETE for all webhook subscriptions
-    # this user owns. Must happen BEFORE task_store.delete_user (which
-    # cascades to triggers/credentials and revokes the OAuth tokens we
-    # need to talk to vendors). Failures are logged but don't block.
+    # this user owns. Must happen BEFORE the accounts are released below
+    # (the vendor delete needs their tokens) and before
+    # task_store.delete_user cascades the credential rows. Failures are
+    # logged but don't block.
     try:
         from services.webhooks import subscription_manager
         await subscription_manager.cleanup_user_subscriptions(sub)
@@ -441,6 +442,18 @@ async def admin_delete_user(
         logger.exception(
             "Service-agent-binding cleanup raised for user %s "
             "(continuing with user delete)", sub,
+        )
+    # The person's vendor accounts go with them: revoked at the vendor, their
+    # token files deleted (the rows cascade, the files would stay and keep
+    # being refreshed), their routes at the event relay ended. After the
+    # subscription cleanups above, which call the vendors with these tokens.
+    hosted_app_providers: set[str] = set()
+    try:
+        from services.oauth import account_release
+        hosted_app_providers = await account_release.release_user_accounts(sub)
+    except Exception:
+        logger.exception(
+            "Vendor account release raised for user %s (continuing with user delete)", sub,
         )
     # Revoke the user's API keys and user-scoped triggers. These tables carry
     # NO foreign key to users(sub), so delete_user does NOT cascade them —
@@ -495,6 +508,10 @@ async def admin_delete_user(
     # holder cache already holds must not outlive it.
     from auth import token_holder
     token_holder.forget(sub)
+    # A hosted GitHub-App account kept the relay forwarding on by itself.
+    from services.webhooks import relay_events
+    for provider_id in sorted(hosted_app_providers):
+        relay_events.sync_provider_soon(provider_id)
     logger.info("Admin %s deleted user %s", mask_email(u.email), sub)
     await offboarding.dispatch_losses(
         sub, offboarding.losses(cast("dict", target)["role"], rows_before, None, {}, all_agents),
@@ -527,7 +544,7 @@ async def admin_create_user(
     if not allowed:
         raise HTTPException(
             status_code=402,
-            detail=f"User limit reached ({current}/{max_users}). Upgrade your license.",
+            detail=f"User limit reached ({current}/{max_users}). The license in Setup, OtoDock sets the limit.",
         )
 
     # Check email uniqueness

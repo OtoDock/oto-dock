@@ -73,7 +73,7 @@ async def build_turn_classifier(cfg: ConfigManager):
     )
 
 
-def build_stt(cfg: ConfigManager, provider: dict | None):
+def build_stt(cfg: ConfigManager, provider: dict | None, *, wide_relisten: bool = False):
     """Build the call STT from a resolved provider-map entry.
 
     Deepgram (the only streaming call STT today) takes the phone's audio knobs +
@@ -103,9 +103,11 @@ def build_stt(cfg: ConfigManager, provider: dict | None):
         )
     # A live final answered with no word over speech is listened to again
     # (Deepgram's empty Greek windows); the turn's take completes the text.
+    # The spoken conversation on a chat (``wide_relisten``) listens again to
+    # a window's uncovered stretches too, as dictation's held windows do.
     enable = getattr(stt, "enable_turn_relisten", None)
     if enable is not None:
-        enable()
+        enable(wide=wide_relisten)
     return stt
 
 

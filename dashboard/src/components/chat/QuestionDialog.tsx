@@ -38,11 +38,22 @@ interface Props {
   readOnly?: boolean
 }
 
+// One question as a card draws it: Claude's and Codex's shapes as they are,
+// Codex's async question as `title` with plain string options.
+function asQuestionItem(q: unknown): QuestionItem {
+  const item = isRecord(q) ? q : {}
+  if (typeof item.question === 'string' || typeof item.title !== 'string') return item as unknown as QuestionItem
+  const options = Array.isArray(item.options)
+    ? item.options.map((o) => (typeof o === 'string' ? { label: o } : o) as QuestionOption)
+    : undefined
+  return { question: item.title, options }
+}
+
 function parseQuestions(toolInput: unknown): QuestionItem[] {
   if (!toolInput) return []
   if (typeof toolInput === 'string') return [{ question: toolInput }]
   const input = isRecord(toolInput) ? toolInput : {}
-  if (input.questions && Array.isArray(input.questions)) return input.questions
+  if (input.questions && Array.isArray(input.questions)) return input.questions.map(asQuestionItem)
   if (input.question) {
     return [{
       question: String(input.question),
@@ -153,7 +164,9 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
     questions.forEach((q, qIdx) => {
       const selected = selections[qIdx] || new Set<number>()
       const custom = customTexts[qIdx]?.trim()
-      if (isMulti && q.header) parts.push(`**${q.header}**:`)
+      // Codex's async questions carry no header: the question labels its line.
+      const label = q.header || q.question
+      if (isMulti && label) parts.push(`**${label}**:`)
       if (q.options && selected.size > 0) {
         const labels = Array.from(selected).map((i) => q.options![i]?.label || `Option ${i + 1}`)
         parts.push(labels.join(', '))

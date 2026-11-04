@@ -83,8 +83,13 @@ android {
             // A debuggable build lets USB/adb tooling inspect the WebView and its
             // session cookie; the release build never is.
             debuggable false
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // R8 shrinks, optimizes and renames the code, and drops unused
+            // resources; the mapping rides the bundle, so Play's crash reports
+            // read the original names. What the page calls by name is kept in
+            // proguard-rules.pro.
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }
@@ -130,6 +135,8 @@ repositories {
 dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    // EdgeToEdge.enable: both bars transparent on every Android version.
+    implementation "androidx.activity:activity:$androidxActivityVersion"
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     // WebViewCompat.addWebMessageListener: the origin-scoped dashboard channel.
@@ -139,6 +146,10 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
+
+    // The store's own review sheet (Play's in-app review), asked for by the
+    // dashboard through the channel's requestStoreReview.
+    implementation 'com.google.android.play:review:2.0.2'
 
     // Firebase Cloud Messaging for push notifications
     implementation platform('com.google.firebase:firebase-bom:34.11.0')

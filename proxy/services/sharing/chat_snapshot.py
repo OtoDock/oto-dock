@@ -3,7 +3,10 @@ at the moment it was shared.
 
 A chat share is a copy, never a live view: the user and assistant text,
 the chat's artifacts (``display_ui`` pages), its displayed images, video,
-audio and files, and — only when asked — the tool-call blocks. Everything
+audio and files, and — only when asked — the tool-call blocks. Each of the
+agent's blocks keeps its row's ``id``, so a reader may report the reply
+from the copy (``api/agents/reply_reports.py``); a person's message and a
+thinking row keep none. Everything
 is copied under ``<agent dir>/shares/users/<creator>/<share id>/`` (the
 creator's quota bucket; outside the files API, the sync and the
 blueprints), so the copy serves after the chat's own files and media
@@ -26,6 +29,7 @@ from pathlib import Path
 import config
 from core import layout
 from core.events import artifact_events
+from core.events.common_events import ROW_ASSISTANT
 from services.infra import safe_fs
 from services.infra.agent_dirs import agent_dirs
 from services.infra.path_confinement import PathOutsideRoot, join_under
@@ -46,6 +50,11 @@ ARTIFACT_EVENTS = artifact_events.SHAREABLE
 # input and result, a subagent, a background command) plus the thinking rows
 # — the ``include_tools`` copy. Every name is a row kind the pump writes.
 TOOL_EVENTS = frozenset({wire.PERSISTED_TOOL, wire.THINKING, wire.TASK_SPAWN, wire.BG_COMMAND_SPAWN})
+# The cards (a setting's, an action card's, a list card's): the copy keeps
+# the row as a placeholder naming the card, since the value, the state and
+# the rows were never in the row and a reader of the link has no sign-in to
+# read them with.
+CARD_EVENTS = frozenset({wire.SETTINGS_CARD, wire.ACTION_CARD, wire.LIST_CARD})
 _INERT_INLINE = ("audio/", "video/", "image/")
 
 # Credentials a tool call may have printed (an env dump carries the
@@ -161,7 +170,8 @@ def _snapshot_block(row: dict, copier: _Copier, counter: list[int]) -> dict | No
         return None
     if not isinstance(data, dict):
         return None
-    out: dict = {"role": "event", "event_type": et, "created_at": row.get("created_at") or ""}
+    out: dict = {"id": row.get("id"), "role": "event", "event_type": et,
+                 "created_at": row.get("created_at") or ""}
     if et == wire.UI:
         token = str(data.get("token") or "")
         if not copier.copy_token(token, "ui", ".html"):
@@ -212,6 +222,47 @@ def _snapshot_block(row: dict, copier: _Copier, counter: list[int]) -> dict | No
     return out
 
 
+def _attachment_counts(row: dict) -> tuple[int, int]:
+    """How many photos and files a person's row names (its ``event_data``
+    ``images`` and ``files``)."""
+    try:
+        data = json.loads(row.get("event_data") or "{}")
+    except (TypeError, ValueError):
+        return 0, 0
+    if not isinstance(data, dict):
+        return 0, 0
+
+    def _count(key: str) -> int:
+        items = data.get(key)
+        return sum(1 for item in items if isinstance(item, dict)) if isinstance(items, list) else 0
+
+    return _count("images"), _count("files")
+
+
+def _event_message(row: dict, event_data: str) -> dict:
+    """A copied event row: its kind, the data the copy keeps, its stamp."""
+    return {"role": row.get("role") or "", "event_type": row.get("event_type") or "",
+            "event_data": event_data, "created_at": row.get("created_at") or ""}
+
+
+def _card_block(row: dict) -> dict:
+    """A card row's copy, shaped like an artifact block (``data`` the
+    renderers read): a setting's id and label, an action card's title, a
+    list card's title and kind, nothing else (never the person)."""
+    try:
+        data = json.loads(row.get("event_data") or "")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    out = {"setting": str(data.get("setting") or ""), "label": str(data.get("label") or ""),
+           "title": str(data.get("title") or "")}
+    if data.get("kind"):
+        out["kind"] = str(data["kind"])
+    return {"id": row.get("id"), "role": "event", "event_type": row.get("event_type") or "",
+            "created_at": row.get("created_at") or "", "data": out}
+
+
 def build(chat: dict, share_id: str, creator_username: str, *, include_tools: bool = False) -> str:
     """Write the snapshot and return its ``snapshot_ref``. Raises
     SnapshotTooLarge past the byte cap (the caller undoes the share)."""
@@ -229,19 +280,31 @@ def build(chat: dict, share_id: str, creator_username: str, *, include_tools: bo
             role = row.get("role") or ""
             et = row.get("event_type") or ""
             if role in ("user", "assistant") and not et:
-                if not (row.get("content") or "").strip():
+                # A person's photos and files are counted, never copied: the
+                # copy holds what the chat displayed, not the person's uploads.
+                photos, files = _attachment_counts(row)
+                if not (row.get("content") or "").strip() and not photos and not files:
                     continue
-                messages.append({"role": role, "content": row.get("content") or "",
-                                 "created_at": row.get("created_at") or "",
-                                 "author_sub": row.get("author_sub") or ""})
-            elif role == "event" and et in ARTIFACT_EVENTS:
-                block = _snapshot_block(row, copier, counter)
-                if block:
-                    messages.append(block)
-            elif include_tools and role == "event" and et in TOOL_EVENTS:
-                messages.append({"role": "event", "event_type": et,
-                                 "event_data": redact_tokens(row.get("event_data") or ""),
-                                 "created_at": row.get("created_at") or ""})
+                message = {"role": role, "content": row.get("content") or "",
+                           "created_at": row.get("created_at") or "",
+                           "author_sub": row.get("author_sub") or ""}
+                if role == ROW_ASSISTANT:
+                    message["id"] = row.get("id")
+                if photos or files:
+                    message["attachments"] = {"photos": photos, "files": files}
+                messages.append(message)
+            elif role == "event":
+                if et in ARTIFACT_EVENTS:
+                    block = _snapshot_block(row, copier, counter)
+                    if block:
+                        messages.append(block)
+                elif et in CARD_EVENTS:
+                    messages.append(_card_block(row))
+                elif include_tools and et in TOOL_EVENTS:
+                    copied = _event_message(row, redact_tokens(row.get("event_data") or ""))
+                    if et != wire.THINKING:
+                        copied["id"] = row.get("id")
+                    messages.append(copied)
         doc = {
             "version": 1,
             "chat_id": chat["id"],

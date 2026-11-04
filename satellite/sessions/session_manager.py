@@ -41,6 +41,7 @@ from . import alive_report
 from .cli_session import CLISession, _write_cli_hooks
 from .codex_session import CodexSession, _write_codex_hooks
 from .mcp_install_support import (
+    InstallFailed,
     _fix_shebangs_after_swap,
     _fix_windows_exe_paths_after_swap,
     _force_remove_or_quarantine,
@@ -48,6 +49,9 @@ from .mcp_install_support import (
     _scan_installed_mcps,
     _uv_bin_if_present,
     _warm_one_mcp,
+    _write_runtime_marker,
+    install_failure_cause,
+    mcp_python_spec,
 )
 
 if TYPE_CHECKING:
@@ -932,11 +936,15 @@ class SessionManager:
 
     async def stop_turn(self, msg: dict) -> None:
         """Proxy is asking the current send_message loop to exit (turn over).
-        ``drain_bg`` (set when a backgrounded command is still pending) arms the
-        session's post-turn stdout drainer once this turn's loop exits."""
+        ``drain_bg`` (set when background work is still pending) arms the
+        session's post-turn stdout drainer once this turn's loop exits, for
+        ``drain_bg_s`` seconds (the proxy's background-work ceiling)."""
         session_id = msg.get("session_id", "")
         session = self.sessions.get(session_id)
-        if session and hasattr(session, "request_stop_turn"):
+        if isinstance(session, CLISession):
+            session.request_stop_turn(drain_bg=msg.get("drain_bg", False),
+                                      drain_bg_s=msg.get("drain_bg_s"))
+        elif session and hasattr(session, "request_stop_turn"):
             session.request_stop_turn(drain_bg=msg.get("drain_bg", False))
 
     async def control_response(self, msg: dict) -> None:
@@ -2533,12 +2541,16 @@ class SessionManager:
                 # (everything else installs from wheels only): the proxy's
                 # spec carries the list; an older proxy sends none.
                 source_build = _source_build_of(spec)
+                # A fresh venv runs on this satellite's own Python, never on
+                # whatever python3 comes first on the service's PATH.
+                python_spec = mcp_python_spec()
                 r = await mcp_installer.install_mcp(
                     new_root, spec.get("runtime", ""), source,
                     progress_cb=_progress,
                     uv_bin=_uv_bin_if_present(),
                     python_bin=sys.executable,
                     source_build=source_build,
+                    python_spec=python_spec,
                 )
                 # Retry past a TRANSIENT Windows file lock: a real-time AV
                 # scanner holding a freshly-written file open blocks uv/pip's
@@ -2571,9 +2583,10 @@ class SessionManager:
                         uv_bin=_uv_bin_if_present(),
                         python_bin=sys.executable,
                         source_build=source_build,
+                        python_spec=python_spec,
                     )
                 if not r.ok:
-                    raise RuntimeError(r.log[-500:] if r.log else "install failed")
+                    raise InstallFailed(install_failure_cause(r.log or ""))
 
                 # Verify hash. Soft-warn on mismatch; satellite still keeps
                 # the install (it works — the hash only keys the sync diff).
@@ -2678,6 +2691,11 @@ class SessionManager:
 
                 with contextlib.suppress(OSError):
                     marker.unlink()
+                # A venv made on this satellite's Python (or a floor the
+                # package asked for) is reconciled already: the boot's check
+                # leaves it alone. After the swap, which replaces the folder.
+                if spec.get("runtime") == "python" and getattr(r, "venv_python", ""):
+                    _write_runtime_marker(target_root, python=f"{sys.version_info[0]}.{sys.version_info[1]}")
                 await _progress({"mcp": name, "phase": "done", "pct": 100, "message": "installed"})
                 results[name] = {"status": "ok", "version_hash": r.version_hash}
                 # Pre-warm in the background so it overlaps the next install.
@@ -2700,7 +2718,7 @@ class SessionManager:
                     )
                 with contextlib.suppress(OSError):
                     marker.unlink()
-                err = f"{type(e).__name__}: {e}"
+                err = str(e) if isinstance(e, InstallFailed) else f"{type(e).__name__}: {e}"
                 await _progress({"mcp": name, "phase": "failed", "pct": 100, "message": err, "error": err})
                 results[name] = {"status": "error", "error": err}
 

@@ -35,17 +35,18 @@ const RETURN_KEYS = [
 ]
 
 const CALLBACK_KEYS = [
-  'isViewedChatPtyLive', 'newChatTarget', 'onAborted', 'onAudio', 'onBgAgentDone', 'onBgAgentsComplete',
+  'isViewedChatPtyLive', 'newChatTarget', 'onAborted', 'onActionCard', 'onAudio', 'onBgAgentDone', 'onBgAgentsComplete',
   'onBgCommandDone',
   'onBgCommandSpawn', 'onBgCommandsComplete', 'onChatHistory', 'onChatHistoryDelta', 'onChatMoved', 'onChatRows',
   'onChatViewOnly', 'onContextCompact', 'onDelegateResult', 'onDelegateSpawn', 'onDocumentPreview', 'onDone',
   'onEngineSwitched', 'onError', 'onExecutionModeChanged', 'onFgAgentsComplete', 'onFile', 'onGoalUpdate',
-  'onImageGenFailed', 'onImageGenerating', 'onImages', 'onLimitReached', 'onLimitWarning', 'onLiveState',
+  'onImageGenFailed', 'onImageGenerating', 'onImages', 'onLimitReached', 'onLimitWarning', 'onListCard', 'onLiveState',
   'onLiveness', 'onLocationRequest', 'onMcpCost', 'onMediaFailed', 'onMediaProcessing', 'onMetadata',
   'onModeChanged', 'onModelChanged', 'onNotification', 'onNotificationCount', 'onNotificationSilent',
   'onPermissionPrompt', 'onPermissionResolved', 'onPlanMode', 'onPlanReview', 'onPlanStatus', 'onPreWarmupReady',
   'onPromptRetired',
-  'onQuestion', 'onQueueEditReturn', 'onQueueRemoved', 'onQueueSent', 'onQueued', 'onServerTurnStart', 'onSteered',
+  'onQuestion', 'onQueueEditReturn', 'onQueueRemoved', 'onQueueSent', 'onQueued', 'onScheduleWake', 'onServerTurnStart', 'onSettingsCard',
+  'onSteered',
   'onSwitchEngineDenied', 'onSystem', 'onTaskSpawn', 'onText', 'onThinking', 'onTitleUpdated', 'onTodoUpdate',
   'onToolEnd', 'onToolInfo', 'onToolResult', 'onToolStart', 'onTurnComplete', 'onUrl', 'onVideo', 'onWarmupFailed',
   'onWarmupReady', 'onWarmupStarted', 'onWorkflowEnd', 'onWorkflowProgress', 'onWorkflowStart', 'viewedChatId',

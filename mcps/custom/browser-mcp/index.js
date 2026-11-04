@@ -39,6 +39,8 @@ const os = require("os");
 const path = require("path");
 
 const studio = require("./studio.js");
+const ownProfile = require("./own_profile.js");
+const ownUpload = require("./own_upload.js");
 
 // OTO_AGENT_NAME is already a filesystem-safe slug; defensively keep only
 // path-safe characters and never allow a "." (so a name can never become a
@@ -285,15 +287,26 @@ function listProcesses() {
     }));
 }
 
-// Pure decision: which profile holders are provably orphaned? A holder is a
-// browser MAIN process (no --type=, killing it tears down its own children)
-// whose command line names this exact profile dir. `procs` is the full table
-// from listProcesses().
+// The profile's browser MAIN processes (no --type=; ending one tears down its
+// own children): the command line names this exact profile dir, with a
+// boundary after the path, so agent "test" never matches "test-agent"'s
+// browser. `procs` is the full table from listProcesses().
+function profileHolders(procs, profileDir) {
+  const flag = `--user-data-dir=${profileDir}`;
+  return procs.filter((p) => {
+    if (/--type=/.test(p.cmd)) return false;
+    for (let i = p.cmd.indexOf(flag); i !== -1; i = p.cmd.indexOf(flag, i + 1)) {
+      const next = p.cmd.charAt(i + flag.length);
+      if (next === "" || next === " " || next === '"' || next === "'") return true;
+    }
+    return false;
+  });
+}
+
+// Pure decision: which profile holders are provably orphaned?
 function findOrphanHolders(procs, profileDir) {
   const byPid = new Map(procs.map((p) => [p.pid, p]));
-  const holders = procs.filter(
-    (p) => p.cmd.includes(`--user-data-dir=${profileDir}`) && !/--type=/.test(p.cmd)
-  );
+  const holders = profileHolders(procs, profileDir);
   return holders.filter((h) => {
     const parent = byPid.get(h.ppid);
     if (!parent) return true; // parent dead → orphan
@@ -457,13 +470,50 @@ function seedProfileDisplayName(profileDir, agentSlug) {
   }
 }
 
+// How a browser starts detached on POSIX, as {command, argv}. On a Mac a
+// browser inside an app bundle starts through LaunchServices (`open`): a
+// direct exec of a Chrome that never ran on that Mac aborts at once (its
+// Application Support folder does not exist yet), and launchd becomes the new
+// instance's parent. `newInstance` (`-n`) is for the shared browser's own
+// profile, never for the person's own browser. `logPath` takes the browser's
+// output so a launch that dies says why. Elsewhere an intermediary shell that
+// exits at once does the detaching.
+function detachedLaunchArgv(exePath, args, { platform = process.platform, logPath = null, newInstance = true } = {}) {
+  const bundle = platform === "darwin" ? /^(.*?\.app)\/Contents\/MacOS\/[^/]+$/.exec(exePath) : null;
+  if (bundle) {
+    const argv = [...(newInstance ? ["-n"] : []), "-a", bundle[1]];
+    if (logPath) argv.push("--stdout", logPath, "--stderr", logPath);
+    if (args.length) argv.push("--args", ...args);
+    return { command: "/usr/bin/open", argv };
+  }
+  return { command: "/bin/sh", argv: ["-c", '"$0" "$@" &', exePath, ...args] };
+}
+
+// The line of a browser's launch log that says why it did not start, cut to
+// 300 characters; "" when there is none: Chrome's FATAL line, or macOS's `open`
+// refusing the launch (outside the desktop session, an app it cannot find).
+// Chrome prints ERROR lines in healthy runs: those never count.
+const LAUNCH_FAILURE = /:FATAL:|^FATAL\b|LSOpen\w*\(\) failed|cannot be opened|Unable to find application/;
+
+function launchFailureLine(logPath) {
+  let text;
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch (_) {
+    return "";
+  }
+  const failed = text.split(/\r?\n/).filter((l) => LAUNCH_FAILURE.test(l)).pop();
+  return failed ? failed.trim().slice(0, 300) : "";
+}
+
 // Launch a browser with its parent chain BROKEN: the session teardown
 // snapshots the MCP's live descendant tree and kills it, so a plain detached
 // child (still ppid-linked to this wrapper) would die with the session. An
-// intermediary shell that exits immediately leaves the browser unreachable
-// from any session's process tree. Used for the dedicated-profile daemon and,
-// in own-browser mode, to start the user's browser when it is not running.
-function launchDetachedBrowser(exePath, args) {
+// intermediary shell that exits immediately (or LaunchServices on a Mac)
+// leaves the browser unreachable from any session's process tree. Used for
+// the dedicated-profile daemon and, in own-browser mode, to start the user's
+// browser when it is not running.
+function launchDetachedBrowser(exePath, args, { logPath = null, newInstance = true } = {}) {
   if (process.platform === "win32") {
     // `start ""` detaches; cmd exits at once. Quote args for cmd.
     const quoted = args.map((a) => `"${a}"`).join(" ");
@@ -474,43 +524,223 @@ function launchDetachedBrowser(exePath, args) {
     }).unref();
     return;
   }
-  const sh = spawn("/bin/sh", ["-c", '"$0" "$@" >/dev/null 2>&1 &', exePath, ...args], {
-    stdio: "ignore",
-    detached: true,
-  });
-  sh.unref();
+  // The log, rewritten per launch, also takes `open`'s own errors (a launch
+  // outside the desktop session fails there).
+  let out = "ignore";
+  if (logPath) {
+    try {
+      out = fs.openSync(logPath, "w");
+    } catch (_) {
+      logPath = null;
+    }
+  }
+  const { command, argv } = detachedLaunchArgv(exePath, args, { logPath, newInstance });
+  const child = spawn(command, argv, { stdio: ["ignore", out, out], detached: true });
+  child.unref();
+  if (typeof out === "number") fs.closeSync(out);
+}
+
+// The shared browser's command line. A closed window comes back with its
+// tabs; after a wedge the stuck tab must not.
+function daemonLaunchArgs(profileDir, { restoreLastSession = true } = {}) {
+  const args = [
+    `--user-data-dir=${profileDir}`,
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check",
+  ];
+  if (restoreLastSession) args.push("--restore-last-session");
+  return args;
+}
+
+// One launch or recovery at a time per profile, across every session of the
+// agent on this machine (each runs its own wrapper): a directory made
+// atomically in the profile. A holder that died leaves it behind; it counts
+// as free once older than LAUNCH_LOCK_STALE_MS (a launch waits 15 s at most,
+// a recovery about 30 s).
+const LAUNCH_LOCK = ".otodock-launch.lock";
+const LAUNCH_LOCK_STALE_MS = 60000;
+
+function tryLaunchLock(profileDir, now = Date.now()) {
+  const dir = path.join(profileDir, LAUNCH_LOCK);
+  try {
+    fs.mkdirSync(dir);
+    return true;
+  } catch (e) {
+    if (e.code !== "EEXIST") return true; // no lock possible here: go on unlocked
+  }
+  try {
+    if (now - fs.statSync(dir).mtimeMs > LAUNCH_LOCK_STALE_MS) {
+      fs.rmdirSync(dir);
+      fs.mkdirSync(dir);
+      return true;
+    }
+  } catch (_) {
+    /* another session took it over first */
+  }
+  return false;
+}
+
+function releaseLaunchLock(profileDir) {
+  try {
+    fs.rmdirSync(path.join(profileDir, LAUNCH_LOCK));
+  } catch (_) {
+    /* already gone */
+  }
+}
+
+async function withLaunchLock(profileDir, fn) {
+  while (!tryLaunchLock(profileDir)) await new Promise((f) => setTimeout(f, 250));
+  try {
+    return await fn();
+  } finally {
+    releaseLaunchLock(profileDir);
+  }
 }
 
 // Resolve (or start) the shared browser daemon and return its CDP endpoint,
 // or null when this machine must fall back to the classic persistent launch
 // (non-Chromium browser, no known exe path, or a live non-daemon browser
 // legitimately holding the profile).
-async function ensureBrowserDaemon(profileDir, exePath, agentSlug) {
-  let endpoint = await liveCdpEndpoint(profileDir);
-  if (endpoint) return endpoint;
-  // A browser without a debug port holds the profile: reap it if provably
-  // orphaned (pre-daemon zombie / crashed daemon); a live-owned one keeps its
-  // exclusive claim and we fall back.
-  reapOrphanedBrowser(profileDir);
-  if (profileLooksLocked(profileDir)) return null;
-  seedProfileDisplayName(profileDir, agentSlug);
-  launchDetachedBrowser(exePath, [
-    `--user-data-dir=${profileDir}`,
-    "--remote-debugging-port=0",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--restore-last-session",
-  ]);
-  for (let i = 0; i < 60; i++) {
-    await new Promise((f) => setTimeout(f, 250));
-    endpoint = await liveCdpEndpoint(profileDir);
+async function ensureBrowserDaemon(profileDir, exePath, agentSlug, { restoreLastSession = true } = {}) {
+  const live = await liveCdpEndpoint(profileDir);
+  if (live) return live;
+  return withLaunchLock(profileDir, async () => {
+    // Another session may have launched it while this one waited.
+    let endpoint = await liveCdpEndpoint(profileDir);
     if (endpoint) return endpoint;
+    // A browser without a debug port holds the profile: reap it if provably
+    // orphaned (pre-daemon zombie / crashed daemon); a live-owned one keeps
+    // its exclusive claim and we fall back.
+    reapOrphanedBrowser(profileDir);
+    if (profileLooksLocked(profileDir)) return null;
+    seedProfileDisplayName(profileDir, agentSlug);
+    launchDetachedBrowser(exePath, daemonLaunchArgs(profileDir, { restoreLastSession }), {
+      logPath: path.join(profileDir, "launch.log"),
+    });
+    for (let i = 0; i < 60; i++) {
+      await new Promise((f) => setTimeout(f, 250));
+      endpoint = await liveCdpEndpoint(profileDir);
+      if (endpoint) return endpoint;
+    }
+    process.stderr.write(
+      `[browser-control] Browser daemon did not expose a CDP endpoint within 15s ` +
+        `(profile ${profileDir}); falling back to a per-session browser.\n`
+    );
+    return null;
+  });
+}
+
+// --- A shared browser that lets no new session attach ----------------------
+//
+// A CDP attach waits for every page already open in the browser to
+// initialize, under a 30 s limit (Playwright's connectOverCDP); one tab whose
+// renderer stopped answering (a page frozen or hung after hours in the
+// background) makes every new session's first browser call fail with
+// "initializeServer: Timeout 30000ms exceeded", the call log ending at
+// "<ws connected>", while the browser itself still answers on its debugging
+// port. Upstream: microsoft/playwright#42730 (closed as a duplicate of
+// #41093, not planned). Only a fresh browser recovers.
+const WEDGED_ATTACH_RE = /(initializeServer|connectOverCDP): Timeout \d+ms exceeded/;
+
+function isWedgedAttachError(text) {
+  const s = String(text || "");
+  return WEDGED_ATTACH_RE.test(s) && s.includes("<ws connected>");
+}
+
+// What a session does about a wedged attach. `childEndpoint` is the endpoint
+// its child timed out on, `live` the profile's live endpoint now (null when
+// none answers), `sameBrowser` whether the browser answering there is the one
+// the profile's DevToolsActivePort names.
+function wedgeAction({ handled, childEndpoint, live, sameBrowser }) {
+  if (handled) return "pass";
+  if (!live) return "relaunch";
+  if (live !== childEndpoint) return "attach";
+  return sameBrowser ? "end-and-relaunch" : "pass";
+}
+
+function endpointPort(endpoint) {
+  const m = /:(\d+)\/?$/.exec(String(endpoint || ""));
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// The browser websocket path DevToolsActivePort names (its second line), and
+// the one the browser on `port` reports: equal when that port is this
+// profile's browser.
+function readDevtoolsBrowserPath(profileDir) {
+  try {
+    return fs.readFileSync(path.join(profileDir, "DevToolsActivePort"), "utf8").split("\n")[1].trim() || null;
+  } catch (_) {
+    return null;
   }
-  process.stderr.write(
-    `[browser-control] Browser daemon did not expose a CDP endpoint within 15s ` +
-      `(profile ${profileDir}); falling back to a per-session browser.\n`
-  );
-  return null;
+}
+
+function cdpBrowserPath(port, timeoutMs) {
+  return new Promise((resolve) => {
+    const http = require("http");
+    const req = http.get({ host: "127.0.0.1", port, path: "/json/version", timeout: timeoutMs }, (res) => {
+      let body = "";
+      res.on("data", (d) => (body += d));
+      res.on("end", () => {
+        try {
+          resolve(new URL(JSON.parse(body).webSocketDebuggerUrl).pathname);
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.on("error", () => resolve(null));
+  });
+}
+
+// End the profile's browser: a polite stop, a forced one after 5 s, then wait
+// for the profile to unlock. True once nothing holds it.
+async function endProfileBrowser(profileDir) {
+  const holders = profileHolders(listProcesses(), profileDir);
+  const waitUnlocked = async () => {
+    for (let i = 0; i < 20; i++) {
+      if (!profileLooksLocked(profileDir)) return true;
+      await new Promise((f) => setTimeout(f, 250));
+    }
+    return !profileLooksLocked(profileDir);
+  };
+  for (const h of holders) {
+    try {
+      if (process.platform === "win32") killPid(h.pid);
+      else process.kill(h.pid, "SIGTERM");
+    } catch (_) {
+      /* already exited */
+    }
+  }
+  if (await waitUnlocked()) return true;
+  for (const h of holders) {
+    try {
+      killPid(h.pid);
+    } catch (_) {
+      /* already exited */
+    }
+  }
+  return waitUnlocked();
+}
+
+// The tabs Chromium would reopen at the next start, moved aside after a
+// wedge: a profile set to continue where it left off would otherwise bring
+// the stuck tab back without --restore-last-session.
+function setAsideSessions(profileDir) {
+  const from = path.join(profileDir, "Default", "Sessions");
+  const to = path.join(profileDir, "Default", "Sessions.before-restart");
+  try {
+    if (!fs.existsSync(from)) return false;
+    fs.rmSync(to, { recursive: true, force: true });
+    fs.renameSync(from, to);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 // --- stdio supervisor plumbing (pure helpers, unit-tested) ------------------
@@ -719,18 +949,19 @@ function extensionLooksInstalled(userDataDir) {
   } catch (_) {
     return false;
   }
-  for (const entry of entries) {
-    if (entry !== "Default" && !entry.startsWith("Profile ")) continue;
-    const profile = path.join(userDataDir, entry);
-    if (fs.existsSync(path.join(profile, "Extensions", EXTENSION_ID))) return true;
-    try {
-      if (fs.readFileSync(path.join(profile, "Preferences"), "utf8").includes(`"${EXTENSION_ID}"`))
-        return true;
-    } catch (_) {
-      /* no preferences yet */
-    }
+  return entries.some(
+    (entry) => ownProfile.isProfileFolder(entry) && extensionInProfile(path.join(userDataDir, entry))
+  );
+}
+
+// One profile folder: the extension's folder or its id in the Preferences.
+function extensionInProfile(profile) {
+  if (fs.existsSync(path.join(profile, "Extensions", EXTENSION_ID))) return true;
+  try {
+    return fs.readFileSync(path.join(profile, "Preferences"), "utf8").includes(`"${EXTENSION_ID}"`);
+  } catch (_) {
+    return false;
   }
-  return false;
 }
 
 // The extension titles the session's tab group after the MCP client's name;
@@ -747,6 +978,15 @@ function rewriteClientName(initLine, name) {
     /* forward verbatim */
   }
   return initLine;
+}
+
+// A tool response's text blocks, joined ("" for none or an unreadable line).
+function resultText(line) {
+  try {
+    return ((JSON.parse(line).result || {}).content || []).map((c) => c.text || "").join("\n");
+  } catch (_) {
+    return "";
+  }
 }
 
 // A tool RESPONSE carrying an error: the text (result.isError content or a
@@ -834,7 +1074,9 @@ async function main() {
         home,
         hasToken: Boolean(process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN),
         tokenExpected: process.env.OTO_BROWSER_TOKEN_EXPECTED === "1",
+        tokenWithheld: process.env.OTO_BROWSER_TOKEN_WITHHELD === "1",
         unattended: process.env.OTO_BROWSER_UNATTENDED === "1",
+        profileSetting: process.env.OTO_BROWSER_PROFILE || "",
         agentSlug: process.env.OTO_AGENT_NAME,
       });
       return;
@@ -1060,6 +1302,14 @@ function wireStderrHints(child, profileDir) {
 // relaunch the daemon (ensureBrowserDaemon), spawn a new cli.js against the
 // new endpoint, replay the captured `initialize` handshake (REINIT_ID, its
 // response swallowed) + `notifications/initialized`, then resume forwarding.
+// A session also restarts its child onto another session's relaunched browser
+// (the profile's port moved) and after a closed-browser answer.
+//
+// Wedge recovery (once per session): browser calls that fail on a wedged
+// attach (isWedgedAttachError) are held back, not answered. Under the launch
+// lock the browser the child timed out on is ended when it is still this
+// profile's, a fresh one starts without its old tabs, and the held calls are
+// sent again: they never ran, since the attach failed before the tool.
 function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
   const state = {
     child: null,
@@ -1072,6 +1322,11 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
     swallowReinit: false,
     chain: Promise.resolve(), // serializes client-line handling
     shuttingDown: false,
+    toolLines: new Map(), // browser tools/call id → its line, while the child has it
+    held: new Map(), // id → {line, response}: calls that failed on a wedged attach
+    recovering: false,
+    wedgeHandled: false, // the one recovery this session gets has run
+    needsRestart: false, // a closed-browser answer: restart on the next call
   };
 
   function spawnChild(endpoint) {
@@ -1081,11 +1336,28 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
     });
     const out = new LineSplitter();
     child.stdout.on("data", (chunk) => {
+      // A child a restart retired answers requests the restart already
+      // failed ("retry"): forwarding them would answer them twice. A child
+      // that exited by itself keeps its late output: Node can deliver it after
+      // 'exit', and those answers were never sent.
+      if (child.retired) return;
       for (let line of out.feed(chunk)) {
         const { id } = peekRpc(line);
         if (state.swallowReinit && id === REINIT_ID) {
           state.swallowReinit = false;
           continue;
+        }
+        if (id !== void 0 && state.toolLines.has(id)) {
+          const request = state.toolLines.get(id);
+          state.toolLines.delete(id);
+          const err = toolErrorText(line);
+          if (err !== null && isWedgedAttachError(err) && (state.recovering || !state.wedgeHandled)) {
+            state.pending.delete(id);
+            state.held.set(id, { line: request, response: line });
+            scheduleWedgeRecovery();
+            continue;
+          }
+          if (err !== null && isClosedBrowserError(err)) state.needsRestart = true;
         }
         if (id !== void 0) state.pending.delete(id);
         if (id !== void 0 && state.listIds.has(id)) {
@@ -1139,10 +1411,12 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
     return fs.existsSync(path.join(profileDir, "DevToolsActivePort"));
   }
 
-  async function restartFlow() {
+  async function restartFlow({ restoreLastSession = true } = {}) {
     const old = state.child;
     state.child = null;
+    state.needsRestart = false;
     if (old) {
+      old.retired = true;
       try {
         old.kill();
       } catch (_) {
@@ -1150,7 +1424,10 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
       }
     }
     failPending("The browser was closed — it is being relaunched, retry the action.");
-    const endpoint = await ensureBrowserDaemon(profileDir, cfg.executablePath, process.env.OTO_AGENT_NAME);
+    state.toolLines.clear();
+    const endpoint = await ensureBrowserDaemon(profileDir, cfg.executablePath, process.env.OTO_AGENT_NAME, {
+      restoreLastSession,
+    });
     if (!endpoint) {
       process.stderr.write(
         `[browser-control] Could not relaunch the browser for ${profileDir}; ` +
@@ -1169,6 +1446,81 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
     return true;
   }
 
+  // Another session relaunched the shared browser: this child still dials the
+  // old port, so it follows the profile's current one.
+  function endpointMoved() {
+    const port = readDevtoolsPort(profileDir);
+    return Boolean(port && state.endpoint && endpointPort(state.endpoint) !== port);
+  }
+
+  function scheduleWedgeRecovery() {
+    if (state.recovering) return; // the running recovery sends this call too
+    state.recovering = true;
+    state.wedgeHandled = true;
+    state.chain = state.chain.then(recoverFromWedge).catch(() => {});
+  }
+
+  async function recoverFromWedge() {
+    let relaunched = false;
+    let outcome = "pass";
+    try {
+      const childEndpoint = state.endpoint;
+      outcome = await withLaunchLock(profileDir, async () => {
+        const live = await liveCdpEndpoint(profileDir);
+        const port = endpointPort(live);
+        const sameBrowser = Boolean(
+          live && port && readDevtoolsBrowserPath(profileDir) === (await cdpBrowserPath(port, 2000))
+        );
+        const action = wedgeAction({ handled: false, childEndpoint, live, sameBrowser });
+        if (action === "end-and-relaunch") {
+          const pids = profileHolders(listProcesses(), profileDir).map((h) => h.pid);
+          process.stderr.write(
+            `[browser-control] The shared browser on ${live} lets no new session attach ` +
+              `(a tab that stopped answering blocks every new session). Ending it ` +
+              `(pid ${pids.join(", ") || "unknown"}) and starting a fresh one without its old tabs.\n`
+          );
+          if (!(await endProfileBrowser(profileDir))) {
+            process.stderr.write("[browser-control] The browser did not exit; leaving it as it is.\n");
+            return "pass";
+          }
+          setAsideSessions(profileDir);
+        } else if (action === "relaunch") {
+          process.stderr.write("[browser-control] No shared browser answers; starting a fresh one.\n");
+          setAsideSessions(profileDir);
+        } else if (action === "attach") {
+          process.stderr.write(`[browser-control] Another session already started a fresh browser on ${live}.\n`);
+        } else {
+          process.stderr.write(
+            `[browser-control] The browser on ${live} is not this profile's; leaving it as it is.\n`
+          );
+        }
+        return action;
+      });
+      if (outcome !== "pass") relaunched = await restartFlow({ restoreLastSession: false });
+      if (relaunched) {
+        process.stderr.write(
+          `[browser-control] Fresh browser on ${state.endpoint}; sending ${state.held.size} held call(s) again.\n`
+        );
+        for (const [id, { line }] of state.held) {
+          state.pending.add(id);
+          state.toolLines.set(id, line);
+          state.child.stdin.write(line + "\n");
+        }
+        state.held.clear();
+      }
+    } catch (e) {
+      process.stderr.write(`[browser-control] Recovering the browser failed: ${e.message}\n`);
+    } finally {
+      for (const [id, { response }] of state.held) {
+        process.stdout.write(
+          (outcome === "pass" ? response : buildErrorResponse(id, unavailableMessage())) + "\n"
+        );
+      }
+      state.held.clear();
+      state.recovering = false;
+    }
+  }
+
   // The generic "unavailable — try again" hid the actual cause: the stderr
   // profile-lock hint is invisible to the calling agent. When the profile is
   // provably held by a LIVE browser (another session of this agent), say so —
@@ -1177,11 +1529,7 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
     try {
       if (profileLooksLocked(profileDir)) {
         const procs = listProcesses();
-        const holders = procs.filter(
-          (p) =>
-            p.cmd.includes(`--user-data-dir=${profileDir}`) &&
-            !/--type=/.test(p.cmd)
-        );
+        const holders = profileHolders(procs, profileDir);
         const orphans = findOrphanHolders(procs, profileDir);
         const live = holders.filter((h) => !orphans.includes(h));
         if (live.length > 0)
@@ -1192,6 +1540,11 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
             "to finish), then try again."
           );
       }
+      // A browser that did not start (Chrome on a Mac where it never
+      // ran, a missing library) left its reason in the launch log.
+      const fatal = launchFailureLine(path.join(profileDir, "launch.log"));
+      if (fatal && profileHolders(listProcesses(), profileDir).length === 0)
+        return `The browser could not start on this machine. It said: ${fatal}`;
     } catch (_) {
       /* diagnosis is best-effort — fall through to the generic message */
     }
@@ -1209,6 +1562,13 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
     // by itself" bug: every session spawn sends initialize/tools/list, and
     // the old unconditional restart relaunched a browser the user had closed.
     if (method === "tools/call") {
+      if (state.child && !state.childIsIdle && (state.needsRestart || endpointMoved())) {
+        const ok = await restartFlow();
+        if (!ok) {
+          if (isRequest) process.stdout.write(buildErrorResponse(id, unavailableMessage()) + "\n");
+          return;
+        }
+      }
       if (!state.child || state.childIsIdle || !browserAlive()) {
         // browser_close with no daemon anywhere: closing nothing is success.
         // Launching just to close was the last "opens by itself" path — an
@@ -1238,12 +1598,14 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
       ensureIdleChild();
     }
     if (isRequest) state.pending.add(id);
+    if (isRequest && method === "tools/call") state.toolLines.set(id, line);
     try {
       state.child.stdin.write(line + "\n");
     } catch (_) {
       state.child = null; // EPIPE — recovered by the next request
       if (isRequest) {
         state.pending.delete(id);
+        state.toolLines.delete(id);
         process.stdout.write(
           buildErrorResponse(id, "The browser session restarted — retry the action.") + "\n"
         );
@@ -1321,6 +1683,12 @@ function runExtensionSupervisor(cli, cfg, opts) {
   const userDataDir = defaultUserDataDir(cfg.executablePath, opts.home);
   const clientName = agentDisplayName(opts.agentSlug);
   const browserName = path.basename(cfg.executablePath || "the browser");
+  // The profile the connect page opens in (own_profile.js): the hook's input
+  // is set here alone, never taken from the environment the MCP was given.
+  const profile = ownProfile.pickProfile(opts.profileSetting,
+    ownProfile.browserProfiles(userDataDir, extensionInProfile), ownProfile.browserLabel(cfg.executablePath));
+  delete process.env.OTO_BROWSER_PROFILE_DIR;
+  delete process.env.PLAYWRIGHT_MCP_PROFILE_DIR_NAME;
   const state = {
     child: null,
     initLine: null, // client's verbatim initialize request
@@ -1335,6 +1703,10 @@ function runExtensionSupervisor(cli, cfg, opts) {
     watchdogId: void 0,
     chain: Promise.resolve(),
     shuttingDown: false,
+    internal: new Map(), // the supervisor's own requests to the child: id → resolve
+    internalSeq: 0,
+    lastClick: null, // the last browser_click's target: an upload's default element
+    root: null, // the client's first root (its roots/list answer)
   };
 
   function clearWatchdog() {
@@ -1350,10 +1722,14 @@ function runExtensionSupervisor(cli, cfg, opts) {
   }
 
   function spawnChild() {
-    const child = spawn(process.execPath, [cli, "--extension"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-    });
+    const env = { ...process.env };
+    const args = [cli, "--extension"];
+    if (profile.folder) {
+      env.OTO_BROWSER_PROFILE_DIR = profile.folder;
+      env.PLAYWRIGHT_MCP_PROFILE_DIR_NAME = profile.folder;
+      args.unshift("--require", path.join(__dirname, "profile_hook.js"));
+    }
+    const child = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"], env });
     const out = new LineSplitter();
     child.stdout.on("data", (chunk) => {
       if (state.child !== child) return; // a retired child's late output
@@ -1361,6 +1737,16 @@ function runExtensionSupervisor(cli, cfg, opts) {
         const { id } = peekRpc(line);
         if (state.swallowReinit && id === REINIT_ID) {
           state.swallowReinit = false;
+          continue;
+        }
+        if (id !== void 0 && state.internal.has(id)) {
+          // An answer means the connect finished: the watchdog of the
+          // agent's upload stands down.
+          const settle = state.internal.get(id);
+          state.internal.delete(id);
+          clearWatchdog();
+          if (toolErrorText(line) === null) state.connected = true;
+          settle(line);
           continue;
         }
         if (id !== void 0) {
@@ -1375,7 +1761,8 @@ function runExtensionSupervisor(cli, cfg, opts) {
           if (state.listIds.has(id)) {
             state.listIds.delete(id);
             try {
-              line = JSON.stringify(studio.mergeToolsResult(JSON.parse(line), studio.toolDefinitions()));
+              line = JSON.stringify(ownUpload.patchUploadSchema(
+                studio.mergeToolsResult(JSON.parse(line), studio.toolDefinitions())));
             } catch (_) {
               /* pass the child's line through untouched */
             }
@@ -1389,6 +1776,8 @@ function runExtensionSupervisor(cli, cfg, opts) {
       if (state.child !== child) return;
       state.child = null;
       clearWatchdog();
+      for (const settle of state.internal.values()) settle(null);
+      state.internal.clear();
       failPending("The browser session ended — retry the action.");
     };
     child.on("exit", gone);
@@ -1421,12 +1810,14 @@ function runExtensionSupervisor(cli, cfg, opts) {
   // Reasons no browser call can succeed in this session — answered at once,
   // never forwarded (forwarding would open a connect page nobody can approve).
   function permanentFailure() {
+    if (opts.tokenWithheld)
+      return "This session does not run as this computer's owner, so it cannot use the owner's browser.";
     if (opts.tokenExpected && !opts.hasToken)
       return (
-        "The saved browser extension token could not be fetched for this session — " +
-        "start a new chat (or re-run the task); if it persists, clear and re-save the " +
-        "token in the machine's settings."
+        "The browser token was not handed to this session. The next session on this computer " +
+        "gets it again. If it does not, save the token again in the machine's settings."
       );
+    if (profile.error) return profile.error;
     if (opts.unattended && !opts.hasToken)
       return (
         "This unattended session (task, call or meeting) cannot click Allow in the " +
@@ -1437,9 +1828,16 @@ function runExtensionSupervisor(cli, cfg, opts) {
   }
 
   function installHint() {
-    return extensionLooksInstalled(userDataDir)
+    if (profile.several.length)
+      return (
+        ` These profiles have the extension: ${ownProfile.profileList(profile.several)}. ` +
+        "Set Browser profile in the machine's settings to the one you use."
+      );
+    const where = profile.folder ? path.join(userDataDir, profile.folder) : userDataDir;
+    const there = profile.folder ? extensionInProfile(where) : extensionLooksInstalled(userDataDir);
+    return there
       ? ""
-      : ` The extension does not look installed in ${userDataDir} — install it from ${EXTENSION_INSTALL_URL}.`;
+      : ` The extension does not look installed in ${where} — install it from ${EXTENSION_INSTALL_URL}.`;
   }
 
   function connectTimeoutMessage() {
@@ -1475,9 +1873,77 @@ function runExtensionSupervisor(cli, cfg, opts) {
     process.stderr.write(
       `[browser-control] ${browserName} is not running — starting it for the user.\n`
     );
-    launchDetachedBrowser(cfg.executablePath, []);
+    // The person's own browser: never a second instance, never a log in
+    // their own browser's folder.
+    launchDetachedBrowser(cfg.executablePath,
+      profile.folder ? [`--profile-directory=${profile.folder}`] : [], { newInstance: false });
     for (let i = 0; i < 60 && !profileLooksLocked(userDataDir); i++)
       await new Promise((f) => setTimeout(f, 250));
+  }
+
+  // One request of the supervisor's own to the child (the upload's steps):
+  // its answer line, or null when the child went away.
+  function callChild(name, args) {
+    const id = `__otodock_upload_${++state.internalSeq}__`;
+    return new Promise((settle) => {
+      state.internal.set(id, settle);
+      try {
+        state.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call",
+          params: { name, arguments: args } }) + "\n");
+      } catch (_) {
+        state.internal.delete(id);
+        settle(null);
+      }
+    });
+  }
+
+  function answer(id, text, isError) {
+    if (!state.pending.has(id)) return; // the connect watchdog answered it already
+    state.pending.delete(id);
+    state.toolIds.delete(id);
+    process.stdout.write((isError ? buildErrorResponse(id, text) : buildToolTextResponse(id, text)) + "\n");
+  }
+
+  // browser_file_upload in own mode (own_upload.js): read, clear the
+  // chooser, build the files in the page, then the page's state.
+  async function upload(id, args) {
+    const cwd = state.root || process.cwd();
+    const picked = ownUpload.resolveUploadPaths(args.paths, { cwd });
+    if (picked.error) return answer(id, picked.error, true);
+    const files = picked.files;
+    const source = ownUpload.pageFunction(ownUpload.payloadsOf(files));
+    await callChild("browser_file_upload", {});
+    const given = typeof args.target === "string" && args.target ? args : state.lastClick;
+    const evaluate = (where) => callChild("browser_evaluate", where
+      ? { function: source, target: where.target, element: where.element || "the file field" }
+      : { function: source });
+    let reply = await evaluate(given);
+    if (reply && given && given === state.lastClick && toolErrorText(reply) !== null)
+      reply = await evaluate(null);
+    if (reply === null) return answer(id, "The browser session ended. Retry the action.", true);
+    const failed = toolErrorText(reply);
+    const status = ownUpload.statusOf(failed === null ? resultText(reply) : "");
+    const said = ownUpload.answerFor(status, files);
+    if (failed !== null && status === null) return answer(id, failed, true);
+    if (said.error) return answer(id, said.error, true);
+    const text = resultText(await callChild("browser_snapshot", {}));
+    return answer(id, text ? `${said.text}\n\n${text}` : said.text, false);
+  }
+
+  function noteClientLine(line, method, toolName) {
+    if (!method && line.includes('"roots"')) {
+      try {
+        const roots = JSON.parse(line).result?.roots;
+        const first = Array.isArray(roots) && roots[0] && roots[0].uri;
+        if (first) state.root = require("url").fileURLToPath(first);
+      } catch (_) {
+        /* not a roots answer the supervisor can read */
+      }
+    }
+    if (toolName === "browser_click") {
+      const args = JSON.parse(line).params.arguments || {};
+      if (typeof args.target === "string") state.lastClick = { target: args.target, element: args.element };
+    }
   }
 
   async function handleClientLine(line) {
@@ -1487,6 +1953,7 @@ function runExtensionSupervisor(cli, cfg, opts) {
       state.initLine = line;
       line = rewriteClientName(line, clientName);
     } else if (method === "notifications/initialized") state.initializedLine = line;
+    noteClientLine(line, method, toolName);
     if (method === "tools/call") {
       const blocked = permanentFailure();
       if (blocked) {
@@ -1511,6 +1978,12 @@ function runExtensionSupervisor(cli, cfg, opts) {
         if (isRequest) armWatchdog(id);
       }
       if (isRequest) state.toolIds.add(id);
+      const args = isRequest && toolName === "browser_file_upload" ? JSON.parse(line).params.arguments || {} : null;
+      if (args && Array.isArray(args.paths) && args.paths.length) {
+        state.pending.add(id);
+        await upload(id, args);
+        return;
+      }
     } else if (!state.child) {
       spawnChild();
     }
@@ -1601,12 +2074,15 @@ if (require.main === module) {
     resolveBrowserConfig, isChromiumFamily, channelExecutable,
     profileLooksLocked, findOrphanHolders, readDevtoolsPort, agentDisplayName,
     seedProfileDisplayName,
+    profileHolders, daemonLaunchArgs, tryLaunchLock, releaseLaunchLock, LAUNCH_LOCK,
+    LAUNCH_LOCK_STALE_MS, isWedgedAttachError, wedgeAction, endpointPort, setAsideSessions,
     LineSplitter, peekRpc, rewriteInitId, buildErrorResponse,
     buildToolTextResponse, REINIT_ID,
     classifyClientLine,
     firefoxCandidates, detectSystemFirefox, playwrightFirefoxPath,
     EXTENSION_ID, EXTENSION_INSTALL_URL, extensionBrowserEnv, defaultUserDataDir,
-    extensionLooksInstalled, rewriteClientName, toolErrorText,
+    extensionLooksInstalled, extensionInProfile, rewriteClientName, toolErrorText, resultText,
     isClosedBrowserError, connectTimeoutMs,
+    detachedLaunchArgv, launchFailureLine, runExtensionSupervisor,
   };
 }

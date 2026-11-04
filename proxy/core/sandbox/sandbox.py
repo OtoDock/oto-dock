@@ -411,9 +411,10 @@ def _first_line(argv: list[str]) -> str:
 def _pasta_version() -> tuple[str, str]:
     """(the version to name, its build date) of the pasta on PATH.
 
-    Debian's package prints "pasta unknown version" (built outside git), so a
-    binary under /usr/bin with no date in its line falls back to the
-    package's own version."""
+    Debian's package prints no date (built outside git: bookworm's says
+    "pasta unknown version", trixie's prints nothing), so a binary under
+    /usr/bin with no date in its line falls back to the package's own
+    version."""
     exe = shutil.which("pasta")
     if not exe:
         return "", ""

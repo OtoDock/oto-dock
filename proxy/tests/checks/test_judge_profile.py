@@ -152,10 +152,10 @@ def test_codex_gets_read_only_without_plan():
                                   working_dir="", config_dir="", permission_mode="judge")
     plan = CodexAppServerSession(session_id="s2", agent_name="a", model="m", sandbox_mode="read-only",
                                  working_dir="", config_dir="", permission_mode="plan")
-    assert judge._collaboration_mode() == {"mode": "default"}
-    assert plan._collaboration_mode() == {"mode": "plan"}
+    assert judge._collaboration_mode()["mode"] == "default"
+    assert plan._collaboration_mode()["mode"] == "plan"
     judge.set_mode("plan", "read-only")
-    assert judge._collaboration_mode() == {"mode": "plan"}
+    assert judge._collaboration_mode()["mode"] == "plan"
 
 
 def test_a_judge_leaves_the_scopes_settings_as_every_session_has_them(tmp_path, monkeypatch):
@@ -581,3 +581,60 @@ def test_a_cut_evaluation_stops_the_judge_run(judged, monkeypatch):
             await asyncio.wait_for(judge_kind.wait_run("run-hung", timeout=60, cancelled=lambda: False), 0.3)
     asyncio.run(cut())
     assert cancelled == ["run-hung"] and "run-hung" not in judge_kind._run_futures
+
+
+@pytest.mark.parametrize("command,reads", [
+    ("git status", True),
+    ("git -C /workspace/repo log --oneline -5", True),
+    ("git --no-pager diff HEAD~1", True),
+    ("git branch -a", True),
+    ("git remote -v", True),
+    ("git stash list", True),
+    ("git worktree list", True),
+    # A second command after a newline, a pipe or a redirect.
+    ("git status\npython3 /tmp/x.py", False),
+    ("git log | sh", False),
+    ("git diff > out.txt", False),
+    # Flags that write a file, run a program or read outside the repository.
+    ("git diff --output=/workspace/x", False),
+    ("git log --output /workspace/x", False),
+    ("git grep -Oless pattern", False),
+    ("git grep --open-files-in-pager=vi x", False),
+    ("git diff --ext-diff", False),
+    ("git show --textconv HEAD:a", False),
+    ("git cat-file --filters HEAD:a", False),
+    ("git diff --no-index /etc/passwd a", False),
+    ("git -c core.pager=sh log", False),
+    # The changing forms of the listing subcommands.
+    ("git branch -D main", False),
+    ("git branch newname", False),
+    ("git remote add x https://example.com/r.git", False),
+    ("git remote set-url origin https://example.com/r.git", False),
+    ("git tag -d v1", False),
+    ("git stash drop", False),
+    ("git push", False),
+    ("git commit -m x", False),
+    ("git", False),
+    # git takes an unambiguous abbreviation of a long option and bundles short
+    # ones: each of these ran a program in a probe on git 2.34.1.
+    ("git grep --open=/x a", False),
+    ("git grep --open-files=/x a", False),
+    ("git grep -iO/x a", False),
+    ("git grep -nO/x a", False),
+    ("git cat-file --textc HEAD:f", False),
+    # Abbreviations a newer git may take.
+    ("git diff --ext HEAD", False),
+    ("git diff --no-ind a b", False),
+    ("git log --outp=x", False),
+    # A bare -- ends the options; what follows is still read (the safe side).
+    ("git log -- a.py", True),
+    ("git diff HEAD -- a.py", True),
+    ("git log -- --output=x", False),
+    ("git log --no-ext-diff -p", True),
+    ("git log --no-textconv -p", True),
+    ("git log -5", True),
+    ("git diff --exit-code", True),
+])
+def test_a_judge_reads_git_only_in_its_reading_forms(command, reads):
+    from auth.git_reads import read_only_git
+    assert read_only_git(command) is reads

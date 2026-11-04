@@ -1,0 +1,68 @@
+{
+ "source": "A recognizer whose later final repeats the text it already finalised (reported on Android Chrome).",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "result",
+   "resultIndex": 0,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello"
+    },
+    {
+     "isFinal": false,
+     "text": "hello how are you"
+    }
+   ]
+  },
+  {
+   "event": "result",
+   "resultIndex": 1,
+   "results": [
+    {
+     "isFinal": true,
+     "text": "hello"
+    },
+    {
+     "isFinal": true,
+     "text": "hello how are you"
+    }
+   ]
+  },
+  {
+   "event": "stop_called"
+  },
+  {
+   "event": "end"
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [
+   "hello",
+   "how are you"
+  ],
+  "replaces": [],
+  "interims": [
+   "how are you"
+  ],
+  "errors": [],
+  "ended": [
+   "stopped"
+  ],
+  "recognizers": 1
+ }
+}

@@ -1,0 +1,46 @@
+{
+ "source": "A recognizer that ends at once twice with no result: the dictation stops with a sentence instead of restarting forever.",
+ "events": [
+  {
+   "event": "start"
+  },
+  {
+   "event": "wait",
+   "ms": 100
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 150
+  },
+  {
+   "event": "start"
+  },
+  {
+   "event": "wait",
+   "ms": 100
+  },
+  {
+   "event": "end"
+  },
+  {
+   "event": "wait",
+   "ms": 300
+  }
+ ],
+ "expect": {
+  "start": "ok",
+  "finals": [],
+  "replaces": [],
+  "interims": [],
+  "errors": [
+   "STOPPED"
+  ],
+  "ended": [
+   "quick-ends"
+  ],
+  "recognizers": 2
+ }
+}

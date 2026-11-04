@@ -471,6 +471,7 @@ from api.apps import (
     app_actions as app_actions_router,
     app_bindings as app_bindings_router,
     app_egress as app_egress_router,
+    app_follow as app_follow_router,
     app_inbound as app_inbound_router,
     app_proxy as app_proxy_router,
     app_secrets as app_secrets_router,
@@ -492,8 +493,12 @@ from api.billing import (
     billing as billing_router,
     usage as usage_router,
 )
+from api.cards import cards as cards_router
 from api.checks import checks as checks_router
-from api.departments import departments as departments_router
+from api.departments import (
+    departments as departments_router,
+    sets as department_sets_router,
+)
 from api.duplex import duplex as duplex_router
 from api.events import (
     subscriptions as subscriptions_router,
@@ -503,6 +508,7 @@ from api.events import (
 from api.hooks import hooks as hooks_router
 from api.internal import internal as internal_router
 from api.mcp import (
+    bearer_allowlist as bearer_allowlist_router,
     community as community_router,
     credentials as credentials_router,
     gateway as mcp_gateway_router,
@@ -519,6 +525,7 @@ from api.media import (
     wopi as wopi_router,
 )
 from api.meetings import meetings as meetings_router
+from api.notebook import notebook as notebook_router
 from api.notifications import notifications as notifications_router
 from api.phone import (
     call_control as call_control_router,
@@ -529,6 +536,7 @@ from api.phone import (
 )
 from api.remote import remote_machines as remote_machines_router
 from api.sessions import sessions as sessions_router
+from api.settings import settings as settings_router
 from api.sharing import external as external_shares_router, shares as shares_router
 from api.tasks import (
     continuations as continuations_router,
@@ -539,6 +547,7 @@ from api.tasks import (
 app.include_router(auth_router.router)
 app.include_router(setup_router.router)
 app.include_router(sessions_router.router)
+app.include_router(settings_router.router)
 app.include_router(hooks_router.router)
 app.include_router(tasks_router.router)
 app.include_router(delegation_router.router)
@@ -554,8 +563,11 @@ app.include_router(agents_router.router)
 app.include_router(chats_router.router)
 app.include_router(reply_reports_router.router)
 app.include_router(departments_router.router)
+app.include_router(department_sets_router.router)
+app.include_router(cards_router.router)
 app.include_router(notifications_router.router)
 app.include_router(credentials_router.router)
+app.include_router(bearer_allowlist_router.router)
 app.include_router(mcp_gateway_router.router)
 # claude_oauth and openai_oauth use the same `/v1/oauth/{provider}/*` prefix
 # as the generic MCP OAuth router; FastAPI routing is first-match-wins, so
@@ -575,6 +587,7 @@ app.include_router(images_router.router)
 app.include_router(media_router.router)
 app.include_router(ui_router.router)
 app.include_router(apps_router.router)
+app.include_router(app_follow_router.router)
 app.include_router(app_actions_router.router)
 app.include_router(app_proxy_router.router)
 app.include_router(app_bindings_router.router)
@@ -582,6 +595,7 @@ app.include_router(app_secrets_router.router)
 app.include_router(app_egress_router.router)
 app.include_router(app_inbound_router.router)
 app.include_router(checks_router.router)
+app.include_router(notebook_router.router)
 app.include_router(shares_router.router)
 app.include_router(external_shares_router.router)
 app.include_router(wopi_router.router)
@@ -722,11 +736,13 @@ async def spa_catchall(path: str, request: Request):
             return negotiated_file_response(
                 safe, safe.stat(), request.headers,
                 extra_headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"})
-        # Unhashed names that keep their URL across releases (the wake-word
-        # worker, the manifest, the APKs): revalidate on every load (a 304
-        # on the ETag), or a browser's heuristic freshness keeps running the
-        # previous file after the page reloaded onto a new build.
-        return FileResponse(str(safe), headers={"Cache-Control": "no-cache"})
+        # Unhashed names that keep their URL across releases (the boot
+        # script, the wake-word worker, the manifest, the APKs): revalidate on
+        # every load and answer a matching ETag with 304, or a browser's
+        # heuristic freshness keeps running the previous file after the page
+        # reloaded onto a new build.
+        return negotiated_file_response(
+            safe, safe.stat(), request.headers, extra_headers={"Cache-Control": "no-cache"})
     # /ui-kit/* are subresources of sandboxed artifact iframes (echarts, tokens
     # CSS, fonts) — a miss must 404 loudly, not serve index.html with 200
     # (a <script src> would silently load HTML-as-JS on a build/copy mistake).

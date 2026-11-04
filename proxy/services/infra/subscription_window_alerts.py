@@ -196,11 +196,10 @@ def _owner_when(owner: str, instant: datetime) -> str:
 async def _notify(sub: dict, *, scoped_label: str, window_label: str, threshold: int,
                   severity: str, pct: float, resets_at: datetime, others: int) -> None:
     from core.session.session_manager import account_label_for
+    from services.infra import subscription_health
     from services.notifications import notification_manager
     product = account_label_for(sub.get("layer", ""), "AI engine")
-    label = sub.get("label") or product
-    email = sub.get("oauth_email") or ""
-    account = f"{label} ({email})" if email and email not in label else label
+    account = subscription_health.account_name(sub, product)
     when = _owner_when(sub["owner_sub"], resets_at)
     window = f"{scoped_label} {window_label} limit" if scoped_label else f"{window_label} limit"
     if threshold >= 100:
@@ -215,6 +214,16 @@ async def _notify(sub: dict, *, scoped_label: str, window_label: str, threshold:
         body = f"{pct:.0f}% used. Resets {when}."
     if others > 0:
         body += " New work goes to your other accounts first."
+    # The reached quota window of an account the person uses themselves,
+    # with no other account on the engine: the row opens User Settings, AI
+    # Engines, whose notice says where to pick another engine. A per-model
+    # window keeps the engine working, a pool-only account was never theirs
+    # to switch from.
+    href = ""
+    if (threshold >= 100 and not scoped_label and others == 0
+            and bool(sub.get("use_personal"))):
+        href = f"/user-settings?tab=ai-engines&limit={sub.get('layer', '')}"
+        body += " Open it to see where to pick another engine until then."
     await notification_manager.fire_notification(
         title=title,
         body=body,
@@ -223,4 +232,5 @@ async def _notify(sub: dict, *, scoped_label: str, window_label: str, threshold:
         target=sub["owner_sub"],
         source="subscription_windows",
         source_id=f"{sub['id']}:{window}:{threshold}",
+        href=href,
     )

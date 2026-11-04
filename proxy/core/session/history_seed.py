@@ -34,6 +34,7 @@ import logging
 from typing import cast
 
 from core.events import tool_roles
+from core.events.common_events import row_attachments
 from storage import database as task_store
 from ws import wire_events as wire
 
@@ -161,10 +162,18 @@ def _render_row(row: dict) -> str | None:
     """One digest line per DB row; None = row type not included (whitelist)."""
     role = row.get("role") or ""
     content = row.get("content") or ""
-    if role == "user" and content:
+    if role == "user":
+        # A message of photos or files alone is a message; the paths let the
+        # fresh session open them again.
+        photos, files = row_attachments(row.get("event_data"))
+        if not content and not photos and not files:
+            return None
         if _is_result_callback(content):
             return None
-        return f"User: {_truncate(content, SEED_PER_MESSAGE_CHARS)}"
+        said = _truncate(content, SEED_PER_MESSAGE_CHARS)
+        if photos or files:
+            said = f"{said} [attached: {', '.join('/' + p for p in photos + files)}]".strip()
+        return f"User: {said}"
     if role == "assistant" and content:
         return f"Assistant: {_truncate(content, SEED_PER_MESSAGE_CHARS)}"
     if role != "event":

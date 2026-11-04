@@ -1,6 +1,7 @@
 import { apiFetch } from './auth'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiJson } from '../lib/http/apiJson'
+import type { NotificationSeverity } from '../lib/status/notificationSeverity'
 
 export interface NotificationDefinition {
   /** Set on a row the offboarding transfer moved: the first creator's sub,
@@ -11,7 +12,7 @@ export interface NotificationDefinition {
   id: string
   title: string
   body: string
-  severity: 'info' | 'success' | 'warning' | 'danger'
+  severity: NotificationSeverity
   scope: string
   target: string | null
   /** A user-scope row's recipient name (the admin audit view). */
@@ -108,7 +109,7 @@ export interface NotificationDelivery {
   notification_id: string | null
   title: string
   body: string
-  severity: 'info' | 'success' | 'warning' | 'danger'
+  severity: NotificationSeverity
   scope: string
   source: string
   delivered_at: string
@@ -150,6 +151,20 @@ export async function subscribePush(platform: string, subscriptionData: string):
     method: 'POST',
     body: JSON.stringify({ platform, subscription_data: subscriptionData }),
   })
+}
+
+/** Drop this device's push registration on this server (the caller's own
+ *  row for the token). True when the server answered, a token it no longer
+ *  holds included; false on a refusal or a network error, so the caller
+ *  keeps the token and asks again later. */
+export async function unsubscribePush(subscriptionData: string): Promise<boolean> {
+  try {
+    const res = await apiFetch(
+      `/v1/push/unsubscribe?subscription_data=${encodeURIComponent(subscriptionData)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
 }
 
 export async function getVapidPublicKey(): Promise<string> {

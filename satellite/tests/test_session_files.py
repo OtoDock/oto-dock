@@ -274,3 +274,40 @@ def test_pty_base_close_wipes_session_files(stub_fetch, temp_secrets_root, tmp_p
     assert secrets_dir.is_dir()
     asyncio.run(sess.close())
     assert not secrets_dir.exists()
+
+
+def test_the_fetch_goes_direct_whatever_proxy_the_environment_names(monkeypatch):
+    """PROXY_URL is this machine's own loopback tunnel: an environment proxy
+    (or Windows' Internet Options one, which never exempts 127.0.0.1) must
+    not capture the fetch."""
+    import json
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            data = json.dumps({"files": {"ssh/id": {"content_b64": "eA=="}}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, dead)
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    try:
+        got = session_files._fetch(f"http://127.0.0.1:{server.server_address[1]}", "tok")
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert got == {"ssh/id": {"content_b64": "eA=="}}

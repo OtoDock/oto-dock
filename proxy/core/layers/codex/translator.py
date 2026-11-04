@@ -145,9 +145,28 @@ _SUPPRESSED_METHODS = frozenset({
     # 0.152+: the daemon announces a provider auth refresh (token rotation)
     # — housekeeping, nothing for the chat.
     "modelProvider/authRecoveryStarted", "modelProvider/authRecoveryCompleted",
-    # 0.163+, experimental: the thread's unread marker after every turn.
+    # 0.163+, experimental: the thread's unread marker after every turn (0.166 too).
     "thread/readState/changed",
+    # The thread's settings after a change, the app-server's remote-control
+    # state, Auto's reviewer items (its stop already ends the turn as
+    # tooManyDenials), its strict-review ask, the model's verification and
+    # safety buffering, moderation data, a patch's streaming: housekeeping.
+    "thread/settings/updated", "remoteControl/status/changed",
+    "item/autoApprovalReview/started", "item/autoApprovalReview/completed",
+    "autoApprovalReview/strictReviewRequired", "model/verification",
+    "model/safetyBuffering/updated", "turn/moderationMetadata",
+    "item/fileChange/patchUpdated",
 })
+
+# A ``warning`` notification's text: the platform's own hook-trust flag on
+# every thread start (DEBUG), what Codex recovers from by itself (INFO: the
+# WebSocket transport falling back to HTTPS, a model with no metadata, a
+# thread resumed on another model). Any other text is the operator's (a
+# hooks file that did not load, a transcript that did not save, code mode
+# unavailable) and logs at WARNING. None is chat content.
+_OWN_FLAG_WARNING = "`--dangerously-bypass-hook-trust` is enabled"
+_RECOVERED_WARNINGS = ("Falling back from WebSockets to HTTPS transport", "Model metadata for",
+                       "This session was recorded with model")
 
 
 # ``MessagePhase`` of an agentMessage written between steps (the preamble
@@ -157,7 +176,7 @@ _COMMENTARY = "commentary"
 
 
 # ``TurnError.codexErrorInfo`` values that end a turn for a reason the
-# platform names (app-server schema of Codex 0.160.0 to 0.163.0): (reason, detail).
+# platform names (app-server schema of Codex 0.160.0 to 0.166.0): (reason, detail).
 _ENDING_INFO = {
     "usageLimitExceeded": (turn_ending.LIMIT, ""),
     "cyberPolicy": (turn_ending.DECLINED, "cyber"),
@@ -426,6 +445,28 @@ class CodexEventTranslator:
             return []
 
         if method in _SUPPRESSED_METHODS:
+            return []
+
+        if method == "guardianWarning":
+            # Auto's reviewer on its own decision, a timeout or a failure:
+            # the operator's, never chat content.
+            logger.info("Codex reviewer: %s", str((params or {}).get("message") or "")[:300])
+            return []
+
+        if method == "windows/worldWritableWarning":
+            # Folders a Windows machine's sandbox cannot protect.
+            p = params if isinstance(params, dict) else {}
+            logger.warning("Codex sandbox: world-writable folders it cannot protect: %s "
+                           "(and %s more%s)", ", ".join(str(x) for x in (p.get("samplePaths") or [])[:5]),
+                           p.get("extraCount", 0), "; the scan failed" if p.get("failedScan") else "")
+            return []
+
+        if method == "warning":
+            message = str((params or {}).get("message") or "") if isinstance(params, dict) else ""
+            level = (logging.DEBUG if message.startswith(_OWN_FLAG_WARNING)
+                     else logging.INFO if message.startswith(_RECOVERED_WARNINGS)
+                     else logging.WARNING)
+            logger.log(level, "Codex warning: %s", message[:300])
             return []
 
         logger.debug("Codex translator: unhandled notification %s", method)

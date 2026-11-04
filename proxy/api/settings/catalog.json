@@ -1,0 +1,1601 @@
+{
+ "version": 1,
+ "entries": [
+  {
+   "id": "user.general.display-name",
+   "area": "user",
+   "section": "general",
+   "group": "Profile",
+   "label": "Display Name",
+   "kind": "text",
+   "help": "The name other people see on your messages.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "value": {
+    "read": {
+     "path": "/auth/me",
+     "field": "display_name"
+    },
+    "write": {
+     "path": "/v1/users/me/profile",
+     "field": "display_name"
+    }
+   }
+  },
+  {
+   "id": "user.general.email",
+   "area": "user",
+   "section": "general",
+   "group": "Profile",
+   "label": "Email",
+   "kind": "text",
+   "help": "The address you sign in with. Changing it asks for your password.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Update Email",
+    "Confirm password to change email"
+   ],
+   "note": "A local account only. An account from a sign-in provider shows it read only."
+  },
+  {
+   "id": "user.general.role",
+   "area": "user",
+   "section": "general",
+   "group": "Profile",
+   "label": "Role",
+   "kind": "readonly",
+   "help": "Your platform role. An administrator changes it under Admin, Users.",
+   "reads": "member",
+   "writes": null,
+   "where": "User Settings, General",
+   "who": "Nobody changes it. The page only shows it.",
+   "card": false
+  },
+  {
+   "id": "user.general.change-password",
+   "area": "user",
+   "section": "general",
+   "group": "Security",
+   "label": "Change Password",
+   "kind": "action",
+   "help": "Sets a new password after you confirm the current one.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Current password",
+    "New password",
+    "Confirm new password"
+   ],
+   "note": "A local account only."
+  },
+  {
+   "id": "user.general.add-passkey",
+   "area": "user",
+   "section": "general",
+   "group": "Security",
+   "label": "Add a passkey",
+   "kind": "action",
+   "help": "Adds a passkey to sign in with, after you confirm your password.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "+ Add another passkey",
+    "Create passkey",
+    "Name, e.g. This laptop"
+   ],
+   "note": "A local account only, and only when OtoDock is open at its secure address."
+  },
+  {
+   "id": "user.general.passkey",
+   "area": "user",
+   "section": "general",
+   "group": "Security",
+   "label": "Passkey",
+   "kind": "item",
+   "help": "Renames or removes one of your passkeys. Each change asks for your password.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Rename",
+    "Remove",
+    "Passkey name",
+    "Password"
+   ],
+   "item": "a passkey"
+  },
+  {
+   "id": "user.general.authenticator-app",
+   "area": "user",
+   "section": "general",
+   "group": "Security",
+   "label": "Use an authenticator app",
+   "kind": "action",
+   "help": "Adds time-based codes as a second factor, with recovery codes to keep. Remove takes it off again.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "+ Set up an authenticator app",
+    "Verify and enable",
+    "Remove",
+    "000000"
+   ],
+   "note": "A local account only."
+  },
+  {
+   "id": "user.general.theme",
+   "area": "user",
+   "section": "general",
+   "group": "Appearance",
+   "label": "Theme",
+   "kind": "choice",
+   "help": "Choose how the dashboard looks. Kept in this browser.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "options": [
+    {
+     "value": "system",
+     "label": "System"
+    },
+    {
+     "value": "light",
+     "label": "Light"
+    },
+    {
+     "value": "dark",
+     "label": "Dark"
+    }
+   ],
+   "value": {
+    "device": "theme"
+   }
+  },
+  {
+   "id": "user.general.chat-activity",
+   "area": "user",
+   "section": "general",
+   "group": "Appearance",
+   "label": "Chat activity",
+   "kind": "choice",
+   "help": "Compact folds tool activity into expandable summaries. Kept in this browser.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "options": [
+    {
+     "value": "compact",
+     "label": "Compact"
+    },
+    {
+     "value": "detailed",
+     "label": "Detailed"
+    }
+   ],
+   "value": {
+    "device": "chat-activity"
+   }
+  },
+  {
+   "id": "user.general.subscription-usage-alerts",
+   "area": "user",
+   "section": "general",
+   "group": "Notifications",
+   "label": "Subscription usage alerts",
+   "kind": "toggle",
+   "help": "This watches your connected Claude and ChatGPT accounts. You get a notification when one passes 90% of its weekly limit. You get another when it reaches the limit.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "value": {
+    "read": {
+     "path": "/v1/users/me/ui-prefs",
+     "field": "subscription_usage_alerts"
+    },
+    "write": {
+     "path": "/v1/users/me/ui-prefs",
+     "field": "subscription_usage_alerts"
+    },
+    "default": true
+   }
+  },
+  {
+   "id": "user.general.share-focus",
+   "area": "user",
+   "section": "general",
+   "group": "Apps",
+   "label": "Agents know which app I am looking at",
+   "kind": "toggle",
+   "help": "While an app is on your screen, the agent you talk to learns its name. Nobody else learns what you are looking at.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "value": {
+    "read": {
+     "path": "/v1/users/me/ui-prefs",
+     "field": "share_focus_with_agents"
+    },
+    "write": {
+     "path": "/v1/users/me/ui-prefs",
+     "field": "share_focus_with_agents"
+    },
+    "default": true
+   }
+  },
+  {
+   "id": "user.general.agents-may-open-apps",
+   "area": "user",
+   "section": "general",
+   "group": "Apps",
+   "label": "Agents may open apps on my screen",
+   "kind": "toggle",
+   "help": "An agent can bring up one of its apps for you. In the chat you are in, it opens right away. Anywhere else, you get a notice with an Open button.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "value": {
+    "read": {
+     "path": "/v1/users/me/ui-prefs",
+     "field": "agents_may_open_apps"
+    },
+    "write": {
+     "path": "/v1/users/me/ui-prefs",
+     "field": "agents_may_open_apps"
+    },
+    "default": true
+   }
+  },
+  {
+   "id": "user.general.wake-word",
+   "area": "user",
+   "section": "general",
+   "group": "Wake word",
+   "label": "Wake word",
+   "kind": "toggle",
+   "help": "To start a voice conversation, say “Hey OtoDock” on any dashboard page. You can also say “Hey” plus an agent’s name. Detection runs only on this device. Audio never leaves it until a conversation starts.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "names": [
+    "Off",
+    "On"
+   ],
+   "note": "The microphone is only on while the dashboard is open.",
+   "value": {
+    "read": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "wake_word_enabled"
+    },
+    "write": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "wake_word_enabled"
+    },
+    "default": false
+   }
+  },
+  {
+   "id": "user.general.wake-word-diagnostics",
+   "area": "user",
+   "section": "general",
+   "group": "Wake word",
+   "label": "Record diagnostics",
+   "kind": "action",
+   "help": "Records what the wake word hears on this device, for troubleshooting.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Stop recording diagnostics",
+    "Troubleshooting"
+   ],
+   "note": "Under Troubleshooting, shown while the wake word is on."
+  },
+  {
+   "id": "user.general.clear-memory",
+   "area": "user",
+   "section": "general",
+   "group": "Memory",
+   "label": "Clear my memory across all agents",
+   "kind": "action",
+   "help": "Deletes the personal memories agents captured about you, across every agent. It asks you to type a confirmation first.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, General",
+   "who": "Any signed-in person, on their own account.",
+   "card": false
+  },
+  {
+   "id": "user.integrations.add-account",
+   "area": "user",
+   "section": "integrations",
+   "group": "Connected Accounts",
+   "label": "Add an account",
+   "kind": "action",
+   "help": "Signs you in to a service your agents use on your behalf, or saves its credentials. A service that takes one account offers no second.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Add another account"
+   ],
+   "note": "A service is listed when a tool of one of your agents uses it."
+  },
+  {
+   "id": "user.integrations.account",
+   "area": "user",
+   "section": "integrations",
+   "group": "Connected Accounts",
+   "label": "Connected account",
+   "kind": "item",
+   "help": "One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. Agents not bound to another account use the default.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Set as default",
+    "This is the default account",
+    "Edit",
+    "Close",
+    "Connect",
+    "Reconnect",
+    "Disconnect",
+    "Remove",
+    "Save",
+    "Add account",
+    "Save token",
+    "Grant for whole tenant",
+    "Get device code"
+   ],
+   "note": "A personal access token takes an optional account label. An account whose sign-in can no longer be renewed shows Reconnect needed with the reason.",
+   "item": "a connected account of a service"
+  },
+  {
+   "id": "user.integrations.agent-binding",
+   "area": "user",
+   "section": "integrations",
+   "group": "Use this account for specific agents",
+   "label": "Use this account for specific agents",
+   "kind": "item",
+   "help": "Binds one of your agents to this account. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Change",
+    "Read only",
+    "All repositories the account reaches",
+    "Search repositories"
+   ],
+   "item": "an agent the account serves"
+  },
+  {
+   "id": "user.integrations.installations",
+   "area": "user",
+   "section": "integrations",
+   "group": "Installations",
+   "label": "Install on GitHub",
+   "kind": "item",
+   "help": "Picks the repositories on GitHub this account reaches. Until the app is installed somewhere, the account reaches nothing.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Change on GitHub",
+    "Refresh"
+   ],
+   "note": "A GitHub account connected through a GitHub App.",
+   "item": "a GitHub App installation"
+  },
+  {
+   "id": "user.integrations.subscribe-to-events",
+   "area": "user",
+   "section": "integrations",
+   "group": "Active subscriptions",
+   "label": "+ Subscribe to events",
+   "kind": "action",
+   "help": "Subscribes to a service's events, for yourself or for an agent this account serves. A personal subscription fires your own triggers and apps.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Subscribe as",
+    "Subscribe to",
+    "Event types",
+    "Create subscription"
+   ],
+   "note": "A service with an event API. Subscribing as an agent needs the manager role on it, and a Personal-only agent is not offered."
+  },
+  {
+   "id": "user.integrations.subscription",
+   "area": "user",
+   "section": "integrations",
+   "group": "Active subscriptions",
+   "label": "Subscription",
+   "kind": "item",
+   "help": "One event subscription: its address and secret to copy, and Delete.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Copy URL",
+    "Copy secret",
+    "Delete"
+   ],
+   "item": "an event subscription"
+  },
+  {
+   "id": "user.integrations.create-api-key",
+   "area": "user",
+   "section": "integrations",
+   "group": "API Keys",
+   "label": "+ Create key",
+   "kind": "action",
+   "help": "Makes a personal API key for your webhook triggers. The key shows once.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Create",
+    "Name",
+    "triggers: fire your own webhook triggers",
+    "Copy to clipboard"
+   ]
+  },
+  {
+   "id": "user.integrations.api-key",
+   "area": "user",
+   "section": "integrations",
+   "group": "API Keys",
+   "label": "API key",
+   "kind": "item",
+   "help": "One of your personal API keys, with when it was made and last used. Revoke ends it at once.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Integrations",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Revoke"
+   ],
+   "item": "a personal API key"
+  },
+  {
+   "id": "user.remote-machines.pair-machine",
+   "area": "user",
+   "section": "remote-machines",
+   "group": "Remote Machines",
+   "label": "Pair Machine",
+   "kind": "action",
+   "help": "Connects your own computer, so agents can run on it. The pair command runs once on that machine.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Remote Machines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Pair",
+    "Machine Name",
+    "Allow full filesystem access",
+    "Operating system"
+   ],
+   "note": "Hidden when the build lacks the feature. A notice replaces the page when an administrator turned user pairing off."
+  },
+  {
+   "id": "user.remote-machines.remove-machine",
+   "area": "user",
+   "section": "remote-machines",
+   "group": "Remote Machines",
+   "label": "Remove machine",
+   "kind": "item",
+   "help": "Unpairs the machine. A machine an administrator paired for the platform is removed under Admin, Remote Machines.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Remote Machines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Confirm"
+   ],
+   "item": "a machine you paired"
+  },
+  {
+   "id": "user.remote-machines.allow-full-fs",
+   "area": "user",
+   "section": "remote-machines",
+   "group": "Filesystem access",
+   "label": "Allow full FS",
+   "kind": "item",
+   "help": "On, agents can read and write any path your OS user can reach. Off, they stay in their agent folders and your home folder. The home folder limit is a guardrail, not full isolation.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Remote Machines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "item": "a machine you paired"
+  },
+  {
+   "id": "user.remote-machines.device-control",
+   "area": "user",
+   "section": "remote-machines",
+   "group": "Device control",
+   "label": "Computer control",
+   "kind": "item",
+   "help": "Grants agents the mouse, keyboard and screen, a browser on this computer, or the applications on it. Turn one on only on a computer you trust them with.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Remote Machines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Browser control",
+    "App connectors",
+    "Grant"
+   ],
+   "item": "a machine you paired"
+  },
+  {
+   "id": "user.remote-machines.browser-mode",
+   "area": "user",
+   "section": "remote-machines",
+   "group": "Device control",
+   "label": "Browser mode",
+   "kind": "item",
+   "help": "A dedicated profile, or your own browser through the Playwright Extension and its token. Browser profile names the profile that has the extension. With a saved token you can also let unattended runs use it.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Remote Machines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Playwright Extension token",
+    "Save token",
+    "Clear",
+    "Browser profile",
+    "Also let unattended runs like scheduled tasks, triggers, calls and meetings use this browser. Off, they cannot use it at all."
+   ],
+   "note": "Shown once browser control is granted.",
+   "item": "a machine with browser control"
+  },
+  {
+   "id": "user.remote-machines.run-agents",
+   "area": "user",
+   "section": "remote-machines",
+   "group": "Run these agents on this machine",
+   "label": "Run these agents on this machine",
+   "kind": "item",
+   "help": "Ticks the agents whose chats run on this machine for you. An agent already on another machine says so.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Remote Machines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "item": "an agent of yours"
+  },
+  {
+   "id": "user.ai-engines.connect-account",
+   "area": "user",
+   "section": "ai-engines",
+   "group": "AI Engines",
+   "label": "Connect your Claude account",
+   "kind": "action",
+   "help": "Signs in to your Claude or ChatGPT subscription, so your own chats and agents run on it. The Claude popup uses the browser's session at platform.claude.com.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, AI Engines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Connect your ChatGPT account",
+    "Add another account",
+    "Connect",
+    "Open",
+    "Copy",
+    "Try again",
+    "Authorization code"
+   ]
+  },
+  {
+   "id": "user.ai-engines.use-api-key",
+   "area": "user",
+   "section": "ai-engines",
+   "group": "AI Engines",
+   "label": "Use an API key instead",
+   "kind": "action",
+   "help": "Saves an API key of the engine's vendor in place of a subscription.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, AI Engines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Add",
+    "API key",
+    "Label, optional"
+   ]
+  },
+  {
+   "id": "user.ai-engines.subscription",
+   "area": "user",
+   "section": "ai-engines",
+   "group": "AI Engines",
+   "label": "Subscription",
+   "kind": "item",
+   "help": "One connected account, with its status and usage windows. Reconnect revives an expired login or renews one that ends soon. Remove takes it off.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, AI Engines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Reconnect",
+    "Remove"
+   ],
+   "item": "a connected account or API key"
+  },
+  {
+   "id": "user.ai-engines.personal-use",
+   "area": "user",
+   "section": "ai-engines",
+   "group": "AI Engines",
+   "label": "Personal use",
+   "kind": "item",
+   "help": "Use this account for your own chats.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, AI Engines",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "item": "a connected account"
+  },
+  {
+   "id": "user.ai-engines.shared-with-agents",
+   "area": "user",
+   "section": "ai-engines",
+   "group": "AI Engines",
+   "label": "Shared with agents",
+   "kind": "item",
+   "help": "Add this account to the shared subscriptions your agents use.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "User Settings, AI Engines",
+   "who": "A platform administrator.",
+   "card": false,
+   "note": "Platform administrators only.",
+   "item": "a connected account"
+  },
+  {
+   "id": "user.audio.voice-playback",
+   "area": "user",
+   "section": "audio",
+   "group": "Audio",
+   "label": "Voice playback",
+   "kind": "choice",
+   "help": "What reads replies aloud: this device, the platform's speech service, or Auto.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Audio",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "options": [
+    {
+     "value": "auto",
+     "label": "Auto"
+    },
+    {
+     "value": "native",
+     "label": "Native"
+    },
+    {
+     "value": "platform",
+     "label": "Platform"
+    }
+   ],
+   "note": "Shown when the administrator's policy is User's choice. Otherwise the platform policy sets it.",
+   "value": {
+    "read": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "tts_mode"
+    },
+    "write": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "tts_mode"
+    },
+    "default": "auto"
+   }
+  },
+  {
+   "id": "user.audio.dictation",
+   "area": "user",
+   "section": "audio",
+   "group": "Audio",
+   "label": "Dictation",
+   "kind": "choice",
+   "help": "What listens when you dictate: this device, the platform's speech service, or Auto.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Audio",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "options": [
+    {
+     "value": "auto",
+     "label": "Auto"
+    },
+    {
+     "value": "native",
+     "label": "Native"
+    },
+    {
+     "value": "platform",
+     "label": "Platform"
+    }
+   ],
+   "note": "Shown when the administrator's policy is User's choice. Also in Safari, and on an iPhone or iPad, under Native preferred with a speech provider.",
+   "value": {
+    "read": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "stt_mode"
+    },
+    "write": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "stt_mode"
+    },
+    "default": "auto"
+   }
+  },
+  {
+   "id": "user.audio.dictation-language",
+   "area": "user",
+   "section": "audio",
+   "group": "Audio",
+   "label": "Dictation language",
+   "kind": "choice",
+   "help": "The language the mic recognizes. Set it to dictate in a language other than English. Automatic starts in your browser language. Within a second or two, it moves to the language you speak. Without a speech service, or with Dictation set to Native, this device listens in its own language.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Audio",
+   "who": "Any signed-in person, on their own account.",
+   "card": true,
+   "options": [
+    {
+     "value": "auto",
+     "label": "Automatic"
+    },
+    {
+     "value": "en-US",
+     "label": "English, US"
+    },
+    {
+     "value": "en-GB",
+     "label": "English, UK"
+    },
+    {
+     "value": "el-GR",
+     "label": "Greek"
+    },
+    {
+     "value": "de-DE",
+     "label": "German"
+    },
+    {
+     "value": "es-ES",
+     "label": "Spanish"
+    },
+    {
+     "value": "fr-FR",
+     "label": "French"
+    },
+    {
+     "value": "it-IT",
+     "label": "Italian"
+    }
+   ],
+   "note": "Hidden when chat audio is off. The chat's microphone button also picks it.",
+   "value": {
+    "read": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "stt_language"
+    },
+    "write": {
+     "path": "/v1/users/me/audio-prefs",
+     "field": "stt_language"
+    },
+    "default": "en-US"
+   }
+  },
+  {
+   "id": "user.audio.device-voice",
+   "area": "user",
+   "section": "audio",
+   "group": "Audio",
+   "label": "Voice",
+   "kind": "choice",
+   "help": "Preferred device voice for native playback on this device. Set one language at a time. Kept in this browser.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Audio",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Language"
+   ],
+   "note": "Shown when this device has voices."
+  },
+  {
+   "id": "user.usage.summary",
+   "area": "user",
+   "section": "usage",
+   "group": "Usage",
+   "label": "Usage",
+   "kind": "readonly",
+   "help": "Your platform API use this month and this week, with your own accounts beside it. A daily chart and a per-agent list follow.",
+   "reads": "member",
+   "writes": null,
+   "where": "User Settings, Usage",
+   "who": "Nobody changes it. The page only shows it.",
+   "card": false
+  },
+  {
+   "id": "user.usage.subscription-cap",
+   "area": "user",
+   "section": "usage",
+   "group": "My subscriptions",
+   "label": "Week %",
+   "kind": "number",
+   "help": "Caps your own connected accounts on each engine. Cap them at a share of their weekly window, or at the matching API cost. The first cap reached stops your new chats, or moves them onto an API key. Empty means no cap.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Usage",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Day %",
+    "Week $",
+    "Day $",
+    "When reached",
+    "Save"
+   ]
+  },
+  {
+   "id": "user.usage.api-key-cap",
+   "area": "user",
+   "section": "usage",
+   "group": "My API keys",
+   "label": "Set cap",
+   "kind": "action",
+   "help": "Caps what your own Anthropic or OpenAI API keys spend, by month and by week.",
+   "reads": "member",
+   "writes": "member",
+   "where": "User Settings, Usage",
+   "who": "Any signed-in person, on their own account.",
+   "card": false,
+   "names": [
+    "Close",
+    "Monthly ($)",
+    "Weekly ($)",
+    "Save"
+   ]
+  },
+  {
+   "id": "admin.platform.company-name",
+   "area": "admin",
+   "section": "platform",
+   "group": "Identity",
+   "label": "Company Name",
+   "kind": "text",
+   "help": "Shown as a heading in every agent's instructions.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, General",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "General"
+  },
+  {
+   "id": "admin.platform.general-instructions",
+   "area": "admin",
+   "section": "platform",
+   "group": "Identity",
+   "label": "General Instructions",
+   "kind": "text",
+   "help": "Rules and context every agent reads with its own instructions.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, General",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "General"
+  },
+  {
+   "id": "admin.platform.ai-engines",
+   "area": "admin",
+   "section": "platform",
+   "group": "AI Engines",
+   "label": "Platform subscriptions and API keys",
+   "kind": "item",
+   "help": "The subscriptions, API keys, local model servers and model lists the whole platform runs on. Each model has a tier and a price.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, AI Engines",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "AI Engines",
+   "names": [
+    "Connect",
+    "Add API key",
+    "Add local model server"
+   ],
+   "item": "an engine"
+  },
+  {
+   "id": "admin.platform.otodock",
+   "area": "admin",
+   "section": "platform",
+   "group": "OtoDock",
+   "label": "This install",
+   "kind": "item",
+   "help": "The running version, whether a newer release is out, and the license and billing. A license key is pasted and saved here.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, OtoDock",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "OtoDock",
+   "names": [
+    "License Key",
+    "Save",
+    "Check now",
+    "Re-check now",
+    "Move license"
+   ],
+   "item": "the license, the version and the billing"
+  },
+  {
+   "id": "admin.platform.audio",
+   "area": "admin",
+   "section": "platform",
+   "group": "Audio",
+   "label": "Chat audio policy",
+   "kind": "item",
+   "help": "The chat audio policy: Native only, Native preferred, Platform only or User's choice. Also the speech providers with their keys, voices and defaults.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, Audio",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "Audio",
+   "names": [
+    "Add provider"
+   ],
+   "item": "a speech provider"
+  },
+  {
+   "id": "admin.platform.phone",
+   "area": "admin",
+   "section": "platform",
+   "group": "Phone",
+   "label": "Phone servers and routes",
+   "kind": "item",
+   "help": "The phone servers and the routes, each with its agent, language, transfer targets and PIN. Also the call log, the caller data and the languages automatic detection may pick.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, Phone",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "Phone",
+   "names": [
+    "Add server",
+    "Add route"
+   ],
+   "item": "a phone server or route"
+  },
+  {
+   "id": "admin.platform.require-2fa",
+   "area": "admin",
+   "section": "platform",
+   "group": "Security",
+   "label": "Require Two-Factor Authentication",
+   "kind": "toggle",
+   "help": "Every password account must add a passkey or an authenticator app before it signs in again.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, Security",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "Security",
+   "note": "Refused while it would lock the administrator out."
+  },
+  {
+   "id": "admin.platform.sharing",
+   "area": "admin",
+   "section": "platform",
+   "group": "Sharing",
+   "label": "Sharing",
+   "kind": "toggle",
+   "help": "Whether people may share apps and chats with agents, with departments and by link. Also whether a link may go without a password, and the longest a share lasts.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, Security",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "Security",
+   "names": [
+    "Sharing to agents",
+    "Sharing to departments",
+    "External links",
+    "Links without a password",
+    "User directory when sharing",
+    "Longest share expiry"
+   ]
+  },
+  {
+   "id": "admin.platform.timezone",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Platform Timezone",
+   "kind": "text",
+   "help": "Used for scheduled tasks and for the date and time agents see in messages.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "System Settings"
+  },
+  {
+   "id": "admin.platform.login-session-duration",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Login Session Duration",
+   "kind": "number",
+   "help": "Hours of inactivity before a user must sign in again.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": false,
+   "tab": "System Settings",
+   "note": "Active users stay signed in, so it only signs out idle sessions."
+  },
+  {
+   "id": "admin.platform.allow-user-paired-machines",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Allow users to pair their own remote machines",
+   "kind": "toggle",
+   "help": "Users can pair their own machines, like laptops or home servers. Their agents can then run there.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "note": "Turning it off disconnects every user-paired machine at once and blocks new pairings.",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "allow_user_paired_machines"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "allow_user_paired_machines"
+    },
+    "default": true,
+    "confirm": "Off disconnects every user-paired machine at once, removes the machine choices people made and refuses new pairings. On lets people pair their own machines again."
+   }
+  },
+  {
+   "id": "admin.platform.fallback-user-machine",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Fall back to local when a user's machine is offline",
+   "kind": "toggle",
+   "help": "If a user's chosen machine is offline, the session runs on the platform instead.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "remote_fallback_user_override"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "remote_fallback_user_override"
+    },
+    "default": true,
+    "confirm": "On, a chat whose machine is offline runs on the platform instead. Off, it waits for the machine."
+   }
+  },
+  {
+   "id": "admin.platform.fallback-agent-machine",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Fall back to local when the agent's remote target is offline",
+   "kind": "toggle",
+   "help": "When a machine an admin chose is offline, the session runs on the platform instead.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "note": "Off by default, because an admin often picks a machine to keep the data there.",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "remote_fallback_agent_default"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "remote_fallback_agent_default"
+    },
+    "default": false,
+    "confirm": "On, an agent whose machine is offline runs on the platform, so its data may leave the machine. Off, it waits for the machine."
+   }
+  },
+  {
+   "id": "admin.platform.interactive-terminals",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Interactive terminal sessions",
+   "kind": "toggle",
+   "help": "Chats and tasks can run Claude Code or Codex as a live dashboard terminal. Off, every session runs the standard way and the interactive switches are hidden.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "interactive_cli_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "interactive_cli_enabled"
+    },
+    "default": true,
+    "confirm": "Off hides the terminal switches everywhere and every new session runs the standard way. On brings the terminals back."
+   }
+  },
+  {
+   "id": "admin.platform.subscription-windows",
+   "area": "admin",
+   "section": "platform",
+   "group": "System Settings",
+   "label": "Read subscription usage from the provider",
+   "kind": "toggle",
+   "help": "OtoDock asks Claude and ChatGPT for each connected account's session and weekly usage and prefers the account that resets first. Off, the shared subscriptions balance by recorded cost only.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "subscription_windows_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "subscription_windows_enabled"
+    },
+    "default": true,
+    "confirm": "Off stops reading the usage windows from Claude and ChatGPT, and the AI Engines cards lose their usage bars. On reads them again."
+   }
+  },
+  {
+   "id": "admin.platform.session-cleanup",
+   "area": "admin",
+   "section": "platform",
+   "group": "Storage and Retention",
+   "label": "Clean up old chat session files",
+   "kind": "toggle",
+   "help": "Chats left untouched for the set period lose their session files, here and on the machines they ran on. Their full history stays saved.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "session_retention_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "session_retention_enabled"
+    },
+    "default": true,
+    "confirm": "On, chats left untouched for the set period lose their session files, here and on the machines they ran on. Their history stays. Off keeps every file.",
+    "cloudManaged": true
+   }
+  },
+  {
+   "id": "admin.platform.archive-cleanup",
+   "area": "admin",
+   "section": "platform",
+   "group": "Archive of removed people",
+   "label": "Archive of removed people",
+   "kind": "toggle",
+   "help": "A removed person's folders are kept in an archive for the set number of days, then deleted.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "names": [
+    "Enabled"
+   ],
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "offboarded_retention_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "offboarded_retention_enabled"
+    },
+    "default": true,
+    "confirm": "On, a removed person's archived folders are deleted after the set number of days. Off keeps every archive for ever.",
+    "cloudManaged": true
+   }
+  },
+  {
+   "id": "admin.platform.mcp-auto-updates",
+   "area": "admin",
+   "section": "platform",
+   "group": "Automatic MCP Updates",
+   "label": "Automatic MCP Updates",
+   "kind": "toggle",
+   "help": "Once a week, in a quiet window, OtoDock applies available updates to community MCPs. Only failures notify admins.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "names": [
+    "Enabled"
+   ],
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "mcp_auto_update_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "mcp_auto_update_enabled"
+    },
+    "default": true,
+    "confirm": "On, community MCPs update once a week on their own. Off, every update waits for an admin."
+   }
+  },
+  {
+   "id": "admin.platform.store-review",
+   "area": "admin",
+   "section": "platform",
+   "group": "Mobile apps",
+   "label": "Ask for a store rating",
+   "kind": "toggle",
+   "help": "The Android and iOS apps ask each person to rate OtoDock in Google Play or the App Store. They ask twice at most, after something went well.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "store_review_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "store_review_enabled"
+    },
+    "default": true,
+    "confirm": "On, the Android and iOS apps ask each person for a store rating twice at most. Off, they never ask."
+   }
+  },
+  {
+   "id": "admin.platform.store-review-days",
+   "area": "admin",
+   "section": "platform",
+   "group": "Mobile apps",
+   "label": "Days before the second ask",
+   "kind": "number",
+   "help": "The second store rating ask comes at least this many days after the first. From 30 to 730.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "store_review_days"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "store_review_days"
+    },
+    "default": 90,
+    "confirm": "The second ask comes at least this many days after the first."
+   }
+  },
+  {
+   "id": "admin.users.add-user",
+   "area": "admin",
+   "section": "users",
+   "group": "Users",
+   "label": "Add User",
+   "kind": "action",
+   "help": "Adds a person with an invite link or a temporary password.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Users",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Invite link",
+    "Temporary password"
+   ]
+  },
+  {
+   "id": "admin.users.user",
+   "area": "admin",
+   "section": "users",
+   "group": "Users",
+   "label": "User",
+   "kind": "item",
+   "help": "A person's platform role and their role on each agent. Also whether they may use the platform's API credentials, a password reset and deletion.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Users",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Platform role",
+    "Agent access",
+    "Platform API",
+    "Reset password",
+    "Delete"
+   ],
+   "item": "a person"
+  },
+  {
+   "id": "admin.usage.limits",
+   "area": "admin",
+   "section": "usage",
+   "group": "Usage and Limits",
+   "label": "Usage and Limits",
+   "kind": "number",
+   "help": "The platform's totals and costs, each person's usage with a limit, agent budgets and the role defaults.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Usage",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Agent Budgets"
+   ]
+  },
+  {
+   "id": "admin.mcp-servers.server",
+   "area": "admin",
+   "section": "mcp-servers",
+   "group": "MCP Servers",
+   "label": "MCP server",
+   "kind": "item",
+   "help": "Every installed tool with its switch, settings, instances and updates. Install takes a ZIP, Browse Community the catalog.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, MCP Servers",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Check Updates",
+    "Install",
+    "Browse Community",
+    "Update",
+    "Switch",
+    "Revert to catalog",
+    "Forget"
+   ],
+   "item": "an installed MCP"
+  },
+  {
+   "id": "admin.skills.package",
+   "area": "admin",
+   "section": "skills",
+   "group": "Skills",
+   "label": "Skill package",
+   "kind": "item",
+   "help": "Every installed skill package with its updates and the catalog to browse.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Skills",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Check Updates",
+    "Update",
+    "Delete",
+    "Browse Community Skills"
+   ],
+   "item": "an installed skill package"
+  },
+  {
+   "id": "admin.mcp-requests.request",
+   "area": "admin",
+   "section": "mcp-requests",
+   "group": "MCP Requests",
+   "label": "Request",
+   "kind": "item",
+   "help": "An agent's request for a tool or a skill, approved with an instance when the tool takes one.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, MCP Requests",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Approve",
+    "Needs instance"
+   ],
+   "item": "a request"
+  },
+  {
+   "id": "admin.remote-machines.pair",
+   "area": "admin",
+   "section": "remote-machines",
+   "group": "Remote Machines",
+   "label": "Pair New Machine",
+   "kind": "action",
+   "help": "Pairs a machine for the whole platform, where agents run by default.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Remote Machines",
+   "who": "A platform administrator.",
+   "card": false
+  },
+  {
+   "id": "admin.remote-machines.machine",
+   "area": "admin",
+   "section": "remote-machines",
+   "group": "Remote Machines",
+   "label": "Machine",
+   "kind": "item",
+   "help": "A machine's capabilities, versions, capacity, updates and grants. The people's own machines are listed too, each removable.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Remote Machines",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Max sessions",
+    "Auto-update",
+    "Filesystem access",
+    "Device control",
+    "Remove"
+   ],
+   "item": "a paired machine"
+  },
+  {
+   "id": "admin.remote-machines.all-roles",
+   "area": "admin",
+   "section": "remote-machines",
+   "group": "Who runs here",
+   "label": "Every role of its agents runs here",
+   "kind": "item",
+   "help": "Off, the chats of editors, contributors and viewers run on the OtoDock platform, as the machine has no sandbox. On, they run on the machine with its access. An outside caller always runs on the platform.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Remote Machines",
+   "who": "A platform administrator.",
+   "card": false,
+   "note": "Only the agents whose default place is this machine. Turning it on asks first.",
+   "item": "a machine an admin paired"
+  },
+  {
+   "id": "admin.shares.share",
+   "area": "admin",
+   "section": "shares",
+   "group": "Shares",
+   "label": "Share",
+   "kind": "item",
+   "help": "Every share to people, agents and departments and every link on the install, each revocable.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Shares",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Revoke"
+   ],
+   "item": "a share or link"
+  },
+  {
+   "id": "admin.reports.report",
+   "area": "admin",
+   "section": "reports",
+   "group": "Reports",
+   "label": "Report",
+   "kind": "item",
+   "help": "The agent replies people flagged, newest first, with who reported and why. Mark one handled or dismiss it, restore it from the closed list, or delete it.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Reports",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Handled",
+    "Dismiss",
+    "Restore",
+    "Delete"
+   ],
+   "item": "a reported reply"
+  }
+ ]
+}

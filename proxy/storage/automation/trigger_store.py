@@ -12,6 +12,7 @@ from typing import Any
 
 import psycopg
 
+from auth import roles
 from storage.pg import get_conn
 
 
@@ -33,6 +34,7 @@ _EDITABLE_TRIGGER_COLUMNS = {
     "notify_body",
     "notify_target_scope",
     "notify_target",
+    "notify_audience",
     "debounce_seconds",
     "event_filter",
     # The app action (APPS.md "Handlers"): validated by the manager's
@@ -68,8 +70,12 @@ def create_trigger(
     community_template_item_slug: str | None = None,
     app_id: str | None = None,
     handler: str | None = None,
+    notify_audience: str = roles.EDITOR,
 ) -> dict:
     """Insert a new trigger row. Returns the full row as dict.
+
+    ``notify_audience`` is who the notify block tells: the lowest per-agent
+    role of an agent-scope notify (``editor`` for a new trigger).
 
     ``app_id`` + ``handler`` make the fire wake an app's handler instead
     of a task (APPS.md "Handlers"); never set together with ``task_id``.
@@ -96,8 +102,8 @@ def create_trigger(
                 subscription_id, event_filter,
                 created_at, updated_at,
                 community_template, community_template_item_slug,
-                app_id, handler)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                app_id, handler, notify_audience)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (tid, slug, name, scope, agent, created_by,
              task_id,
              notify_enabled, notify_severity, notify_title, notify_body,
@@ -106,7 +112,7 @@ def create_trigger(
              subscription_id, json.dumps(event_filter or {}),
              now, now,
              community_template, community_template_item_slug,
-             app_id, handler),
+             app_id, handler, notify_audience or roles.EDITOR),
         )
         row = conn.execute("SELECT * FROM triggers WHERE id=%s", (tid,)).fetchone()
         return dict(row)
@@ -154,17 +160,21 @@ def count_triggers_by_agent() -> dict[str, int]:
         return {r["agent"]: r["cnt"] for r in rows}
 
 
-def count_user_visible_triggers_by_agent(user_sub: str) -> dict[str, int]:
+def count_user_visible_triggers_by_agent(user_sub: str,
+                                         shared_agents: list[str] | None = None) -> dict[str, int]:
     """Return {agent_slug: trigger_count} of triggers ``user_sub`` may see:
-    agent-scoped (shared) + their OWN user-scoped. Never counts other users'
-    user-scoped triggers. Mirrors ``list_triggers_for_user_view``."""
+    agent-scoped (shared; on ``shared_agents`` when given, the agents whose
+    own work the viewer sees) + their OWN user-scoped. Never counts other
+    users' user-scoped triggers. Mirrors ``list_triggers_for_user_view``."""
+    shared = "scope='agent'" if shared_agents is None else "(scope='agent' AND agent = ANY(%s))"
+    params: tuple = (user_sub,) if shared_agents is None else (list(shared_agents), user_sub)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT agent, COUNT(*) AS cnt FROM triggers "
             "WHERE agent IS NOT NULL "
-            "AND (scope='agent' OR (scope='user' AND created_by=%s)) "
+            f"AND ({shared} OR (scope='user' AND created_by=%s)) "
             "GROUP BY agent",
-            (user_sub,),
+            params,
         ).fetchall()
         return {r["agent"]: r["cnt"] for r in rows}
 

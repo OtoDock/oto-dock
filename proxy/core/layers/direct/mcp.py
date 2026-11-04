@@ -38,6 +38,12 @@ logger = logging.getLogger("mcp-manager")
 TOOL_CALL_TIMEOUT = 60
 TOOL_CALL_TIMEOUT_CHAT = 300
 
+# How long one MCP server may take to connect and list its tools before the
+# session starts without it: the servers start together, so this bounds the
+# whole start too. Above a cold start of a large stdio venv, below the app
+# actions' 90 s backstop (``services/apps/headless_exec.py``).
+MCP_START_TIMEOUT_S = 60.0
+
 # The registry's Claude-JSON config format spells streamable HTTP as "http"
 # (the CLI's alias for it) — both spellings are the same transport here. The
 # two dispatch sites below must share this set: they have different type
@@ -216,24 +222,31 @@ class MCPServerConnection:
         task, satisfying anyio's same-task cancel-scope requirement."""
         server_type = self.config.get("type", "stdio")
         try:
-            if server_type == "stdio":
-                await self._start_stdio()
-            elif server_type == "sse" or server_type in _REMOTE_STREAMABLE:
-                await self._start_remote()
-            else:
-                logger.warning("Unknown MCP server type '%s' for %s", server_type, self.name)
-                if not ready.done():
-                    ready.set_result(None)
-                return
+            try:
+                async with asyncio.timeout(MCP_START_TIMEOUT_S):
+                    if server_type == "stdio":
+                        await self._start_stdio()
+                    elif server_type == "sse" or server_type in _REMOTE_STREAMABLE:
+                        await self._start_remote()
+                    else:
+                        logger.warning("Unknown MCP server type '%s' for %s", server_type, self.name)
+                        return
 
-            # Initialize and discover tools
-            result = await cast("ClientSession", self.session).initialize()
-            logger.info(
-                "MCP server '%s' initialized "
-                "(protocol=%s)", self.name, result.protocolVersion
-            )
+                    # Initialize and discover tools
+                    result = await cast("ClientSession", self.session).initialize()
+                    logger.info(
+                        "MCP server '%s' initialized "
+                        "(protocol=%s)", self.name, result.protocolVersion
+                    )
 
-            tools_result = await cast("ClientSession", self.session).list_tools()
+                    tools_result = await cast("ClientSession", self.session).list_tools()
+            except TimeoutError:
+                # A server that never answers (an address that does not
+                # resolve, a process that never speaks) is left out like a
+                # failed one; the contexts it entered are exited below.
+                raise RuntimeError(
+                    f"did not answer within {MCP_START_TIMEOUT_S:.0f} s; the session starts without it"
+                ) from None
             for tool in tools_result.tools:
                 namespaced = f"mcp__{self.name}__{tool.name}"
                 self.tools.append({
@@ -259,13 +272,14 @@ class MCPServerConnection:
             # previous behaviour). Tear down whatever was entered, in THIS task.
             logger.error("Failed to start MCP server '%s': %s", self.name, e)
             await self._teardown()
+            return
+        finally:
+            # start() waits on this: whatever ends the start (a cancel the
+            # client's own task group leaves behind included) resolves it.
             if not ready.done():
                 ready.set_result(None)
-            return
 
-        # Ready — unblock start(), then park until close() signals teardown.
-        if not ready.done():
-            ready.set_result(None)
+        # Ready (start() unblocked above): park until close() signals teardown.
         try:
             await cast("asyncio.Event", self._closing).wait()
         finally:
@@ -517,6 +531,11 @@ class AgentMCPManager:
         # tools cannot exist here when the prompt says they do not.
         self.external = external
         self.credential_env = credential_env
+        # The ``mcpServers`` keys the session's builder left out (a kind's
+        # ``exclude_from``, a credential or audience refusal): the rebuild
+        # below knows the phone and external facts alone, so a task's, a
+        # meeting's and a ``shared_chat`` session's exclusions arrive here
+        # by name, the way the CLI engines never read them from the file.
         self.excluded_mcps = excluded_mcps or set()
         self.session_id = session_id
         # Sidecar HTTP MCPs (registry Claude-JSON ``type: "http"``) are opt-in
@@ -611,12 +630,13 @@ class AgentMCPManager:
             logger.info("Agent '%s' has no MCP servers", self.agent_name)
             return
 
-        # Start servers in parallel, skipping excluded ones
-        # (phone/context exclusions already handled by build_session_mcp_config)
+        # Start servers in parallel, skipping the ones the session's builder
+        # left out (the phone and external exclusions are already applied
+        # by build_session_mcp_config above).
         tasks = []
         for name, srv_config in servers_config.items():
             if name in self.excluded_mcps:
-                logger.info("Skipping credential-excluded MCP: %s", name)
+                logger.info("Skipping MCP the session's builder left out: %s", name)
                 continue
             if self.included_mcps is not None and name not in self.included_mcps:
                 continue
@@ -792,8 +812,9 @@ class MCPPool:
         for chats, tasks and meetings; stdio-only + 60 s for phone calls.
         ``external`` marks a session whose caller is not a platform user
         (the management MCPs are never started for it). ``user_role`` and
-        ``scope`` are what the build judges the manifests' audience with
-        (``AgentMCPManager``).
+        ``scope`` are what the build judges the manifests' audience with,
+        and ``excluded_mcps`` the server keys the session's builder left
+        out (``AgentMCPManager``).
         """
         async with self._lock:
             mgr = self._managers.get(session_id)

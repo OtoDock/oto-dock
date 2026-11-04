@@ -280,6 +280,17 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
     )
   }
 
+  // Photos of the person's message above that did not reach the agent (one
+  // that did not decode, one saved earlier that is gone): persisted right
+  // after the person's row, so a reload shows it where the live frame did.
+  if (subtype === SYSTEM_SUBTYPE.PHOTOS_NOT_ATTACHED) {
+    return (
+      <div className={`${NOTICE_BOX} ${NOTICE.warning}`} data-testid="photos-not-attached">
+        {message || 'The photos did not reach the agent. Attach them again to send them.'}
+      </div>
+    )
+  }
+
   // A message typed while the agent worked (or the chat got ready) that the
   // server refused before any turn: live only, the text is back in the
   // composer.

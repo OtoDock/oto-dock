@@ -140,7 +140,7 @@ async def test_a_skill_above_a_callers_viewer_role_stays_out_of_the_prompt(
     seen: dict = {}
 
     def _skills(model, *, context="", placement=None, skip_http_mcps=False,
-                external=False, user_role=None):
+                external=False, user_role=None, shared_chat=False):
         seen["user_role"] = user_role
         out = [("everyone", "EVERYONE-SKILL-BODY", "always")]
         if mcp_registry.skill_audience_admits(SimpleNamespace(audience="editor"), user_role):

@@ -502,3 +502,38 @@ def test_the_password_confirm_answers_503_past_the_hash_gate(monkeypatch):
 
     code, headers = asyncio.run(scenario())
     assert code == 503 and headers.get("Retry-After")
+
+
+# ── the sign-in stamp (Admin, Users "Last login") ─────────────────────────
+
+
+def test_a_new_account_has_never_signed_in_until_its_first_login():
+    sub = _user()
+    assert db.get_user(sub)["last_login"] == ""
+    assert _post_login(_client()).status_code == 200
+    stamped = datetime.fromisoformat(db.get_user(sub)["last_login"])
+    assert datetime.now(timezone.utc) - stamped < timedelta(minutes=1)
+
+
+def test_every_sign_in_answer_stamps_the_account():
+    """The passkey, the app's exchange, the second factor and single sign-on
+    all answer through ``_login_response``."""
+    sub = _user()
+    old = "2020-01-01T00:00:00+00:00"
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET last_login=%s WHERE sub=%s", (old, sub))
+        conn.commit()
+    asyncio.run(identity._login_response(db.get_user(sub), "oidc"))
+    assert db.get_user(sub)["last_login"] > old
+
+
+def test_a_failed_stamp_never_fails_the_sign_in(monkeypatch):
+    import psycopg
+    sub = _user()
+
+    def _boom(_sub):
+        raise psycopg.OperationalError("down")
+    monkeypatch.setattr(identity.task_store, "record_login", _boom)
+    r = asyncio.run(identity._login_response(db.get_user(sub), "local"))
+    assert r.status_code == 200

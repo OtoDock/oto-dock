@@ -841,12 +841,27 @@ class TestScopeStickyAndPersistedBindings:
         return base
 
     @staticmethod
+    def _pin(mock_store, sub):
+        # Both reads of the persisted binding: the scope's latest inside the boot
+        # grace window, the live rows after it (a worker older than ten minutes).
+        mock_store.get_scope_binding.return_value = sub
+        mock_store.list_scope_bindings.return_value = [{"session_id": "", "subscription_id": sub}]
+
+    @staticmethod
     def _reset(sp):
+        # Every map a candidate's eligibility reads: a test on another xdist
+        # worker's schedule may have rested or throttled sub-a before this one.
         sp._session_subscriptions.clear()
         sp._session_binding_ctx.clear()
         sp._session_scope_keys.clear()
         sp._scope_recent.clear()
         sp._throttled_until.clear()
+        sp._throttled_hard.clear()
+        sp._window_rests.clear()
+        sp._scoped_rests.clear()
+        sp._auth_fail_streaks.clear()
+        sp._refresh_backoff.clear()
+        sp._scope_rebalance_last.clear()
 
     def test_credential_scope_key_shape(self):
         from services.engines import subscription_pool as sp
@@ -927,11 +942,10 @@ class TestScopeStickyAndPersistedBindings:
         mock_store.get_subscription_consumption.side_effect = (
             lambda sid, since: {"sub-a": 9.0, "sub-b": 0.0}[sid]
         )
-        mock_store.get_scope_binding.return_value = "sub-a"
+        self._pin(mock_store, "sub-a")
         handle = sp.acquire_subscription(
             "claude-code-cli", None, sticky_scope="local:/agents/dev/.claude")
         assert handle.subscription_id == "sub-a"
-        mock_store.get_scope_binding.assert_called_with("local:/agents/dev/.claude")
         self._reset(sp)
 
     @patch("services.engines.subscription_pool.subscription_store")
@@ -949,7 +963,7 @@ class TestScopeStickyAndPersistedBindings:
         ]
         mock_store.get_credential_data.return_value = {"api_key": "k", "access_token": "t"}
         mock_store.get_subscription_consumption.side_effect = lambda sid, since: 0.0
-        mock_store.get_scope_binding.return_value = "sub-oauth"
+        self._pin(mock_store, "sub-oauth")
         handle = sp.acquire_subscription(
             "claude-code-cli", "user-1", sticky_scope="local:/agents/dev/.claude")
         assert handle.subscription_id == "sub-key"
@@ -2552,6 +2566,68 @@ class TestPoolCapEnforcement:
         err = NoSubscriptionError("pool_cap")
         assert err.reason == "pool_cap" and "Usage page" in str(err)
         assert str(NoSubscriptionError("pool_cap", "custom")) == "custom"
+
+
+class TestLocalOnlyNarrowing:
+    """``acquire_subscription(allowed_auth=...)``: the local-only rule's
+    backstop. A subscription is refused on an engine the agent restricts to
+    local models, a local server's row is taken, and nothing left raises
+    ``local_only`` for BOTH scopes (an agent-scope spawn must never start on
+    the credential file its scope dir still holds)."""
+
+    def _sub(self, sid, auth="oauth", owner="u", provider="openai"):
+        return {"id": sid, "layer": "codex-cli", "provider": provider,
+                "auth_type": auth, "owner_sub": owner, "is_primary": 0,
+                "status": "active", "active_sessions": 0}
+
+    @staticmethod
+    def _reset(sp):
+        sp._session_subscriptions.clear()
+        sp._scope_recent.clear()
+        sp._throttled_until.clear()
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_a_subscription_is_refused_and_a_local_row_taken(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [self._sub("own-login")]
+        mock_store.list_platform_pool.return_value = [self._sub("local-1", "local_endpoint", owner="admin-1", provider="ollama")]
+        mock_store.get_user_allow_platform_auth.return_value = True
+        mock_store.get_credential_data.return_value = {"endpoint_url": "http://ollama:11434"}
+        handle = sp.acquire_subscription("codex-cli", "u", allowed_auth=sp._LOCAL_AUTH_TYPES)
+        assert handle is not None and handle.subscription_id == "local-1"
+        assert handle.auth_type == "local_endpoint"
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_nothing_local_raises_for_both_scopes(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [self._sub("own-login")]
+        mock_store.list_platform_pool.return_value = [self._sub("pool-key", "api_key", owner="admin-1")]
+        mock_store.get_user_allow_platform_auth.return_value = True
+        mock_store.get_credential_data.return_value = {"api_key": "sk"}
+        for sub in ("u", None):
+            with pytest.raises(sp.NoSubscriptionError) as ei:
+                sp.acquire_subscription("codex-cli", sub, allowed_auth=sp._LOCAL_AUTH_TYPES)
+            assert ei.value.reason == "local_only"
+            assert "only local models" in str(ei.value)
+        # Without the narrowing the same rows serve both scopes.
+        assert sp.acquire_subscription("codex-cli", "u") is not None
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_resolve_subscription_env_narrows_from_the_agent_row(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [self._sub("own-login")]
+        mock_store.list_platform_pool.return_value = []
+        mock_store.get_user_allow_platform_auth.return_value = True
+        mock_store.list_models.return_value = []
+        mock_store.get_credential_data.return_value = {"oauth_token": {"accessToken": "tok", "expiresAt": int((time.time() + 7200) * 1000)}}
+        agent = {"slug": "demo", "execution_path": "codex-cli", "execution_paths": "",
+                 "local_only_engines": json.dumps(["codex-cli"])}
+        with pytest.raises(sp.NoSubscriptionError) as ei:
+            sp.resolve_subscription_env("codex-cli", "u", model="gpt-6.1-sol", agent_info=agent)
+        assert ei.value.reason == "local_only"
 
 
 class TestStickyYieldsToExhaustion:

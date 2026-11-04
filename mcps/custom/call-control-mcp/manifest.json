@@ -2,7 +2,7 @@
   "name": "call-control-mcp",
   "server_name": "call-control",
   "label": "Call controls",
-  "description": "The call tools of a phone session: end the call, hand the caller to a colleague configured on the line, ask the agent that placed the call. Attached to every call by the platform; assigned to no agent.",
+  "description": "The call tools of a phone session: end the call, hand the caller to a colleague configured on the line, ask the agent that placed the call. The platform attaches it to every call, and no agent is assigned it.",
   "version": "1.0.0",
   "category": "core",
   "server": {
@@ -21,7 +21,7 @@
   "agent_env": {
     "OTO_CALL_ASK_BACK": "${session.call_ask_back}"
   },
-  "assignment_mode": "explicit",
+  "assignment_mode": "platform",
   "exclude_from": [],
   "permissions": {
     "default_tier": "standard",

@@ -21,6 +21,8 @@ vi.mock('@/api/auth', () => ({
       return new Response(JSON.stringify({ agents: [
         { name: 'office', collaborative: false, default_scope: 'agent' },
         { name: 'site', collaborative: true, default_scope: 'user' },
+        { name: 'solo', collaborative: false, default_scope: 'user' },
+        { name: 'desk', collaborative: true, default_scope: 'agent' },
       ] }))
     }
     if (url.endsWith('/reset-password')) return new Response(JSON.stringify({ temp_password: 'tmp-pass-42' }))
@@ -129,5 +131,49 @@ describe('Users page: the one-time password after a reset', () => {
     fireEvent.click(within(result).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByTestId('reset-password-result')).toBeNull()
     expect(screen.getByRole('button', { name: 'Reset Password' })).toHaveFocus()
+  })
+
+  it('shows when each person last signed in, and Never signed in for an unused account', async () => {
+    h.users = [
+      { ...person({ site: 'viewer' }), sub: 'a', email: 'a@x', name: 'Ann', last_login: '2026-10-27T10:00:00+00:00' },
+      { ...person({ site: 'viewer' }), sub: 'b', email: 'b@x', name: 'Bob', last_login: '' },
+    ]
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    renderWithDialogs(<QueryClientProvider client={qc}><UsersPage /></QueryClientProvider>)
+    expect(await screen.findByText(/^Last login /)).toBeInTheDocument()
+    expect(screen.getAllByText(/^Last login /)).toHaveLength(1)
+    expect(screen.getByText('Never signed in')).toBeInTheDocument()
+  })
+})
+
+// ─── A ticked agent that works personal-first tells the admin what the new
+//     person will see (and will not): their own space and the shared one ───
+
+describe('Users page: the sentence under a personal-first agent', () => {
+  it('shows it for a ticked Personal + shared agent and never for a Shared-only one', async () => {
+    h.users = [person({ office: 'editor' })]
+    await openEditor()
+    expect(screen.queryByTestId('personal-first-hint-site')).toBeNull()
+    const siteBox = screen.getAllByText('site').map((el) => el.closest('label')).find(Boolean)!
+    fireEvent.click(within(siteBox as HTMLElement).getByRole('checkbox'))
+    expect(screen.getByTestId('personal-first-hint-site').textContent)
+      .toBe('They will see the shared space and their own, not yours.')
+    expect(screen.queryByTestId('personal-first-hint-office')).toBeNull()
+  })
+
+  it('names the own space alone under Personal only, says nothing under Shared + personal, and goes on untick', async () => {
+    h.users = [person({ office: 'editor' })]
+    await openEditor()
+    const box = (agent: string) => within(screen.getAllByText(agent).map((el) => el.closest('label')).find(Boolean) as HTMLElement)
+      .getByRole('checkbox')
+    fireEvent.click(box('solo'))
+    expect(screen.getByTestId('personal-first-hint-solo').textContent).toBe('They will see their own space only, not yours.')
+    fireEvent.click(box('desk'))
+    expect(screen.queryByTestId('personal-first-hint-desk')).toBeNull()
+    fireEvent.click(box('site'))
+    expect(screen.getByTestId('personal-first-hint-site')).toBeTruthy()
+    fireEvent.click(box('site'))
+    expect(screen.queryByTestId('personal-first-hint-site')).toBeNull()
+    expect(screen.getByTestId('personal-first-hint-solo')).toBeTruthy()
   })
 })

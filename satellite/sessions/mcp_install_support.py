@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -527,14 +528,81 @@ def _write_runtime_marker(mcp_dir: Path, **updates: object) -> None:
         logger.warning("could not write runtime marker for %s: %s", mcp_dir.name, e)
 
 
+class InstallFailed(RuntimeError):
+    """An MCP install that ran and failed; its message is the cause alone."""
+
+
+# The lines of an install log that say why it failed: uv's and pip's error
+# lines and headlines, a build backend's cause, a missing tool, library or
+# wheel. Leading tree glyphs of uv's report are dropped first.
+_CAUSE_START = ("error:", "Caused by", "Failed to", "No solution found")
+_CAUSE_WORDS = re.compile(
+    r"no usable wheels|requires Python|does not satisfy|not found|could not be found"
+    r"|is not installed|No space left|RequiredDependencyException"
+)
+_TREE_GLYPHS = " \t×├╰─▶│|"
+# A network, service, disk or file-lock failure's words (the proxy's ``mcp_sync.
+# _TRANSIENT_FAIL_RE``, held equal by a test): such a line leads the cause, so
+# the cut keeps it and the platform never remembers the failure as lasting.
+_NETWORK_WORDS = re.compile(
+    r"Failed to fetch|Failed to download|resolve host|spurious network error|error sending request"
+    r"|dns error|timed out|Connection (?:reset|refused|closed)|Network is unreachable|tls handshake"
+    r"|No space left on device|Disk quota exceeded|Text file busy|resource busy"
+    r"|being used by another process|Resource temporarily unavailable",
+    re.IGNORECASE,
+)
+
+
+def install_failure_cause(log: str) -> str:
+    """Why an install failed, in one line: the cause lines of ``log`` in
+    order (the network ones first), each once, joined by " / " and cut to
+    600 characters, else the log's last 500 characters. The platform tells
+    the session this, and a cause it reads as lasting skips the install at
+    the next hour's starts."""
+    found: list[str] = []
+    for raw in log.splitlines():
+        line = " ".join(raw.lstrip(_TREE_GLYPHS).split())
+        if not line or line in found:
+            continue
+        if (line.startswith(_CAUSE_START) or line.upper().startswith("ERROR:")
+                or _CAUSE_WORDS.search(line) or _NETWORK_WORDS.search(line)):
+            found.append(line)
+    if not found:
+        return " ".join(log[-500:].split()) or "install failed"
+    network = [line for line in found if _NETWORK_WORDS.search(line)]
+    cause = " / ".join(network + [line for line in found if line not in network])
+    return cause if len(cause) <= 600 else cause[:597].rstrip() + "..."
+
+
+def mcp_python_spec() -> str | None:
+    """The interpreter a fresh MCP venv is made on, as the proxy pins its own
+    (``mcp_venv_bootstrap.proxy_python_spec``): this satellite's base Python
+    by path (no PATH search and no download; on a Mac, Homebrew's stable opt
+    path), else its ``major.minor``. Without a pin ``uv venv`` takes the
+    first ``python3`` on the service's PATH, which on a Mac is Homebrew's
+    newest minor, one the MCPs' compiled packages publish no builds for yet.
+    ``None`` on Windows, whose MCP venvs keep uv's default."""
+    if not config.HOST.posix:
+        return None
+    minor = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    cand = os.path.join(sys.base_prefix, "bin", f"python{minor}")
+    return cand if os.path.isfile(cand) else minor
+
+
 def _needs_python_reconcile(venv_dir: Path, target: tuple[int, int], mcp_dir: Path) -> bool:
     """``True`` when the venv interpreter lags this host and isn't already
     reconciled to it (a marker == target means a real upstream requires-python
-    ceiling kept it lower — don't re-install it every boot)."""
+    ceiling kept it lower — don't re-install it every boot).
+
+    On a Mac a venv NEWER than this host is rebuilt too: Homebrew's plain
+    python3 moved to a minor no compiled package serves yet, and a venv made
+    on it before the satellite pinned its own stays broken. Elsewhere a newer
+    venv is a floor the package asked for. The marker == target rule keeps a
+    floor-kept venv from rebuilding at every boot on both sides."""
     if not venv_dir.is_dir():
         return False
     vm = _venv_python_minor(venv_dir)
-    if vm is None or vm >= target:
+    if vm is None or vm == target or (vm > target and config.HOST.name != config.DARWIN):
         return False
     return _read_runtime_marker(mcp_dir).get("python") != f"{target[0]}.{target[1]}"
 
@@ -542,7 +610,7 @@ def _needs_python_reconcile(venv_dir: Path, target: tuple[int, int], mcp_dir: Pa
 async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], mcp_dir: Path) -> None:
     """Pre-create ``venv_dir`` on this host's interpreter so the subsequent
     install pip-installs into a venv that matches the platform. Best-effort."""
-    spec = f"{target[0]}.{target[1]}"
+    spec = mcp_python_spec() or f"{target[0]}.{target[1]}"
     # The installer's own scrubbed environment (its allowlisted names, no
     # configuration file of any package manager) and its time bound, as every
     # other subprocess of an install gets: no satellite-side variable reaches uv.
@@ -595,6 +663,28 @@ async def _reconcile_node_addons(mcp_dir: Path, name: str) -> str | None:
         return "skipped-node-rebuild-fail"
 
 
+def _settle_venv_asides(mcps_dir: Path, target: tuple[int, int]) -> None:
+    """The old venvs a rebuild set aside, after a satellite that stopped in
+    the middle of one: put back where the rebuild did not finish (its marker
+    does not name ``target``; a half-built venv is replaced), dropped where it
+    did or the MCP is gone. An MCP left with no venv would be skipped by every
+    later boot."""
+    for aside in sorted(mcps_dir.glob(".venv-aside-*")):
+        category, _, name = aside.name[len(".venv-aside-"):].partition("-")
+        mcp_dir = mcps_dir / category / name
+        try:
+            done = _read_runtime_marker(mcp_dir).get("python") == f"{target[0]}.{target[1]}"
+            if name and (mcp_dir / "manifest.json").is_file() and not done:
+                if (mcp_dir / "venv").exists():
+                    force_rmtree(mcp_dir / "venv")
+                os.replace(aside, mcp_dir / "venv")
+                logger.info("reconcile: put back the venv of %s a stopped rebuild set aside", name)
+            else:
+                force_rmtree(aside)
+        except OSError:
+            logger.warning("reconcile: could not settle %s", aside.name)
+
+
 async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str, str]:
     """Rebuild MCP venvs / native addons that lag this host's interpreter / node.
 
@@ -610,6 +700,7 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
     if not mcps_dir.is_dir():  # noqa: ASYNC240  # runs at boot before the link connects (__main__)
         return results
     target = sys.version_info[:2]
+    await asyncio.to_thread(_settle_venv_asides, mcps_dir, target)
 
     for cat_dir in sorted(mcps_dir.iterdir()):  # noqa: ASYNC240  # runs at boot before the link connects (__main__)
         if not cat_dir.is_dir():
@@ -638,18 +729,33 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                     continue
                 if not _needs_python_reconcile(venv_dir, target, mcp_dir):
                     continue
+                # The old venv waits aside (outside the MCP's folder, so no
+                # version hash ever reads it) until the rebuild succeeds: a
+                # rebuild that fails (offline at boot) puts it back, where a
+                # missing venv would be skipped by every later boot.
+                aside = mcps_dir / f".venv-aside-{cat_dir.name}-{mcp_dir.name}"
                 try:
-                    force_rmtree(venv_dir)  # Windows AV-lock safe
+                    if aside.exists():
+                        force_rmtree(aside)
+                    os.replace(venv_dir, aside)
                 except OSError:
-                    logger.warning("reconcile: could not remove stale venv for %s", name)
+                    logger.warning("reconcile: could not set the stale venv of %s aside", name)
                     continue
                 if uv_bin:
                     await _uv_venv_pinned(uv_bin, venv_dir, target, mcp_dir)
                 logger.info("reconcile: rebuilding %s venv on Python %s.%s", name, *target)
+                rebuilt = False
                 try:
-                    r = await mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=uv_bin)
+                    # The pin again: the pre-created venv is best effort, and
+                    # without it uv takes the first python3 on PATH.
+                    r = await mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=uv_bin,
+                                                        python_spec=mcp_python_spec())
                     if r.ok:
-                        _write_runtime_marker(mcp_dir, python=f"{target[0]}.{target[1]}")
+                        rebuilt = True
+                        # Reconciled only on the pin (or a floor the package
+                        # asked for): a venv uv made elsewhere is tried again.
+                        if r.venv_python or _venv_python_minor(venv_dir) == target:
+                            _write_runtime_marker(mcp_dir, python=f"{target[0]}.{target[1]}")
                         results[name] = "ok-py-reconcile"
                     else:
                         results[name] = "failed"
@@ -657,6 +763,16 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                 except Exception:
                     logger.exception("reconcile: %s rebuild errored", name)
                     results[name] = "exception"
+                if rebuilt:
+                    with contextlib.suppress(OSError):
+                        force_rmtree(aside)
+                else:
+                    try:
+                        if venv_dir.exists():
+                            force_rmtree(venv_dir)
+                        os.replace(aside, venv_dir)
+                    except OSError:
+                        logger.warning("reconcile: could not put the old venv of %s back", name)
 
             elif runtime == "node" and (mcp_dir / "node_modules").is_dir():
                 # A rebuild runs the packages' own lifecycle scripts, which the

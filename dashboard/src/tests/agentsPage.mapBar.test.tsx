@@ -55,7 +55,9 @@ vi.mock('../api/userUiPrefs', () => ({
 
 // The map never reports WebGL unavailable here, so the page stays in map view.
 vi.mock('../components/agents-map/AgentsMap3D', () => ({
-  default: () => <div data-testid="map-stub" />,
+  default: ({ openAgentSlug }: { openAgentSlug?: string }) => (
+    <div data-testid="map-stub" data-open-agent={openAgentSlug ?? ''} />
+  ),
 }))
 vi.mock('../components/AgentCard', () => ({
   default: ({ agent }: { agent: { display_name: string } }) => (
@@ -65,11 +67,11 @@ vi.mock('../components/AgentCard', () => ({
 vi.mock('../components/AgentInstallModal', () => ({ default: () => null }))
 vi.mock('../components/CommunityAgentsBrowser', () => ({ default: () => null }))
 
-function mount() {
+function mount(entries?: { pathname: string; state?: unknown }[]) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={entries}>
         <AgentsPage />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -96,5 +98,15 @@ describe('AgentsPage top bar over the map', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Map' }))
     expect(classesOf(screen.getByTestId('agents-top-bar'))).toContain('dark')
+  })
+
+  it('opens the map on the agent the chat page handed over, else on nothing in particular', () => {
+    mount([{ pathname: '/agents', state: { fromAgent: 'alpha' } }])
+    expect(screen.getByTestId('map-stub').getAttribute('data-open-agent')).toBe('alpha')
+  })
+
+  it('passes no agent to the map when the page opens on its own', () => {
+    mount()
+    expect(screen.getByTestId('map-stub').getAttribute('data-open-agent')).toBe('')
   })
 })

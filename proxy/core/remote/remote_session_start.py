@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, cast
 from auth.roles import row_role
 from core import placement
 from core.execution_layer import AgentConfig
+from core.remote import tunnel_state
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session import session_state as _state
 from core.session.session_state import (
@@ -136,18 +137,22 @@ else:
 
 def placement_refuses(machine_id: str, config: AgentConfig) -> bool:
     """Whether ``placement.may_run_on`` refuses this session on the machine:
-    the config's person (``user_sub``, "" for a run with no person) at its
-    session's role. A machine row that is gone refuses nothing here (the
-    start fails on the missing connection). Synchronous."""
+    the config's person (``placement_sub`` when set, else ``user_sub``, ""
+    for a run with no person) at its session's role, for the config's agent
+    and its default place. A machine row that is gone refuses nothing here
+    (the start fails on the missing connection). Synchronous."""
     from auth import roles
     from storage import remote_store
+    from storage.agents import agent_store
     machine = remote_store.get_remote_machine(machine_id)
     if machine is None:
         return False
     role = getattr(config.security_context, "role", "") or ""
-    return not placement.may_run_on(machine, run_sub=config.user_sub or None,
+    person = config.user_sub if config.placement_sub is None else config.placement_sub
+    agent_default = (agent_store.get_agent(config.agent_name) or {}).get("execution_target")
+    return not placement.may_run_on(machine, run_sub=person or None,
                                     run_can_manage=roles.can_manage(role),
-                                    user_paired_allowed=True)
+                                    user_paired_allowed=True, agent_default=agent_default)
 
 
 async def _tools_row(chat_id: str, message: str) -> None:
@@ -269,6 +274,19 @@ class RemoteSessionStartMixin(_Host):
             self._spawning.discard(session_id)
             clear_starting(session_id)
 
+    def _refuse_unready_machine(self, machine_id: str) -> None:
+        """A start needs the machine connected and its local link answering:
+        a machine whose link is down (satellite 0.5.168 reports it) would
+        spawn a session whose every hook and MCP call fails, so it is refused
+        with the reason, before anything is evicted for it."""
+        if not self._cm.is_connected(machine_id):
+            raise RuntimeError(
+                f"Satellite {machine_id[:8]} is not connected"
+            )
+        if self._cm.tunnel_ok(machine_id) is False:
+            raise tunnel_state.TunnelDown(tunnel_state.refusal(
+                self._cm.satellite_name(machine_id) or f"The machine {machine_id[:8]}"))
+
     async def _start_session_impl(self, session_id: str, config: AgentConfig,
                                   registered: list[bool]) -> None:
         machine_id = config.execution_target
@@ -280,15 +298,13 @@ class RemoteSessionStartMixin(_Host):
         refuse_session_on_agent_state(config.security_context)
         # The placement guard: never a session on a place its person may not
         # use (a shared chat another person placed on their computer, a task's
-        # stale machine, an admin machine below the owner tier). The chat
-        # builder names the place first; this holds every other spawn.
+        # stale machine, an admin machine below the owner tier unless its
+        # every-role switch admits the agent's chats). The chat builder names
+        # the place first; this holds every other spawn.
         if await asyncio.to_thread(placement_refuses, machine_id, config):
             raise placement.PlacementRefused(placement.REFUSED_SENTENCE)
 
-        if not self._cm.is_connected(machine_id):
-            raise RuntimeError(
-                f"Satellite {machine_id[:8]} is not connected"
-            )
+        self._refuse_unready_machine(machine_id)
 
         # Per-satellite soft pre-check: reject early when the satellite
         # reports it's at its session ceiling (admin override or its own physical
@@ -525,8 +541,8 @@ class RemoteSessionStartMixin(_Host):
             })
 
         async def _sync_progress(done: float, total: int) -> None:
-            # W2 (sync-performance): live workspace-sync progress in the SAME
-            # install bar ("workspace files — N%"). Throttling lives in
+            # Live workspace-sync progress in the SAME install bar ("Syncing
+            # workspace files…", its own row). Throttling lives in
             # _initial_workspace_sync; the started-once defer keeps an
             # already-synced tree bar-free (no 100% flash). ``done`` counts
             # the share of a push still moving, so a large file moves the
@@ -541,6 +557,8 @@ class RemoteSessionStartMixin(_Host):
                 "phase": "syncing",
                 "pct": int(done * 100 / max(total, 1)),
                 "message": f"{int(done)}/{total} files",
+                # The size of the copy, for the bar's hint.
+                "files_total": total,
             })
 
         mark_starting(session_id, REMOTE_START_MARK_TTL_S)
@@ -736,6 +754,7 @@ class RemoteSessionStartMixin(_Host):
             used_mcps=set(assigned_mcps),
             fallback_reason=getattr(config, "fallback_reason", None),
             resume_handle=config.resume_handle,
+            tunnel_port=tunnel_state.payload_port(payload),
         )
         # The engine's own per-session state (a translator, a router that
         # consumes the event queue — whatever the engine keeps across turns).

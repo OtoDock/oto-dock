@@ -42,6 +42,7 @@ import { useWarmupSends, type HeldSend } from './useWarmupSends'
 import { isNativePlatform } from '../../../audio/types'
 import { chatTargetsKey } from '../../../api/remoteMachines'
 import { emitAppToast } from '../../../lib/appToasts'
+import { useStoreReviewTurns } from '../../../hooks/storeReview/useStoreReview'
 
 type Selection = ReturnType<typeof useModelEngineSelection>
 type FindBar = ReturnType<typeof useFindBar>
@@ -185,13 +186,11 @@ export function useAgentChatStream({
       setChatActiveLayer(data.execution_path || agentExecutionPath)  // Lock to chat's actual layer
       setWarmingUp(false)
       // Interactive CLI: a live PTY-backed session →
-      // render the terminal, NOT the pump UI. Text-only cold sends ride the
-      // warmup and the backend delivers them (submit_prompt / server kick);
-      // the hook's flush + decline replay only remain for the attachments
-      // stash. 'none' = not interactive: fall through to the server-kick.
-      const interactiveStatus = latestRef.current.interactive.onWarmupReady(data, {
-        onDecline: (t, cid) => { serverKickPendingRef.current = false; ws.sendMessage(t, cid) },
-      })
+      // render the terminal, NOT the pump UI. Cold sends ride the warmup with
+      // their attachments and the backend delivers them (submit_prompt /
+      // server kick). 'none' = not interactive: fall through to the
+      // server-kick, which also runs a start declined to headless.
+      const interactiveStatus = latestRef.current.interactive.onWarmupReady(data)
       const kick = serverKickPendingRef.current
       if (interactiveStatus !== 'none') {
         serverKickPendingRef.current = false
@@ -482,6 +481,9 @@ export function useAgentChatStream({
   useEffect(() => wsSubscribe(WIRE.SHARE_INBOX, (msg) => {
     if (msg.type === WIRE.SHARE_INBOX) onShareInbox(msg)
   }), [wsSubscribe])
+
+  // The apps' store review ask watches this page's turns (hooks/storeReview).
+  useStoreReviewTurns(wsSubscribe)
 
   // Eager pre-warmup: start MCP init when landing on the FAVORITE agent's
   // new-chat page. Non-favorite agents warm lazily on first interaction

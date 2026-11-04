@@ -825,8 +825,23 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "external": _mf.parse_external(row),
             **_runtime_fields(row, u),
             **(_placement_fields(placed, u) if placed else {}),
+            **_follow_fields(row, u, placed is not None),
         })
     return out
+
+
+def _follow_fields(row: dict, u: UserContext, placed: bool) -> dict:
+    """What a copy that follows another agent's app shows whoever may
+    manage it (services/apps/app_follow.py): the source, the
+    release the copy stands at, whether this viewer may take the source's
+    releases, and the update the card offers."""
+    if not row.get("follows") or placed or not _can_manage(row, u):
+        return {}
+    from services.apps import app_follow
+    state = app_follow.state(row)
+    if not state:
+        return {}
+    return {"follows": {**state["source"], "can_take": app_follow.may_take(row, u), "update": state["update"]}}
 
 
 def _placement_fields(info: dict, u: UserContext) -> dict:

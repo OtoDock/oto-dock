@@ -8,7 +8,7 @@ import {
   useResumeTrigger,
 } from '../../api/triggers'
 import { useAuth } from '../../contexts/AuthContext'
-import { canManageAgent } from '../../lib/permissions'
+import { canEditAgent, canManageAgent } from '../../lib/permissions'
 import { CreateTriggerModal, EditTriggerModal, FireTestModal } from './AgentTriggers.modals'
 import { AgentApiKeysSection } from './AgentTriggers.apiKeys'
 import { TaskModelChip } from '../../components/common/TaskModelChip'
@@ -87,6 +87,12 @@ export default function AgentTriggers() {
           {filtered.length} of {triggers.length}
         </span>
       </div>
+      {/* Below the editor tier the server lists only the person's own. */}
+      {!canEditAgent(user, agent) && (
+        <p className="text-xs text-secondary" data-testid="own-triggers-only">
+          Triggers the agent runs on its own show for editors and managers.
+        </p>
+      )}
 
       {filtered.length === 0 ? (
         <div className={`${CARD} p-8 text-center`}>

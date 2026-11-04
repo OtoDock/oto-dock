@@ -6,10 +6,12 @@ Work an agent does on its own. Three shapes: **recurring** (cron or plain interv
 fired in the creator's timezone), **one-time** (`run_at` or a delay; the row cleans
 itself up after firing), and **trigger-fired** (no schedule — runs when a wired trigger
 fires). Chats can also schedule a **continuation** — a bounded future wake of the same
-conversation.
+conversation, shown in the chat as a "Scheduled wake" card.
 
-- **Scopes**: *user* (private to the creator — any user) vs *agent* (team-visible, results
-  in the shared workspace — needs per-agent **editor+**). Agent-scope runs created by a
+- **Scopes**: *user* (private to the creator — any user) vs *agent* (the agent's own work,
+  with results in the shared workspace. It needs per-agent **editor+**, and only editors
+  and managers see it and its runs. A contributor or a viewer sees only their own tasks,
+  and the page says so). Agent-scope runs created by a
   **manager/admin** get knowledge write access; editor-created stay read-only. A task or
   trigger that runs without a person reaches the agent's shared workspace and knowledge,
   never a person's private folder, and the agent's settings only when its creator manages
@@ -19,6 +21,14 @@ conversation.
 - **Completion notification** (required per task): *auto* (generic "Task Complete/
   Failed"), *manual* (the agent writes its own, with real results — the common choice),
   *none* (silent). Failures always notify except in *none*.
+- **Who is told** (a shared task): the row's **Settings** picks the lowest role that gets
+  its notifications: **Everyone who uses the agent**, **Contributors, editors and
+  managers**, **Editors and managers** (the default for a new task) or **Managers**.
+  Admins are always told. A task made before 1.9.1 keeps telling everyone. The choice
+  also covers what the task's runs send themselves, a wake the task schedules in its
+  chat, and the work a run hands out. People below the editor role get the notification
+  without a link to the agent's chat. Through the agent: `audience` on the schedules
+  tools.
 - **Checks**: a task can name checks that judge each run; a run whose check still fails
   is reported failed (see Checks below).
 - **Permission mode**: a task runs in **Don't Ask** by default (nobody is there to
@@ -33,13 +43,34 @@ conversation.
   place (`machine` on the schedules tools, or the row's Settings). A person's own task
   can run on one of their own computers, and an admin can also pick an admin machine. A
   task that runs without a person never runs on a personal computer. A delegated job
-  takes a machine the same way (`machine` on `delegate`). When the machine is offline
-  at run time, the run uses the agent's usual place and its chat says so.
+  takes a machine the same way (`machine` on `delegate`). A chat lane may also run on
+  the delegating person's own computer, even one that works for the whole agent. There
+  it works as that person, with their role and their own AI account, and it stops when
+  they lose the editor role or their place on the agent. When the machine is offline
+  at run time, the run uses the agent's usual place and its chat says so. A chat lane
+  on the person's own computer waits for it instead. The round ends with "<name> is
+  offline, so this work cannot run there now. Reconnect it, then continue the work."
   `get_task` shows the machine, and `get_task_history` shows where each run ran.
+- **Tools in a task**: a task run and a delegated job have the agent's tools, image,
+  music and video generation included (since 1.9.1). Tools that need a person in the
+  chat stay out, such as the agent's own settings. A chat lane a person delegates
+  from their own chat keeps them, as their chat does, the Settings tool included.
+  A meeting goes without the generation tools.
+- **"What are my schedules?"**: draw the list, never a paragraph. The Settings tool's
+  `show_list` (`tasks`, `triggers`, `notifications`, `machines`, `mcps`; `scope` mine,
+  agent or all; `status` active or paused) puts a live list card in the chat that the
+  dashboard fetches with the person's own sign-in, with the page's own row actions
+  (pause, resume, run now, open the page). You never see its rows.
 - **Model pinning**: a task can pin a specific model and engine for its runs, leaving
   the agent's default untouched — the lever for "lighter default, one demanding daily job
-  on a strong model". Ask the user before pinning; read the current pin back from
-  `list_tasks` (`runs on: <model> [pinned|agent default|layer default, tier N]`) or
+  on a strong model". Without a pin, a person's own task runs on the engine their new
+  chats take there. On a Shared-only agent it runs on the agent's default. A model
+  pinned without an engine runs on the engine the task would take unpinned (the
+  person's own engine for their own task, else the agent's default) when that engine
+  offers it, else on the first engine of the agent's own order that does. Name the engine when the same model is on two engines and you want
+  the other. Ask the user before
+  pinning; read the current pin back from `list_tasks`
+  (`runs on: <model> [pinned|your engine|agent default|layer default, tier N]`) or
   `get_task`, which also shows the prompt and warns when a pin no longer resolves;
   pick by capability tier (`[t1]` frontier … `[t4]` fast), never by the id's name.
   Both Scheduled Tasks pages show the effective model per task as a chip carrying the
@@ -68,10 +99,13 @@ conversation.
   their rows (hover for the date). A transferred task runs without writing knowledge
   until a manager of the agent (or an admin) adopts it by editing its prompt.
 - **Managing**: Agent Settings → Monitoring → Scheduled Tasks (run/pause/resume/delete,
-  role-gated per row, and **Settings** for the task's machine and mode for a person who
-  may edit the task); run history in the sidebar's Task history view (rename/delete,
-  role-gated); a finished run's chat can be continued — and, once over, switched to
-  another engine/model from its picker (editor+, on the subscriptions admins share with agents).
+  role-gated per row, and **Settings** for the task's name, machine, mode and who is told
+  for a person who may edit the task); run history in the sidebar's Task history view
+  (rename/delete, role-gated); a run shows its own title once it has one, with the task's
+  name under it, and a new name given there changes that run only (the task's own name
+  changes in its **Settings** or through the agent's `edit_task`); a finished run's chat
+  can be continued — and, once over, switched to another engine/model from its picker
+  (editor+, on the subscriptions admins share with agents).
 
 ## Triggers
 
@@ -80,7 +114,9 @@ an app, or a mix. Same user/agent scoping as tasks: an agent-scope trigger takes
 **editor+** (an editor changes their own, a manager any; contributors and viewers make
 personal ones only). The dashboard's **+ New trigger** form offers the agent scope only
 to managers (on a Shared only agent it is the only scope); elsewhere an editor makes one
-through the agent in chat.
+through the agent in chat. Only editors and managers see the agent-scope triggers. The
+form's notify block has **Who is told**, with the same four choices (editors and
+managers by default, admins always).
 
 - **Generic webhooks**: every trigger gets a URL under `/v1/webhooks/…`; external
   systems POST JSON with `Authorization: Bearer otok_<key>`. Keys are minted under
@@ -103,7 +139,15 @@ through the agent in chat.
   a shared app, say) can link to. A user trigger links only to a personal subscription, an
   agent trigger only to that agent's; the trigger form's picker lists just the matching
   ones. Deleting a subscription that triggers still fire from asks twice; the triggers
-  stay but stop receiving events. Delivery is asynchronous — wait ~10–15 s before judging
+  stay but stop receiving events. A subscription receives nothing while an admin has
+  its MCP turned off. Its row says "Its MCP is turned off", and it works again once the
+  MCP is on. Deleting the MCP deletes its subscriptions. When a person disconnects the
+  account, or the person is removed, the account's subscriptions go and its events stop.
+  Events from Slack, Notion, Zoom or OtoDock's GitHub App can stop after a restore from
+  an older backup, and the subscribe form then says so. Check the server's clock first
+  (within five minutes of the real time), then ask OtoDock support to reset this
+  install's events. They resume within an hour of the reset.
+  Delivery is asynchronous — wait ~10–15 s before judging
   a test. A GitHub event that reaches the install twice (a repository's and its
   organization's subscription, or two accounts) wakes an action once.
 - Extras: per-trigger debounce; pause/resume; test-fire from chat; the trigger rows and
@@ -147,17 +191,20 @@ its template (until then the Checks section says the tool is off).
 ## Notifications
 
 Delivered where the user is: dashboard toast + bell inbox when active, browser push and
-the Android app when away. Every notification lands in the inbox regardless. Severities: info/success
+the Android and iOS apps when away. Every notification lands in the inbox regardless. Severities: info/success
 (chime), warning (amber, distinct sound), **danger** (stays until dismissed, alarm —
 reserve for genuine emergencies). Titles cap at 100 chars, bodies ~2 short sentences —
 write headlines, details stay in the linked chat/run. Notifications can be scheduled
 (one-time or recurring) without an LLM run — prefer that over a task when the reminder
-only needs to *say* something, not *do* something. Management: bell panel; Agent
+only needs to *say* something, not *do* something. A notification for the whole agent
+reaches every member when it comes from a chat. When a task sends it, it reaches the
+people the task's **Who is told** names. Management: bell panel; Agent
 Settings → Monitoring → Notifications; admin audit page.
 
 ## Usage awareness
 
-Costs are estimated at API pricing and attributed to the model that actually ran.
+Costs are estimated at API pricing and attributed to the model that actually ran. A
+spoken conversation's speech shows on the Usage pages under the person who spoke.
 Budgets (admin, **Admin → Usage**) cap only **platform-paid** usage (borrowed API keys,
 direct engine) — never a user's own subscription. At 80% the user gets a warning; at
 100% new work is blocked until an admin raises the limit; blocked task runs record

@@ -5,6 +5,7 @@ import { placePhrase } from './remoteMachines'
 import type { McpRuntime } from '../lib/kinds/mcpRuntime'
 import { TARGET_LOCAL } from '../lib/placement'
 import type { DockerStatus, EnableDockerResult } from '../lib/status/docker'
+import type { BearerPending } from './oauth'
 
 export interface ConfigField {
   key: string
@@ -66,6 +67,10 @@ export interface McpAppKind {
   fields: { key: string; label: string; input_type: string; help?: string }[]
 }
 
+// An MCP the platform attaches to the sessions that need it (call-control on
+// every call): nobody assigns it.
+export const ASSIGNMENT_PLATFORM = 'platform'
+
 export interface McpServer {
   name: string
   label: string
@@ -94,7 +99,7 @@ export interface McpServer {
   skills: McpSkill[]
   config_fields: ConfigField[]
   config_values: Record<string, string>
-  assignment_mode: 'auto' | 'explicit'
+  assignment_mode: 'auto' | 'explicit' | 'platform'
   instances?: McpInstancesConfig
   // Skill packages only: the package bundles executable scripts/ content
   // (allowed since 2026-08-27; always surfaced as a provenance badge).
@@ -363,12 +368,33 @@ export interface McpUpdateInfo {
   catalog_ref?: string
 }
 
+// An update the proxy runs as a job: its phase and the sentence the row
+// shows where its Update button was.
+export interface McpUpdateJob {
+  phase: string
+  detail: string
+  started_at: string
+}
+
+// How an update job ended (`mcp_updater.JOB_DONE` / `JOB_FAILED`).
+export const UPDATE_JOB_END = { DONE: 'done', FAILED: 'failed' } as const
+
+// An update job that ended, read back for a short while after its end.
+export interface McpUpdateFinished {
+  status: (typeof UPDATE_JOB_END)[keyof typeof UPDATE_JOB_END]
+  log: string
+  ended_at: string
+}
+
 export interface McpUpdateState {
   updates: Record<string, McpUpdateInfo>
   checked: number
   // Empty until the first check.
   checked_at: string
   auto_update_enabled?: boolean
+  // The update jobs (update-state only; a check answers without them).
+  running?: Record<string, McpUpdateJob>
+  finished?: Record<string, McpUpdateFinished>
 }
 
 // What the weekly job will do with an offer, in one line (null: nothing to
@@ -403,8 +429,17 @@ export function isUpdateOffer(info: McpUpdateInfo | undefined): boolean {
   return reason === 'package' || reason === 'manifest' || reason === 'both' || reason === 'source'
 }
 
+// How often the page reads an update job back while one runs.
+export const UPDATE_POLL_MS = 2_000
+
+function hasRunningJob(state: McpUpdateState | undefined): boolean {
+  return Object.keys(state?.running ?? {}).length > 0
+}
+
 // The last check as the proxy persisted it: the MCP Servers page shows it on
-// load, after a navigation or a restart, without Check Updates pressed.
+// load, after a navigation or a restart, without Check Updates pressed. While
+// an update job runs the page follows it, and a page opened mid-job shows it
+// at once.
 export function useMcpUpdateState() {
   return useQuery({
     queryKey: ['mcp-update-state'],
@@ -412,6 +447,8 @@ export function useMcpUpdateState() {
       return apiJson<McpUpdateState>('/v1/admin/mcps/update-state').catch(withMessage('Failed to load the update state'))
     },
     staleTime: 60_000,
+    refetchOnMount: 'always',
+    refetchInterval: (query) => (hasRunningJob(query.state.data) ? UPDATE_POLL_MS : false),
   })
 }
 
@@ -436,16 +473,56 @@ function dropFromUpdates(qc: ReturnType<typeof useQueryClient>, name: string) {
   }
 }
 
-/** An update's answer; the row shows its install log. */
+/** An update's end; the row shows its install log. */
 export interface McpUpdateResult {
   install_log?: string
 }
 
+// Starts the update and answers at once: the MCP Servers page follows the
+// job through the update state (`running`, then `finished`).
+export function useStartMcpUpdate() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) => {
+      await apiOk(`/v1/admin/mcps/${name}/update`, { method: 'POST' }, 'The update did not start')
+    },
+    onSuccess: (_data, name) => {
+      // The row changes and the polling starts before the first read.
+      qc.setQueryData(['mcp-update-state'], (old: McpUpdateState | undefined) => old && {
+        ...old,
+        running: { ...old.running, [name]: { phase: 'queued', detail: 'Starting the update.', started_at: new Date().toISOString() } },
+      })
+    },
+    // A refusal shows the update that already runs (another tab, the weekly run).
+    onSettled: () => qc.invalidateQueries({ queryKey: ['mcp-update-state'] }),
+  })
+}
+
+// The longest the Skills page waits on one update.
+const UPDATE_WAIT_MS = 30 * 60_000
+
+async function waitForUpdate(name: string): Promise<McpUpdateResult> {
+  const deadline = Date.now() + UPDATE_WAIT_MS
+  while (Date.now() < deadline) {
+    const state = await apiJson<McpUpdateState>('/v1/admin/mcps/update-state', {}, 'Failed to load the update state')
+    if (!state.running?.[name]) {
+      const end = state.finished?.[name]
+      if (end?.status === UPDATE_JOB_END.FAILED) throw new Error(end.log || 'Update failed')
+      // Another page may have read the end first: the update ran.
+      return { install_log: end?.log ?? '' }
+    }
+    await new Promise(resolve => setTimeout(resolve, UPDATE_POLL_MS))
+  }
+  return { install_log: '' }
+}
+
+// Starts the update and waits for its end (the Skills page).
 export function useUpdateMcp() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (name: string): Promise<McpUpdateResult> => {
-      return apiJson<McpUpdateResult>(`/v1/admin/mcps/${name}/update`, { method: 'POST' }, 'Update failed')
+      await apiOk(`/v1/admin/mcps/${name}/update`, { method: 'POST' }, 'Update failed')
+      return waitForUpdate(name)
     },
     onSuccess: (_data, name) => {
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
@@ -527,6 +604,8 @@ export interface InstallResult {
   old_version: string | null
   runtime: string
   install_log: string
+  /** The addresses the MCP sends a sign-in to that wait for the admin's Allow. */
+  hosts_to_confirm?: BearerPending
 }
 
 export function useInstallMcp() {
@@ -697,7 +776,7 @@ export interface AgentMcp {
   author_url?: string
   /** The install dir ships an icon.png. */
   icon?: boolean
-  assignment_mode: 'auto' | 'explicit'
+  assignment_mode: 'auto' | 'explicit' | 'platform'
   credential_type: string
   /** Manifest declares a service account — the binding dropdown only
    *  renders (and queries its options) where this is true. */

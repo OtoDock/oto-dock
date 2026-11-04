@@ -1,10 +1,11 @@
 /**
- * OAuth utility — handles popups on web, deep links on native Android.
+ * OAuth utility: popups on the web, the system browser in the apps.
  *
- * On Android (Capacitor), OAuth flows that need a callback use deep links:
- * the system browser redirects to otodock://... which Android routes back
- * to the app. For flows without a redirect (Claude OAuth code-paste), Chrome
- * Custom Tab is used instead.
+ * In the apps (Android and iOS) a flow that needs a callback opens the
+ * system browser through the native channel (openNativeBrowser): a Custom
+ * Tab on Android, the authentication session on iOS. The browser redirects
+ * to otodock://, and the app hands the link to window._handleDeepLink. A flow
+ * without a redirect (Claude's code paste) opens the system's browser view.
  */
 
 import { Capacitor } from '@capacitor/core'
@@ -40,7 +41,7 @@ export function deepLinkPending(): boolean {
   return pendingDeepLink !== null
 }
 
-/** Called from Android native via evaluateJavascript when an otodock://oauth/* deep link fires. */
+/** Called by either app's shell when an otodock://oauth/* link arrives. */
 const deepLinkWindow: Window & { _handleDeepLink?: (url: string) => unknown } = window
 deepLinkWindow._handleDeepLink = (url: string) => {
   if (pendingDeepLink) {
@@ -160,7 +161,7 @@ export async function openOAuthWindow(
     if (options?.useDeepLink && hasNativeBridge()) {
       // Deep link mode: the app opens the system browser (after the person
       // confirms another site); the browser redirects to otodock://, which the
-      // app routes back via onNewIntent → handleDeepLink. The waiter exists
+      // app hands back to window._handleDeepLink. The waiter exists
       // before the ask, so a build reload waits while the confirm is open,
       // and its timeout starts only once the browser opened: the confirm may
       // stay open for NATIVE_BROWSER_TIMEOUT_MS. Every way out of the ask
@@ -179,7 +180,7 @@ export async function openOAuthWindow(
       return false
     }
 
-    // Chrome Custom Tab mode (used for Claude OAuth code-paste flow)
+    // The system's browser view (a Custom Tab, the iOS Safari view), for Claude's code paste
     const { Browser } = await import('@capacitor/browser')
     await Browser.open({ url, presentationStyle: 'popover' })
     if (onBrowserClosed) {

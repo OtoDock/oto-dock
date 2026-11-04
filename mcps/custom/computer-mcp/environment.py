@@ -148,47 +148,135 @@ def check_session_active() -> None:
         )
 
 
-def check_macos_permissions() -> dict:
-    """Probe macOS Accessibility (input) + Screen Recording (capture) grants.
+def check_macos_permissions(prompt: bool = False) -> dict:
+    """Read macOS's Accessibility (input) and Screen Recording (capture)
+    grants for this process.
 
     Returns ``{"accessibility": bool|None, "screen_recording": bool|None,
-    "notes": str}``. ``None`` => couldn't determine (pyobjc/Quartz missing or
-    API unavailable). Non-macOS returns all-None with an explanatory note.
-    Used by the ``check_permissions`` action so a first-run user gets a clear
-    "go grant these two toggles" message instead of mysterious black frames /
-    dead clicks.
+    "notes": str}``. ``None`` => couldn't determine (pyobjc missing or the API
+    unavailable). Non-macOS returns all-None with an explanatory note. With
+    ``prompt`` macOS is asked to show its two permission questions for what is
+    not granted yet, which also lists the app in System Settings: the first
+    action of a process asks once, the ``check_permissions`` tool never does.
     """
     if os_kind() != "darwin":
         return {
             "accessibility": None,
             "screen_recording": None,
-            "notes": "Permission probes are macOS-only; this is not macOS.",
+            "notes": "Permission checks are macOS only. This is not macOS.",
         }
     out: dict = {"accessibility": None, "screen_recording": None, "notes": ""}
     notes = []
-    # Accessibility (synthetic input) via ApplicationServices.AXIsProcessTrusted.
     try:
-        from ApplicationServices import AXIsProcessTrusted  # type: ignore
+        from ApplicationServices import (  # type: ignore
+            AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
+        )
 
-        out["accessibility"] = bool(AXIsProcessTrusted())
+        out["accessibility"] = bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: prompt}))
     except Exception:  # noqa: BLE001  # pyobjc calls raise whatever the macOS bridge does
-        notes.append("could not read Accessibility status")
-    # Screen Recording (capture) via Quartz preflight (macOS 10.15+).
+        notes.append("Could not read the Accessibility status")
     try:
         import Quartz  # type: ignore
 
         preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
         if preflight is not None:
-            out["screen_recording"] = bool(preflight())
+            granted = bool(preflight())
+            request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
+            if not granted and prompt and request is not None:
+                granted = bool(request())
+            out["screen_recording"] = granted
         else:
-            notes.append("Screen Recording preflight API unavailable (old macOS)")
+            notes.append("This macOS cannot report Screen Recording")
     except Exception:  # noqa: BLE001  # pyobjc calls raise whatever the macOS bridge does
-        notes.append("could not read Screen Recording status")
-    if out["accessibility"] is False or out["screen_recording"] is False:
-        notes.append(
-            "Grant the satellite's host app BOTH Accessibility and Screen "
-            "Recording under System Settings -> Privacy & Security, then "
-            "restart the satellite."
-        )
-    out["notes"] = "; ".join(notes)
+        notes.append("Could not read the Screen Recording status")
+    missing = [k for k, v in (("screen", out["screen_recording"]), ("accessibility", out["accessibility"]))
+               if v is False]
+    if missing:
+        notes.append(grant_message(missing))
+    out["notes"] = ". ".join(n.rstrip(".") for n in notes) + ("." if notes else "")
     return out
+
+
+def responsible_app() -> tuple[str, str] | None:
+    """``(name, path)`` of the app macOS credits this process's permissions
+    to (the satellite's ``OtoDock Satellite.app``, or for an older install
+    its Python), read from libSystem. ``None`` when unreadable."""
+    if os_kind() != "darwin":
+        return None
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        who = lib.responsibility_get_pid_responsible_for_pid
+        who.argtypes, who.restype = [ctypes.c_int], ctypes.c_int
+        buf = ctypes.create_string_buffer(4096)
+        if lib.proc_pidpath(who(os.getpid()), buf, ctypes.c_uint32(4096)) <= 0:
+            return None
+        path = buf.value.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001  # a private libSystem call: any failure means unknown
+        return None
+    bundle = path.split(".app/Contents/MacOS/")[0] + ".app" if ".app/Contents/MacOS/" in path else ""
+    name = os.path.basename(bundle)[: -len(".app")] if bundle else os.path.basename(path)
+    return name, bundle or path
+
+
+def _macos_major() -> int:
+    import platform
+
+    try:
+        return int(platform.mac_ver()[0].split(".")[0])
+    except ValueError:
+        return 0
+
+
+def grant_message(missing: list[str]) -> str:
+    """What the person turns on, named as their macOS shows it. ``missing``
+    holds ``"screen"`` and/or ``"accessibility"``."""
+    major = _macos_major()
+    lists = {
+        "accessibility": "Device Control and Data Access" if major >= 27 else "Accessibility",
+        "screen": "Screen & System Audio Recording" if major >= 15 else "Screen Recording",
+    }
+    can = {"screen": "see the screen", "accessibility": "control the mouse and keyboard"}
+    app = responsible_app()
+    start = ""
+    if app is not None and app[1].endswith(".app"):
+        who = app[0]
+        where = who if who == "OtoDock Satellite" else f"{who} ({app[1]})"
+    else:
+        # A bare program is never the one to turn on: over SSH it is sshd,
+        # and its switch would let every SSH sign-in see and drive the screen.
+        who = where = "the satellite's app"
+        if app is not None:
+            start = "Start the satellite from its login item, not from a terminal. "
+    return (
+        f"macOS does not let {who} {' or '.join(can[m] for m in missing)} yet. {start}"
+        f"Turn on {where} in System Settings, Privacy & Security, under "
+        f"{' and under '.join(lists[m] for m in missing)}. "
+        "Then start a new chat on this machine."
+    )
+
+
+# The first action of a process asks macOS to show its questions, once.
+_asked = False
+
+
+def check_macos_grants(input_needed: bool) -> None:
+    """On a Mac, raise :class:`DeviceUnavailable` when macOS has DEFINITELY
+    not granted what an action needs: Screen Recording for the screenshot
+    every action returns, Accessibility for input. macOS drops the input and
+    greys the capture without an error, so a pretend success would mislead.
+    An unreadable status (``None``) never refuses."""
+    global _asked
+    if os_kind() != "darwin":
+        return
+    perms = check_macos_permissions(prompt=not _asked)
+    _asked = True
+    missing = []
+    if perms["screen_recording"] is False:
+        missing.append("screen")
+    if input_needed and perms["accessibility"] is False:
+        missing.append("accessibility")
+    if missing:
+        raise DeviceUnavailable(grant_message(missing))

@@ -229,31 +229,67 @@ def _moved_pin(chat_id: str) -> str:
     return pin
 
 
+def personal_owner_of(target: placement.PlacementCapabilities, mount_username: str,
+                      person_sub: str | None, browser) -> str:
+    """The person whose own things an agent-scope session (no mount
+    username: a Shared-only chat, a chat worker) may carry to a personal
+    machine: its person when that person owns the machine (``browser`` is
+    the target's ``remote_store.BrowserTargetSettings``, whose ``owner_sub``
+    is the row's owner, read in the same SELECT as the token), ``""``
+    otherwise. Every builder of such a session asks it once, and its answer
+    is the owner filter of the build (``build_session_mcp_config``'s
+    ``personal_owner``) and the bundles' owner (``personal_machine_bundles``)."""
+    if not (target.user_paired and not mount_username and person_sub and browser is not None):
+        return ""
+    return person_sub if getattr(browser, "owner_sub", "") == person_sub else ""
+
+
 def personal_machine_bundles(secret_bundles: dict, target: placement.PlacementCapabilities,
-                             mount_username: str, agent_name: str, *, who: str) -> dict:
-    """The secret bundles a session may carry to ``target``: none for an
-    agent-scope session (no mount username: a Shared-only chat) on a
-    person's own machine, where the agent's own accounts stay on the
-    platform. No per-session secret file goes to a personal disk; the MCPs
-    that sign in with them fail there instead of carrying the agent's
-    account. Every build of such a session asks it (the chat's, a wake's)."""
-    if secret_bundles and target.user_paired and not mount_username:
+                             mount_username: str, agent_name: str, *, who: str,
+                             owner: str = "") -> dict:
+    """The secret bundles a session may carry to ``target``. An agent-scope
+    session (no mount username: a Shared-only chat) on a person's own
+    machine carries only what is that person's, and only when it runs as
+    them (``owner``, from ``personal_owner_of``): the machine's own browser
+    token, and the bundles of MCPs whose credential is one person's account
+    (``credential_resolver.carries_to_personal_machine``), which the build's
+    owner filter resolved from that person's bindings alone. Everything else
+    (the agent's other accounts, an admin's instance settings, a key) stays
+    on the platform, logged by name. Every build of such a session asks it
+    (the chat's, a wake's, a chat worker's)."""
+    if not (secret_bundles and target.user_paired and not mount_username):
+        return secret_bundles
+    from core.credentials.mcp_broker import SecretBundle
+    from services.oauth.credential_resolver import carries_to_personal_machine
+    kept: dict = {}
+    for key, bundle in secret_bundles.items() if owner else ():
+        if key == mcp_registry.BROWSER_SERVER_KEY:
+            token = bundle.env.get(mcp_registry.BROWSER_TOKEN_ENV)
+            if token:
+                kept[key] = SecretBundle(env={mcp_registry.BROWSER_TOKEN_ENV: token})
+            continue
+        manifest = mcp_registry.get_manifest_by_config_key(key)
+        if manifest is not None and carries_to_personal_machine(manifest):
+            kept[key] = bundle
+    withheld = sorted(set(secret_bundles) - set(kept))
+    if withheld:
         logger.warning("%s: %s runs agent-scoped on the personal machine %s: secret files "
                        "withheld for %s", who, agent_name, target.machine_id[:8],
-                       ", ".join(sorted(secret_bundles)))
-        return {}
-    return secret_bundles
+                       ", ".join(withheld))
+    return kept
 
 
-def _placement_refusal(target: str, run_sub: str | None, role: str | None) -> str:
+def _placement_refusal(target: str, run_sub: str | None, role: str | None,
+                       agent_default: str | None) -> str:
     """The sentence when a session of this person may not run on ``target``
-    (``placement.may_run_on``); ``""`` when it may. Synchronous."""
+    (``placement.may_run_on``, ``agent_default`` the agent's own default
+    place); ``""`` when it may. Synchronous."""
     machine = remote_store.get_remote_machine(target)
     if machine is None:
         return ""
     allowed_user = task_store.get_platform_setting("allow_user_paired_machines") != "0"
     if placement.may_run_on(machine, run_sub=run_sub, run_can_manage=roles.can_manage(role),
-                            user_paired_allowed=allowed_user):
+                            user_paired_allowed=allowed_user, agent_default=agent_default):
         return ""
     name = str(machine.get("name") or target[:8])
     if not placement.machine_is_admin_paired(machine):
@@ -401,9 +437,11 @@ async def build_agent_config(
     if not placement.is_local(target_value) and not placement.is_offline_sentinel(target_value):
         # The placement guard: never a session on a place its person may not
         # use (a shared chat another person placed on their computer, an
-        # admin machine below the owner tier). Sent with the sentence that
-        # says where the chat is.
-        refusal = await asyncio.to_thread(_placement_refusal, target_value, creds_sub, user_role)
+        # admin machine below the owner tier unless its every-role switch
+        # admits the agent's chats). Sent with the sentence that says where
+        # the chat is.
+        refusal = await asyncio.to_thread(_placement_refusal, target_value, creds_sub, user_role,
+                                          agent_info.get("execution_target"))
         if refusal:
             raise placement.PlacementRefused(refusal)
     # The resolved placement — the kind (local / admin-paired / user-paired)
@@ -439,9 +477,44 @@ async def build_agent_config(
         _names = {m.name for m in agent_mcps}
         if PHONE_MCP in _names and CALL_CONTROL_MCP not in (extra_mcps or []):
             extra_mcps = [*(extra_mcps or []), CALL_CONTROL_MCP]
+    # A chat that is not the person's own (``mcp_registry.SHARED_CHAT_CONTEXT``):
+    # no person, a task chat reopened in the dashboard, a
+    # Shared-only agent's chat, or a chat row another person owns (an admin
+    # driving a member's chat, a delegated worker's chat). The MCP set and
+    # the prompt both read the fact, passed only when it holds.
+    from core.session.visibility import SCOPE_AGENT
+    shared_chat = (
+        not creds_sub or task_identity is not None or ident.shared_only
+        or vis.mount_scope == SCOPE_AGENT
+    )
+    if not shared_chat and chat_id:
+        _owner_row = await asyncio.to_thread(task_store.get_chat, chat_id)
+        if _owner_row:
+            shared_chat = (_owner_row.get("user_sub") or "") not in ("", creds_sub)
+    # Passed only when it holds: a build of the person's own chat calls the
+    # builders with exactly the keywords their goldens record. The two
+    # builders are read at call time, as their test stubs expect.
+
+    # An agent-scope session on a personal machine: the machine's owner when
+    # they are the person at the chat (``personal_owner_of``), else nobody.
+    personal_owner = personal_owner_of(target, vis.mount_username, creds_sub, target_browser)
+    on_personal = target.user_paired and vis.mount_scope == SCOPE_AGENT
+
+    def _mcp_build(*args, **kwargs):
+        if shared_chat:
+            kwargs["shared_chat"] = True
+        if on_personal:
+            kwargs["personal_owner"] = personal_owner
+        return mcp_registry.build_session_mcp_config(*args, **kwargs)
+
+    def _prompt_build(*args, **kwargs):
+        if shared_chat:
+            kwargs["shared_chat"] = True
+        return config.build_agent_prompt(*args, **kwargs)
+
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
-            mcp_registry.build_session_mcp_config, agent_name, creds_sub,
+            _mcp_build, agent_name, creds_sub,
             session_id=session_id,
             delegation_targets=resolved_targets,
             mcp_config_format=mcp_format,
@@ -464,7 +537,8 @@ async def build_agent_config(
         )
     )
     secret_bundles = personal_machine_bundles(secret_bundles, target, vis.mount_username,
-                                              agent_name, who="build_agent_config")
+                                              agent_name, who="build_agent_config",
+                                              owner=personal_owner)
 
     # Inject manifest-declared path_env values. The framework auto-resolves
     # each role to a sandbox-style virtual path based on user/agent scope
@@ -562,7 +636,7 @@ async def build_agent_config(
         delegation_targets=resolved_targets,
         # Pre-resolved off-loop: the delegation + meetings providers are no-I/O.
         delegation_roster=await asyncio.to_thread(
-            dynamic_context.build_delegation_roster, resolved_targets,
+            dynamic_context.build_delegation_roster, resolved_targets, creds_sub or "",
         ),
         meetings_access=await asyncio.to_thread(
             dynamic_context.build_meetings_access, creds_sub or "", user_role or "",
@@ -581,7 +655,7 @@ async def build_agent_config(
     # context and memory and walks the workspace tree (tens of milliseconds
     # on a large agent), which the loop must not wait for.
     agent_prompt = await asyncio.to_thread(
-        config.build_agent_prompt,
+        _prompt_build,
         agent_name, username=vis.mount_username, role=user_role,
         excluded_mcps=excluded_mcps or None,
         dynamic_contexts=dynamic_contexts or None,
@@ -768,6 +842,7 @@ async def build_agent_config(
         mcp_config_path=str(mcp_config) if mcp_config else "",
         credential_env=credential_env or {},
         mcp_secret_bundles=secret_bundles or {},
+        excluded_mcps=frozenset(excluded_mcps or ()),
         permission_mode=permission_mode,
         client_type=client_type,
         model=resolved_model,

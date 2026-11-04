@@ -1,24 +1,32 @@
 package com.otodock;
 
-import android.app.Activity;
 import android.app.KeyguardManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.TextView;
+import androidx.activity.ComponentActivity;
+import androidx.activity.EdgeToEdge;
+import androidx.activity.SystemBarStyle;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 /**
  * Lightweight full-screen alarm UI shown OVER the lock screen for danger alarms.
- * Launched by AlarmService's full-screen intent. Deliberately a plain Activity
+ * Launched by AlarmService's full-screen intent. Deliberately a plain screen
  * (no WebView / dashboard) so nothing sensitive is exposed on the keyguard — the
  * dashboard only opens after the user unlocks. Closes itself when the alarm stops
  * (button, notification action, app open, or timeout) via ACTION_ALARM_STOPPED.
  */
-public class AlarmActivity extends Activity {
+public class AlarmActivity extends ComponentActivity {
 
     /** Set by NotificationService's lock-screen alarm: the alarm's service
      *  could not start from the background, so this activity starts it once
@@ -51,7 +59,21 @@ public class AlarmActivity extends Activity {
         }
 
         setContentView(R.layout.activity_alarm);
-        getWindow().setStatusBarColor(0xFFDA3536);
+        // The red runs under both bars, which are transparent with light
+        // icons; the layout keeps its own padding clear of them.
+        SystemBarStyle clear = SystemBarStyle.dark(Color.TRANSPARENT);
+        EdgeToEdge.enable(this, clear, clear);
+        View root = ((ViewGroup) findViewById(android.R.id.content)).getChildAt(0);
+        final int left = root.getPaddingLeft();
+        final int top = root.getPaddingTop();
+        final int right = root.getPaddingRight();
+        final int bottom = root.getPaddingBottom();
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
+            Insets bars = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            view.setPadding(left + bars.left, top + bars.top, right + bars.right, bottom + bars.bottom);
+            return WindowInsetsCompat.CONSUMED;
+        });
 
         Intent intent = getIntent();
         startAlarmOnResume = savedInstanceState == null && intent != null

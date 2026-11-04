@@ -34,6 +34,9 @@ Passes (the full list and its order are ``_run_sweep_sync``'s):
      revoked chat share's copy 7 days after the revoke, then revoked and
      declined share rows 30 days after the revoke or the decision
      (``share_store.STALE_SHARE_DAYS``).
+  Reply reports (``reply-reports``) — always on: a report a year after it
+     was filed, open or closed, its chat there or not
+     (``db_reply_reports.KEEP_DAYS``).
 
 On a remote machine only the CLI transcripts age out (``_pass_remote_sessions``:
 the chats pinned to it are flagged like local ones, and a 0.5.150 satellite
@@ -55,6 +58,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -457,19 +461,66 @@ def _home_for_chat(agent: str, user_sub: str) -> Path:
 
 def _unlink(path: Path, stats: dict, count_key: str, bytes_key: str,
             dry_run: bool) -> None:
+    """Remove one session file, or a folder an engine keeps for a session,
+    beneath the agents root with no link followed (a planted link at any
+    component is left where it is, and is no error); counted under
+    ``count_key``, its bytes under ``bytes_key``."""
+    from services.infra import safe_fs
     try:
-        size = path.lstat().st_size
+        st = path.lstat()
     except OSError:
         return
+    tree = stat.S_ISDIR(st.st_mode)
+    size = _tree_bytes(path) if tree else st.st_size
     if not dry_run:
         try:
-            path.unlink()
+            _remove_beneath(path, tree=tree)
+        except safe_fs.SymlinkRefused:
+            logger.debug("retention: %s sits behind a link: left in place", path)
+            return
         except OSError as e:
             stats["errors"] += 1
             logger.warning("retention: failed to delete %s: %s", path, e)
             return
     stats[count_key] += 1
     stats[bytes_key] += size
+
+
+def _remove_beneath(path: Path, *, tree: bool) -> None:
+    """``path`` removed beneath the agents root (its ``rel`` from the path as
+    listed, never resolved); one outside it (the legacy transcript beside
+    the proxy's own home) is removed in place."""
+    import shutil
+
+    from services.infra import safe_fs
+    try:
+        rel = safe_fs.rel_under(str(path), config.AGENTS_DIR)
+    except safe_fs.SafeFsError:
+        if tree:
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        return
+    if tree:
+        safe_fs.rmtree_beneath(config.AGENTS_DIR, rel)
+    else:
+        safe_fs.unlink_beneath(config.AGENTS_DIR, rel)
+
+
+def _unlink_with_companions(layers, path: Path, stats: dict, count_key: str,
+                            bytes_key: str, dry_run: bool) -> None:
+    """A session file and what its engine keeps beside it (Claude's
+    ``<id>/`` folder): the file counts, the folder adds its bytes."""
+    _unlink(path, stats, count_key, bytes_key, dry_run)
+    for extra in {c for layer in layers for c in layer.session_file_companions(path)}:
+        try:
+            if not stat.S_ISDIR(extra.lstat().st_mode):
+                continue
+        except OSError:
+            continue
+        before = stats[count_key]
+        _unlink(extra, stats, count_key, bytes_key, dry_run)
+        stats[count_key] = before
 
 
 def _mtime_older_than(path: Path, age_s: float, now: float) -> bool:
@@ -540,11 +591,12 @@ def _pass_aged_chats(days: int, live: LiveSnapshot, stats: dict,
     else:
         flagged = set(task_store.flag_chats_for_retention(
             [cid for cid, _ in planned], cutoff))
+    layers = list(get_all_layers().values())
     for cid, files in planned:
         if cid not in flagged:
             continue
         for f in files:
-            _unlink(f, stats, "session_files_deleted", "bytes_freed", dry_run)
+            _unlink_with_companions(layers, f, stats, "session_files_deleted", "bytes_freed", dry_run)
     stats["chats_flagged"] += len(flagged)
 
 
@@ -731,7 +783,8 @@ def _pass_orphans(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
                 if not _UUID_RE.match(ref) or ref in refs:
                     continue
                 if _mtime_older_than(f, ORPHAN_GRACE_S, now):
-                    _unlink(f, stats, "orphans_deleted", "orphan_bytes", dry_run)
+                    _unlink_with_companions(layers, f, stats, "orphans_deleted",
+                                            "orphan_bytes", dry_run)
 
 
 def _pass_codex_junk(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
@@ -861,6 +914,27 @@ def _pass_stale_shares(stats: dict, dry_run: bool) -> None:
     stats["shares_deleted"] += share_store.delete_stale_shares(dry_run=dry_run)
 
 
+def _pass_notebook_entries(stats: dict, dry_run: bool) -> None:
+    """Notebook entries (``storage/notebook/``): every agent keeps its newest 500,
+    deleted ones counted, whatever the chat retention toggle says (a size
+    bound, like the recover bin's)."""
+    from services.notebook.entries import KEEP_PER_AGENT
+    from storage.notebook import db_notebook
+    stats["notebook_entries_pruned"] += db_notebook.prune_per_agent(
+        KEEP_PER_AGENT, dry_run=dry_run,
+    )
+
+
+def _pass_reply_reports(stats: dict, dry_run: bool) -> None:
+    """Reports of replies (``storage/db_reply_reports.py``): each one goes
+    ``KEEP_DAYS`` after it was filed, whatever the chat retention toggle
+    says; a report outlives its chat, so its age is what bounds it."""
+    from storage import db_reply_reports
+    stats["reply_reports_deleted"] += db_reply_reports.delete_older_than(
+        db_reply_reports.KEEP_DAYS, dry_run=dry_run,
+    )
+
+
 def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
                     dry_run: bool) -> dict:
     started = time.monotonic()
@@ -884,6 +958,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "mcp_autoupdate_rows_deleted": 0,
         "share_snapshots_deleted": 0,
         "shares_deleted": 0,
+        "notebook_entries_pruned": 0,
+        "reply_reports_deleted": 0,
         "recover_bin_rows_pruned": 0,
         "recover_bin_orphans_deleted": 0,
         # The machines (``_pass_remote_sessions``, on the loop after this).
@@ -929,6 +1005,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         ("recover-bin-blobs", lambda: _pass_recover_bin_blobs(stats, dry_run)),
         ("share-snapshots", lambda: _pass_share_snapshots(stats, dry_run)),
         ("stale-shares", lambda: _pass_stale_shares(stats, dry_run)),
+        ("notebook-entries", lambda: _pass_notebook_entries(stats, dry_run)),
+        ("reply-reports", lambda: _pass_reply_reports(stats, dry_run)),
         ("offboarded-archives", lambda: _pass_offboarded_archives(stats, dry_run)),
     ])
     for name, fn in passes:

@@ -5,13 +5,17 @@ export interface MemorySettings {
   id: number
   user_memory_enabled: boolean
   agent_memory_enabled: boolean
-  // Per scope: topic files inject in FULL into the system prompt while
-  // their total stays under this budget; past it only the generated
-  // MEMORY.md index is injected (agents read topics via the memory tool).
+  // Per scope: the newest topic files inject in FULL into the system prompt
+  // while their running total stays under this budget; the rest are listed
+  // with their index entries (agents read those via the memory tool).
   inline_budget_bytes: number
-  // User turns without a memory tool call before a one-line capture
-  // reminder rides the next message (0 = off).
+  // User turns without a memory write before a one-line capture reminder
+  // rides the next message (0 = off).
   nudge_turns: number
+  // A topic over this size no longer grows (an edit that shrinks it always
+  // lands); the most one edit may add to a topic.
+  topic_grow_cap_bytes: number
+  entry_cap_bytes: number
 }
 
 export interface AgentMemorySettings {

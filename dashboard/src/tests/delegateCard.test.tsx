@@ -7,6 +7,7 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { act, fireEvent, render, renderHook, screen, within } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import ChatMessages from '@/components/chat/ChatMessages'
 import type { DisplayMessage } from '@/components/chat/types'
@@ -60,13 +61,97 @@ const toggleOf = (card: HTMLElement) => within(card).getByRole('button', { name:
 function renderList(messages: DisplayMessage[], query = '') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
-    <QueryClientProvider client={qc}>
-      <SearchProvider query={query}>
-        <ChatMessages messages={messages} agentName="boss" chatId="c1" onPermissionRespond={() => {}} />
-      </SearchProvider>
-    </QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={qc}>
+        <SearchProvider query={query}>
+          <ChatMessages messages={messages} agentName="boss" chatId="c1" onPermissionRespond={() => {}} />
+        </SearchProvider>
+      </QueryClientProvider>
+    </MemoryRouter>,
   )
 }
+
+/** The person-side row a card sits in (`data-msg-id`) and the width box
+ *  right inside it. */
+const sideOf = (card: HTMLElement) => ({
+  row: card.closest('[data-msg-id]') as HTMLElement,
+  box: card.parentElement as HTMLElement,
+})
+
+describe("every card sits on the person's side", () => {
+  it('a prompt, a result and a wake are right-aligned at the person\'s width', () => {
+    const msgs = dbMessagesToDisplay([
+      promptRow('Review the plan.'),
+      resultRow(),
+      row('event', '', 'schedule_wake', { prompt: 'Check the log.', task_id: 'dyn-c1' }),
+    ], AGENTS)
+    renderList(msgs)
+    const cards = screen.getAllByTestId('delegate-card')
+    expect(cards.map((c) => c.getAttribute('data-kind'))).toEqual(['prompt', 'result', 'wake'])
+    for (const card of cards) {
+      const { row: rowEl, box } = sideOf(card)
+      expect(rowEl.className).toContain('items-end')
+      expect(box.className).toContain('max-w-[85%]')
+    }
+  })
+
+  it('a wake card names the platform\'s prompt, not an agent', () => {
+    renderList(dbMessagesToDisplay([row('event', '', 'schedule_wake', { prompt: 'Check the log.', task_id: 'dyn-c1' })], AGENTS))
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByTestId('wake-card-label')).toHaveTextContent('Scheduled wake')
+    expect(within(card).getByTestId('delegate-card-preview')).toHaveTextContent('Check the log.')
+    expect(within(card).queryByText('Boss Agent')).toBeNull()
+    expect(within(card).queryByText('Worker Agent')).toBeNull()
+  })
+
+  it("the resume after the agent's move reads Continued after the move", () => {
+    renderList(dbMessagesToDisplay([row('event', '', 'schedule_wake', {
+      prompt: 'You now run on drill-sat. Continue the work.', source: 'move',
+    })], AGENTS))
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByTestId('wake-card-label')).toHaveTextContent('Continued after the move')
+    expect(within(card).queryByText('Scheduled wake')).toBeNull()
+    expect(within(card).getByTestId('delegate-card-preview')).toHaveTextContent('You now run on drill-sat. Continue the work.')
+  })
+
+  it("a task run's own prompt is a card with its badge", () => {
+    const msgs = dbMessagesToDisplay([row('user', 'count the files', '', {
+      agent_slug: 'worker', agent_display_name: 'Worker Agent', agent_color: '', badge: 'task prompt',
+    })], AGENTS)
+    expect(msgs[0].delegateCard).toEqual({ kind: 'prompt', key: `db-${nextId - 1}` })
+    renderList(msgs)
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByText('task prompt')).toBeInTheDocument()
+    expect(sideOf(card).row.className).toContain('items-end')
+  })
+
+  it('a result names its task and links the worker chat outside the toggle', () => {
+    renderList(dbMessagesToDisplay([resultRow({ worker_chat_id: 'w-1' })], AGENTS))
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByTestId('delegate-card-task')).toHaveTextContent('cards')
+    const link = within(card).getByRole('link', { name: 'Open lane' })
+    expect(link).toHaveAttribute('href', '/chat/worker/w-1')
+    expect(link.closest('button')).toBeNull()
+    fireEvent.click(link)
+    expect(toggleOf(card)).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('a result from before the worker chat was recorded has no link', () => {
+    renderList(dbMessagesToDisplay([resultRow()], AGENTS))
+    expect(screen.queryByRole('link', { name: 'Open lane' })).toBeNull()
+  })
+
+  it('no separator line follows a card', () => {
+    const { container } = renderList(dbMessagesToDisplay([resultRow(), row('assistant', 'the synthesis')], AGENTS))
+    expect(container.querySelectorAll('.border-t.border-subtle')).toHaveLength(0)
+    // An agent-style row that is no card (a meeting prompt) keeps the line
+    // before it and after it.
+    const { container: two } = renderList(dbMessagesToDisplay([row('assistant', 'one'), row('user', 'x', '', {
+      agent_slug: 'worker', agent_display_name: 'Worker Agent', agent_color: '', badge: 'meeting prompt',
+    }), row('assistant', 'two')], AGENTS))
+    expect(two.querySelectorAll('.border-t.border-subtle')).toHaveLength(2)
+  })
+})
 
 describe('the delegate card', () => {
   it('a result is collapsed by default and a click opens and closes it', () => {
@@ -99,24 +184,37 @@ describe('the delegate card', () => {
     expect(within(card).getByText('delegated by')).toBeInTheDocument()
     expect(within(card).getByTestId('delegate-card-preview').textContent).toBe('Review the plan, then report.')
     fireEvent.click(within(card).getByRole('button', { expanded: false }))
-    // Expanded, the stored text is whole.
-    expect(card.textContent).toContain('[DELEGATED_WORK]')
+    // Expanded, the wrappers stay hidden: the builder dropped them from the
+    // block (the stored row keeps them).
+    expect(card.textContent).toContain('Review the plan, then report.')
+    expect(card.textContent).not.toContain('[DELEGATED_WORK]')
+    expect(card.textContent).not.toContain('[TASK_OUTPUT_DIR]')
   })
 
-  it('strips only a leading, closed wrapper', () => {
+  it('the preview reads the block as the builder left it', () => {
     const block = (content: string) => [{ type: 'text' as const, content }]
     expect(delegatePreviewText('prompt', block('[DELEGATED_WORK] a word I typed'))).toBe('[DELEGATED_WORK] a word I typed')
     expect(delegatePreviewText('prompt', block('Fix it. [DELEGATED_WORK]x[/DELEGATED_WORK]')))
       .toBe('Fix it. [DELEGATED_WORK]x[/DELEGATED_WORK]')
-    // Nothing but the envelope: the text shows as it is.
-    expect(delegatePreviewText('prompt', block('[DELEGATED_WORK]only[/DELEGATED_WORK]')))
-      .toBe('[DELEGATED_WORK]only[/DELEGATED_WORK]')
     expect(delegatePreviewText('result', block('… [output truncated — showing the last 12000 chars; open the worker chat for the full run]\n\n## Done\n- **all** `green`')))
       .toBe('Done all green')
   })
 
-  it('a plain user message is never a card, whatever it says', () => {
+  it('a prompt that was only the wrapper keeps its card, with no text', () => {
+    const msgs = dbMessagesToDisplay([promptRow(ENVELOPE.trim()), row('assistant', 'ok')], AGENTS)
+    expect(msgs).toHaveLength(2)
+    expect(msgs[0].delegateCard).toEqual({ kind: 'prompt', key: `db-${nextId - 2}` })
+    expect(msgs[0].blocks).toEqual([])
+    renderList(msgs)
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByText('delegated by')).toBeInTheDocument()
+    expect(within(card).queryByTestId('delegate-card-preview')).toBeNull()
+    expect(card.textContent).not.toContain('[DELEGATED_WORK]')
+  })
+
+  it('a plain user message is never a card, and its leading wrapper is drawn clean', () => {
     const msgs = dbMessagesToDisplay([row('user', `${ENVELOPE}typed by a person`), row('assistant', 'ok')], AGENTS)
+    expect(msgs[0].blocks).toEqual([{ type: 'text', content: 'typed by a person' }])
     renderList(msgs)
     expect(screen.queryByTestId('delegate-card')).toBeNull()
     expect(screen.getByText(/typed by a person/)).toBeInTheDocument()
@@ -129,8 +227,51 @@ describe('the delegate card', () => {
     })], AGENTS)
     renderList(msgs)
     const chips = screen.getByTestId('delegate-file-chips')
-    expect(within(chips).getByText('inbox/worker/report.md')).toBeInTheDocument()
+    expect(within(chips).getByTestId('delegate-file-chip-label')).toHaveTextContent('…/report.md')
     expect(within(chips).queryByText('huge.bin')).toBeNull()
+  })
+
+  it('two names that share their start read apart on a narrow card', () => {
+    const base = 'users/alice/workspace/projects/website-round/home-walk/after/hero-strong-spotlight-section-walkthrough'
+    const msgs = dbMessagesToDisplay([resultRow({ files: [
+      { path: `${base}-1280.txt`, bytes: 10 }, { path: `${base}-0390.txt`, bytes: 10 },
+    ] })], AGENTS)
+    renderList(msgs)
+    const tails = within(screen.getByTestId('delegate-file-chips')).getAllByTestId('delegate-file-chip-label')
+      .map((l) => (l.lastElementChild as HTMLElement).textContent)
+    expect(tails).toEqual(['-1280.txt', '-0390.txt'])
+  })
+
+  it('a long path stays inside the card: a short name on the chip, the whole path wrapping when open', () => {
+    const long = 'users/alice/workspace/projects/website-round/home-walk/after/hero-strong-spotlight-1280.png'
+    expect(long.length).toBeGreaterThanOrEqual(90)
+    const msgs = dbMessagesToDisplay([resultRow({ files: [{ path: long, bytes: 2048 }] })], AGENTS)
+    renderList(msgs)
+    const chips = screen.getByTestId('delegate-file-chips')
+    // Every box from the card down may shrink below its text: the chips'
+    // row, the chip, the label (which truncates with an ellipsis).
+    expect(chips.className).toMatch(/\bmin-w-0\b/)
+    expect(chips.className).toMatch(/\bmax-w-full\b/)
+    const chip = within(chips).getByRole('button')
+    expect(chip.className).toMatch(/\bmin-w-0\b/)
+    expect(chip.className).toMatch(/\bmax-w-full\b/)
+    expect(chip).toHaveAttribute('title', long)
+    // Cut in the middle: the start may shrink to an ellipsis, the end stays.
+    const label = within(chip).getByTestId('delegate-file-chip-label')
+    expect(label).toHaveTextContent('…/after/hero-strong-spotlight-1280.png')
+    const [head, tail] = Array.from(label.children) as HTMLElement[]
+    expect(head.className).toMatch(/\bmin-w-0\b/)
+    expect(head.className).toMatch(/\btruncate\b/)
+    expect(tail).toHaveTextContent('-1280.png')
+    expect(tail.className).toMatch(/\bshrink-0\b/)
+    // The pane never scrolls sideways: the list is clipped across.
+    expect(chips.closest('.overflow-x-clip')).not.toBeNull()
+    // Opened, the card lists the whole path, free to wrap.
+    fireEvent.click(toggleOf(screen.getByTestId('delegate-card')))
+    const listed = within(screen.getByTestId('delegate-files')).getByTitle(long)
+    expect(listed).toHaveTextContent('projects/website-round/home-walk/after/hero-strong-spotlight-1280.png')
+    expect(listed.className).toContain('[overflow-wrap:anywhere]')
+    expect(listed.className).not.toMatch(/\btruncate\b/)
   })
 
   it('never collapses a message that holds a live control', () => {

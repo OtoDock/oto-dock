@@ -180,6 +180,10 @@ def _sweep_satellite_screenshots(agents_dir: "Path", keep: int) -> None:
 # plenty of slack on busy hosts.
 _CLOCK_JUMP_THRESHOLD = 60
 
+# The local link's check before a connect is bounded well inside any wait:
+# it runs before the socket opens, never inside the platform's auth window.
+_PRECONNECT_CHECK_S = 8.0
+
 # Reconnect backoff: exponential from BASE, capped at CAP, with ±50% jitter
 # applied per attempt. The cap is deliberately low (not 60s) so the satellite
 # recovers within ~30s of a proxy restart / brief outage instead of idling up
@@ -360,6 +364,12 @@ class SatelliteWSClient:
         self._bulk_send_queue: asyncio.Queue = asyncio.Queue(maxsize=_BULK_LANE_SIZE)
         self._send_wakeup: asyncio.Event = asyncio.Event()
         self._authenticated = False
+        # When the link to the platform went down (monotonic; None while it
+        # is up). A fresh process counts as down until its first auth.
+        self._link_down_since: float | None = time.monotonic()
+        # The per-agent STAT fingerprints the heartbeat carries (refreshed
+        # every _FINGERPRINT_INTERVAL by the heartbeat loop).
+        self._agent_fingerprints: dict[str, str] = {}
         # Set by __main__.py post-construction; the WS routes inbound
         # http_response/http_response_chunk frames to this. Optional so
         # tests that don't need the tunnel don't have to construct one.
@@ -457,6 +467,10 @@ class SatelliteWSClient:
                 backoff = _RECONNECT_BACKOFF_BASE
             writer_task: asyncio.Task | None = None
             heartbeat_task: asyncio.Task | None = None
+            # The local link is checked (and healed) before the socket opens,
+            # so the auth capabilities carry a port that answers and the
+            # check never eats into the platform's auth window.
+            await self._check_tunnel("a connect")
             try:
                 logger.info("Connecting to %s...", self.config.platform_url)
                 async with websockets.connect(
@@ -543,6 +557,8 @@ class SatelliteWSClient:
             finally:
                 self._ws = None
                 self._authenticated = False
+                if self._link_down_since is None:
+                    self._link_down_since = time.monotonic()
                 for task in (writer_task, heartbeat_task):
                     if task is not None and not task.done():
                         task.cancel()
@@ -615,6 +631,46 @@ class SatelliteWSClient:
             self._set_status("reconnecting")
             await asyncio.sleep(delay)
             backoff = min(backoff * 2, _RECONNECT_BACKOFF_CAP)
+
+    def link_down_for(self) -> float | None:
+        """Seconds since the link to the platform went down; None while up."""
+        since = self._link_down_since
+        return None if since is None else time.monotonic() - since
+
+    async def _check_tunnel(self, trigger: str) -> None:
+        """The local link's check and heal, bounded; never raises."""
+        if self.tunnel is None:
+            return
+        try:
+            await asyncio.wait_for(self.tunnel.check_and_heal(trigger), _PRECONNECT_CHECK_S)
+        except asyncio.TimeoutError:
+            logger.info("tunnel: the local link check (%s) did not finish in %.0f s",
+                        trigger, _PRECONNECT_CHECK_S)
+        except Exception:  # noqa: BLE001  # a failed check must not stop the link or the heartbeat
+            logger.warning("tunnel: the local link check (%s) failed", trigger, exc_info=True)
+
+    def _heartbeat_frame(self) -> dict:
+        return {
+            "type": "heartbeat",
+            "load": _get_system_load(),
+            # All live agent sessions: headless (-p/codex) + interactive PTY
+            # (the latter also holds native-CLI/otodock sessions). The old
+            # count missed pty_sessions → undercounted interactive boxes.
+            "active_sessions": len(self.sm.sessions) + len(self.sm.pty_sessions),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent_fingerprints": self._agent_fingerprints,
+            # The local link's state (0.5.168): ``tunnel_ok``,
+            # ``local_tunnel_port``, ``tunnel_rebinds``, ``last_tunnel_error``.
+            **(self.tunnel.state() if self.tunnel is not None else {}),
+        }
+
+    async def heartbeat_now(self) -> None:
+        """A heartbeat out of turn (a heal moved or restored the local link),
+        only on a live link: a frame queued while the link is down could land
+        after an auth that reported newer state."""
+        if self._ws is None or not self._authenticated:
+            return
+        await self.enqueue_send(self._heartbeat_frame())
 
     async def enqueue_send(self, msg: dict) -> None:
         """Queue a message for the writer task. Drops oldest on overflow.
@@ -843,6 +899,8 @@ class SatelliteWSClient:
         """Send auth message directly, wait for auth_result (5s timeout)."""
         from ..config import SATELLITE_VERSION
         caps = self.sm.detect_capabilities()
+        if self.tunnel is not None:
+            caps.update(self.tunnel.state())
         if getattr(self, "_insecure_link", False):
             caps["insecure_transport"] = True
         auth_msg = {
@@ -903,6 +961,7 @@ class SatelliteWSClient:
                 return
             raise ConnectionError(f"Auth rejected: {resp}")
         self._authenticated = True
+        self._link_down_since = None
 
         # Report our live interactive PTY session ids so the proxy can
         # reconcile on reconnect — re-adopt survivors, exit the dead, reap orphans.
@@ -1184,7 +1243,6 @@ class SatelliteWSClient:
         last_tick = time.monotonic()
         last_sleep_clock = sleep_clock()
         last_fp_compute = 0.0
-        agent_fingerprints: dict[str, str] = {}
         while True:
             try:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL)
@@ -1211,7 +1269,7 @@ class SatelliteWSClient:
             # its idle-sync sweep on these. Best-effort.
             if now - last_fp_compute >= _FINGERPRINT_INTERVAL:
                 try:
-                    agent_fingerprints = await asyncio.to_thread(
+                    self._agent_fingerprints = await asyncio.to_thread(
                         self.sm.compute_agent_fingerprints
                     )
                     last_fp_compute = now
@@ -1224,16 +1282,10 @@ class SatelliteWSClient:
                     )
                 except Exception:  # noqa: BLE001  # the heartbeat loop's screenshot sweep: a raise stops heartbeats
                     logger.debug("screenshots sweep failed", exc_info=True)
+            # The local link answers, or is healed, before its state rides
+            # the frame (a tunnel listener can die inside a living process).
+            await self._check_tunnel("the heartbeat")
             try:
-                await self.enqueue_send({
-                    "type": "heartbeat",
-                    "load": _get_system_load(),
-                    # All live agent sessions: headless (-p/codex) + interactive PTY
-                    # (the latter also holds native-CLI/otodock sessions). The old
-                    # count missed pty_sessions → undercounted interactive boxes.
-                    "active_sessions": len(self.sm.sessions) + len(self.sm.pty_sessions),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "agent_fingerprints": agent_fingerprints,
-                })
+                await self.enqueue_send(self._heartbeat_frame())
             except Exception:
                 logger.exception("heartbeat enqueue failed")

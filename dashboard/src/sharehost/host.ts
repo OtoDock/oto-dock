@@ -33,6 +33,40 @@ export interface SnapshotMessage {
   event_type?: string
   data?: Record<string, unknown>
   event_data?: string
+  /** A person's message: how many photos and files went with it (counted,
+   *  never copied into the snapshot). */
+  attachments?: SnapshotAttachments
+}
+
+export interface SnapshotAttachments { photos: number; files: number }
+
+/** A settings card's placeholder in a copy: the setting is named, its
+ *  value was never in the chat's rows. */
+export function settingsPlaceholder(label: unknown): string {
+  return `A settings card for ${String(label || 'a setting')}. It shows in the chat only.`
+}
+
+/** An action card's placeholder in a copy: its title, no button. */
+export function cardPlaceholder(title: unknown): string {
+  return `A card: ${String(title || 'a question from the agent')}. It shows in the chat only.`
+}
+
+/** A list card's placeholder in a copy: its title, no row (the rows were
+ *  never in the chat's rows). */
+export function listPlaceholder(title: unknown): string {
+  return `A list card: ${String(title || 'a list')}. It shows in the chat only.`
+}
+
+/** A snapshot bubble's line for what went with a person's message:
+ *  "2 photos attached", "1 file attached", "2 photos and 1 file attached";
+ *  '' for none. */
+export function attachmentsLine(a: SnapshotAttachments | undefined): string {
+  if (!a) return ''
+  const parts = [
+    a.photos ? `${a.photos} photo${a.photos === 1 ? '' : 's'}` : '',
+    a.files ? `${a.files} file${a.files === 1 ? '' : 's'}` : '',
+  ].filter(Boolean)
+  return parts.length ? `${parts.join(' and ')} attached` : ''
 }
 
 export interface HostMessage {

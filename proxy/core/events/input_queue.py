@@ -141,7 +141,8 @@ def _row_to_input(row: dict) -> QueuedInput:
         author_sub=row.get("author_sub") or "",
         item=TurnInput(text=row.get("text") or "", cli_text=row.get("cli_text") or "",
                        images=images, image_meta=list(meta.get("images") or []),
-                       files=list(meta.get("files") or [])),
+                       files=list(meta.get("files") or []),
+                       card=meta.get("card") if isinstance(meta.get("card"), dict) else None),
         origin_conn=row.get("origin_conn") or "",
     )
 
@@ -663,24 +664,43 @@ def announce_queued(qi: QueuedInput, index: int) -> None:
             authors=(qi.author_sub,))
 
 
+async def _reopen_cards(taken: list[QueuedInput]) -> None:
+    """A card's answer that leaves the queue unsent gives its click back
+    (services/cards): the card is pressable again rather than reading
+    "You answered" for a message the agent never got."""
+    marked = [qi.item.card for qi in taken if qi.item.card]
+    if not marked:
+        return
+    from storage.cards import db_cards
+    for card in marked:
+        try:
+            await run_db(db_cards.unclaim_button, str(card.get("card_id") or ""), str(card.get("button") or ""))
+        except Exception:
+            logger.exception("a card's click could not be given back (card %s)", card.get("card_id"))
+
+
 async def return_items(chat_id: str, taken: list[QueuedInput], reason: str) -> None:
     """``taken`` leave without a turn and go back to their authors:
     ``queue_cleared`` with the reason to the chat's audience, the composer
     fields to each author's sockets, and the undelivered card for a reason
     the server decided (always: the live frame can be lost) or for a Stop's
-    return an author has no socket to take."""
+    return an author has no socket to take. A card's answer among them
+    gives its click back and goes nowhere else: back in a composer or on
+    an undelivered card it would answer the reopened card a second time."""
     if not taken:
         return
     q = get(chat_id)
     await q.drop_job(taken)
+    await _reopen_cards(taken)
     by_author: dict[str, list[QueuedInput]] = {}
     for qi in taken:
-        by_author.setdefault(qi.author_sub, []).append(qi)
+        if not qi.item.card:
+            by_author.setdefault(qi.author_sub, []).append(qi)
     returned = {sub: combined_fields(items) for sub, items in by_author.items() if sub}
     unreached = fan_out(chat_id, {"type": wire.QUEUE_CLEARED,
                                   "queue_ids": [qi.queue_id for qi in taken],
                                   "reason": reason},
-                        authors=by_author, returned_to=returned)
+                        authors={qi.author_sub for qi in taken}, returned_to=returned)
     from core.events.stream_pump import shelve_undelivered
     card = _CARD_REASONS.get(reason)
     for sub, items in by_author.items():
@@ -708,9 +728,14 @@ def return_soon(chat_id: str, reason: str) -> None:
 
 async def cancel_own(chat_id: str, author_sub: str) -> list[QueuedInput]:
     """The person's own waiting messages, cancelled (Edit): their composer
-    gets them back, nobody gets a card."""
+    gets them back, nobody gets a card. A card's answer stays queued: it is
+    not taken back."""
     q = await loaded(chat_id)
     taken = q.take(author_sub)
+    answers = [qi for qi in taken if qi.item.card]
+    if answers:
+        q.put_back(answers)
+        taken = [qi for qi in taken if not qi.item.card]
     await return_items(chat_id, taken, "cancel")
     return taken
 
@@ -742,6 +767,7 @@ async def drop_where(*, conn_id: str = "", author_sub: str = "", chat_id: str = 
             q.items[:] = [qi for qi in q.items if id(qi) not in ids]
             known = by_chat.setdefault(q.chat_id, [])
             known.extend(qi.queue_id for qi in gone if qi.queue_id not in known)
+            await _reopen_cards(gone)
     for cid, queue_ids in by_chat.items():
         await loaded(cid)   # the chat's audience
         fan_out(cid, {"type": wire.QUEUE_CLEARED, "queue_ids": queue_ids, "reason": "revoked"},
@@ -779,15 +805,18 @@ async def _after_pump_end(chat_id: str, *, return_upto: int | None, viewers: boo
         logger.exception("chat=%s: the queue's delivery after the turn failed", chat_id[:8])
 
 
-def arm(chat_id: str) -> None:
+def arm(chat_id: str, *, delay: float = VIEWER_GRACE_S) -> None:
     """Deliver what the chat holds once no pump drives it (a message queued
-    with no pump left to drain it, rows restored after a restart)."""
+    with no pump left to drain it, rows restored after a restart). The
+    grace lets a viewer's socket re-register first; a card's answer, pressed
+    on a live socket, passes none."""
     if _frozen():
         return
 
     async def _later() -> None:
         try:
-            await asyncio.sleep(VIEWER_GRACE_S)
+            if delay > 0:
+                await asyncio.sleep(delay)
             await deliver(chat_id)
         except Exception:
             logger.exception("chat=%s: the queue's delivery failed", chat_id[:8])

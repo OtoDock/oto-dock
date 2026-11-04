@@ -111,7 +111,7 @@ def test_reset_drops_resolved_preserves_event_identity():
     assert r.spawned == set() and r.completed == set()
     assert r.pending_stops == set() and r.workflow_tuids == set()
     assert r.task_to_tuid == {}
-    assert r.chat_id == ""
+    assert r.chat_id == "chat-1"            # names the chat, not the turn
     assert r._all_done_event is ev          # same Event object (no orphaned waiters)
     assert ev.is_set() is False
 

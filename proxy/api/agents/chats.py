@@ -10,7 +10,7 @@ import re
 import time
 import unicodedata
 import uuid
-from typing import cast
+from typing import Annotated, cast
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -143,7 +143,7 @@ def _task_scope_sub(u: UserContext) -> str | None:
 
 
 def _list_chats_sync(u: UserContext, agent: str | None, kind: str,
-                     limit: int) -> list[dict]:
+                     limit: int, before: tuple[str, str] | None = None) -> list[dict]:
     """The listing as ONE executor job: the access checks, the store reads
     and the flag stamping together, so the 30 s poll of every open
     dashboard costs the loop a hand-off and a JSON render, nothing more.
@@ -154,18 +154,41 @@ def _list_chats_sync(u: UserContext, agent: str | None, kind: str,
         if not agent:
             raise HTTPException(status_code=400, detail="agent parameter required")
         require_agent_access(u, agent)
-        chats = task_store.list_task_chats(agent, _task_scope_sub(u), limit=limit)
+        chats = task_store.list_task_chats(agent, _task_scope_sub(u), limit=limit,
+                                           own_only=not u.sees_agent_automations(agent),
+                                           before=before)
         _stamp_mutation_flags(u, chats)
         return chats
     # Shared-only agents have ONE shared chat list (synthetic owner); every
     # other mode lists the user's own. A global (no-agent) list stays per-user.
     from core.session.visibility import chat_history_owner
     owner = chat_history_owner(agent, u.sub) if agent else u.sub
+    hide = False
     if owner != u.sub:
         require_agent_access(u, cast("str", agent))  # the shared pool is its members' only
-    chats = task_store.list_chats(owner, agent=agent, limit=limit)
+        # The pool's delegated workers are the agent's own work.
+        hide = not u.sees_agent_automations(cast("str", agent))
+    chats = task_store.list_chats(owner, agent=agent, limit=limit, hide_agent_runs=hide,
+                                  before=before)
     _stamp_mutation_flags(u, chats)
     return chats
+
+
+def _list_page_sync(u: UserContext, agent: str | None, kind: str, limit: int,
+                    before: tuple[str, str] | None) -> bytes:
+    """One page of the listing and whether older rows remain: the store is
+    asked one row more than the page (the messages page's idiom), and the
+    extra row is dropped before the flags are stamped on the rest."""
+    rows = _list_chats_sync(u, agent, kind, limit + 1, before)
+    has_more = len(rows) > limit
+    return json_body({"chats": rows[:limit], "has_more": has_more})
+
+
+# The sidebar's cursor: the last shown row's sort key. Printable ASCII only,
+# so a NUL or a `+` the query decoding turned into a space is refused here
+# instead of failing the read or answering the wrong page.
+_CURSOR_AT = r"^\d{4}-\d{2}-\d{2}T[0-9:.]{2,20}([+-]\d{2}:\d{2}|Z)?$"
+_CURSOR_ID = r"^[\x21-\x7e]{1,200}$"
 
 
 @router.get("/v1/chats")
@@ -173,10 +196,20 @@ async def list_chats(
     agent: str | None = Query(None),
     kind: str = Query("chats", pattern="^(chats|tasks)$"),
     limit: int = Query(50, ge=1, le=200),
+    before_updated_at: Annotated[str | None, Query(pattern=_CURSOR_AT)] = None,
+    before_chat_id: Annotated[str | None, Query(pattern=_CURSOR_ID)] = None,
     user: UserContext | None = Depends(get_current_user),
 ):
+    """The sidebar's lists, newest first, a page at a time: the first page
+    without a cursor, then the rows after ``before_updated_at`` and
+    ``before_chat_id`` (the last row shown). ``has_more`` says whether older
+    rows remain."""
     u = require_auth(user)
-    return json_response(await run_db(_chats_body, _list_chats_sync, u, agent, kind, limit))
+    if (before_updated_at is None) != (before_chat_id is None):
+        raise HTTPException(status_code=400,
+                            detail="Send before_updated_at and before_chat_id together.")
+    before = (before_updated_at, before_chat_id) if before_updated_at and before_chat_id else None
+    return json_response(await run_db(_list_page_sync, u, agent, kind, limit, before))
 
 
 def _chats_body(rows_of, *args) -> bytes:
@@ -192,11 +225,10 @@ def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
 
     Task-listing rows carry their run/definition columns inline
     (``_TASK_RUN_COLS``); plain chat rows batch-resolve runs in ONE query
-    (uuid delegate-worker chats live in plain lists). ``can_delete`` always
-    judges the RUN (delete removes the chat's history entry); ``can_rename``
-    judges what rename actually hits — the DYNAMIC TASK row for name-labeled
-    task rows (that rename goes to ``PATCH /v1/tasks``, judged on the
-    definition's scope/creator), else the chat/run."""
+    (uuid delegate-worker chats live in plain lists). ``can_delete`` judges
+    the RUN (delete removes the chat's history entry), and ``can_rename``
+    equals it on every row: a task row's rename edits its run's chat too
+    (``PATCH /v1/chats``), never the task definition."""
     if not rows:
         return
     need_lookup = [r.get("id", "") for r in rows if "run_id" not in r]
@@ -209,13 +241,7 @@ def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
         else:
             run = runs_by_chat.get(r.get("id", ""))
         r["can_delete"] = can_mutate_chat(u, r, run, run_resolved=True)
-        if r.get("task_name") and r.get("task_id"):
-            r["can_rename"] = _task_mutation_allowed(
-                u.acting_role(r.get("agent", "")), u.acting_sub or "",
-                r.get("task_scope") or "agent", r.get("task_created_by") or "",
-            )
-        else:
-            r["can_rename"] = r["can_delete"]
+        r["can_rename"] = r["can_delete"]
         # Sharing a chat as a snapshot (SHARING.md): the owner of a per-user
         # chat, editor and above on a shared-only agent's chat, never a task
         # run — the same rule the share routes apply.
@@ -281,8 +307,21 @@ def _widget_chat_visible(u: UserContext, chat: dict) -> bool:
     return is_shared_chat_owner(owner) and _widget_shows_agent(u, chat.get("agent", ""))
 
 
+def _hidden_workers(u: UserContext, chats: list[dict]) -> frozenset[str]:
+    """The shared-pool chats among ``chats`` that carry an agent-scope run
+    (delegated workers) on agents whose own work the viewer does not see:
+    one read, only when such a chat is there. Synchronous."""
+    from core.session.visibility import is_shared_chat_owner
+    ids = [c.get("id") or "" for c in chats
+           if is_shared_chat_owner(c.get("user_sub") or "")
+           and session_kind.of_chat(c) is not session_kind.TASK
+           and not u.sees_agent_automations(c.get("agent") or "")]
+    return frozenset(task_store.chat_ids_with_agent_runs(ids)) if ids else frozenset()
+
+
 def _shape_active_row(u: UserContext, chat: dict, status: str, *,
-                      runs: dict[str, dict], dyn_names: dict[str, str]) -> dict | None:
+                      runs: dict[str, dict], dyn_names: dict[str, str],
+                      hidden: frozenset[str] = frozenset()) -> dict | None:
     """One Active-now widget row, or None when the viewer must not see it.
     ``runs`` (run id → row) and ``dyn_names`` (task id → name) are the
     batched reads of ``_active_rows``; a run absent from the map hides the
@@ -298,11 +337,13 @@ def _shape_active_row(u: UserContext, chat: dict, status: str, *,
       for their creator — deliberately NO admin bypass (the admin audit page
       is the full-view surface). Gate the row on the RUN's visibility so the
       widget never emits a row whose destination page is empty. Task rows are
-      labeled by the task's NAME, matching the sidebar's task mode; the chat
-      title (prompt first line / LLM upgrade) is the fallback for runs whose
-      task row is already gone.
+      labeled as the sidebar's task mode labels them: the run chat's own title
+      once the title model wrote it or a person renamed it
+      (``title_generated``), else the task's NAME, else the chat title (a run
+      whose task row is already gone).
     - Chat rows follow ``_widget_chat_visible`` (assignment-scoped, no admin
-      bypass).
+      bypass); ``hidden`` names the shared pool's delegated workers the viewer
+      may not see (an agent-scope run below the editor tier, ``_hidden_workers``).
     """
     from core.session.visibility import is_shared_chat_owner
     cid = chat.get("id", "")
@@ -312,11 +353,14 @@ def _shape_active_row(u: UserContext, chat: dict, status: str, *,
         run = runs.get(session_kind.run_id_of_chat(cid))
         if not run or not _widget_shows_agent(u, run.get("agent", "")):
             return None
-        if (run.get("scope") or "agent") == "user" and \
-                run.get("created_by") != u.acting_sub:
+        if (run.get("scope") or "agent") == "user":
+            if run.get("created_by") != u.acting_sub:
+                return None
+        elif not u.sees_agent_automations(run.get("agent", "")):
             return None
-        title = dyn_names.get(run.get("task_id") or "") or title
-    elif not _widget_chat_visible(u, chat):
+        if not (chat.get("title_generated") and title):
+            title = dyn_names.get(run.get("task_id") or "") or title
+    elif cid in hidden or not _widget_chat_visible(u, chat):
         return None
     return {
         "id": cid,
@@ -477,6 +521,8 @@ def _active_rows(u: UserContext, streaming_ids: list[str], warming_ids: list[str
     dyn_names = task_store.get_dynamic_task_names(
         [run.get("task_id") or "" for run in runs.values()])
 
+    unread = task_store.list_unread_finished_chats(since)
+    hidden = _hidden_workers(u, [*chats.values(), *unread])
     rows: list[dict] = []
     seen: set[str] = set()
     for ids, status in ((streaming_ids, chat_phase.STREAMING),
@@ -488,7 +534,8 @@ def _active_rows(u: UserContext, streaming_ids: list[str], warming_ids: list[str
             chat = chats.get(cid)
             if not chat:
                 continue
-            row = _shape_active_row(u, chat, status, runs=runs, dyn_names=dyn_names)
+            row = _shape_active_row(u, chat, status, runs=runs, dyn_names=dyn_names,
+                                    hidden=hidden)
             if row:
                 rows.append(row)
 
@@ -497,12 +544,12 @@ def _active_rows(u: UserContext, streaming_ids: list[str], warming_ids: list[str
     # steady done tint + dot and retires the row on open). Same per-row access
     # rule as the streaming set; 48h window, so an abandoned chat eventually
     # ages out of the widget while staying unread in its own history list.
-    for chat in task_store.list_unread_finished_chats(since):
+    for chat in unread:
         cid = chat.get("id", "")
         if not cid or cid in seen:
             continue
         seen.add(cid)
-        if not _widget_chat_visible(u, chat):
+        if cid in hidden or not _widget_chat_visible(u, chat):
             continue
         rows.append({
             "id": cid,
@@ -541,14 +588,17 @@ def _search_chats_sync(u: UserContext, agent: str, kind: str, q: str,
                        limit: int) -> list[dict]:
     if kind == "tasks":
         require_agent_access(u, agent)
-        results = task_store.search_task_chats(agent, q, _task_scope_sub(u), limit=limit)
+        results = task_store.search_task_chats(agent, q, _task_scope_sub(u), limit=limit,
+                                               own_only=not u.sees_agent_automations(agent))
         _stamp_mutation_flags(u, results)
         return results
     from core.session.visibility import chat_history_owner
     owner = chat_history_owner(agent, u.sub)
+    hide = False
     if owner != u.sub:
         require_agent_access(u, agent)
-    results = task_store.search_chats(owner, agent, q, limit=limit)
+        hide = not u.sees_agent_automations(agent)
+    results = task_store.search_chats(owner, agent, q, limit=limit, hide_agent_runs=hide)
     _stamp_mutation_flags(u, results)
     return results
 

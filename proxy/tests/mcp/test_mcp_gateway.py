@@ -187,6 +187,33 @@ def test_a_dead_account_is_a_reconnect_refusal_never_a_header(tmp_path, monkeypa
     assert "reconnect" in out.detail and "at-1" not in out.detail
 
 
+def test_a_file_its_server_refused_still_resolves_and_names_the_refused_calls(tmp_path, monkeypatch):
+    """A session that holds the MCP keeps calling (an answered call clears
+    the mark); the forward learns what the mark recorded and the token's
+    digest, never the token."""
+    key = _provider()
+    bearer_allowlist.add_allowed(key, "mcp.example.com", "test")
+    monkeypatch.setattr(mcp_gateway, "_egress_refusal", lambda u: None)
+    _token_file(tmp_path, extra={"refused_by": {"m1": {"at": "x", "methods": ["initialize"]}}})
+    cred = _vendor(key, value="", token_ref=TokenRef(str(tmp_path), "acct"), manifest="m1")
+    out = mcp_gateway.resolve_credential(cred)
+    assert isinstance(out, Resolved) and out.value == "Bearer at-1"
+    assert out.marked == ("initialize",) and len(out.digest) == 16 and "at-1" not in out.digest
+    raw = json.loads((tmp_path / "acct.json").read_text())
+    assert mcp_gateway.token_digest(raw, cred.token_ref) == out.digest
+    other = _vendor(key, value="", token_ref=TokenRef(str(tmp_path), "acct"), manifest="m2")
+    assert mcp_gateway.resolve_credential(other).marked == ()
+
+
+def test_request_methods_reads_a_message_or_a_batch():
+    assert mcp_gateway.request_methods(b'{"jsonrpc":"2.0","id":1,"method":"tools/call"}') == ("tools/call",)
+    assert mcp_gateway.request_methods(
+        b'[{"id":1,"method":"initialize"},{"method":"notifications/initialized"},{"id":2}]'
+    ) == ("initialize", "notifications/initialized")
+    assert mcp_gateway.request_methods(b"not json") == ()
+    assert mcp_gateway.request_methods(b"") == ()
+
+
 def test_a_missing_token_file_or_an_empty_value_refuses(tmp_path, monkeypatch):
     key = _provider()
     bearer_allowlist.add_allowed(key, "mcp.example.com", "test")

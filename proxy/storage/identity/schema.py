@@ -51,7 +51,13 @@ def init_identity(conn) -> None:
             token_epoch_at TEXT,
             -- The TOTP time step the account accepted last: a code is good
             -- only for a later step (auth/totp.py, RFC 6238 replay).
-            totp_last_step BIGINT NOT NULL DEFAULT 0
+            totp_last_step BIGINT NOT NULL DEFAULT 0,
+            -- A preferred engine stored before the engines followed use:
+            -- read only, first while the person has no chat in the window
+            -- on an engine the agent allows them
+            -- (services/engines/engine_resolution.py); never written now,
+            -- dropped at the next minor.
+            preferred_execution_path TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
@@ -251,8 +257,13 @@ def init_identity(conn) -> None:
     # pairs may receive a user's OAuth token via HTTP Authorization
     # injection. Hybrid model: MCP manifests declare INTENT
     # (``credentials.oauth.bearer_required`` + ``proposed_hosts``); this
-    # table is the platform-controlled REALITY. Seeded with known vendor
-    # hosts below; admins can extend via /v1/admin/oauth-bearer-allowlist.
+    # table is the platform-controlled REALITY, with no predefined row;
+    # admins can extend via /v1/admin/oauth-bearer-allowlist.
+    # ``source``: ``admin`` (hand-added, or seeded by an older version),
+    # else the MCP whose manifest put the row there (an older install's
+    # table takes it in ``bearer_allowlist.migrate``). The ledgers beside it
+    # record the hosts each MCP's provenance approved, kept while the MCP is
+    # disabled, and where each MCP was installed from.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS oauth_bearer_allowlist (
             id SERIAL PRIMARY KEY,
@@ -260,16 +271,39 @@ def init_identity(conn) -> None:
             host_pattern TEXT NOT NULL,
             added_by TEXT NOT NULL DEFAULT 'system',
             added_at TEXT NOT NULL,
-            UNIQUE(provider_id, host_pattern)
+            source TEXT NOT NULL DEFAULT 'admin',
+            CONSTRAINT oauth_bearer_allowlist_source_key UNIQUE (provider_id, host_pattern, source)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_bearer_allowlist_mcp_approved (
+            mcp_name TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            host_pattern TEXT NOT NULL,
+            via TEXT NOT NULL,
+            approved_by TEXT NOT NULL DEFAULT '',
+            approved_at TEXT NOT NULL,
+            PRIMARY KEY (mcp_name, provider_id, host_pattern)
         )
     """)
 
-    # Seed vendor-official hosts so the framework works out of the box.
-    # Idempotent (ON CONFLICT DO NOTHING) — keeps admin-added entries intact;
-    # admins re-add any deleted defaults via the "Restore defaults" action
-    # (Admin Setup → Security). DEFAULT_ALLOWLIST is the single source of truth.
-    from storage.identity import bearer_allowlist
-    bearer_allowlist.seed_defaults(conn)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_bearer_allowlist_mcp_origin (
+            mcp_name TEXT PRIMARY KEY,
+            via TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )
+    """)
+    # The old boot seed's ledger: nothing writes or reads it, and a released
+    # table is never dropped.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_bearer_allowlist_seeded (
+            provider_id TEXT NOT NULL,
+            host_pattern TEXT NOT NULL,
+            seeded_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, host_pattern)
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS infra_credentials (
@@ -342,3 +376,17 @@ def init_identity(conn) -> None:
         ON oauth_client_registrations(issuer, redirect_uri)
         WHERE revoked_at = ''
     """)
+
+
+def migrate_identity(conn) -> None:
+    """The identity domain's forward migrations on an existing install
+    (``run_migrations`` calls it; every step is idempotent)."""
+    # 1.9.1: the bearer allowlist's rows carry their source.
+    from storage.identity import bearer_allowlist
+    bearer_allowlist.migrate(conn)
+    # 1.9.1: a preferred engine ('' on every pre-existing row). Read only,
+    # as the seed of the engine order by use; dropped at the next minor.
+    conn.execute(
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS preferred_execution_path TEXT NOT NULL DEFAULT ''"
+    )

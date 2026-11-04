@@ -215,10 +215,14 @@ class ProxyClient:
         except Exception as e:  # noqa: BLE001  # the proxy socket's send raises by its state and transport
             logger.warning("WS call control result send failed: %s", e)
 
-    def discard_turn(self) -> None:
-        """Stop reading the open turn: the line closes as the farewell drains
-        and whatever the engine still produces is the proxy's transcript. The
-        receiver drops the turn's remaining frames."""
+    def discard_turn(self, turn: int | None = None) -> None:
+        """Stop reading ``turn``: the line closes as the farewell drains and
+        whatever the engine still produces is the proxy's transcript. The
+        receiver drops the turn's remaining frames. A newer turn opened since
+        (the outcome summary of a call the person hung up on) keeps its queue;
+        ``None`` names the open turn."""
+        if turn is not None and turn != self._current_turn:
+            return
         self._turn_queue = None
         self.turn_in_flight = False
 
@@ -349,7 +353,8 @@ class ProxyClient:
         self._current_turn = turn
         # Fresh queue per turn: frames from abandoned/aborted turns die with
         # their old queue instead of bleeding into this one.
-        self._turn_queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue()
+        self._turn_queue = queue
 
         try:
             frame = {
@@ -369,7 +374,6 @@ class ProxyClient:
             return
 
         full_response = []
-        queue = self._turn_queue
         # Turn-liveness flag for _cancel_tts's upstream-abort gate: a commit
         # landing after the engine finished must not fire a session-scoped
         # abort that could kill an unrelated queued turn.
@@ -574,6 +578,30 @@ async def report_relisten_usage(*, agent: str, provider: str, seconds: float, se
             )
     except Exception as e:  # noqa: BLE001  # usage reports are best effort, the call's teardown must not see them
         logger.warning("Second-listen usage report failed: %s", e)
+
+
+async def report_duplex_usage(*, chat_id: str, sub: str, provider: str, stream_seconds: float,
+                              relisten_seconds: float, session_id: str = "") -> None:
+    """Report one spoken conversation's speech seconds (the stream's, the
+    second listen's apart) to the proxy, which records them under the person
+    who spoke. Best effort, as the others."""
+    if stream_seconds <= 0 and relisten_seconds <= 0:
+        return
+    try:
+        async with httpx.AsyncClient(
+            base_url=config.PROXY_URL,
+            timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0),
+        ) as http:
+            await http.post(
+                "/v1/phone/usage/duplex",
+                headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
+                json={"chat_id": chat_id, "sub": sub, "provider": provider,
+                      "stream_seconds": round(float(stream_seconds), 2),
+                      "relisten_seconds": round(float(relisten_seconds), 2),
+                      "session_id": session_id or ""},
+            )
+    except Exception as e:  # noqa: BLE001  # usage reports are best effort, the session's teardown must not see them
+        logger.warning("Spoken conversation usage report failed: %s", e)
 
 
 async def report_turn_classifier_usage(

@@ -535,3 +535,42 @@ def test_a_revive_on_a_new_thread_reseeds_the_chat_bound_to_the_session(temp_db)
     asyncio.run(codex_remote._reseed_after_revive("sid-rv"))
     assert db.get_chat("c-rv")["pending_history_seed"] == "resume_failed"
     asyncio.run(codex_remote._reseed_after_revive("sid-nobody"))   # no chat: nothing
+
+
+# ---------------------------------------------------------------------------
+# A person's attachments in the digest
+# ---------------------------------------------------------------------------
+
+def _meta(*photos, files=()):
+    return json.dumps({
+        **({"images": [{"name": p.rsplit("/", 1)[-1], "path": p} for p in photos]} if photos else {}),
+        **({"files": [{"name": f.rsplit("/", 1)[-1], "path": f} for f in files]} if files else {}),
+    })
+
+
+def test_seed_names_a_messages_attachments_by_path(temp_db):
+    from core.session.history_seed import build_history_seed
+    from storage import database as db
+    db.create_chat("c-att", "user-1", "agent-x")
+    _add(db, "c-att", "user", "what is in these",
+         event_data=_meta("users/u/workspace/uploads/photos/a.jpg",
+                          files=["users/u/workspace/uploads/files/b.pdf"]))
+    _add(db, "c-att", "assistant", "a cat and a bill")
+    _add(db, "c-att", "user", "the current prompt")
+
+    seed = build_history_seed("c-att")
+    assert ("User: what is in these [attached: /users/u/workspace/uploads/photos/a.jpg, "
+            "/users/u/workspace/uploads/files/b.pdf]") in seed
+
+
+def test_seed_keeps_a_message_of_photos_alone(temp_db):
+    from core.session.history_seed import build_history_seed
+    from storage import database as db
+    db.create_chat("c-photo", "user-1", "agent-x")
+    _add(db, "c-photo", "user", "", event_data=_meta("users/u/workspace/uploads/photos/a.jpg"))
+    _add(db, "c-photo", "assistant", "a cat")
+    _add(db, "c-photo", "user", "the current prompt")
+
+    seed = build_history_seed("c-photo")
+    assert "User: [attached: /users/u/workspace/uploads/photos/a.jpg]" in seed
+    assert seed.index("User: [attached:") < seed.index("Assistant: a cat")

@@ -73,3 +73,42 @@ def test_sessions_count_independently(temp_db):
     assert memory_nudge.maybe_nudge("b") is None
     assert memory_nudge.maybe_nudge("a") == memory_nudge.NUDGE_TEXT
     assert memory_nudge.maybe_nudge("b") == memory_nudge.NUDGE_TEXT
+
+
+# ---------------------------------------------------------------------------
+# The arm after a compaction
+# ---------------------------------------------------------------------------
+
+def test_a_compaction_arms_the_next_message_once(temp_db):
+    _reset_module()
+    memory_nudge._armed.clear()
+    memory_store.update_settings(nudge_turns=10)
+    sid = "s-armed"
+    assert memory_nudge.maybe_nudge(sid) is None
+    memory_nudge.arm(sid)
+    memory_nudge.arm(sid)  # a second completed phase re-arms harmlessly
+    assert memory_nudge.maybe_nudge(sid) == memory_nudge.NUDGE_TEXT
+    assert memory_nudge.maybe_nudge(sid) is None
+    assert sid not in memory_nudge._armed and memory_nudge._counters[sid] == 1
+
+
+def test_the_arm_respects_the_off_switch_and_forget(temp_db):
+    _reset_module()
+    memory_nudge._armed.clear()
+    memory_store.update_settings(nudge_turns=0)
+    memory_nudge.arm("s-off")
+    assert memory_nudge.maybe_nudge("s-off") is None
+    assert "s-off" not in memory_nudge._armed
+    memory_store.update_settings(nudge_turns=5)
+    memory_nudge.arm("s-gone")
+    memory_nudge.forget("s-gone")
+    assert "s-gone" not in memory_nudge._armed
+
+
+def test_the_arm_has_its_own_bound(temp_db, monkeypatch):
+    _reset_module()
+    memory_nudge._armed.clear()
+    monkeypatch.setattr(memory_nudge, "_MAX_TRACKED_SESSIONS", 3)
+    for i in range(8):
+        memory_nudge.arm(f"task-{i}")  # a task session nobody nudges
+    assert list(memory_nudge._armed) == ["task-5", "task-6", "task-7"]

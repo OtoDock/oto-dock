@@ -26,7 +26,9 @@ pygetwindow==0.0.9
 pyjwt==2.15.1
 pymsgbox==2.0.1
 pyobjc-core==12.2.1 ; sys_platform == 'darwin'
+pyobjc-framework-applicationservices==12.2.1 ; sys_platform == 'darwin'
 pyobjc-framework-cocoa==12.2.1 ; sys_platform == 'darwin'
+pyobjc-framework-coretext==12.2.1 ; sys_platform == 'darwin'
 pyobjc-framework-quartz==12.2.1 ; sys_platform == 'darwin'
 pyperclip==1.11.0
 pyrect==0.2.0

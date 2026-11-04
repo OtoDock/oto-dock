@@ -59,6 +59,11 @@ interface Props {
   /** A person's own placement: revoke their share (the host confirms
       first); offered in place of Hide for me when the host passes it. */
   onRemoveForMe?: () => void
+  /** An app that follows another agent's app (services/apps/app_follow.py): this app's release onto the source, held for the
+      source's approval, for whoever may manage both; and the end of the
+      lineage (the host confirms first). */
+  onSendToSource?: () => void
+  onStopFollowing?: () => void
   /** Chip placement: light glyph on the chip's own color. */
   onChip?: boolean
 }
@@ -66,7 +71,7 @@ interface Props {
 export default function AppMenu({
   app, fullScreen = false, onHideForMe, onUnpin, onShare, onRollback, onLogs, onSettings,
   onTogglePreview, previewing = false, onDelete, onWhereFrom, onRemoveFromAgent, onRemoveForMe,
-  onChip = false,
+  onSendToSource, onStopFollowing, onChip = false,
 }: Props) {
   // What the app's kind can do (lib/kinds/app.ts) decides which rows show.
   const kind = appKind(app)
@@ -191,6 +196,18 @@ export default function AppMenu({
           {onSettings && kind.hasSettings && app.can_manage && (
             <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onSettings() })} title="The secrets the app needs, set by a person">
               Settings
+            </button>
+          )}
+          {onSendToSource && app.follows && (
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onSendToSource() })}
+              title={`Puts this app’s release into ${app.follows.agent_name}’s app, where it waits for approval`}>
+              Send this release to the source
+            </button>
+          )}
+          {onStopFollowing && app.follows && (
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onStopFollowing() })}
+              title="This app no longer offers the source’s releases">
+              Stop following
             </button>
           )}
           {canHide && (

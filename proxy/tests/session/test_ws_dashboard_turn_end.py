@@ -7,7 +7,7 @@ a dead process is reaped with the ``lost`` ending."""
 import asyncio
 import json
 
-import pytest  # noqa: F401  (temp_db / monkeypatch fixtures)
+import pytest
 
 import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from core.events import turn_ending
@@ -336,3 +336,143 @@ def test_a_send_that_takes_waiting_messages_names_the_turn_that_ended(temp_db, m
             assert prompts[1].rstrip().endswith("waiting one\n\nfresh one")
     run_ws_scenario(scenario)
 
+
+# ── the cancelled context names the cut message's attachments ─────────────
+
+
+def _person(db, cid, text, *photos, files=()):
+    meta = {}
+    if photos:
+        meta["images"] = [{"name": "p.jpg", "path": p} for p in photos]
+    if files:
+        meta["files"] = [{"name": "f", "path": f} for f in files]
+    db.add_chat_message(cid, "user", text, event_data=json.dumps(meta) if meta else "")
+
+
+def _ended(db, cid, reason="lost"):
+    db.add_chat_message(cid, "event", "", event_type="system", event_data=json.dumps(
+        {"type": "system", "subtype": "turn_ended", "reason": reason, "message": "x"}))
+
+
+PHOTO = "users/admin/workspace/uploads/photos/img_1.jpg"
+DOC = "users/admin/workspace/uploads/files/plan.pdf"
+
+
+class TestCancelledContextAttachments:
+    def test_resume_names_the_cut_messages_photos_and_files(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-1", "user-admin", "agent-x")
+        _person(temp_db, "cc-1", "read these", PHOTO, files=[DOC])
+        temp_db.add_chat_message("cc-1", "assistant", "Looking")
+        _ended(temp_db, "cc-1")
+        _person(temp_db, "cc-1", "Continue from where you stopped.")
+        ctx = cancelled_context("cc-1")
+        assert "ended early (lost)" in ctx
+        assert "User said: read these" in ctx
+        assert f"- /{PHOTO}" in ctx and f"- /{DOC}" in ctx
+        assert "Your partial response before cancellation:\nLooking" in ctx
+
+    def test_a_message_of_photos_alone_is_the_cut_message(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-2", "user-admin", "agent-x")
+        _person(temp_db, "cc-2", "an earlier message")
+        temp_db.add_chat_message("cc-2", "assistant", "an earlier answer")
+        _person(temp_db, "cc-2", "", PHOTO)
+        _ended(temp_db, "cc-2")
+        _person(temp_db, "cc-2", "Continue from where you stopped.")
+        ctx = cancelled_context("cc-2")
+        assert "User sent attachments with no text." in ctx
+        assert f"- /{PHOTO}" in ctx
+        assert "an earlier message" not in ctx
+
+    def test_send_again_with_the_same_photos_gets_no_copy(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-3", "user-admin", "agent-x")
+        _person(temp_db, "cc-3", "", PHOTO)
+        _ended(temp_db, "cc-3", "exited")
+        _person(temp_db, "cc-3", "", PHOTO)
+        assert cancelled_context("cc-3") == ""
+
+    def test_the_same_text_with_other_photos_is_a_new_message(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-4", "user-admin", "agent-x")
+        _person(temp_db, "cc-4", "look", PHOTO)
+        _ended(temp_db, "cc-4", "exited")
+        _person(temp_db, "cc-4", "look", "users/admin/workspace/uploads/photos/img_2.jpg")
+        assert f"- /{PHOTO}" in cancelled_context("cc-4")
+
+    def test_send_again_missing_a_photo_that_is_gone_gets_no_copy(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-5", "user-admin", "agent-x")
+        _person(temp_db, "cc-5", "look", PHOTO, "users/admin/workspace/uploads/photos/gone.jpg")
+        _ended(temp_db, "cc-5", "exited")
+        _person(temp_db, "cc-5", "look", PHOTO)
+        assert cancelled_context("cc-5") == ""
+
+    def test_an_engine_that_takes_photos_inline_gets_their_count(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-6", "user-admin", "agent-x")
+        _person(temp_db, "cc-6", "look", PHOTO, files=[DOC])
+        _ended(temp_db, "cc-6", "exited")
+        _person(temp_db, "cc-6", "Continue from where you stopped.")
+        ctx = cancelled_context("cc-6", inline_photos=True)
+        assert "Attached to it: 1 photo(s)." in ctx
+        assert f"/{PHOTO}" not in ctx and f"- /{DOC}" in ctx
+
+    def test_the_messages_that_went_with_it_are_named_too(self, temp_db):
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-7", "user-admin", "agent-x")
+        temp_db.add_chat_message("cc-7", "assistant", "the answer before")
+        # A batch: a waiting message taken along with the person's send.
+        _person(temp_db, "cc-7", "first part", PHOTO)
+        _person(temp_db, "cc-7", "second part")
+        _ended(temp_db, "cc-7")
+        _person(temp_db, "cc-7", "Continue from where you stopped.")
+        ctx = cancelled_context("cc-7")
+        assert "User said: first part\n\nsecond part" in ctx
+        assert f"- /{PHOTO}" in ctx
+        assert "the answer before" not in ctx
+
+    def test_send_again_of_a_joined_batch_gets_no_copy(self, temp_db):
+        # The dashboard's Send again joins the cut turn's messages with a
+        # blank line (lastTurnPrompt), as this builder joins the cut rows.
+        from ws.dashboard_cancelled import cancelled_context
+        temp_db.create_chat("cc-8", "user-admin", "agent-x")
+        temp_db.add_chat_message("cc-8", "assistant", "the answer before")
+        _person(temp_db, "cc-8", "first part", PHOTO)
+        _person(temp_db, "cc-8", "second part")
+        _ended(temp_db, "cc-8", "exited")
+        _person(temp_db, "cc-8", "first part\n\nsecond part", PHOTO)
+        assert cancelled_context("cc-8") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_queued_batch_on_an_engine_that_takes_photos_inline_gets_their_count(temp_db):
+    """A queued batch delivered as the next turn reads the cut turn's context
+    as an idle send does: an engine with no Read tool gets the photos
+    counted, never paths it cannot open."""
+    from types import SimpleNamespace
+
+    from ws.dashboard import DashboardConnection
+    temp_db.create_chat("cc-q", "user-admin", "agent-x")
+    _person(temp_db, "cc-q", "look", PHOTO, files=[DOC])
+    _ended(temp_db, "cc-q", "exited")
+    temp_db.update_chat("cc-q", last_turn_aborted=True, last_abort_graceful=False)
+    conn = object.__new__(DashboardConnection)
+    conn.user_sub = "user-admin"
+    conn.user = {"username": "admin"}
+
+    def _layer(inline):
+        return SimpleNamespace(capabilities_for=lambda sid: SimpleNamespace(
+            behaviour=SimpleNamespace(attach_images_inline=inline)))
+
+    prompt, consumed = await conn._prepared_prompt("cc-q", "go on", new_text="go on",
+                                                   layer=_layer(True), session_id="s-1")
+    assert consumed == {"last_turn_aborted": True, "last_abort_graceful": False}
+    assert "Attached to it: 1 photo(s)." in prompt and f"/{PHOTO}" not in prompt
+    assert f"- /{DOC}" in prompt and prompt.endswith("go on")
+
+    temp_db.update_chat("cc-q", last_turn_aborted=True, last_abort_graceful=False)
+    prompt, _consumed = await conn._prepared_prompt("cc-q", "go on", new_text="go on",
+                                                    layer=_layer(False), session_id="s-1")
+    assert f"- /{PHOTO}" in prompt

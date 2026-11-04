@@ -45,6 +45,10 @@ export interface ClampOptions {
   gap?: number
   /** Which anchor edge the panel's matching edge lines up with. */
   align?: 'left' | 'right'
+  /** Where the panel goes when it fits both ways: below (the default), or
+   *  above, for an anchor that sits right over a field the panel must not
+   *  cover (the place chip over the message box). */
+  prefer?: 'below' | 'above'
 }
 
 /** Pure: the placement for a panel of `panel` size next to `anchor` inside
@@ -65,6 +69,7 @@ export function clampPopover(
   const fitsBelow = below + panel.height <= viewport.height - margin
   const above = anchor.top - gap - panel.height
   const fitsAbove = above >= margin
+  if (opts.prefer === 'above' && fitsAbove) return { top: above, left, flipped: true }
   if (fitsBelow || !fitsAbove) {
     const maxTop = viewport.height - panel.height - margin
     return { top: Math.max(margin, Math.min(below, maxTop)), left, flipped: false }
@@ -83,7 +88,7 @@ export function usePopoverPlacement(
   panelRef: RefObject<HTMLElement | null>,
   opts: ClampOptions = {},
 ): Placement | null {
-  const { margin, gap, align } = opts
+  const { margin, gap, align, prefer } = opts
   const getPanel = useCallback(() => panelRef.current, [panelRef])
   const box = useElementBox(getPanel, anchor !== null)
   return useMemo(() => {
@@ -92,9 +97,9 @@ export function usePopoverPlacement(
       anchor,
       { width: box.width, height: box.height },
       { width: box.viewportWidth, height: box.viewportHeight },
-      { margin, gap, align },
+      { margin, gap, align, prefer },
     )
-  }, [anchor, box, margin, gap, align])
+  }, [anchor, box, margin, gap, align, prefer])
 }
 
 /** The four numbers a `DOMRect` contributes, as a plain object React can

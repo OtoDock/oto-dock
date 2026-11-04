@@ -127,13 +127,24 @@ def _gather_sync(agent: str, owner: str, own_chat_id: str) -> tuple[list, list]:
         siblings.append((row.get("title") or cid[:8], status))
         sibling_ids.add(cid)
     tasks: list[tuple[str, str]] = []
+    # A person below the editor tier is not told what the agent runs on its
+    # own behalf; a shared pool (``agent::``) only has editors' sessions.
+    shared_work = True
+    from core.session.visibility import is_synthetic_owner
+    if owner and not is_synthetic_owner(owner):
+        from auth import roles
+        from auth.providers import acting_role_of
+        shared_work = roles.can_edit(acting_role_of(owner, agent))
     for r in snap["tasks"]:
         if r.get("agent") != agent:
             continue
         rcid = r.get("chat_id") or ""
         if rcid and (rcid == own_chat_id or rcid in sibling_ids):
             continue
-        if r.get("scope") == "user" and r.get("created_by") != owner:
+        if r.get("scope") == "user":
+            if r.get("created_by") != owner:
+                continue
+        elif not shared_work:
             continue
         tasks.append((r.get("name") or r["task_id"], r["task_id"]))
     return siblings, tasks

@@ -3,8 +3,8 @@
 Memory content lives in markdown files under each agent's tree
 (``knowledge/memory/`` shared, ``users/{u}/context/memory/`` per-user —
 see ``services/memory_file``). This module manages only the platform
-toggles, per-agent overrides, the prompt-injection inline budget, and the
-turn-counter nudge knob.
+toggles, per-agent overrides, the prompt-injection inline budget, the
+turn-counter nudge knob and the two size caps.
 
 All functions are synchronous (called via ``asyncio.to_thread`` from async
 contexts).
@@ -49,6 +49,7 @@ def update_settings(**kwargs) -> dict[str, Any]:
     allowed = {
         "user_memory_enabled", "agent_memory_enabled",
         "inline_budget_bytes", "nudge_turns",
+        "topic_grow_cap_bytes", "entry_cap_bytes",
     }
     updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not updates:

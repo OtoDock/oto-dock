@@ -8,22 +8,25 @@ name: ci
 # same tools and severities: gitleaks, hadolint, actionlint, reuse, pip-audit
 # and, on a pull request, the dependency review.
 #
-# Branch protection on main requires `proxy`, `dashboard`, `satellite` and
-# `phone`; every other job here reports without blocking a merge. The
-# dashboard's ESLint gate and the proxy's mypy check run in their own jobs
-# (`dashboard-lint`, `typecheck`) for that reason.
+# Branch protection on main requires every job here. The dashboard's ESLint
+# gate and the proxy's mypy check run in their own jobs (`dashboard-lint`,
+# `typecheck`).
+#
+# A release candidate branch (`rc/<version>-rcN`) runs every job too: a
+# release publishes only a tree whose whole run here is green.
 
 on:
   workflow_dispatch: {}
   push:
-    branches: [main]
+    branches: [main, 'rc/**']
   pull_request:
 
 permissions:
   contents: read
 
-# A force-push to a PR branch cancels the now-stale run; pushes to main
-# always run to completion (their results guard the release flow).
+# A force-push to a PR branch cancels the now-stale run; pushes to main and
+# to a release candidate branch always run to completion (their results
+# guard the release flow).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -31,10 +34,13 @@ concurrency:
 jobs:
   proxy:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    # A named image, never ubuntu-latest: the sandbox tests run bwrap and pasta on the
+    # runner itself, and the moving label reached Ubuntu 26.04 on 2026-11-04, where
+    # pasta reads no nameserver and refuses to start the command.
+    runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
+        image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -59,9 +65,8 @@ jobs:
             audio/pyproject.toml
 
       - name: ruff
-        # The import and dead-code rules this required check has always held;
-        # the rest of ruff.toml's policy (and its baseline) runs in the `lint`
-        # job, which reports without blocking a merge.
+        # The import and dead-code rules this check has always held; the rest
+        # of ruff.toml's policy (and its baseline) runs in the `lint` job.
         run: |
           python -m pip install -q "ruff==0.15.22"
           ruff check --select F401,F821,F403,F405,F811,F841,B018,E722,SIM105,PLW0108 .
@@ -96,9 +101,62 @@ jobs:
         working-directory: audio
         run: python -m pytest -q
 
+  # The sandbox suite on GitHub's newest Ubuntu image: the one check that
+  # follows the moving label. Informational until it has been green on two
+  # releases (a new image lands between releases, and the pinned jobs above
+  # are the gate); read its result before a publish all the same.
+  sandbox-newest-ubuntu:
+    if: github.repository == 'OtoDock/oto-dock'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        env:
+          POSTGRES_USER: otodock
+          POSTGRES_PASSWORD: otodock
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U otodock"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            proxy/requirements.txt
+            proxy/requirements-test.txt
+            audio/pyproject.toml
+
+      - name: System tools used by the suite
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap passt iproute2 ripgrep
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          lsb_release -ds; pasta --version | head -n 1; aa-status --json 2>/dev/null | head -c 400 || true
+
+      - name: Install proxy dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install "./audio[localmodels]"
+          python -m pip install -r proxy/requirements.txt -r proxy/requirements-test.txt
+
+      - name: pytest (the sandbox)
+        working-directory: proxy
+        env:
+          TEST_DATABASE_URL: postgresql://otodock:otodock@localhost:5432/otodock_test
+        run: python -m pytest -n 4 -q tests/execution/test_sandbox.py tests/execution/test_hook_bind.py
+
   # The same suites on arm64: the release images publish for both
   # architectures, and the sandbox (bwrap + pasta namespaces) and the ONNX
-  # models are the parts a build alone does not prove. Not a required check.
+  # models are the parts a build alone does not prove.
   # Same steps as `proxy` on a GitHub-hosted arm64 runner (free for public
   # repositories).
   proxy-arm64:
@@ -106,7 +164,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
+        image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -157,7 +215,7 @@ jobs:
   # root so the `satellite` package imports as it does on a paired machine.
   satellite:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -192,7 +250,7 @@ jobs:
   # tomli below 3.11 (the daemon validates a composed config.toml with it).
   satellite-floor:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -223,7 +281,7 @@ jobs:
   # package). cwd = repo root so `./audio` resolves.
   phone:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -250,7 +308,7 @@ jobs:
 
   dashboard:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -279,10 +337,10 @@ jobs:
         run: npx vitest run
 
   # ESLint on the dashboard: every rule an error; dashboard/eslint-suppressions.json
-  # is empty (a finding is fixed, never suppressed). Not a required check.
+  # is empty (a finding is fixed, never suppressed).
   dashboard-lint:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -303,11 +361,10 @@ jobs:
         run: npm run lint
 
   # mypy on the whole proxy (proxy/mypy.ini `files = .`), with the proxy's
-  # dependencies installed so their types are the ones a local run sees. Not
-  # a required check.
+  # dependencies installed so their types are the ones a local run sees.
   typecheck:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -336,10 +393,10 @@ jobs:
   # The Android app as a contributor builds it: the web bundle synced into
   # the Gradle project, the debug APK and the native unit tests. No
   # google-services.json (the app then builds without push) and no signing
-  # values (only release packaging needs them). Not a required check.
+  # values (only release packaging needs them).
   android:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -374,10 +431,10 @@ jobs:
 
   # Secrets in the tracked tree, the Dockerfiles, the workflows and the
   # licensing (REUSE.toml), each tool at a pinned version checked against its
-  # published sha256, and ruff's whole policy. Not a required check.
+  # published sha256, and ruff's whole policy.
   lint:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GITLEAKS_VERSION: 8.24.3
       GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
@@ -440,10 +497,10 @@ jobs:
 
   # Known vulnerabilities in every pinned Python lockfile, judged as the
   # release gate judges them: one with a fixed release fails, one without a
-  # fix yet is a warning. Not a required check.
+  # fix yet is a warning.
   pip-audit:
     if: github.repository == 'OtoDock/oto-dock'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -487,11 +544,10 @@ jobs:
           PY
 
   # A pull request that adds a dependency with a known high or critical
-  # vulnerability is flagged, the severity the release gate fails on. Not a
-  # required check.
+  # vulnerability is flagged, the severity the release gate fails on.
   dependency-review:
     if: github.repository == 'OtoDock/oto-dock' && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:

@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchAuthConfig, signOutEverywhere } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
 import { ROLE, allowedOnSharedOnly, roleBadge, roleLabel } from '../../lib/permissions'
-import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
+import { PERSONAL_FIRST_HINT, isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { useSetPlatformAuth } from '../../api/executionLayers'
 import { apiJson, apiOk, withMessage } from '../../lib/http/apiJson'
 import { SaveState } from '../../components/ui/SettingsControls'
@@ -53,9 +53,10 @@ function useAgentList() {
       const data = await apiJson<{ agents: { name: string; collaborative?: boolean; default_scope?: 'user' | 'agent' }[] }>(
         '/v1/agents?all=true',
       ).catch(withMessage('Failed to fetch agents'))
-      // A Shared-only agent takes editor or manager assignments only.
+      // A Shared-only agent takes editor or manager assignments only; a
+      // personal-first one tells the admin what the new person will see.
       return data.agents
-        .map((a) => ({ name: a.name, sharedOnly: isSharedOnly(modeOfAgent(a)) }))
+        .map((a) => ({ name: a.name, sharedOnly: isSharedOnly(modeOfAgent(a)), hint: PERSONAL_FIRST_HINT[modeOfAgent(a)] }))
     },
   })
 }
@@ -358,13 +359,14 @@ export default function UsersPage() {
   const renderAgentEditor = () => (
     <div className="space-y-2">
       <div className="flex flex-col gap-1.5">
-        {allAgents?.map(({ name: agent, sharedOnly: agentSharedOnly }) => {
+        {allAgents?.map(({ name: agent, sharedOnly: agentSharedOnly, hint }) => {
           const role = editAgentRoles[agent] || startingRole(agent)
           // A Shared-only agent offers editor and manager only; a lower row an
           // older install holds shows, marked, and cannot be picked again.
           const legacy = agentSharedOnly && !allowedOnSharedOnly(role)
           return (
-            <label key={agent} className="flex items-center gap-2 min-w-0 text-xs text-primary">
+            <div key={agent}>
+            <label className="flex items-center gap-2 min-w-0 text-xs text-primary">
               <input
                 type="checkbox"
                 checked={editAgents.includes(agent)}
@@ -401,6 +403,10 @@ export default function UsersPage() {
                 </select>
               )}
             </label>
+            {hint && editAgents.includes(agent) && (
+              <p className="ml-6 text-3xs text-tertiary" data-testid={`personal-first-hint-${agent}`}>{hint}</p>
+            )}
+            </div>
           )
         })}
       </div>
@@ -757,7 +763,7 @@ export default function UsersPage() {
                     <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}
                       title="No password set yet. The invite link has not been used yet. Reset the password to give them a new way in.">Invite pending</span>
                   )}
-                  <span>Last login {formatDate(u.last_login)}</span>
+                  <span>{u.last_login ? `Last login ${formatDate(u.last_login)}` : 'Never signed in'}</span>
                   <span>Created {formatDate(u.created_at)}</span>
                 </div>
               )}

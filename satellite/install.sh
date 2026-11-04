@@ -45,6 +45,12 @@ CREDENTIAL_HELPER_B64="${CREDENTIAL_HELPER_B64:-}"
 SATELLITE_TARBALL_B64="${SATELLITE_TARBALL_B64:-}"
 SATELLITE_REPO="${SATELLITE_REPO:-}"
 
+# macOS: the platform's Python minor (PYTHON_VERSION in VERSIONS.md; a test
+# holds this default equal to it). The satellite and its MCP environments
+# run on it there: Homebrew's plain python3 moves to a new minor before the
+# packages the MCPs need publish builds for it.
+OTODOCK_PYTHON_MINOR="${OTODOCK_PYTHON_MINOR:-3.13}"
+
 if [ -z "$MACHINE_ID" ] || [ -z "$MACHINE_SECRET" ] || [ -z "$PLATFORM_URL" ]; then
     err "Missing MACHINE_ID, MACHINE_SECRET, or PLATFORM_URL."
     err "This script is meant to be invoked via the platform's bootstrap"
@@ -122,9 +128,68 @@ install_baseline_tools() {
 }
 install_baseline_tools
 
+# --- macOS: Homebrew on this shell's PATH, the login item's names ---
+# The baseline ran in a child shell, so its PATH did not come back, and an
+# SSH command runs no login shell.
+BREW_PREFIX=""
+if [ "$OS_TYPE" = "macos" ]; then
+    for b in "$(command -v brew 2>/dev/null || true)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if [ -n "$b" ] && [ -x "$b" ]; then
+            eval "$("$b" shellenv)"
+            BREW_PREFIX="$("$b" --prefix)"
+            break
+        fi
+    done
+    LAUNCHD_LABEL="com.otodock.satellite"
+    PLIST_FILE="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+    UID_NUM="$(id -u)"
+fi
+
+# Stop the login item and wait until launchd lets it go: `bootout` returns
+# before the job is gone, and a bootstrap right after it fails. A job an
+# older installer loaded over SSH may sit in the user domain instead.
+macos_stop_job() {
+    launchctl bootout "gui/$UID_NUM/$LAUNCHD_LABEL" 2>/dev/null || true
+    launchctl bootout "user/$UID_NUM/$LAUNCHD_LABEL" 2>/dev/null || true
+    if [ -f "$PLIST_FILE" ]; then
+        launchctl unload "$PLIST_FILE" 2>/dev/null || true
+    fi
+    for _ in $(seq 1 20); do
+        launchctl print "gui/$UID_NUM/$LAUNCHD_LABEL" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    warn "The satellite's login item is still loaded. Continuing."
+}
+
+# The login item's PATH: launchd gives it only the system folders, so without
+# Homebrew's and the per-user ones no CLI, npm or node resolves.
+macos_daemon_path() {
+    local d out=""
+    for d in ${BREW_PREFIX:+"$BREW_PREFIX/bin" "$BREW_PREFIX/sbin"} /usr/local/bin "$HOME/.local/bin" \
+             /usr/bin /bin /usr/sbin /sbin; do
+        case ":$out:" in *":$d:"*) ;; *) out="${out:+$out:}$d" ;; esac
+    done
+    echo "$out"
+}
+
 # --- Step 2: Python check ---
 PYTHON_CMD=""
-for cmd in python3 python; do
+if [ "$OS_TYPE" = "macos" ]; then
+    # The platform's minor through Homebrew's stable opt path (a patch
+    # upgrade of the keg keeps the venv working), else that minor on PATH.
+    for cmd in "${BREW_PREFIX:+$BREW_PREFIX/opt/python@$OTODOCK_PYTHON_MINOR/bin/python$OTODOCK_PYTHON_MINOR}" \
+               "python$OTODOCK_PYTHON_MINOR"; do
+        if [ -n "$cmd" ] && command -v "$cmd" &>/dev/null; then
+            PYTHON_CMD="$cmd"
+            ok "Python $OTODOCK_PYTHON_MINOR found ($cmd)"
+            break
+        fi
+    done
+    # Homebrew's newest python3 is a minor no compiled package serves yet:
+    # every Python tool would build from source and fail.
+    [ -n "$PYTHON_CMD" ] || warn "Python $OTODOCK_PYTHON_MINOR not found. Install it with 'brew install python@$OTODOCK_PYTHON_MINOR' and pair again, or tools written in Python may not install."
+fi
+[ -n "$PYTHON_CMD" ] || for cmd in python3 python; do
     if command -v "$cmd" &>/dev/null; then
         version=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
         major=$(echo "$version" | cut -d. -f1)
@@ -158,6 +223,10 @@ chmod 700 "$OTO_DIR"
 ok "Directories created"
 
 # --- Step 4: extract satellite tarball ---
+# A Mac paired before runs the satellite from these files: stop it first.
+if [ "$OS_TYPE" = "macos" ]; then
+    macos_stop_job
+fi
 if [ -n "$SATELLITE_TARBALL_B64" ]; then
     info "Extracting embedded satellite package..."
     echo "$SATELLITE_TARBALL_B64" | base64 -d | tar -xz -C "$SATELLITE_DIR"
@@ -174,6 +243,16 @@ else
 fi
 
 # --- Step 5: venv + Python deps ---
+# A Mac paired with Homebrew's newest Python moves to the platform's minor.
+# A host without it keeps the venv it has.
+if [ "$OS_TYPE" = "macos" ] && [ -d "$SATELLITE_DIR/venv" ]; then
+    want="$("$PYTHON_CMD" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    have="$("$SATELLITE_DIR/venv/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+    if [ "$want" = "$OTODOCK_PYTHON_MINOR" ] && [ "$have" != "$want" ]; then
+        info "Moving the satellite to Python $want (it ran on ${have:-an unreadable Python})..."
+        rm -rf "$SATELLITE_DIR/venv"
+    fi
+fi
 if [ ! -d "$SATELLITE_DIR/venv" ]; then
     "$PYTHON_CMD" -m venv "$SATELLITE_DIR/venv"
 fi
@@ -237,6 +316,11 @@ codex_bin = codex
 EOF
 chmod 600 "$OTO_DIR/satellite.conf"
 ok "Configuration written"
+
+# --- macOS: the satellite's app ---
+# The login item runs OtoDock Satellite.app, so macOS lists the satellite's
+# permissions under that name (satellite/host/macos_app.py builds it).
+APP_EXE="$OTO_DIR/OtoDock Satellite.app/Contents/MacOS/OtoDock Satellite"
 
 # --- Step 7: install + start per-user service ---
 # Per-user model: the daemon runs in the installing user's own session
@@ -302,31 +386,63 @@ EOF
         warn "  sudo loginctl enable-linger $USER"
     fi
 elif [ "$OS_TYPE" = "macos" ]; then
-    PLIST_FILE="$HOME/Library/LaunchAgents/com.otodock.satellite.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
+    if "$SATELLITE_DIR/venv/bin/python" "$SATELLITE_DIR/satellite/host/macos_app.py" "$OTO_DIR"; then
+        PROGRAM_ARGS="        <string>$APP_EXE</string>"
+        ASSOCIATED="    <key>AssociatedBundleIdentifiers</key><string>$LAUNCHD_LABEL</string>"
+    else
+        PROGRAM_ARGS="        <string>$SATELLITE_DIR/venv/bin/python</string>
+        <string>-m</string>
+        <string>satellite</string>"
+        ASSOCIATED=""
+    fi
     cat > "$PLIST_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>com.otodock.satellite</string>
+    <key>Label</key><string>$LAUNCHD_LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$SATELLITE_DIR/venv/bin/python</string>
-        <string>-m</string>
-        <string>satellite</string>
+$PROGRAM_ARGS
     </array>
+$ASSOCIATED
     <key>WorkingDirectory</key><string>$SATELLITE_DIR</string>
     <key>KeepAlive</key><true/>
     <key>RunAtLoad</key><true/>
     <key>StandardOutPath</key><string>$OTO_DIR/satellite.log</string>
     <key>StandardErrorPath</key><string>$OTO_DIR/satellite.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$(macos_daemon_path)</string>
+    </dict>
 </dict>
 </plist>
 EOF
-    launchctl unload "$PLIST_FILE" 2>/dev/null || true
-    launchctl load "$PLIST_FILE"
-    ok "launchd service installed and started"
+    # In the person's desktop session, where the screen is and where macOS
+    # asks for permissions, also when the pairing runs over SSH.
+    macos_stop_job
+    if launchctl print "gui/$UID_NUM" >/dev/null 2>&1; then
+        started=false
+        for _ in 1 2 3; do
+            if said="$(launchctl bootstrap "gui/$UID_NUM" "$PLIST_FILE" 2>&1)"; then
+                started=true
+                break
+            fi
+            sleep 2
+        done
+        if [ "$started" != true ]; then
+            err "The satellite's login item did not start. launchctl said: $said"
+            err "Try again with: launchctl bootstrap gui/$UID_NUM $PLIST_FILE"
+            exit 1
+        fi
+        ok "launchd service installed and started in your desktop session"
+    else
+        warn "No one is signed in to this Mac's desktop, so the satellite starts in the background."
+        warn "Screen and input control, and the permission questions, need a desktop sign-in."
+        launchctl load "$PLIST_FILE"
+        ok "launchd service installed and started"
+    fi
 else
     warn "Could not install system service. Run manually:"
     warn "  cd $SATELLITE_DIR && ./venv/bin/python -m satellite"
@@ -341,6 +457,6 @@ if [ "$OS_TYPE" = "linux" ]; then
     echo "Status: systemctl --user status oto-dock-satellite"
     echo "Logs:   journalctl --user -u oto-dock-satellite -f"
 elif [ "$OS_TYPE" = "macos" ]; then
-    echo "Status: launchctl list | grep otodock"
+    echo "Status: launchctl print gui/$(id -u)/com.otodock.satellite"
     echo "Logs:   tail -f $OTO_DIR/satellite.log"
 fi

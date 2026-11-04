@@ -21,6 +21,7 @@ from core.events.artifact_events import (
 )
 from core.session import interactive_session as isess
 from core.session.session_state import get_permission_queue
+from ws import wire_events as wire
 
 _ENV = {"TERM": "xterm-256color", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
@@ -79,6 +80,38 @@ class TestPersistDrainedArtifact:
         stored = json.loads(row["event_data"])
         assert not {"access_token", "access_token_ttl", "token_person"} & stored.keys()
         assert "wopi-tok" not in row["event_data"] and stored["wopi_url"] == "w"
+
+    def test_a_settings_card_persists_its_id_label_and_version_alone(self, temp_db):
+        """The settings tool's card (api/settings) persists like a final
+        artifact, under its own row kind; a value, had the item carried
+        one, never reaches the row."""
+        temp_db.create_chat("chat-art-5", "user-admin", "agent-x")
+        item = {"event_type": wire.ITEM_SETTINGS_CARD, "setting": "user.general.wake-word",
+                "label": "Wake word", "catalog_version": 3, "value": True}
+        row_id = isess.persist_drained_artifact("chat-art-5", item)
+        (row,) = temp_db.get_chat_messages("chat-art-5")
+        assert row["id"] == row_id and row["event_type"] == wire.SETTINGS_CARD
+        assert json.loads(row["event_data"]) == {
+            "type": wire.SETTINGS_CARD, "setting": "user.general.wake-word",
+            "label": "Wake word", "catalog_version": 3}
+
+    def test_an_action_card_persists_its_words_and_buttons_without_parameters(self, temp_db):
+        """A tool's action card (api/cards) persists like the settings card:
+        the id, the words, the buttons' ids, labels and kinds and the
+        options; an action's parameters never reach the row."""
+        temp_db.create_chat("chat-art-6", "user-admin", "agent-x")
+        item = {"event_type": wire.ITEM_ACTION_CARD, "card_id": "card-1", "title": "Move Alpha to Eng",
+                "text": "Places Alpha at the Team level of Eng.", "note": "",
+                "buttons": [{"id": "go", "label": "Move", "kind": "do", "params": {"agent": "alpha"}}],
+                "options": [], "params": {"agent": "alpha"}}
+        row_id = isess.persist_drained_artifact("chat-art-6", item)
+        (row,) = temp_db.get_chat_messages("chat-art-6")
+        assert row["id"] == row_id and row["event_type"] == wire.ACTION_CARD
+        stored = json.loads(row["event_data"])
+        assert stored["type"] == wire.ACTION_CARD and stored["card_id"] == "card-1"
+        assert stored["buttons"] == [{"id": "go", "label": "Move", "kind": "do", "params": {"agent": "alpha"}}] or \
+            stored["buttons"] == [{"id": "go", "label": "Move", "kind": "do"}]
+        assert "params" not in {k for k in stored if k != "buttons"}
 
     def test_transient_and_blocking_items_never_persist(self, temp_db):
         temp_db.create_chat("chat-art-3", "user-admin", "agent-x")
@@ -151,6 +184,82 @@ class TestDrainerPersistence:
             # … while blocking prompts pass through untouched, row-free.
             assert prompt["event_type"] == "permission_prompt"
             assert "db_message_id" not in prompt
+        finally:
+            await s.close()
+
+    async def test_drainer_persists_a_settings_card_and_stamps_its_row(
+        self, temp_db, _clean_registry,
+    ):
+        temp_db.create_chat("chat-drain-card", "user-admin", "agent-x")
+        s = await isess.register(
+            session_id="sid-art-card", chat_id="chat-drain-card",
+            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+        )
+        try:
+            got: asyncio.Queue = asyncio.Queue()
+            s.on_perm_event = got.put_nowait
+            get_permission_queue("sid-art-card").put_nowait({
+                "event_type": wire.ITEM_SETTINGS_CARD, "setting": "user.general.wake-word",
+                "label": "Wake word", "catalog_version": 3,
+            })
+            card = await asyncio.wait_for(got.get(), 5)
+            (row,) = temp_db.get_chat_messages("chat-drain-card")
+            assert row["event_type"] == wire.SETTINGS_CARD
+            assert card["db_message_id"] == row["id"]
+        finally:
+            await s.close()
+
+    async def test_drainer_persists_an_action_card_like_the_settings_card(
+        self, temp_db, _clean_registry,
+    ):
+        # The gate before the viewer check names both card kinds: a card
+        # drawn in a terminal chat has its history row, so the chat view
+        # behind the terminal shows it.
+        temp_db.create_chat("chat-drain-acard", "user-admin", "agent-x")
+        s = await isess.register(
+            session_id="sid-art-acard", chat_id="chat-drain-acard",
+            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+        )
+        try:
+            got: asyncio.Queue = asyncio.Queue()
+            s.on_perm_event = got.put_nowait
+            get_permission_queue("sid-art-acard").put_nowait({
+                "event_type": wire.ITEM_ACTION_CARD, "card_id": "card-1", "title": "Move Alpha to Eng",
+                "text": "Places Alpha at the Team level of Eng.", "note": "",
+                "buttons": [{"id": "go", "label": "Move", "kind": "do", "params": {"agent": "alpha"}}],
+                "options": [], "params": {"agent": "alpha"},
+            })
+            card = await asyncio.wait_for(got.get(), 5)
+            (row,) = temp_db.get_chat_messages("chat-drain-acard")
+            assert row["event_type"] == wire.ACTION_CARD
+            assert card["db_message_id"] == row["id"]
+        finally:
+            await s.close()
+
+    async def test_drainer_persists_a_list_card_with_its_kind_and_person(
+        self, temp_db, _clean_registry,
+    ):
+        # The third card kind rides the same gate: no row of the list, the
+        # kind, the filters, the title and the person alone.
+        temp_db.create_chat("chat-drain-lcard", "user-admin", "agent-x")
+        s = await isess.register(
+            session_id="sid-art-lcard", chat_id="chat-drain-lcard",
+            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+        )
+        try:
+            got: asyncio.Queue = asyncio.Queue()
+            s.on_perm_event = got.put_nowait
+            get_permission_queue("sid-art-lcard").put_nowait({
+                "event_type": wire.ITEM_LIST_CARD, "kind": "tasks", "filters": {"scope": "mine"},
+                "title": "Your scheduled tasks", "person": "user-admin", "rows": [{"id": "never"}],
+            })
+            card = await asyncio.wait_for(got.get(), 5)
+            (row,) = temp_db.get_chat_messages("chat-drain-lcard")
+            assert row["event_type"] == wire.LIST_CARD
+            assert card["db_message_id"] == row["id"]
+            assert json.loads(row["event_data"]) == {
+                "type": wire.LIST_CARD, "kind": "tasks", "filters": {"scope": "mine"},
+                "title": "Your scheduled tasks", "person": "user-admin"}
         finally:
             await s.close()
 

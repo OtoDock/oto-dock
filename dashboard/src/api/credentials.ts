@@ -126,10 +126,14 @@ export interface AccountSummary {
   installations?: AccountInstallation[]
   // The token can no longer serve a session (a grant the vendor ended, an
   // expired token nobody can refresh, a file the MCP's way of issuing
-  // tokens no longer covers): the card says reconnect, the resolver
-  // leaves the MCP out of new sessions.
+  // tokens no longer covers, the MCP's own server refusing the token):
+  // the card says reconnect, the resolver leaves the MCP out of new
+  // sessions.
   needs_reconnect?: boolean
   reconnect_reason?: string
+  /** How the account was connected: ``personal_access_token`` takes a new
+   * token in place of a sign-in; empty for an OAuth sign-in. */
+  flow?: string
   // Required fields the saved account lacks (a field the manifest added
   // later): the MCP stays out of its sessions until they are filled.
   missing_required?: string[]
@@ -151,6 +155,8 @@ export const RECONNECT_REASONS: Record<string, string> = {
   installation_not_owned: "the account's owner no longer owns the installation the agent's GitHub identity uses",
   installation_hosted: 'hosted sign-in gives an agent no app identity. A manager binds the account itself in Agent Settings, MCPs',
   installation_reach_outdated: 'a repository the agent may reach is no longer in the installation. A manager picks the repositories again in Agent Settings, MCPs',
+  removed_at_vendor: "OtoDock's app was removed from this account at the vendor",
+  refused: 'the vendor no longer accepts its access',
 }
 
 export function reconnectReasonText(reason?: string): string {

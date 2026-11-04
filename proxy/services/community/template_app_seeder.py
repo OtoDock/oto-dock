@@ -77,6 +77,12 @@ async def stop() -> None:
         _worker = None
 
 
+def _origin(template) -> tuple[str, str]:
+    """Where a seeded copy's code came from: the template and its version
+    (a template read before the version field existed has none)."""
+    return str(getattr(template, "slug", "") or ""), str(getattr(template, "version", "") or "")
+
+
 def template_ref(template_slug: str, slug: str) -> str:
     return f"{template_slug}:{slug}"
 
@@ -350,7 +356,8 @@ async def seed_shared(agent: str, template: CommunityAgentTemplate, data: dict) 
                     agent, "", None, item.slug, item.dir, template_slug=template.slug,
                     tasks=list(item.blueprint.get("tasks") or []), cold=True, approve_as=by,
                     template_ref=template_ref(template.slug, item.slug),
-                    triggers=list(item.blueprint.get("triggers") or []))
+                    triggers=list(item.blueprint.get("triggers") or []),
+                    origin=_origin(template))
             except Exception as e:
                 logger.exception("template app %s: import failed", item.slug)
                 out["failed"].append({"slug": item.slug, "reason": str(e)})
@@ -492,7 +499,7 @@ async def seed_user_copy(agent: str, owner_sub: str, slug: str, *,
             res = await app_blueprints.import_folder(
                 agent, username, owner_sub, slug, source, template_slug=template.slug,
                 tasks=_blueprint_tasks(source), cold=True, approve_as=by, template_ref=ref,
-                triggers=_blueprint_triggers(source))
+                triggers=_blueprint_triggers(source), origin=_origin(template))
         except Exception as e:
             reason = str(e)
             logger.exception("template app %s for %s: seed failed", slug, username)
@@ -531,11 +538,12 @@ async def restore(row: dict) -> dict:
     async with _lock(agent, username, slug):
         # The import's upsert clears the state and unhides the row itself;
         # an import that fails leaves the opt-out as it was.
+        tpl = cast("CommunityAgentTemplate", template)
         res = await app_blueprints.import_folder(
-            agent, username, row.get("owner_sub"), slug, source, template_slug=cast("CommunityAgentTemplate", template).slug,
+            agent, username, row.get("owner_sub"), slug, source, template_slug=tpl.slug,
             tasks=_blueprint_tasks(source), cold=True, approve_as=by,
-            template_ref=row.get("template_ref") or template_ref(cast("CommunityAgentTemplate", template).slug, slug),
-            triggers=_blueprint_triggers(source))
+            template_ref=row.get("template_ref") or template_ref(tpl.slug, slug),
+            triggers=_blueprint_triggers(source), origin=_origin(tpl))
     if res.get("app_id"):
         await asyncio.to_thread(resume_copy_triggers, str(res["app_id"]))
     res["restored"] = "brought back from the template's copy"

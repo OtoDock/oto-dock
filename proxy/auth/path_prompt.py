@@ -99,7 +99,6 @@ _SCOPE_AWARE_MCP_NOUNS: dict[str, str] = {
     "notifications-mcp": "notifications",
     "triggers-mcp": "triggers",
     "meetings-mcp": "meetings",
-    "memory-mcp": "memories",
 }
 
 
@@ -107,7 +106,7 @@ def _scope_aware_nouns(assigned_mcp_names: tuple[str, ...] | list[str]) -> list[
     """Return the list of scope-aware nouns for the enabled MCPs.
 
     Preserves the canonical noun order (tasks → delegated sessions → notifications → triggers
-    → meetings → memories) regardless of MCP scan order. Returns an empty
+    → meetings) regardless of MCP scan order. Returns an empty
     list when none of the scope-aware MCPs are enabled — the caller then
     omits the MCP-defaults sentence entirely.
     """
@@ -115,6 +114,26 @@ def _scope_aware_nouns(assigned_mcp_names: tuple[str, ...] | list[str]) -> list[
     return [
         noun for slug, noun in _SCOPE_AWARE_MCP_NOUNS.items() if slug in enabled
     ]
+
+
+# The one scope rule for files, memory and apps (the memory directive and the
+# Folders closer point at it): content decides, never the default alone.
+CONTENT_RULE = (
+    "Content decides where work goes, for files, memory and apps alike. A "
+    "draft, an exploration and one person's own work stay in their personal "
+    "space. A final, and anything that defines how the team works (a "
+    "process, a template, a checklist, an app the team uses, the agents' "
+    "own setup), goes to the shared space or a knowledge library. A process "
+    "the team follows is knowledge, not memory."
+)
+
+
+def _scope_block(*sentences: str) -> str:
+    """The section: its heading, the sentences that are not empty joined by
+    one space, no trailing space, one blank line before the next section
+    (a line ending in a space right above ``---`` reads as a setext
+    heading)."""
+    return "# Execution Scope\n\n" + " ".join(s for s in sentences if s) + "\n\n"
 
 
 def _join_nouns(nouns: list[str]) -> str:
@@ -141,10 +160,10 @@ def _build_execution_scope_section(
     Renders one of SIX blocks based on
     ``(session_scope, role, agent.default_scope)``:
 
-    - **Block A** — user-scope, manager/admin, ``default_scope == "user"``
-      (personal-leaning agents). Defaults to user-scope; override to agent.
-    - **Block B** — user-scope, manager/admin, ``default_scope == "agent"``
-      (operational agents). Defaults to agent-scope; override to user.
+    - **Block A** — user-scope, manager/admin, ``default_scope == "user"``.
+      Defaults to user-scope; override to agent.
+    - **Block B** — user-scope, manager/admin, ``default_scope == "agent"``.
+      Defaults to agent-scope; override to user.
     - **Block C** — user-scope, editor, ``default_scope == "user"``.
     - **Block D** — user-scope, editor, ``default_scope == "agent"``.
     - **Block E** — user-scope, viewer (regardless of default_scope).
@@ -152,10 +171,11 @@ def _build_execution_scope_section(
     - **Block F** — agent-scope (no user owner — phone / task / trigger).
       Everything defaults to agent-scope.
 
-    Each block now emits 1–2 short sentences. Folder semantics moved to
-    ``_build_folders_section``; knowledge-vs-workspace prose moved to
-    ``_build_building_agents_section``. The MCP-defaults sentence is
-    skipped entirely when no scope-aware MCPs are enabled.
+    Each block is a few short sentences; the collaborative blocks A to D
+    carry ``CONTENT_RULE``, the one rule for files, memory and apps. Folder
+    semantics live in ``_build_folders_section``; knowledge-vs-workspace
+    prose in ``_build_building_agents_section``. The MCP-defaults sentence
+    is skipped entirely when no scope-aware MCPs are enabled.
     """
     # Look up agents.default_scope. Best-effort: a missing or unknown agent
     # row falls back to the safer "user" default.
@@ -178,7 +198,7 @@ def _build_execution_scope_section(
 
     if is_external_ctx(ctx):
         # Block G — external route (a phone caller who is not a platform
-        # user). Memory is the only scope-aware MCP such a session can have.
+        # user). No scope-aware MCP names a noun here.
         if external_home_of(ctx):
             space = (
                 "This caller has a private space (`/caller/`): anything you "
@@ -216,14 +236,12 @@ def _build_execution_scope_section(
         # meeting). Keyed on the ABSENCE of a human, regardless of mount scope.
         mcp_line = (
             f"{capitalised} you create default to **agent scope**, visible "
-            f"to all users of this agent.\n"
+            "to all users of this agent."
         ) if joined else ""
-        return (
-            "# Execution Scope\n\n"
+        return _scope_block(
             "You are in **agent scope** — no user owner. This is a "
-            "system-initiated task, phone call, or trigger. "
-            f"{mcp_line}"
-            "\n"
+            "system-initiated task, phone call, or trigger.",
+            mcp_line,
         )
 
     # Shared-only HUMAN chat (visibility-modes) — a person is here (keep their
@@ -231,41 +249,36 @@ def _build_execution_scope_section(
     # no personal space, and one chat history shared with every assigned user.
     if ctx.session_scope == "agent":
         if ctx.role == roles.VIEWER:
-            return (
-                "# Execution Scope\n\n"
+            return _scope_block(
                 f"You are assisting {name} (viewer) in this agent's **shared "
                 "space** — its workspace, knowledge, and memory are shared with "
                 "every user of this agent. Your access is read-only; you cannot "
-                "change shared state.\n\n"
+                "change shared state."
             )
         if ctx.role == roles.CONTRIBUTOR:
             mcp_line = (
                 f"{capitalised} are not available to your role here: they would "
                 "be shared with every user of this agent, which needs editor "
-                "role, and this agent has no personal scope.\n"
+                "role, and this agent has no personal scope."
             ) if joined else ""
-            return (
-                "# Execution Scope\n\n"
+            return _scope_block(
                 f"You are assisting {name} (contributor) in this agent's **shared "
                 "space** — its workspace, knowledge, and memory are shared with "
                 "every user of this agent. You may write the shared workspace; "
-                "knowledge and the shared memory are read-only for your role. "
-                f"{mcp_line}"
-                "\n"
+                "knowledge and the shared memory are read-only for your role.",
+                mcp_line,
             )
         role_tag = f" ({ctx.role})" if ctx.role == roles.EDITOR else ""
         mcp_line = (
             f"{capitalised} you create are **shared** with every user of this "
-            "agent.\n"
+            "agent."
         ) if joined else ""
-        return (
-            "# Execution Scope\n\n"
+        return _scope_block(
             f"You are assisting {name}{role_tag} in this agent's **shared "
             "space**. Everything here — workspace, knowledge, and memory — is "
             "shared with every user of this agent; there is no personal space, "
-            "and the chat history is shared too. "
-            f"{mcp_line}"
-            "\n"
+            "and the chat history is shared too.",
+            mcp_line,
         )
 
     # Personal-only (visibility-modes) — fully private to this user. No shared
@@ -274,15 +287,13 @@ def _build_execution_scope_section(
         role_tag = f" ({ctx.role})" if ctx.role in (roles.EDITOR, roles.CONTRIBUTOR, roles.VIEWER) else ""
         mcp_line = (
             f"{capitalised} you create are **private to {name}** — this agent "
-            "has no shared space.\n"
+            "has no shared space."
         ) if joined else ""
-        return (
-            "# Execution Scope\n\n"
+        return _scope_block(
             f"You are in a **personal space** for {name}{role_tag}. Everything "
             "here — your workspace, context, and memory — is private to this "
-            "user; this agent has no shared space. "
-            f"{mcp_line}"
-            "\n"
+            "user; this agent has no shared space.",
+            mcp_line,
         )
 
     if ctx.role in (roles.VIEWER, roles.CONTRIBUTOR):
@@ -291,48 +302,33 @@ def _build_execution_scope_section(
         plural = "viewers" if ctx.role == roles.VIEWER else "contributors"
         mcp_line = (
             f"{capitalised} you create default to **user scope** — {plural} "
-            f"cannot create agent-scope items.\n"
+            "cannot create agent-scope items."
         ) if joined else (
-            f"{plural.capitalize()} cannot create agent-scope items — only personal ones.\n"
+            f"{plural.capitalize()} cannot create agent-scope items — only personal ones."
         )
-        return (
-            "# Execution Scope\n\n"
-            f"You are in **user scope** for {name} ({ctx.role}). "
-            f"{mcp_line}"
-            "\n"
-        )
+        return _scope_block(f"You are in **user scope** for {name} ({ctx.role}).", mcp_line)
 
     role_tag = f" ({ctx.role})" if ctx.role == roles.EDITOR else ""
 
     if default_scope == "agent":
-        # Blocks B (manager/admin) and D (editor) — operational agent.
+        # Blocks B (manager/admin) and D (editor): the shared space is home.
         mcp_line = (
-            f"This is an operational agent — most work is shared. "
             f"{capitalised} you create default to **agent scope**, visible "
-            f"to all users of this agent. Override `scope=\"user\"` only "
-            f"when the content is clearly user-specific.\n"
-        ) if joined else (
-            "This is an operational agent — most work is shared.\n"
-        )
-        return (
-            "# Execution Scope\n\n"
-            f"You are in **user scope** for {name}{role_tag}. "
-            f"{mcp_line}"
-            "\n"
+            "to all users of this agent. One that is a person's own goes to "
+            "user scope."
+        ) if joined else ""
+        return _scope_block(
+            f"You are in **user scope** for {name}{role_tag}. This agent "
+            "works in its shared space by default.",
+            CONTENT_RULE, mcp_line,
         )
 
-    # Blocks A (manager/admin) and C (editor) — personal-leaning agent.
+    # Blocks A (manager/admin) and C (editor): the personal space is home.
     mcp_line = (
-        f"{capitalised} you create default to **user scope** — visible "
-        f"only to this user. Override `scope=\"agent\"` only when the user "
-        f"explicitly asks for a shared / system-wide action.\n"
+        f"{capitalised} you create default to **user scope**, visible only "
+        "to this user. One that serves the whole team goes to agent scope."
     ) if joined else ""
-    return (
-        "# Execution Scope\n\n"
-        f"You are in **user scope** for {name}{role_tag}. "
-        f"{mcp_line}"
-        "\n"
-    )
+    return _scope_block(f"You are in **user scope** for {name}{role_tag}.", CONTENT_RULE, mcp_line)
 
 
 def _build_execution_environment_section(
@@ -562,22 +558,53 @@ def _library_rows(ctx: SecurityContext, *, session_writes_knowledge: bool) -> li
                 f"- `{mount}` (RW) — Shared knowledge "
                 f"library from the **{src}** agent. Edits here flow back to "
                 "that agent's library and every other agent attached to "
-                "it, including the library's `bulletin/` note.\n"
+                "it.\n"
             )
         else:
             rows.append(
                 f"- `{mount}` (RO) — Shared knowledge "
                 f"library from the **{src}** agent (curated by that agent's "
-                "team; read-only here). Its `bulletin/` note is auto-loaded "
-                "into your context.\n"
+                "team; read-only here).\n"
             )
     return rows
+
+
+def _hand_over_clause(assigned_mcp_names: tuple[str, ...] | list[str], *,
+                      contributor: bool = False) -> str:
+    """The hand to the team, offered on the cues: the card when the session
+    can draw one (settings-mcp carries ``show_card``), a question otherwise.
+    A contributor's field work goes to the team as it arrives
+    (``_contributor_field``), so their rule names their other files."""
+    whose = "their other files" if contributor else "a person's files"
+    cue = (f"Never move or copy {whose} to the shared workspace on your "
+           "own. When the conversation says a piece of work is final (final, done, "
+           "send it to the team, the client's copy, the finished drawings), ")
+    if "settings-mcp" in set(assigned_mcp_names or ()):
+        return cue + ("draw the `hand_files` card with `show_card` and let the person "
+                      "press it: a move, or a copy when they still work on the files.")
+    return cue + "ask whether to move the files to the shared workspace, and wait for the answer."
+
+
+SAY_WHERE = "Say where you saved every document you create."
+
+
+def _contributor_field(shared: str) -> str:
+    return (f"A contributor's photos and reports for the team go to {shared} as "
+            "they arrive: save them there.")
+
+
+# What each default scope means for the team, in the Building Agents closer.
+_SCOPE_MEANING = {
+    "user": "its people work in their own space and hand finals over",
+    "agent": "the team's shared desk",
+}
 
 
 def _build_folders_section(
     ctx: SecurityContext,
     *,
     default_scope: str,
+    assigned_mcp_names: tuple[str, ...] | list[str] = (),
 ) -> str:
     """Build the ``# Folders`` section — per-role folder map.
 
@@ -586,9 +613,15 @@ def _build_folders_section(
     derived from ``(session_scope, default_scope)``:
 
     - user-scope session + agent default_scope='agent' → default `/workspace/`
-      (operational agents prefer shared work).
+      (the shared space is home).
     - user-scope session + default_scope='user' → default `/users/{u}/workspace/`.
     - agent-scope session → always `/workspace/`.
+
+    The closer follows the role too: a viewer writes their own space only,
+    a contributor's photos and reports go to the shared workspace as they
+    arrive, and every closer of a shared space but the viewer's carries
+    the hand-over cues (``_hand_over_clause``). Every human closer ends
+    with ``SAY_WHERE``.
 
     User-scope sessions get explicit upload paths
     (``users/{u}/workspace/uploads/photos/`` for chat photos,
@@ -668,7 +701,7 @@ def _build_folders_section(
             ctx, session_writes_knowledge=ctx.knowledge_rw))
         frows.append(
             "\nDefault workspace for this session is `/workspace/`. Read from "
-            "`/knowledge/` when reference material is needed.\n\n"
+            "`/knowledge/` when reference material is needed. " + SAY_WHERE + "\n\n"
         )
         return "".join(frows)
 
@@ -709,7 +742,7 @@ def _build_folders_section(
         srows.append(
             "\nDefault writes for this session go to `/workspace/` — this agent "
             "has **no personal space**; everything is shared with all its "
-            "users.\n\n"
+            "users. " + SAY_WHERE + "\n\n"
         )
         return "".join(srows)
 
@@ -772,28 +805,42 @@ def _build_folders_section(
         f"`{layout.virtual_workspace(u)}/uploads/files/` (other files).\n"
     )
 
+    personal = f"`{layout.virtual_workspace(u)}/`"
+    shared = f"`{layout.V_WORKSPACE}/`"
     if not ctx.mount_shared:
         # Personal-only — there is no shared workspace to point at.
         rows.append(
-            f"\nDefault writes for this session go to `{layout.virtual_workspace(u)}/`. "
+            f"\nDefault writes for this session go to {personal}. "
             "This agent is **personal only** — it has no shared space; "
-            "everything you do stays private to you.\n\n"
+            f"everything you do stays private to you. {SAY_WHERE}\n\n"
+        )
+    elif ctx.role == roles.VIEWER:
+        rows.append(
+            f"\nDefault writes for this session go to {personal}. Your role "
+            f"reads the shared workspace and writes your own space. {SAY_WHERE}\n\n"
         )
     elif default_scope == "agent":
+        contributor = ctx.role == roles.CONTRIBUTOR
+        field = f"{_contributor_field(shared)} " if contributor else ""
         rows.append(
-            f"\nDefault writes for this session go to `{layout.V_WORKSPACE}/` (this is "
-            "an operational agent — outputs there are visible to every "
-            f"user of this agent). Use `{layout.virtual_workspace(u)}/` for personal "
-            "drafts, private notes, or anything the user wants to keep to "
-            "themselves.\n\n"
+            f"\nDefault writes for this session go to {shared}, where every "
+            "user of this agent reads them. Drafts, private notes and a "
+            f"person's own work go to {personal}. {field}"
+            f"{_hand_over_clause(assigned_mcp_names, contributor=contributor)} "
+            f"{SAY_WHERE}\n\n"
+        )
+    elif ctx.role == roles.CONTRIBUTOR:
+        rows.append(
+            f"\nDefault writes for this session go to {personal}. "
+            f"{_contributor_field(shared)} "
+            f"{_hand_over_clause(assigned_mcp_names, contributor=True)} {SAY_WHERE}\n\n"
         )
     else:
         rows.append(
-            f"\nDefault writes for this session go to "
-            f"`{layout.virtual_workspace(u)}/`. The agent's `{layout.V_WORKSPACE}/` is its "
-            "shared workspace — write there when the work is collaborative "
-            "or the user wants to share it with other users of this "
-            "agent.\n\n"
+            f"\nDefault writes for this session go to {personal}, the person's "
+            f"drafts and their own work. Finals and what the team shares go to "
+            f"{shared}, by the rule in Execution Scope. "
+            f"{_hand_over_clause(assigned_mcp_names)} {SAY_WHERE}\n\n"
         )
 
     return "".join(rows)
@@ -863,18 +910,13 @@ def _build_building_agents_section(
     # via the right channel given which tools are available. # Execution
     # Scope above already states the consequence; this sentence focuses on
     # the change path.
-    if has_config:
-        scope_close = (
-            f"This agent's `default_scope` is **{default_scope}** — change "
-            "it via `agent-config-mcp.update_default_scope(...)` if a "
-            "different default fits the agent's purpose better.\n"
-        )
-    else:
-        scope_close = (
-            f"This agent's `default_scope` is **{default_scope}** — change "
-            "it from the agent settings page in the dashboard if a different "
-            "default fits the agent's purpose better.\n"
-        )
+    meaning = _SCOPE_MEANING.get(default_scope, "")
+    change = ("via `agent-config-mcp.update_default_scope(...)`" if has_config
+              else "from the agent settings page in the dashboard")
+    scope_close = (
+        f"This agent's `default_scope` is **{default_scope}**: {meaning}. Change "
+        f"it {change} if a different default fits the agent's purpose better.\n"
+    )
 
     # Folder bullets adapt to the agent's mode: Personal-only has no shared
     # /knowledge or /workspace; Shared-only has no per-user dirs.
@@ -915,13 +957,11 @@ def _build_building_agents_section(
     folder_bullets.append(
         "- Agents collaborate through shared knowledge libraries: a "
         "knowledge folder promoted to a library can be attached to other "
-        "agents (mounted at `/knowledge/shared/…`, optionally writable), "
-        "and its `bulletin/` file is auto-loaded into every attached "
-        "agent's context — the channel for runtime notes every agent of "
-        "a team should see (\"this week we focus on X\", \"new video "
-        "idea landed\"). Platform admins/creators set this up from Agent "
-        "Settings → Shared Knowledge; recommend it (like departments) "
-        "when several agents need shared awareness.\n"
+        "agents (mounted at `/knowledge/shared/…`, optionally writable). "
+        "Platform admins/creators set this up from Agent Settings → "
+        "Shared Knowledge; recommend it (like departments) when several "
+        "agents need the same material. Separately, agents one delegation "
+        "step apart share dated notes in the Notebook.\n"
     )
     if "user" in ctx.available_scopes:
         folder_bullets.append(
@@ -1039,7 +1079,8 @@ def build_permission_context(
     # 4. Folders — per-role folder map with uploads + default-workspace pointer.
     sections.append(
         "---\n\n"
-        + _build_folders_section(ctx, default_scope=default_scope)
+        + _build_folders_section(ctx, default_scope=default_scope,
+                                 assigned_mcp_names=assigned_mcp_names)
     )
 
     # 5. Building Agents — manager+ on user-scope only (empty otherwise).

@@ -289,3 +289,138 @@ class TestPickAccount:
         assert credential_resolver.pick_account(
             mcp_name, "agent", user_sub=user_sub,
         ).label == "B"
+
+
+# ---------------------------------------------------------------------------
+# The label a sign-in lands on (oauth_account_store.account_label_for): one
+# login per token file, so choosing an account for one MCP never moves
+# another MCP of the provider onto another login.
+# ---------------------------------------------------------------------------
+
+class TestSigninLabel:
+    def _file(self, d, label, account_id, *, issued="app", client_id="cid", extra=None):
+        import json
+        body = {"provider": "facebook", "account_id": account_id, "client_id": client_id,
+                "access_token": "x", "extra": dict(extra or {})}
+        if issued == "relay":
+            body["extra"]["via_relay"] = True
+        (d / f"{label}.json").write_text(json.dumps(body))
+
+    def _pick(self, d, *, hint="", own="Dimitris M", identity="fb-2", email="Dimitris M",
+              issued="app:cid", named=()):
+        from services.oauth import oauth_account_store as store
+        return store.account_label_for(d, hint=hint, identity_label=own, identity=identity, email=email,
+                                       issued=issued, named_elsewhere=lambda label: label in named)
+
+    def test_the_same_login_shares_one_file(self, tmp_path):
+        self._file(tmp_path, "Dimitris M", "fb-1")
+        assert self._pick(tmp_path, identity="fb-1", named=("Dimitris M",)) == "Dimitris M"
+
+    def test_another_login_with_the_same_name_gets_a_number(self, tmp_path):
+        self._file(tmp_path, "Dimitris M", "fb-1")
+        assert self._pick(tmp_path) == "Dimitris M 2"
+        self._file(tmp_path, "Dimitris M 2", "fb-2")
+        assert self._pick(tmp_path) == "Dimitris M 2"
+        assert self._pick(tmp_path, identity="fb-3") == "Dimitris M 3"
+
+    def test_a_login_already_on_file_under_another_label_lands_there(self, tmp_path):
+        self._file(tmp_path, "Dimitris M", "fb-1")
+        self._file(tmp_path, "Work", "fb-2")
+        assert self._pick(tmp_path) == "Work"
+
+    def test_a_reconnect_keeps_its_card_unless_another_mcp_shares_it(self, tmp_path):
+        self._file(tmp_path, "Dimitris M", "fb-1")
+        # only this MCP names it: the card is rewritten, as before
+        assert self._pick(tmp_path, hint="Dimitris M") == "Dimitris M"
+        # a sibling MCP names it: the other login goes to its own label
+        assert self._pick(tmp_path, hint="Dimitris M", named=("Dimitris M",)) == "Dimitris M 2"
+        # the same login reconnects the shared card
+        assert self._pick(tmp_path, hint="Dimitris M", identity="fb-1", named=("Dimitris M",)) == "Dimitris M"
+
+    def test_a_reconnect_takes_its_cards_missing_file(self, tmp_path):
+        assert self._pick(tmp_path, hint="Dimitris M", named=("Dimitris M",)) == "Dimitris M"
+        assert self._pick(tmp_path) == "Dimitris M"
+
+    def test_an_add_never_lands_on_a_siblings_dangling_row(self, tmp_path):
+        """A sibling's row whose file is gone (a disconnect before 1.9.1 left
+        it): the new login is numbered, and the row waits for its own card's
+        Reconnect, which takes it back."""
+        assert self._pick(tmp_path, named=("Dimitris M",)) == "Dimitris M 2"
+        self._file(tmp_path, "Dimitris M 2", "fb-2")
+        assert self._pick(tmp_path, identity="fb-2", named=("Dimitris M",)) == "Dimitris M 2"
+        assert self._pick(tmp_path, hint="Dimitris M", identity="fb-1", named=("Dimitris M",)) == "Dimitris M"
+
+    def test_a_file_issued_another_way_is_kept_from_a_sibling(self, tmp_path):
+        self._file(tmp_path, "Dimitris M", "fb-1", issued="relay")
+        # app-scoped ids of two apps cannot be compared: only this MCP holds it, overwrite
+        assert self._pick(tmp_path, identity="fb-1") == "Dimitris M"
+        # a sibling holds it: never overwritten
+        assert self._pick(tmp_path, identity="fb-1", named=("Dimitris M",)) == "Dimitris M 2"
+
+    def test_no_vendor_id_keeps_the_label_unless_a_sibling_holds_it(self, tmp_path):
+        self._file(tmp_path, "postiz", "postiz")
+        assert self._pick(tmp_path, own="postiz", identity="", email="postiz") == "postiz"
+        assert self._pick(tmp_path, own="postiz", identity="", email="postiz", named=("postiz",)) == "postiz 2"
+
+    def test_a_legacy_file_that_recorded_the_email_is_the_same_login(self, tmp_path):
+        self._file(tmp_path, "a@b.example", "a@b.example")
+        assert self._pick(tmp_path, own="a@b.example", identity="g-77", email="a@b.example",
+                          named=("a@b.example",)) == "a@b.example"
+        # a name is never an email
+        self._file(tmp_path, "Ann", "Ann")
+        assert self._pick(tmp_path, own="Ann", identity="g-78", email="Ann", named=("Ann",)) == "Ann 2"
+
+    def test_how_a_token_was_issued(self):
+        from services.oauth import oauth_account_store as store
+        assert store.issued_by({"via_relay": True, "app_kind": "github_app"}, "") == "relay:github_app"
+        assert store.issued_by({"flow": "mcp_authorization", "issuer": "https://a.example/"}, "c") == \
+            "registered:https://a.example"
+        assert store.issued_by({"flow": "personal_access_token"}, "") == "pat"
+        assert store.issued_by({}, "cid-1") == "app:cid-1"
+
+    def test_a_vendor_name_the_label_rule_refuses_is_cleaned(self):
+        from services.oauth import oauth_account_store as store
+        assert store.clean_label("Dimitris M", provider_id="facebook", identity="1") == "Dimitris M"
+        assert store.clean_label("O'Brien  Ann", provider_id="facebook", identity="1") == "O Brien Ann"
+        assert store.clean_label("Δημήτρης", provider_id="facebook", identity="10023456789") == "facebook 23456789"
+        assert store.clean_label("x" * 200, provider_id="facebook", identity="1") == "x" * 128
+        store.validate_account_label(store._numbered("x" * 128, 12))
+
+
+class TestMcpsNamingLabel:
+    def test_lists_every_mcp_of_the_person_with_the_label(self, user_sub):
+        credential_store.set_user_credentials(user_sub, "fb-a", {"K": "v"}, account_label="Same")
+        credential_store.set_user_credentials(user_sub, "fb-b", {"K": "v"}, account_label="Same")
+        credential_store.set_user_credentials(user_sub, "fb-b", {"K": "v"}, account_label="Other")
+        assert credential_store.mcps_naming_label(user_sub, "Same") == ["fb-a", "fb-b"]
+        assert credential_store.mcps_naming_label(user_sub, "Other") == ["fb-b"]
+        assert credential_store.mcps_naming_label(user_sub, "None") == []
+
+
+def test_two_sign_ins_at_once_never_share_a_label(monkeypatch, tmp_path):
+    """The person's provider lock covers the choice and the write: two
+    logins of one name signing in together land on two labels."""
+    import asyncio
+    import json
+
+    import config
+    from auth.oauth_providers.base import UserInfo
+    from services.oauth import oauth_account_store as store
+    from storage import database as task_store
+    monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "alice")
+    monkeypatch.setattr(store, "other_mcps_naming", lambda *a: [])
+
+    async def sign_in(login: str) -> str:
+        async with store.signin_label(
+            user_sub="alice-sub", provider_id="facebook", mcp_name="fb-a", hint="", own_label="Ann",
+            userinfo=UserInfo(email="Ann", account_id=login), identity=login, issued="app:cid",
+        ) as label:
+            await asyncio.sleep(0.05)
+            d = store.get_token_dir("alice", provider_id="facebook")
+            (d / f"{label}.json").write_text(json.dumps({"account_id": login, "client_id": "cid", "extra": {}}))
+            return label
+
+    async def both():
+        return await asyncio.gather(sign_in("fb-1"), sign_in("fb-2"))
+    assert sorted(asyncio.run(both())) == ["Ann", "Ann 2"]

@@ -591,7 +591,13 @@ async def _main(config_path: Path | None = None) -> None:
     # (~/.npm-global/bin — sudo-less Linux can't write NodeSource's /usr
     # prefix) must resolve for every child this process spawns; augment
     # PATH once, before any session/MCP spawn.
-    from .host.cli_versions import ensure_user_npm_bin_on_path
+    # A Mac's login item starts with only the system folders on PATH: its
+    # Homebrew and per-user folders come first.
+    from .host.cli_versions import (
+        ensure_darwin_tool_dirs_on_path,
+        ensure_user_npm_bin_on_path,
+    )
+    ensure_darwin_tool_dirs_on_path()
     ensure_user_npm_bin_on_path()
 
     # Ensure directories exist
@@ -610,6 +616,19 @@ async def _main(config_path: Path | None = None) -> None:
     tunnel_port = await tunnel.start()
     ws.tunnel = tunnel
     sm.local_tunnel_port = tunnel_port
+    # A heal that could not keep the port moves it here too (app steps read it).
+    tunnel.on_port = lambda port: setattr(sm, "local_tunnel_port", port)
+
+    # The loop's exception handler, at once: an accept failure on the
+    # tunnel's listening socket (CPython's Proactor loop closes the socket
+    # for good after one) starts a heal and is never swallowed. On Windows it
+    # also drops benign close-time noise: when the WS drops or the Proactor
+    # tears sockets down, the transport's ``socket.shutdown(SHUT_RDWR)`` on an
+    # already-closed socket raises ConnectionResetError, which the default
+    # handler would log as a multi-line stack trace that reflects no problem.
+    from .transport.http_tunnel import make_loop_exception_handler
+    asyncio.get_running_loop().set_exception_handler(
+        make_loop_exception_handler(tunnel, quiet_close_resets=not satconfig.HOST.posix))
 
     # The local control socket — lets `otodock claude|codex` on
     # THIS machine open an interactive session as the agent. Brokers via the
@@ -670,27 +689,6 @@ async def _main(config_path: Path | None = None) -> None:
     # Handle graceful shutdown
     loop = asyncio.get_event_loop()
     shutdown_event = asyncio.Event()
-
-    # Suppress benign Windows asyncio shutdown noise. When the WS
-    # connection drops (e.g. proxy closes after machine deletion) or
-    # the proactor event loop tears down sockets, the ProactorBase
-    # transport tries to call ``socket.shutdown(SHUT_RDWR)`` on an
-    # already-closed socket and raises ConnectionResetError. asyncio
-    # then logs it via the default exception handler, polluting the
-    # uninstall log with a multi-line stack trace that doesn't reflect
-    # any real problem. Install a handler that filters these specific
-    # close-time errors but lets every other exception through to the
-    # default reporter.
-    if not satconfig.HOST.posix:
-        def _benign_close_filter(loop_, context):
-            exc = context.get("exception")
-            msg = context.get("message", "")
-            if isinstance(exc, ConnectionResetError):
-                return  # silent — socket was already closed
-            if "WinError 10054" in msg:
-                return
-            loop_.default_exception_handler(context)
-        loop.set_exception_handler(_benign_close_filter)
 
     def _signal_handler():
         logging.getLogger("satellite").info("Shutdown signal received")

@@ -118,3 +118,23 @@ export const INFO_TIP_BUTTON =
   'text-tertiary transition-colors duration-fast hover:text-link aria-expanded:text-link ' +
   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring'
 export const TOAST = 'rounded-popover bg-surface-overlay text-primary shadow-elevation-3'
+// Controls a `group` shows on hover or focus, and only where the device can
+// hover: a tablet or an open foldable is wider than `md` with no hover, so it
+// keeps them in sight as a phone does. Never gated by width. The reveals win
+// by specificity (and `group-hover:` is gated on hover itself). The caller
+// drops the collapse for a selected or open item, which always shows them.
+//
+// A list row's trailing control (the chat list's options button) that takes
+// no width until shown. Clipped, never `hidden`: it stays in the Tab order.
+export const ROW_TRAIL_HOVER_REVEAL =
+  '[@media(hover:hover)]:w-0 [@media(hover:hover)]:overflow-hidden ' +
+  'group-hover:w-auto group-hover:overflow-visible ' +
+  'group-focus-within:w-auto group-focus-within:overflow-visible'
+// Actions that keep their place and fade in (a settings row's Discover,
+// Edit and Remove, a file tile's menu): still in the Tab order.
+export const HOVER_REVEAL_FADE =
+  '[@media(hover:hover)]:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
+// A flex control that takes no space until shown (a file tree row's menu):
+// the group's own focusable reveals it for the keyboard.
+export const HOVER_REVEAL_FLEX =
+  '[@media(hover:hover)]:hidden group-hover:flex group-focus-within:flex'

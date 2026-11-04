@@ -26,7 +26,7 @@ from auth import roles
 from auth.providers import acting_role_of
 from core import layout
 from core.events import chat_writer
-from core.events.common_events import TurnInput
+from core.events.common_events import TurnInput, carries_prompt, photos_not_attached
 from core.events.stream_pump import (
     _active_pumps,
     _pending_permissions,
@@ -64,6 +64,7 @@ from services.infra import safe_fs
 from services.notifications import notification_manager
 from storage import database as task_store
 from storage.agents import agent_store
+from storage.chat.chat_titles import title_from_prompt
 from storage.pg import run_db
 from ws import wire_events as wire
 
@@ -71,8 +72,6 @@ from ws import wire_events as wire
 # its helpers are imported inside the functions that call them: this
 # module imports first too (tests/core/test_import_layers.py).
 from ws.dashboard_chat_text import (
-    _APP_ACTION_HEADER_RE,
-    _TIME_PRELUDE_RE,
     _provider_switch_blocker,
     interactive_prelude,
     live_model,
@@ -240,6 +239,11 @@ class AttachmentsRefused(Exception):
     scope puts them; the message is refused whole, with the reason."""
 
 
+# A saved path or a file name naming a control character is refused (the
+# prompt prints it).
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _reattach_saved_photo(agent: str, agent_dir: Path, rel_path: str, expected_prefix: str,
                           *, with_bytes: bool) -> dict | None:
     """A photo already saved in the chat's scope, in the shape
@@ -251,7 +255,7 @@ def _reattach_saved_photo(agent: str, agent_dir: Path, rel_path: str, expected_p
     any component (``safe_fs``, the files API's own read), so the file
     checked is the file read however long the photo waited for its slot.
     None when the path is outside the scope, not an image, or refused."""
-    if not rel_path.startswith(expected_prefix):
+    if not rel_path.startswith(expected_prefix) or _CONTROL_CHARS.search(rel_path):
         return None
     media_type = mimetypes.guess_type(rel_path)[0] or "image/jpeg"
     if not media_type.startswith("image/"):
@@ -267,9 +271,6 @@ def _reattach_saved_photo(agent: str, agent_dir: Path, rel_path: str, expected_p
         "base64": base64.b64encode(data).decode("ascii") if with_bytes else "",
         "media_type": media_type,
     }
-
-
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _scoped_files(agent_dir: Path, expected_prefix: str, files: list[dict]) -> list[dict]:
@@ -333,32 +334,13 @@ class ChatSupportMixin(_Host):
     session_id: "str | None"
 
     def _deterministic_title(self, text: str) -> str:
-        """Stable chat title from the first user message — first ~6 words / 48 chars,
-        whitespace-collapsed, ellipsis if truncated. No LLM, no post-turn rename
-        (replaces the old OpenAI title generator that caused the "New Chat" → rename
-        churn). Interactive sends reach here with the injected ``[Current time:
-        ...]`` stamp already prepended — drop it or it becomes the title. A
-        app action's framed prompt titles as "App — Label" instead of the
-        raw framing brackets (twin recognizer in transcript_tailer)."""
-        stripped = text or ""
-        while True:  # stacked preludes (the time stamp plus the focus line)
-            once = _TIME_PRELUDE_RE.sub("", stripped, count=1)
-            if once == stripped:
-                break
-            stripped = once
-        m = _APP_ACTION_HEADER_RE.match(stripped)
-        if m:
-            stripped = f"{m.group(1)} — {m.group(2)}"
-        cleaned = " ".join(stripped.split())
-        if not cleaned:
-            return "New Chat"
-        words = cleaned.split(" ")
-        title = " ".join(words[:6])
-        cut = len(words) > 6
-        if len(title) > 48:
-            title = title[:48].rstrip()
-            cut = True
-        return title + ("…" if cut else "")
+        """The chat's title at send time, before any model titles it: the
+        first words a person wrote (``storage/chat/chat_titles``), the
+        injected preludes and the platform's wrappers dropped. "" when
+        nothing a person wrote remains (a photo alone, a wrapper alone): the
+        title writes skip an empty title, so the chat stays untitled and its
+        next real message titles it."""
+        return title_from_prompt(text)
 
     def _interactive_prelude(self, text: str, *, session_id: str = "",
                              focus_line: str = "") -> str:
@@ -383,22 +365,39 @@ class ChatSupportMixin(_Host):
             return text
         return "\n\n".join([*notes, text]) if notes else text
 
-    async def _persist_first_prompt(self, cid: str, prompt_text: str) -> None:
+    async def _persist_first_prompt(self, cid: str, msg: dict) -> None:
         """Persist the first user prompt + a deterministic title at send-time so
         the chat is durable during the spawn window and the sidebar shows a
         stable name immediately. The turn is server-kicked after
         warmup_ready via _handle_chat(_server_kick=True), which skips re-persist.
-        Image/file attachment meta for the first prompt is captured at turn time.
 
-        ONE chat-lane job (row + conditional title): awaited, so the tailer's
-        duplicate-skip note below never precedes the row it refers to."""
-        if not cid or not prompt_text:
+        ``msg`` is the warm-up frame. Its photos are saved and its files
+        checked HERE (``_first_prompt_attachments``), so the row carries their
+        meta like any other send's and a dropped photo's notice follows it;
+        the frame then names the saved photos by path, so the kick and the
+        terminal's first prompt read the same files (no second copy).
+
+        ONE chat-lane job (row + notice + conditional title): awaited, so the
+        tailer's duplicate-skip note below never precedes the row it refers to."""
+        prompt_text = msg.get("text", "")
+        if not cid or not carries_prompt(msg):
+            return
+        meta, dropped = await self._first_prompt_attachments(msg)
+        if not meta and not prompt_text:
+            # Photos or files alone, refused or none of them readable: no
+            # empty row, and the kick refuses the message with the reason.
             return
         _sub = self.user_sub
         title = self._deterministic_title(prompt_text)
+        event_data = json.dumps(meta) if meta else ""
 
         def _job() -> dict | None:
-            task_store.add_chat_message(cid, "user", prompt_text, author_sub=_sub)
+            task_store.add_chat_message(cid, "user", prompt_text, event_data=event_data,
+                                        author_sub=_sub)
+            if dropped:
+                task_store.add_chat_message(
+                    cid, "event", "", event_type=wire.SYSTEM,
+                    event_data=json.dumps(wire.photos_not_attached_block(dropped)))
             # A title that already landed (rename, LLM upgrade) wins: this
             # method re-runs on every cold re-send of an already-titled chat.
             if task_store.set_chat_title_if_unset(cid, title):
@@ -429,82 +428,47 @@ class ChatSupportMixin(_Host):
                 logger.debug("first-prompt title broadcast failed for %s",
                              cid, exc_info=True)
 
-    def _build_cancelled_context(self, cid: str, *, new_text: str | None = None,
-                                 new_rows: int = 1) -> str:
-        """Read the cancelled turn's messages from DB and format for injection.
-
-        The current user message was JUST saved before this is called (with
-        the person's waiting messages an idle send took: ``new_rows`` rows
-        in all), unless ``new_text`` names it (a queued batch whose rows land
-        after its turn starts). Walk backwards past them to find the previous
-        user message (the cancelled one) and any partial assistant response
-        after it.
-        """
-        messages = task_store.get_chat_messages(cid)
-        if not messages:
-            return ""
-
-        skip = 0 if new_text is not None else max(1, new_rows)
-        user_count = 0 if new_text is None else 1
-        new_text = new_text or ""
-        last_user_text = ""
-        assistant_parts: list[str] = []
-        # The turn ended on its own (the chat's ``turn_ended`` row), not by
-        # the person's Stop: the words say so.
-        ended = ""
-
-        for msg in reversed(messages):
-            if msg["role"] == "user" and msg["content"]:
-                if skip:
-                    skip -= 1
-                    if not new_text:
-                        new_text = msg["content"]
-                    if not skip:
-                        user_count = 1
-                    continue  # Skip the new message(s) (just saved)
-                if msg["content"].strip() == wire.RESUME_TEXT:
-                    # An earlier Resume: part of the same work, never the
-                    # prompt that started it.
-                    continue
-                last_user_text = msg["content"]
-                break
-            elif msg["role"] == "assistant" and msg["content"]:
-                if user_count >= 1:
-                    assistant_parts.insert(0, msg["content"])
-            elif msg["role"] == "event":
-                if user_count >= 1 and not ended and msg.get("event_type") == wire.SYSTEM:
-                    try:
-                        data = json.loads(msg.get("event_data") or "{}")
-                    except (TypeError, ValueError):
-                        data = {}
-                    if isinstance(data, dict) and data.get("subtype") == wire.SUBTYPE_TURN_ENDED:
-                        ended = str(data.get("reason") or "error")
-                continue
-
-        if not last_user_text:
-            return ""
-        if new_text.strip() == last_user_text.strip():
-            # The same message again (the card's Send again): the engine
-            # gets it once, with no copy of the turn it repeats.
-            return ""
-
-        head = (f"[Your previous turn ended early ({ended}) before it finished. "
-                if ended else "[Your previous response was cancelled by the user. ")
-        parts = [
-            head + "The cancelled turn was not saved to your session context, "
-            "so here is what happened:]",
-            f"User said: {last_user_text}",
-        ]
-        if assistant_parts:
-            combined = "\n".join(assistant_parts)
-            if len(combined) > 2000:
-                combined = combined[:2000] + "\n... (response was truncated)"
-            parts.append(f"Your partial response before cancellation:\n{combined}")
-        else:
-            parts.append("(You had not started responding yet when cancelled)")
-        parts.append("[End of cancelled context. The user's new message follows below.]")
-
-        return "\n".join(parts)
+    async def _first_prompt_attachments(self, msg: dict) -> tuple[dict | None, int]:
+        """Save a warm-up's photos and check its files: the row's meta and how
+        many photos did not reach the agent. Engine-neutral (no bytes; the
+        kick reads them back as its engine needs) and pushed to no machine
+        (the chat's session does not exist yet). The frame's photos become
+        the saved ones by path, its files the checked ones, and the drop
+        count rides it to the kick (``_photos_dropped``). ``(None, 0)``,
+        the frame untouched, when nothing could be saved here: a refusal (the
+        kick refuses with the reason), a missing agent or username (the kick's
+        own checks answer), or a message of no text none of whose photos and
+        files survived (the kick finds the same and refuses it)."""
+        images = msg.get("images") or []
+        files = msg.get("files") or []
+        if not images and not files:
+            return {}, 0
+        agent = self.agent_name or ""
+        username = self.user.get("username") or ""
+        is_agent_scoped = _vis.is_shared_only(agent)
+        if not agent or (not is_agent_scoped and not username):
+            return None, 0
+        try:
+            if not await run_db(agent_store.agent_exists, agent):
+                return None, 0
+            _cli, _imgs, image_meta, valid_files = await self._process_attachments(
+                "", images, files, agent=agent, agent_dir=config.get_agent_dir(agent),
+                is_agent_scoped=is_agent_scoped, username=username,
+                is_direct_llm=False, push=False,
+            )
+        except AttachmentsRefused:
+            return None, 0
+        except Exception:  # noqa: BLE001  # the kick saves them as it always did
+            logger.warning("chat=%s: the first message's attachments were left to its turn",
+                           (self.chat_id or "")[:8], exc_info=True)
+            return None, 0
+        if not image_meta and not valid_files and not msg.get("text"):
+            return None, 0
+        dropped = photos_not_attached(images, image_meta)
+        msg["images"] = [{"path": m["path"], "name": m["name"]} for m in image_meta]
+        msg["files"] = valid_files
+        msg["_photos_dropped"] = dropped
+        return TurnInput(text="", image_meta=image_meta, files=valid_files).event_meta, dropped
 
     async def _refuse_input(self, message: str, queue_id: str = "") -> None:
         """A message refused before any turn: the bare error frame, or, for
@@ -584,7 +548,7 @@ class ChatSupportMixin(_Host):
     async def _process_attachments(self,
         text: str, images: list[dict], files: list[dict], *,
         agent: str, agent_dir, is_agent_scoped: bool, username: str,
-        is_direct_llm: bool,
+        is_direct_llm: bool, push: bool = True,
     ) -> tuple[str, list[dict], list[dict], list[dict]]:
         """Save chat-attached photos/files to the agent's scope-correct
         workspace and build the turn payload.
@@ -607,7 +571,8 @@ class ChatSupportMixin(_Host):
         place, so a re-send never writes a second copy. No attachment path
         touches the filesystem on the event loop. A message refused part-way
         (a photo over the size limit, the slot wait) keeps none of the photos
-        it saved."""
+        it saved. ``push=False`` leaves the machines alone (a warm-up's save,
+        before the chat's session exists: the turn pushes what it reads)."""
         from ws.dashboard import _save_base64_image
         image_meta: list[dict] = []
         attached_images: list[dict] = []  # for Direct LLM content blocks
@@ -682,7 +647,7 @@ class ChatSupportMixin(_Host):
                     await asyncio.shield(asyncio.to_thread(_discard_photos, agent, fresh))
                 raise
 
-            if saved_images:
+            if saved_images and push:
                 # Push freshly-saved photos to any active remote satellite
                 # session for this agent. Mirrors api/media/uploads.py — without
                 # this, the satellite-side CLI tries to Read the path before
@@ -696,6 +661,7 @@ class ChatSupportMixin(_Host):
                     except Exception:
                         logger.exception("Photo push to satellite failed: %s", s["path"])
 
+            if saved_images:
                 if is_direct_llm:
                     # Direct LLM agents have no Read tool — attach images as
                     # native vision content blocks via `images` kwarg into

@@ -6,6 +6,11 @@ statement is idempotent (``CREATE ... IF NOT EXISTS``); see
 ``docs/architecture/DATABASE-SCHEMA.md``.
 """
 
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def init_mcp(conn) -> None:
     """MCP framework state, per-agent assignments, and instances."""
@@ -211,3 +216,69 @@ def init_mcp_autoupdate(conn) -> None:
             updated_at TEXT NOT NULL
         )
     """)
+
+
+# The generation MCPs' skills an install copied into agent_skills at
+# assignment while their manifests left them out of tasks (before 1.9.1).
+GENERATION_SKILLS = ("music-gen-usage", "image-gen-usage", "video-gen-usage")
+_GENERATION_SKILLS_FLAG = "generation_skills_in_tasks"
+# The memory MCP's always-loaded card, gone in 1.9.1 (the prompt's Memory
+# section carries the rules once): its rows go with it.
+RETIRED_MEMORY_SKILL = "memory-usage"
+_MEMORY_SKILL_FLAG = "memory_usage_rows_dropped"
+
+
+def migrate_mcp(conn) -> None:
+    """The MCP domain's forward data migrations (``run_migrations`` calls it).
+
+    1.9.1: the image, music and video tools load in task sessions as in
+    chats, meetings still without them. A skill row that still holds the old
+    default (exactly ``["task"]``) takes the new one; a row an admin changed
+    keeps its value. One shot (a ``platform_settings`` flag), in a SAVEPOINT
+    so a surprise row never aborts the boot (it retries next start)."""
+    _drop_retired_memory_skill_rows(conn)
+    if conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
+                    (_GENERATION_SKILLS_FLAG,)).fetchone():
+        return
+    from core.session import session_kind
+    old_default, new_default = [session_kind.TASK.name], [session_kind.MEETING.name]
+    conn.execute("SAVEPOINT generation_skills")
+    try:
+        rows = conn.execute(
+            "SELECT agent_name, skill_id, exclude_from FROM agent_skills WHERE skill_id = ANY(%s)",
+            (list(GENERATION_SKILLS),),
+        ).fetchall()
+        for r in rows:
+            try:
+                current = json.loads(r["exclude_from"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if current == old_default:
+                conn.execute(
+                    "UPDATE agent_skills SET exclude_from = %s WHERE agent_name = %s AND skill_id = %s",
+                    (json.dumps(new_default), r["agent_name"], r["skill_id"]),
+                )
+        conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+                     "ON CONFLICT (key) DO NOTHING", (_GENERATION_SKILLS_FLAG,))
+        conn.execute("RELEASE SAVEPOINT generation_skills")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT generation_skills")
+        logger.exception("generation skills migration failed: will retry next startup")
+
+
+def _drop_retired_memory_skill_rows(conn) -> None:
+    """Once: the ``agent_skills`` rows of the retired ``memory-usage`` card
+    go, so no agent keeps a row for a skill no manifest declares. Its own
+    flag, so a later skill reusing the id keeps its rows."""
+    if conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
+                    (_MEMORY_SKILL_FLAG,)).fetchone():
+        return
+    conn.execute("SAVEPOINT memory_usage_rows")
+    try:
+        conn.execute("DELETE FROM agent_skills WHERE skill_id = %s", (RETIRED_MEMORY_SKILL,))
+        conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+                     "ON CONFLICT (key) DO NOTHING", (_MEMORY_SKILL_FLAG,))
+        conn.execute("RELEASE SAVEPOINT memory_usage_rows")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT memory_usage_rows")
+        logger.exception("memory skill rows migration failed: will retry next startup")

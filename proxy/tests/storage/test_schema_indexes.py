@@ -24,7 +24,7 @@ from psycopg import sql
 import config
 from storage import pg, schema
 from storage.automation import db_tasks
-from storage.chat import db_chats
+from storage.chat import db_chats, engine_use
 
 
 def _seed(conn) -> None:
@@ -37,13 +37,16 @@ def _seed(conn) -> None:
                       f"proj{i % 9}" if i % 3 == 0 else "",
                       f"c{i - 1}" if i % 4 == 0 and i else "",
                       now if i % 5 == 0 else None,
-                      "wake" if i == 7 else ""))
+                      "wake" if i == 7 else "",
+                      "claude-code-cli" if i % 3 else "",
+                      "delegated" if i % 8 == 2 else "dashboard"))
         runs.append((f"r{i}", f"t{i % 11}", f"agent{i % 5}", "cron", "completed",
                      f"2026-09-{1 + i % 25:02d}T10:00:00", f"sess{i % 50}", cid))
     conn.cursor().executemany(
         "INSERT INTO chats (id, user_sub, agent, session_id, created_at, updated_at, "
-        "source_type, project_id, parent_chat_id, last_response_at, pending_delegate_wake) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", chats)
+        "source_type, project_id, parent_chat_id, last_response_at, pending_delegate_wake, "
+        "execution_path, origin) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", chats)
     conn.cursor().executemany(
         "INSERT INTO task_runs (id, task_id, agent, trigger_type, status, started_at, "
         "session_id, chat_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", runs)
@@ -125,6 +128,7 @@ CASES = [
     ("idx_chats_parent", db_chats, "list_chats_by_parent", ("c3",)),
     ("idx_chats_last_response", db_chats, "list_unread_finished_chats", ("2026-01-01",)),
     ("idx_chats_pending_wake", db_chats, "list_chats_with_pending_wakes", ()),
+    ("idx_chats_own_engine_use", engine_use, "own_chat_counts", ("u3", "2026-09-01T00:00:00+00:00")),
 ]
 
 
@@ -140,6 +144,20 @@ def test_the_hot_lookups_use_their_index(seeded, monkeypatch, index, module, fn,
     wanted = index if isinstance(index, tuple) else (index,)
     assert any(i in custom for i in wanted), f"{fn}: {wanted} not in the custom plan"
     assert any(i in generic for i in wanted), f"{fn}: {wanted} not in the generic plan"
+
+
+@pytest.mark.parametrize("fn,args", [
+    ("list_chats", ("u3", "agent3")),
+    ("list_task_chats", ("agent1", "u1")),
+])
+def test_a_sidebar_page_after_a_cursor_reads_the_agent_index(seeded, monkeypatch, fn, args):
+    rec = _Recorder()
+    monkeypatch.setattr(db_chats, "get_conn", rec.get_conn)
+    getattr(db_chats, fn)(*args, before=("2026-09-26T10:00:00", "c200"))
+    query, params = rec.queries[0]
+    custom, generic = _plans(query, params)
+    assert "idx_chats_agent_updated" in custom, f"{fn}: the custom plan skips the index"
+    assert "idx_chats_agent_updated" in generic, f"{fn}: the generic plan skips the index"
 
 
 def test_list_runs_by_session_uses_the_session_index(seeded, monkeypatch):

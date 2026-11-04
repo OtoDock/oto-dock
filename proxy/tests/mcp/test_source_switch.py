@@ -718,7 +718,7 @@ def test_update_state_reads_the_persisted_check(temp_db, monkeypatch):
     r = _client(_principal("admin")).get("/v1/admin/mcps/update-state")
     assert r.status_code == 200
     assert r.json() == {"updates": {}, "checked": 0, "checked_at": "",
-                        "auto_update_enabled": True}
+                        "running": {}, "finished": {}, "auto_update_enabled": True}
     store.replace_check_results({"x-mcp": {"current": "1", "latest": "2", "registry": "npm",
                                            "package": "x", "reason": "package"}})
     body = _client(_principal("admin")).get("/v1/admin/mcps/update-state").json()

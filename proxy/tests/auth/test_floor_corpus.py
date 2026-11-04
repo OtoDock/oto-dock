@@ -628,7 +628,8 @@ def _special_scenarios():
         yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "ctx": ""}
         yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "ctx": "remote-full-editor"}
         yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "ctx": "judge"}
-        yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "layer": "holds-turn"}
+        yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "interactive": True,
+               "layer": "nonblocking-question"}
         yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "layer": "canonical"}
         yield {**_BASE_SCENARIO, "mode": mode, "client": dash, "layer": "reviews"}
         yield {**_BASE_SCENARIO, "mode": mode, "client": session_kind.TASK.name, "layer": "reviews"}
@@ -646,8 +647,9 @@ def _special_scenarios():
 
 
 class _Layer:
-    """An engine stub: one whose question tool holds the turn open
-    (Codex's), one that names MCP tools with a sanitized server key, one
+    """An engine stub: one whose question tool opens no dialog that holds
+    the turn in its terminal (Codex's async one), one that names MCP tools
+    with a sanitized server key, one
     whose own reviewer judges the call (Auto), one whose terminal reports
     its mode and asks from the hook (Claude Code's, with no reviewer, or
     with its classifier running in its auto mode), or Codex's terminal,
@@ -671,8 +673,8 @@ class _Layer:
         return tool_name
 
     def capabilities_for(self, session_id):
-        holds = self.kind == "holds-turn"
-        behaviour = type("B", (), {"question_tool_holds_turn": holds})()
+        nonblocking = ("AskUserQuestion",) if self.kind == "nonblocking-question" else ()
+        behaviour = type("B", (), {"nonblocking_question_tools": nonblocking})()
         return type("C", (), {"behaviour": behaviour})()
 
 
@@ -750,6 +752,11 @@ def decide(floor, monkeypatch):
     monkeypatch.setattr(mcp_registry, "device_capability_for_server",
                         lambda server: _DEVICE_CAPS.get(server, ""))
     monkeypatch.setattr(stream_pump, "_active_pumps", pumps)
+    # The corpus records where a card goes as a queued item: a live pump
+    # reads the queue (where a card shows with no pump is
+    # tests/hooks/test_hook_cards_between_turns.py's).
+    from core.session import engine_prompts
+    monkeypatch.setattr(engine_prompts, "queue_has_reader", lambda queue: True)
     monkeypatch.setattr(session_config_dir, "attached_ssh_hosts", lambda agent: SSH_HOSTS)
     # Every call answers alone: the terminal's last word and an Allow kept
     # for the engine's repeat request never carry over to the next.

@@ -735,6 +735,21 @@ async def test_an_admin_cancels_another_persons_message_and_a_member_cannot(temp
     assert q.items == [] and admin.errors == []
 
 
+@pytest.mark.asyncio
+async def test_a_card_answer_is_not_cancelled_by_its_author_or_an_admin(temp_db, monkeypatch):
+    from services.cards import status as card_status
+    from services.notifications import notification_manager
+    monkeypatch.setattr(notification_manager, "push_live", lambda *a, **k: 1)
+    cid = "chat-card-q"
+    temp_db.create_chat(cid, "user-viewer", "agent-a", "default")
+    q = await input_queue.loaded(cid)
+    await q.add("q-card", "user-viewer", TurnInput("Yes.", card={"card_id": "card-1", "button": "yes"}))
+    for conn in (_CancelConnection("user-viewer", "member", cid), _CancelConnection("user-admin", "admin", cid)):
+        await conn._on_cancel_queued({"queue_id": "q-card"})
+        assert conn.errors == [card_status.CARD_ANSWER_STAYS]
+    assert [qi.queue_id for qi in q.items] == ["q-card"]
+
+
 def test_a_shared_session_serves_only_the_person_it_was_warmed_for(monkeypatch):
     from types import SimpleNamespace
 
@@ -1977,6 +1992,57 @@ def test_a_delivery_types_the_authors_batch_into_their_own_terminal(temp_db, mon
     run_ws_scenario(scenario)
 
 
+def test_a_card_answer_typed_into_the_persons_terminal_keeps_its_mark(temp_db, monkeypatch):
+    """A card's say message, queued by the server as the person's own, goes
+    into the terminal they drive, and its one row carries the card's mark
+    (the history draws it as the card's answer)."""
+    from core.session import interactive_session
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            term = _OwnTerminal(chat_id, sid)
+            monkeypatch.setattr(interactive_session, "find_live_for_chat",
+                                lambda cid: term if cid == chat_id else None)
+            q = await input_queue.loaded(chat_id)
+            mark = {"card_id": "card-1", "button": "yes"}
+            await q.add("q-card", "user-admin", TurnInput("Yes, go ahead.", card=mark))
+            input_queue.arm(chat_id, delay=0.0)
+            await _wait_for(lambda: term.typed)
+            assert b"Yes, go ahead." in term.typed[0]
+            sent = await _until(ws, "queue_sent")
+            assert sent["queue_ids"] == ["q-card"] and sent["card"] == mark
+            await chat_writer.drain(chat_id, timeout=5)
+            rows = [m for m in task_store.get_chat_messages(chat_id) if m["role"] == "user"]
+            assert [r["content"] for r in rows] == ["Yes, go ahead."]
+            assert json.loads(rows[0]["event_data"])["card"] == mark
+            assert layer.messages == []
+    run_ws_scenario(scenario)
+
+
+def test_a_browser_cannot_send_the_platforms_own_keys(temp_db, monkeypatch):
+    """A chat frame carrying ``_server_kick`` (a handler's in-process key that
+    skips the user row) is a plain send: the key is taken out at the socket,
+    so the person's row is written and the turn runs."""
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            ws.client_send({"type": "chat", "text": "no row?", "chat_id": chat_id,
+                            "_server_kick": True, "_artifact_framed": True})
+            await _until(ws, "done")
+            assert [(m[0], m[1]) for m in layer.messages] == [(sid, "no row?")]
+            await chat_writer.drain(chat_id, timeout=5)
+            assert ("user", "no row?") in _rows(chat_id)
+    run_ws_scenario(scenario)
+
+
 def test_a_queued_turn_on_a_machine_that_does_not_answer_goes_out_when_it_does(
         temp_db, monkeypatch):
     """The dead session's machine is connected but silent past the inline
@@ -2065,8 +2131,7 @@ def test_the_meeting_note_is_a_prelude_every_matcher_strips():
     )
     from core.session.transcript_tailer import _title_from_prompt
     from services.meetings.meeting_context import parent_note
-    from storage.chat.chat_titles import deterministic_title
-    from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
+    from storage.chat.chat_titles import PRELUDE_RE as ws_re, title_from_prompt
     note = parent_note({"id": "mtg-0123456789ab", "topic": "office\nmargins [q3]"}, turns=3,
                        names=["Head", "Alpha"], last_words="We keep 12 %. ] then",
                        summary=True, ended_at="2026-10-16 01:00")
@@ -2075,7 +2140,7 @@ def test_the_meeting_note_is_a_prelude_every_matcher_strips():
                  f"{stamp} {note} what did they decide?"):
         assert _title_from_prompt(text) == "what did they decide?"
         assert codex_title(text) == "what did they decide?"
-        assert deterministic_title(text) == "what did they decide?"
+        assert title_from_prompt(text) == "what did they decide?"
         assert _user_row_key(text) == "what did they decide?"
         out = text
         for _ in range(3):
@@ -2083,4 +2148,4 @@ def test_the_meeting_note_is_a_prelude_every_matcher_strips():
         assert out.strip() == "what did they decide?"
     # A person quoting the note's tail mid-message is never touched.
     quoted = 'say "you have only this note.]" back to me'
-    assert deterministic_title(quoted).startswith("say")
+    assert title_from_prompt(quoted).startswith("say")

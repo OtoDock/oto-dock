@@ -48,6 +48,7 @@ from auth import roles
 from core import host_os
 from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 from services.infra import external_data
+from services.mcp import team_line
 
 logger = logging.getLogger("otodock")
 
@@ -99,6 +100,13 @@ async def get_dynamic_contexts(
     if "department" not in kwargs and any(
             _providers.get(n) is _delegation_mcp_context for n in assigned_mcp_names):
         kwargs["department"] = await asyncio.to_thread(_department_data, agent_name)
+        # The team line beside it (team_line.py): the assignments, off the loop.
+        kwargs.setdefault("team", await asyncio.to_thread(team_line.data, agent_name))
+    # The display provider names the apps a template seeded: resolved here,
+    # off the loop, so the provider reads nothing.
+    if "template_apps" not in kwargs and any(
+            _providers.get(n) is _display_mcp_context for n in assigned_mcp_names):
+        kwargs["template_apps"] = await asyncio.to_thread(_template_apps, agent_name, user_sub)
     # A session is told once where its GitHub reach stops (the gateway and
     # the credential helper refuse past it), by the scope it resolves in.
     reach_lines = await asyncio.to_thread(_reach_lines, agent_name, assigned_mcp_names, user_sub)
@@ -658,28 +666,57 @@ _ROSTER_MODEL_CAP = 8
 
 def build_delegation_roster(
     delegation_targets: list[str],
+    user_sub: str = "",
 ) -> dict[str, list[dict]]:
-    """Resolve each target agent's enabled execution layers + models.
+    """Resolve each target agent's execution layers + models, for the
+    session's person.
 
-    Returns ``{slug: [{path, is_default, local_only, default_model, models,
-    more}, …]}`` — the data ``_delegation_mcp_context`` renders so a
-    "delegate this on Opus / on codex" request can be validated and chosen
-    instead of delegating blind. Sources match the spawn validator
-    (``spawn_authz.validate_spawn_overrides``): ``_get_execution_paths`` for
-    layers, enabled ``list_models`` rows per layer (deduped — one query per
-    distinct layer, not per agent), ``resolve_agent_model`` for the default —
-    so the advertised set is exactly what a spawn override will pass.
+    Returns ``{slug: [{path, is_default, is_agent_default, person, platform,
+    no_machines, default_model, models, more}, …]}`` — the data
+    ``_delegation_mcp_context`` renders so a "delegate this on Opus / on
+    codex" request can be validated and chosen instead of delegating blind.
+    The engines are the agent's allowlist (``_get_execution_paths``, what the
+    spawn validator ``spawn_authz.validate_spawn_overrides`` passes) narrowed
+    to the engines someone can run there, each tagged with who: ``person``
+    when the session's person holds an account the agent allows
+    (``engine_resolution``: their chats, lanes and own tasks; a resting
+    account still counts, the listing follows what is connected), ``platform``
+    when the platform pool serves it (an agent-scope task or run). The
+    person's resolved engine is marked default and the agent's own engine
+    ``is_agent_default``; a session with no person (agent scope) lists the
+    pool's engines alone; with nothing runnable, the whole allowlist (the
+    spawn's refusal names the reason). Enabled ``list_models`` rows per layer (deduped —
+    one query per distinct layer, not per agent), ``resolve_agent_model``
+    for the default.
 
     Sync DB reads — call via ``asyncio.to_thread`` from the config builders
     and pass the result through the ``delegation_roster`` kwarg; NEVER call
     from a context provider (providers are no-I/O by contract).
     """
     import config as app_config
+    from services.engines import engine_resolution, subscription_pool
     from storage.agents import agent_store
     from storage.agents.agent_store import _get_execution_paths
     from storage.billing import subscription_store
 
     models_by_layer: dict[str, list[dict]] = {}
+    rows = {slug: agent_store.get_agent(slug) for slug in delegation_targets}
+    resolved = engine_resolution.resolve_many([r for r in rows.values() if r], user_sub) if user_sub else {}
+    pooled: dict[str, bool] = {}
+
+    def _person_runs(slug: str, path: str) -> bool:
+        r = resolved.get(slug)
+        return bool(user_sub and r and path in r.allowed)
+
+    def _platform_runs(path: str) -> bool:
+        if path not in pooled:
+            pooled[path] = subscription_pool.layer_platform_configured(path)
+        return pooled[path]
+
+    def _default(slug: str, data: dict) -> str:
+        r = resolved.get(slug)
+        return (r.execution_path if r and r.execution_path
+                else data.get("execution_path") or "")
 
     def _layer_models(path: str) -> list[dict]:
         # Tier order (untiered last), then registry order: the line an
@@ -703,19 +740,31 @@ def build_delegation_roster(
 
     roster: dict[str, list[dict]] = {}
     for slug in delegation_targets:
-        data = agent_store.get_agent(slug)
+        data = rows.get(slug)
         if not data:
             continue
         layers: list[dict] = []
-        for i, path in enumerate(_get_execution_paths(data)):
+        default_path = _default(slug, data)
+        agent_default = data.get("execution_path") or ""
+        # The person's order (their use) when the session has one.
+        allowlist = list(resolved[slug].order_for_me) if slug in resolved else _get_execution_paths(data)
+        # Nothing runnable for the person or the pool: the allowlist as it
+        # is, so the model ids stay learnable and the refusal, with its
+        # reason, comes from the spawn rather than from a blind pin.
+        shown = [p for p in allowlist if _person_runs(slug, p) or _platform_runs(p)] or allowlist
+        for path in shown:
             # Per path: the agent default is honoured only where that
             # layer serves it, else the layer's own first choice (the same
             # rule the task runner applies), so a non-default layer never
-            # shows no default at all.
-            try:
-                default_model = app_config.resolve_agent_model(slug, layer=path)
-            except (RuntimeError, psycopg.Error):
-                default_model = ""
+            # shows no default at all; the person's own model where one
+            # resolved for them.
+            person = resolved.get(slug)
+            default_model = (person.models_for_me.get(path, "") if person else "")
+            if not default_model:
+                try:
+                    default_model = app_config.resolve_agent_model(slug, layer=path)
+                except (RuntimeError, psycopg.Error):
+                    default_model = ""
             catalog = _layer_models(path)
             models = [m["model_id"] for m in catalog]
             # Default first so the cap can never hide it.
@@ -725,8 +774,11 @@ def build_delegation_roster(
                 ]
             layers.append({
                 "path": path,
-                "is_default": i == 0,
-                "local_only": not _supports_remote(path),
+                "is_default": path == default_path,
+                "is_agent_default": path == agent_default,
+                "person": _person_runs(slug, path),
+                "platform": _platform_runs(path),
+                "no_machines": not _supports_remote(path),
                 "default_model": default_model,
                 "models": models[:_ROSTER_MODEL_CAP],
                 "more": max(0, len(models) - _ROSTER_MODEL_CAP),
@@ -821,10 +873,24 @@ def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
 
 def _supports_remote(execution_path: str) -> bool:
     """Whether the engine can run on a satellite at all (the roster's
-    ``local_only`` flag). An unregistered id reads as local."""
+    ``no_machines`` flag). An unregistered id reads as local."""
     from core.session.session_manager import get_layer_capabilities
     caps = get_layer_capabilities(execution_path)
     return bool(caps and caps.runtime.supports_remote_execution)
+
+
+#: The words of a `layers:` line, explained once under Available Agents.
+ROSTER_LEGEND = (
+    "On a `layers:` line, `person` marks an engine the person in this chat "
+    "can run (their chats, lanes and own tasks), `platform` one the platform "
+    "pool serves (agent-scope tasks and runs); `default` is the engine an "
+    "unpinned run of this chat takes and `agent default` the agent's own, "
+    "which its agent-scope tasks take; `no paired machine` means the engine "
+    "runs on the platform host alone. A model copied from a line runs on "
+    "the `default` engine when that engine offers it, else on the first "
+    "engine of the agent's own order that does, which is not always the "
+    "line's order: name its `layer` for an id on two lines."
+)
 
 
 def _fmt_roster_layers(layers: list[dict]) -> str:
@@ -834,8 +900,13 @@ def _fmt_roster_layers(layers: list[dict]) -> str:
         parts = []
         if layer["is_default"]:
             parts.append("default")
-        if layer["local_only"]:
-            parts.append("local only")
+        elif layer.get("is_agent_default"):
+            parts.append("agent default")
+        who = [w for w, runs in (("person", layer.get("person")), ("platform", layer.get("platform"))) if runs]
+        if who:
+            parts.append(", ".join(who))
+        if layer["no_machines"]:
+            parts.append("no paired machine")
         if layer["models"]:
             tiers = layer.get("tiers") or {}
             shown = ", ".join(
@@ -993,7 +1064,9 @@ def _delegation_mcp_context(
         # its place.
         dept_line = _department_line(agent_name, agent_store.get_agent(agent_name) or {}, [],
                                      department=kwargs.get("department", _DEPARTMENT_UNRESOLVED))
-        return "\n".join(p for p in (dept_line.strip(), sibling_block) if p) or None
+        people = team_line.render(kwargs.get("team"), kwargs.get("user_sub", "") or "",
+                                  kwargs.get("user_role", "") or "")
+        return "\n".join(p for p in (dept_line.strip(), people, sibling_block) if p) or None
 
     roster: dict[str, list[dict]] = kwargs.get("delegation_roster") or {}
 
@@ -1036,6 +1109,11 @@ def _delegation_mcp_context(
                                  department=kwargs.get("department", _DEPARTMENT_UNRESOLVED))
     if dept_line:
         lines.append(dept_line)
+    # The people the agent serves, beside the department line (team_line.py).
+    people = team_line.render(kwargs.get("team"), kwargs.get("user_sub", "") or "",
+                              kwargs.get("user_role", "") or "")
+    if people:
+        lines.append(("" if dept_line else "\n") + people)
 
     # Delegation targets (excluding self if present)
     for slug in delegation_targets:
@@ -1057,7 +1135,7 @@ def _delegation_mcp_context(
             "target's `layers:` line above (the `[t1]`..`[t4]` tags are the "
             "capability tiers listed under Model tiers); omit both to "
             "inherit the worker's defaults (recommended). Ignored with "
-            "`continue_id`."
+            "`continue_id`. " + ROSTER_LEGEND
         )
     lines.append(
         "`send_files(target_agent, paths, …)` copies workspace files into a "
@@ -1081,6 +1159,58 @@ def _delegation_mcp_context(
 
 
 register("delegation-mcp", _delegation_mcp_context)
+
+
+# At most this many apps are named; a team with more reads list_apps.
+_TEMPLATE_APPS_CAP = 12
+# An app's title is the bundle's own word: one line, no backtick, at most
+# this long before it reaches a prompt.
+_TEMPLATE_TITLE_CAP = 80
+
+
+def _prompt_word(text: str, cap: int = _TEMPLATE_TITLE_CAP) -> str:
+    """``text`` as a prompt may carry it: whitespace and control
+    characters collapsed to one space, backticks dropped, cut at ``cap``."""
+    cleaned = "".join(" " if ch.isspace() or not ch.isprintable() else ch for ch in text)
+    return " ".join(cleaned.replace("`", "").split())[:cap]
+
+
+def _template_apps(agent_name: str, user_sub: str = "") -> list[dict]:
+    """The agent's shared apps and the person's own that a template or a
+    bundle gave: ``{title, slug, from_template, from_version}`` (sync store
+    reads: call off the loop)."""
+    from services.apps import app_blueprints
+    from storage import database as task_store
+    username = task_store.get_username_by_sub(user_sub) if user_sub else ""
+    rows = task_store.list_apps(agent_name, username or "")
+    out = []
+    for r in rows:
+        # A copy seeded before the origin columns reads its template from
+        # its seed reference (origin_of).
+        from_template, from_version = app_blueprints.origin_of(r)
+        if from_template:
+            out.append({"title": _prompt_word(str(r.get("title") or r.get("slug") or "")), "slug": r.get("slug") or "",
+                        "from_template": from_template, "from_version": from_version})
+    return out
+
+
+def _display_mcp_context(agent_name: str, template_apps: list[dict] | None = None, **kwargs: Any) -> str | None:
+    """Tell the agent which of its apps came from a template, and which
+    one, so it knows the job each app was built for (app_blueprints.py)."""
+    apps = template_apps or []
+    if not apps:
+        return None
+    lines = ["## Apps from templates", "",
+             "These apps came from a template. Each line names it and its version."]
+    for a in apps[:_TEMPLATE_APPS_CAP]:
+        version = f" {a['from_version']}" if a.get("from_version") else ""
+        lines.append(f"- {_prompt_word(str(a['title']))} (`{a['slug']}`): from the `{a['from_template']}` template{version}.")
+    if len(apps) > _TEMPLATE_APPS_CAP:
+        lines.append(f"- and {len(apps) - _TEMPLATE_APPS_CAP} more: `list_apps` names them.")
+    return "\n".join(lines)
+
+
+register("display-mcp", _display_mcp_context)
 
 
 def _schedules_mcp_context(
@@ -1117,19 +1247,26 @@ def _schedules_mcp_context(
     else:
         lines.append(f"Your layers: {_fmt_roster_layers(layers)}")
         lines.extend(_fmt_model_tiers({agent_name: layers}))
+        lines.append("\n" + ROSTER_LEGEND)
 
     lines.append(
-        "\nTasks run on your default model unless pinned. `model` / `layer` "
-        "on `create_scheduled_task`, `create_one_time_task` and `edit_task` "
-        "pin ONE task's runs to a different model or layer, leaving your "
-        "default untouched everywhere else — the lever for keeping a lighter "
-        "default while one demanding task runs on a stronger model (or the "
-        "reverse). Pin by tier, never by how an id sounds: complex, "
-        "open-ended or judgement-heavy work belongs on a tier 1 model. Values "
-        "outside the list above are "
-        "rejected. Ask the user before pinning unless they asked for it; "
-        "`edit_task(model=\"\")` clears a pin. `get_task` reads a task back "
-        "with its prompt."
+        "\nAn unpinned task runs on the engine marked `default` when a person "
+        "created it (their own account, a user-scope task), and on the "
+        "agent's default engine from the platform pool when it is the "
+        "agent's own (an agent-scope task needs an engine tagged `platform`). "
+        "`model` / `layer` on `create_scheduled_task`, `create_one_time_task` "
+        "and `edit_task` pin ONE task's runs to a different model or layer, "
+        "leaving the defaults untouched everywhere else — the lever for "
+        "keeping a lighter default while one demanding task runs on a "
+        "stronger model (or the reverse); a model alone runs on the engine "
+        "the task takes unpinned when that engine offers it, else on the "
+        "first engine of the agent's own order that does, which is not always "
+        "the line's order (name its `layer` for an id on two lines). Pin by "
+        "tier, never by how an id sounds: complex, open-ended or "
+        "judgement-heavy work belongs on a tier 1 model. Values outside the "
+        "list above are rejected. Ask the user before pinning unless they "
+        "asked for it; `edit_task(model=\"\")` clears a pin. `get_task` reads "
+        "a task back with its prompt."
     )
     return "\n".join(lines)
 
@@ -1341,5 +1478,6 @@ def format_ssh_host_command(field_values: dict, *, mux: bool) -> str | None:
 # memory-mcp has no dynamic_context provider — memory reaches the prompt
 # via the dedicated # Memory sections
 # (``configuration.prompts._render_memory_sections``:
-# topic files inline under the budget, generated index past it), so a
+# topic files inline under the budget, past it the newest that fit and the
+# rest listed with their index entries), so a
 # session restart picks up new entries via the normal prompt build.

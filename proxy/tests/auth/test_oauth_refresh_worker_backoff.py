@@ -229,3 +229,144 @@ class TestInvalidGrantGiveUp:
         # invalid_client is permanent for the registered client only
         assert code(OAuthTokenError("p", "refresh", "invalid_client"), "mcp_authorization") == "invalid_client"
         assert code(OAuthTokenError("p", "refresh", "invalid_client"), "standard") == ""
+
+
+def _far_file(path: Path, **fields) -> None:
+    """A token file an hour from its expiry (the tick leaves it alone)."""
+    _write_token_file(path, expires_in_seconds=3600)
+    if fields:
+        raw = json.loads(path.read_text())
+        raw.update(fields)
+        path.write_text(json.dumps(raw))
+
+
+async def _renew_with(provider, path: Path, still=lambda raw: True) -> str:
+    with patch(
+        "auth.oauth_providers.get_provider", return_value=provider,
+    ), patch(
+        "services.mcp.mcp_registry.get_mcps_by_provider", return_value=[],
+    ):
+        return await oauth_refresh_worker.renew_now(path, still=still)
+
+
+class TestRenewalOutOfTurn:
+    """``renew_now``: the credential gateway's ask after the MCP server
+    refused a token far from its expiry."""
+
+    @pytest.fixture(autouse=True)
+    def _no_reservations(self):
+        oauth_refresh_worker._forced_at.clear()
+        yield
+        oauth_refresh_worker._forced_at.clear()
+
+    def _renewed(self):
+        return AsyncMock(return_value=TokenSet(
+            access_token="new-AT", refresh_token="new-RT", expires_in=3600,
+            scope="", token_type="Bearer", raw={},
+        ))
+
+    @pytest.mark.asyncio
+    async def test_a_file_far_from_expiry_is_renewed_once_an_hour(self, sessions_dir):
+        f = sessions_dir / "slack-tokens" / "alice" / "default.json"
+        _far_file(f)
+        clock, now = _fake_clock()
+        oauth_refresh_worker._monotonic = now
+        refresh = self._renewed()
+        assert await _renew_with(_provider(refresh), f) == oauth_refresh_worker.RENEWED
+        assert json.loads(f.read_text())["access_token"] == "new-AT"
+        clock["now"] += 1800
+        assert await _renew_with(_provider(refresh), f) == oauth_refresh_worker.NOT_NOW
+        assert refresh.call_count == 1
+        clock["now"] += 1801
+        assert await _renew_with(_provider(refresh), f) == oauth_refresh_worker.RENEWED
+        assert refresh.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_token_with_nothing_to_renew_it_says_so_without_a_call(self, sessions_dir):
+        refresh = self._renewed()
+        no_refresh = sessions_dir / "slack-tokens" / "alice" / "a.json"
+        _far_file(no_refresh, refresh_token="")
+        pat = sessions_dir / "slack-tokens" / "alice" / "b.json"
+        _far_file(pat, extra={"flow": "personal_access_token"})
+        no_client = sessions_dir / "slack-tokens" / "alice" / "c.json"
+        _far_file(no_client, client_secret="")
+        for f in (no_refresh, pat, no_client):
+            assert await _renew_with(_provider(refresh), f) == oauth_refresh_worker.NOT_RENEWABLE
+        assert refresh.call_count == 0
+        assert oauth_refresh_worker._forced_at == {}
+
+    def test_renewable_follows_the_arms(self):
+        base = {"refresh_token": "RT", "client_id": "ci", "client_secret": "cs", "extra": {}}
+        renewable = oauth_refresh_worker.renewable
+        assert renewable(base)
+        assert not renewable({**base, "refresh_token": ""})
+        assert not renewable({**base, "client_secret": ""})
+        assert renewable({**base, "client_secret": "", "extra": {"via_relay": True}})
+        assert renewable({**base, "client_secret": "", "extra": {"flow": "mcp_authorization"}})
+        assert not renewable({**base, "extra": {"flow": "personal_access_token"}})
+        assert renewable({**base, "refresh_token": "", "extra": {"flow": "client_credentials"}})
+        assert not renewable({"client_id": "", "client_secret": "", "extra": {"flow": "client_credentials"}})
+        assert renewable({"extra": {"flow": "installation"}})
+
+    @pytest.mark.asyncio
+    async def test_a_file_that_changed_or_died_is_not_renewed(self, sessions_dir):
+        f = sessions_dir / "slack-tokens" / "alice" / "default.json"
+        _far_file(f)
+        refresh = self._renewed()
+        assert await _renew_with(_provider(refresh), f, still=lambda raw: False) == oauth_refresh_worker.NOT_NOW
+        _far_file(f, extra={"refresh_failed": "invalid_grant"})
+        assert await _renew_with(_provider(refresh), f) == oauth_refresh_worker.GAVE_UP
+        assert refresh.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failure_backs_off_and_invalid_grant_gives_up(self, sessions_dir, caplog):
+        f = sessions_dir / "slack-tokens" / "alice" / "default.json"
+        _far_file(f)
+        oauth_refresh_worker._monotonic = _fake_clock()[1]
+        refresh = AsyncMock(side_effect=RuntimeError("vendor 500"))
+        assert await _renew_with(_provider(refresh), f) == oauth_refresh_worker.NOT_NOW
+        assert oauth_refresh_worker._failure_state[str(f)]["failures"] == 1
+        assert "default" not in caplog.text
+        g = sessions_dir / "slack-tokens" / "alice" / "other.json"
+        _far_file(g)
+        refresh = AsyncMock(side_effect=RuntimeError("slack token refresh failed: invalid_grant"))
+        assert await _renew_with(_provider(refresh), g) == oauth_refresh_worker.GAVE_UP
+        assert json.loads(g.read_text())["extra"]["refresh_failed"] == "invalid_grant"
+
+
+class TestGuardedRewrite:
+    @pytest.mark.asyncio
+    async def test_a_rewrite_writes_what_the_change_returns(self, sessions_dir):
+        f = sessions_dir / "slack-tokens" / "alice" / "default.json"
+        _far_file(f)
+
+        def mark(raw):
+            return {**raw, "extra": {**raw["extra"], "seen": True}}
+
+        assert await oauth_refresh_worker.rewrite(f, mark) is True
+        assert json.loads(f.read_text())["extra"] == {"seen": True}
+        assert await oauth_refresh_worker.rewrite(f, lambda raw: None) is False
+        assert json.loads(f.read_text())["extra"] == {"seen": True}
+        assert await oauth_refresh_worker.rewrite(f.with_name("gone.json"), mark) is False
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_written_while_a_refreshed_token_waits(self, sessions_dir):
+        f = sessions_dir / "slack-tokens" / "alice" / "default.json"
+        _far_file(f)
+        oauth_refresh_worker._pending_writes[str(f)] = oauth_refresh_worker._PendingWrite(
+            mtime=f.stat().st_mtime, payload={"access_token": "refreshed"})
+        try:
+            assert await oauth_refresh_worker.rewrite(f, lambda raw: {**raw, "x": 1}) is False
+        finally:
+            oauth_refresh_worker._pending_writes.clear()
+        assert "x" not in json.loads(f.read_text())
+
+    def test_the_reread_takes_the_mtime_of_the_file_it_read(self, sessions_dir):
+        f = sessions_dir / "slack-tokens" / "alice" / "default.json"
+        _far_file(f)
+        os.utime(f, (1_000_000, 1_000_000))
+        raw, mtime = oauth_refresh_worker._read_with_mtime(f)
+        assert raw is not None and raw["access_token"] == "old-AT" and mtime == 1_000_000
+        f.write_text("{not json")
+        assert oauth_refresh_worker._read_with_mtime(f) == (None, 0.0)
+        assert oauth_refresh_worker._read_with_mtime(f.with_name("gone.json")) == (None, 0.0)

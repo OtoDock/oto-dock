@@ -29,7 +29,6 @@ from core.session import session_kind
 from core.session.resume_probe import RESUME_PROBE_BUDGET_BACKGROUND_S, settle_resume
 from services.scheduler import delivery, interactive, lanes, runner, shared, task_kinds
 from storage import database as task_store
-from storage.agents import agent_store
 from storage.automation import run_status
 from storage.chat import meeting_status
 
@@ -151,9 +150,10 @@ class TaskRun:
             # when its turn is open, pasted at quiescence otherwise) and
             # the round waits for that turn's end; the tailer persists
             # the turn, so the collection and delivery below stand. The
-            # prompt row is the tailer's too, as for a fresh interactive
-            # round.
-            await interactive._run_borrowed_terminal_turn(self.borrowed, self.prompt)
+            # prompt's row is written from the injection, after what the
+            # terminal produced before it read the prompt.
+            self.prompt_row_id = await interactive._run_borrowed_terminal_turn(
+                self.borrowed, self.prompt, persist_row=self._prompt_row_job)
         else:
             await self._spawn_and_drive()
 
@@ -274,11 +274,9 @@ class TaskRun:
             return task_store.get_last_chat_message_id(self.chat_id)
 
         self.output_cursor = await chat_writer.submit(self.chat_id, _start_round, label="run_start")
-        # The user-prompt bubble is persisted AFTER the config build below, so
-        # we can skip it for an interactive run (there the prompt rides the
-        # PTY/argv and the transcript tailer backfills it — pre-persisting
-        # would duplicate it). Config build is fast relative to start_session,
-        # so the prompt still lands before the slow spawn.
+        # The prompt's row lands after the config build below (fast relative
+        # to start_session, so it still precedes the slow spawn), or from the
+        # injection hook of a borrowed terminal.
         # chat_id on the run immediately so the dashboard can load it while running.
         await run_db(task_store.update_run, self.run_id, chat_id=self.chat_id, session_id=self.session_id)
 
@@ -297,13 +295,21 @@ class TaskRun:
     async def _build_config(self) -> None:
         """The task's agent config; an offline target ends the run."""
         from core.config.task_config_builder import build_task_agent_config
+        from storage.pg import run_db
         # 2. Build config via task_config_builder (handles scope creds,
         #    security context, task suffix, env vars). trigger_payload
         #    threads through so manifest agent_context blocks resolve
         #    ${trigger.*} tokens for webhook-fired tasks.
+        # The run's chat row carries the engine and model the runner
+        # resolved when it created it (``_create_task_chat_row``; a
+        # delegated worker's row the same): the builder takes them so the
+        # session runs where the row says.
+        row = await run_db(task_store.get_chat, self.chat_id) or {}
         self.agent_cfg = await build_task_agent_config(
             self.task.agent, self.task, self.session_id,
             trigger_payload=self.trigger_payload,
+            execution_path=row.get("execution_path") or "",
+            model=row.get("model") or "",
         )
 
         # Hard-fail if the resolved target is the offline sentinel from
@@ -330,6 +336,14 @@ class TaskRun:
                 )
             machine_label = machine.get("name") or offline_machine_id[:8]
             is_admin_target = placement.machine_is_admin_paired(machine)
+            from core.config.task_config_builder import worker_machine_owner
+            if not is_admin_target and await run_db(worker_machine_owner, self.task):
+                # A chat worker on its delegator's own computer: it waits for
+                # it, the chat keeps its place.
+                raise RuntimeError(
+                    f"{machine_label} is offline, so this work cannot run there now. "
+                    f"Reconnect it, then continue the work."
+                )
             if is_admin_target:
                 raise RuntimeError(
                     f"This agent's remote machine '{machine_label}' is currently offline. "
@@ -348,12 +362,16 @@ class TaskRun:
         # Resolve the execution layer from the config's already-resolved
         # target + path so the layer can never disagree with the config
         # (the divergence that silently ran user-scoped tasks on local).
+        # The layer's person: the run's own, else a chat worker's delegator
+        # on their own computer (``placement_sub``), whose session there
+        # carries none of the agent's secrets.
+        cfg = cast("AgentConfig", self.agent_cfg)
         self.layer = get_execution_layer(
             self.task.agent,
-            execution_path=cast("AgentConfig", self.agent_cfg).execution_path,
-            user_sub=self._ident.creds_user_sub,
+            execution_path=cfg.execution_path,
+            user_sub=self._ident.creds_user_sub or cfg.placement_sub or None,
             role=self._ident.role,
-            execution_target=cast("AgentConfig", self.agent_cfg).execution_target,
+            execution_target=cfg.execution_target,
         )
 
         # Pin the task chat to the target it actually runs on
@@ -572,41 +590,31 @@ class TaskRun:
             if _rc is not None and _rc.runtime.interactive_first_prompt_via_argv:
                 cast("AgentConfig", self.agent_cfg).interactive_first_prompt = self.engine_prompt
                 self.first_prompt_in_argv = True
+                # The TUI journals the launch argument as its first user
+                # line: noted before the spawn, so the first tail skips it
+                # (the prompt's row is the run's); a start that fails takes
+                # the note back (``_start_session``).
+                from core.session.transcript_tool_events import note_sent_prompt
+                note_sent_prompt(self.chat_id, self.engine_prompt, owner=self.session_id)
+
+    def _prompt_row_job(self) -> "asyncio.Future[int]":
+        """The prompt's row submitted on the chat's lane (its rows must land
+        in order; the search row rebuild runs off the loop with it): the
+        card the dashboard draws, with the meta naming the agent the prompt
+        came from. An interactive run's terminal journals the same text and
+        the tailer skips it (the note made where the prompt is typed)."""
+        from core.events import chat_writer
+        meta = lanes.prompt_row_meta(self.task.on_complete_agent, self.task.agent)
+        return chat_writer.submit(
+            self.chat_id,
+            functools.partial(task_store.add_chat_message, self.chat_id, "user", self.prompt,
+                              event_data=json.dumps(meta)),
+            label="task_prompt",
+        )
 
     async def _persist_prompt_row(self) -> None:
-        """The prompt's row in the chat (an interactive run's comes from
-        its transcript)."""
-        from core.events import chat_writer
-        # Persist the user-prompt bubble for the message-list view — but NOT
-        # for interactive runs (the tailer backfills it from the transcript,
-        # like an interactive chat; pre-persisting would duplicate it).
-        if not cast("AgentConfig", self.agent_cfg).interactive:
-            delegating_slug = self.task.on_complete_agent
-            if delegating_slug:
-                delegating_data = agent_store.get_agent(delegating_slug)
-                prompt_agent_meta = {
-                    "agent_slug": delegating_slug,
-                    "agent_display_name": delegating_data["display_name"] if delegating_data else delegating_slug,
-                    "agent_color": delegating_data.get("color", "") if delegating_data else "",
-                    "badge": "delegated by",
-                }
-            else:
-                executing_data = agent_store.get_agent(self.task.agent)
-                prompt_agent_meta = {
-                    "agent_slug": self.task.agent,
-                    "agent_display_name": executing_data["display_name"] if executing_data else self.task.agent,
-                    "agent_color": executing_data.get("color", "") if executing_data else "",
-                    "badge": "task prompt",
-                }
-            # On the chat's lane, behind the round's start (its rows
-            # must land in order; the search row rebuild runs off the
-            # loop with it).
-            self.prompt_row_id = await chat_writer.submit(
-                self.chat_id,
-                functools.partial(task_store.add_chat_message, self.chat_id, "user", self.prompt,
-                                  event_data=json.dumps(prompt_agent_meta)),
-                label="task_prompt",
-            )
+        """The prompt's row in the chat, behind the round's start."""
+        self.prompt_row_id = await self._prompt_row_job()
 
     async def _start_session(self) -> None:
         """Step 3 and 4: the session started (unless reused) and marked a
@@ -617,7 +625,15 @@ class TaskRun:
         if not self.reused_warm:
             if cast("AgentConfig", self.agent_cfg).resume and self.prompt_row_id and runner._rebuilds_from_rows(cast("AgentConfig", self.agent_cfg)):
                 cast("AgentConfig", self.agent_cfg).extra_env["_RESUME_SKIP_ROW"] = str(self.prompt_row_id)
-            await cast("ExecutionLayer", self.layer).start_session(self.session_id, cast("AgentConfig", self.agent_cfg))
+            try:
+                await cast("ExecutionLayer", self.layer).start_session(self.session_id, cast("AgentConfig", self.agent_cfg))
+            except BaseException:
+                if self.first_prompt_in_argv:
+                    # The launch argument's note stood for a journal line
+                    # that never comes, and no session registered to drop it.
+                    from core.session.transcript_tool_events import drop_sent_prompt
+                    drop_sent_prompt(self.chat_id, self.engine_prompt, owner=self.session_id)
+                raise
         self.session_started = True
 
         # 4. Mark as task session so /v1/session/current excludes it.
@@ -922,6 +938,7 @@ class TaskRun:
                     source_id=self.task.id,
                     agent_slug=self.task.agent,
                     chat_id=self.chat_id,
+                    audience=self.task.notify_audience,
                 ), name="fire_notification", owner="runner")
         elif self.task.notification_mode == "auto":
             from services.notifications import notification_manager
@@ -935,6 +952,7 @@ class TaskRun:
                 source_id=self.task.id,
                 agent_slug=self.task.agent,
                 chat_id=self.chat_id,
+                audience=self.task.notify_audience,
             ), name="fire_notification", owner="runner")
 
     def leave_for_recovery(self) -> bool:
@@ -1120,6 +1138,7 @@ class TaskRun:
                 source_id=self.task.id,
                 agent_slug=self.task.agent,
                 chat_id=self.chat_id,
+                audience=self.task.notify_audience,
             ), name="fire_notification", owner="runner")
 
         # A retry is for a run that failed — never for a cleanup failure

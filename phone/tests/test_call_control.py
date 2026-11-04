@@ -13,7 +13,9 @@ from pipeline_fakes import FakeCallManager, FakeLLM, make_route
 
 from config_manager import transfer_target_for
 from proxy.client import TOOL_USE_SIGNAL, ProxyClient
+from telephony.ami_events import AmiListenerManager
 from telephony.transfer import (
+    AmiOutboundTransfer,
     AmiTransfer,
     TransferError,
     TwilioTransfer,
@@ -35,13 +37,15 @@ class ControlLLM(FakeLLM):
         self.on_call_control = None
         self.results = []          # (request_id, ok, message)
         self.discarded = 0
+        self.discarded_turns = []
         self.current_turn = 1
 
     async def send_call_control_result(self, request_id, ok, message):
         self.results.append((request_id, ok, message))
 
-    def discard_turn(self):
+    def discard_turn(self, turn=None):
         self.discarded += 1
+        self.discarded_turns.append(turn)
 
 
 class FakeTransfer:
@@ -436,6 +440,126 @@ def test_ami_transfer_sends_a_redirect_to_from_internal():
     assert "down" in AmiTransfer(Manager(), "9", "x", "PJSIP/1").unavailable_reason()
 
 
+_LOCAL1 = "Local/6974163468@from-internal-00000012;1"
+
+
+class _ActionClient:
+    """A live event connection: records the actions a transfer sends."""
+
+    def __init__(self, host, port, username, secret, *, server_key, **kw):
+        self.server_key = server_key
+        self.connected = True
+        self.actions = []
+        self.unmatched_events = 0
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+    async def close(self):
+        self.connected = False
+
+    async def send_action(self, action):
+        self.actions.append(action)
+        return {"Response": "Success"}
+
+
+class _AmiCfg:
+    ami_dtmf_listener = "on"
+    ami_host = ami_username = ami_secret = ""
+    ami_port = 5038
+
+    def ami_event_servers(self):
+        return {"7": {"host": "pbx", "port": 5038, "username": "u", "secret": "s"}}
+
+
+async def _listener():
+    """A listener manager covering server 7, with an Originate on its way for
+    the call whose media leg presents ``uuid-o``."""
+    made = []
+
+    def factory(*a, **kw):
+        made.append(_ActionClient(*a, **kw))
+        return made[-1]
+
+    manager = AmiListenerManager(client_factory=factory)
+    await manager.apply(_AmiCfg())
+    manager.expect_originate("7", "aid", "uuid-o")
+    return manager, made[0]
+
+
+class _MediaLeg:
+    def inject_dtmf(self, digit, duration_ms=0):
+        pass
+
+
+def test_an_outbound_ami_transfer_reads_the_channel_the_pbx_reported():
+    async def run():
+        manager, client = await _listener()
+        handle = AmiOutboundTransfer(manager, "7", "uuid-o")
+        client.connected = False                          # a listener that never logged in
+        assert handle.unavailable_reason() == "the PBX connection is down"
+        client.connected = True
+        assert handle.unavailable_reason() == "the PBX has not named this call's channel yet"
+        assert manager.bind_outbound("7", "uuid-o", _MediaLeg()) is False   # the media leg first
+        assert "not named" in handle.unavailable_reason()
+        with pytest.raises(TransferError):
+            await handle.execute("101")
+        manager._on_originate("7", "aid", "Success", "1760000000.77", _LOCAL1, "4")
+        assert handle.unavailable_reason() == ""
+        await handle.execute("101", label="Manager")
+        assert client.actions == [{"Action": "Redirect", "Channel": _LOCAL1,
+                                   "Context": "from-internal", "Exten": "101", "Priority": "1"}]
+        client.connected = False
+        assert "down" in handle.unavailable_reason()
+        client.connected = True
+        manager.unbind_outbound("7", "uuid-o")
+        assert "not named" in handle.unavailable_reason()
+        await manager.stop()
+    asyncio.run(run())
+
+
+def test_an_outbound_freepbx_call_transfers_once_the_pbx_named_its_channel(make_pipeline):
+    """Before the PBX's report the tool answers the reason and the call goes
+    on; after it the Redirect moves the bound channel and the record reads
+    the transfer."""
+    from calls.call_manager import CallManager, CallStatus
+    from pipeline.call_control import TRANSFER_UNAVAILABLE
+
+    async def run():
+        listener, client = await _listener()
+        manager = CallManager()
+        call = manager.register_call("+30210", "book a table")
+        route = make_route(direction="outbound")
+        route.transfer_targets = [{"label": "Manager", "number": "101"}]
+        llm = ControlLLM()
+        p = make_pipeline(route=route, llm=llm, call_manager=manager,
+                          outbound_call_id=call.call_id)
+        p._transfer = AmiOutboundTransfer(listener, "7", "uuid-o")
+        p._install_call_control()
+        p.state._running = True
+        listener.bind_outbound("7", "uuid-o", _MediaLeg())
+
+        p._on_call_control(_frame("transfer", request_id="early", target="Manager"))
+        await _settle()
+        assert llm.results == [("early", False, TRANSFER_UNAVAILABLE.format(
+            reason="the PBX has not named this call's channel yet"))]
+        assert p.state._control_action == "" and p.state._running is True
+
+        listener._on_originate("7", "aid", "Success", "1760000000.77", _LOCAL1, "4")
+        p._on_call_control(_frame("transfer", request_id="late", target="Manager"))
+        await _settle()
+        assert llm.results[-1][:2] == ("late", True)
+        await p.state._control_between_turns
+        assert client.actions == [{"Action": "Redirect", "Channel": _LOCAL1,
+                                   "Context": "from-internal", "Exten": "101", "Priority": "1"}]
+        await p._finalize_outbound_call()
+        await listener.stop()
+        return call
+    call = asyncio.run(run())
+    assert call.status is CallStatus.COMPLETED
+    assert call.outcome == "Transferred to Manager" and call.transferred_to == "Manager"
+
+
 def test_twilio_transfer_waits_for_the_farewell_then_dials():
     calls = []
     drained = []
@@ -737,7 +861,52 @@ def test_an_end_during_the_opening_survives_the_marker_search(monkeypatch):
     assert client.results[0][1] is True
     assert call.opening_completes_call is True                 # kept past the marker search
     assert "Goodbye." in (call.opening_text or "") and call.warmup_client is client
-    assert client.kw["transfer_available"] is False            # an outbound AMI call names no channel
+    assert client.kw["transfer_available"] is False            # no AMI listener covers the server
+
+
+@pytest.mark.parametrize("ami_key, connected, twilio, promised", [
+    ("7", True, False, True),         # the listener covers the route's server
+    ("7", False, False, False),       # it covers it but never logged in
+    (None, True, False, False),       # a server no listener covers
+    ("absent", True, False, False),   # no listener manager at all
+    (None, True, True, True),         # Twilio moves either direction
+])
+def test_the_warmup_promises_a_transfer_where_the_line_can_make_one(
+        monkeypatch, ami_key, connected, twilio, promised):
+    import proxy.client as pc
+    from calls.call_manager import CallManager
+    from calls.http_api import OutboundCallAPI
+    from config_manager import ConfigManager
+
+    seen = []
+
+    class Client:
+        def __init__(self, **kw):
+            seen.append(kw)
+            self.on_call_control = None
+
+        async def connect(self):
+            return False
+
+        async def close(self):
+            pass
+
+    class Listener:
+        def resolve_server_key(self, server_id):
+            return ami_key
+
+        def action_client(self, key):
+            return type("Events", (), {"connected": connected})()
+
+    monkeypatch.setattr(pc, "ProxyClient", Client)
+    manager = CallManager()
+    api = OutboundCallAPI(manager, ConfigManager())
+    if ami_key != "absent":
+        api.ami_manager = Listener()
+    monkeypatch.setattr(api.cfg, "twilio_server", lambda server_id: {"sid": "AC"} if twilio else None)
+    call = manager.register_call("+30210", "task")
+    asyncio.run(api._warmup_caller_session(call.call_id, _route(direction="outbound")))
+    assert seen[0]["transfer_available"] is promised
 
 
 def test_a_client_that_cannot_transfer_says_so_at_warmup():
@@ -1089,3 +1258,271 @@ def test_the_farewell_check_resumes_on_a_typed_message_after_the_acceptance(make
     asyncio.run(run())
 
     assert p.conn.hangups == 0 and "what else" in _spoken(p)
+
+
+# ---------------------------------------------------------------------------
+# The record closes with the line: a hangup during the reply's cut
+# ---------------------------------------------------------------------------
+
+def test_a_cut_landing_after_a_newer_turn_opened_keeps_that_turn():
+    """The outcome summary of a call the person hung up on opens a turn
+    while the reply before it is still being cut: the cut's discard leaves
+    the summary's queue alone, and its frames reach it."""
+    async def run():
+        c = _client()
+        c._recv_task = asyncio.create_task(c._recv_loop())
+        c._ws.push({"type": "text", "turn": 1, "data": {"content": "Goodbye."}})
+        reply = c._ws_send_message("thanks, bye")
+        assert await reply.__anext__() == "Goodbye."
+        summary = c._ws_send_message("summarise the call")
+        first = asyncio.ensure_future(summary.__anext__())
+        await _settle()
+        assert c.current_turn == 2
+        c.discard_turn(1)                                 # the reply's cut, late
+        assert c._turn_queue is not None and c.turn_in_flight is True
+        c._ws.push({"type": "text", "turn": 2, "data": {"content": "Table booked for eight."}})
+        c._ws.push({"type": "done", "turn": 2})
+        assert await asyncio.wait_for(first, 2) == "Table booked for eight."
+        assert [chunk async for chunk in summary] == []
+        c.discard_turn(2)                                 # the open turn: dropped as before
+        assert c._turn_queue is None and c.turn_in_flight is False
+        await reply.aclose()
+        c._ws.end()
+        await c._recv_task
+    asyncio.run(run())
+
+
+def _outbound_call(make_pipeline, llm, monkeypatch, *, route=None):
+    import proxy.client as pc
+    from calls.call_manager import CallManager
+
+    async def no_report(payload):
+        return None
+    monkeypatch.setattr(pc, "report_call", no_report)
+    manager = CallManager()
+    call = manager.register_call("+30210", "book a table")
+    p = make_pipeline(route=route or _route(direction="outbound"), llm=llm,
+                      call_manager=manager, outbound_call_id=call.call_id)
+    return p, call
+
+
+def test_the_record_closes_when_the_summary_never_comes(make_pipeline, monkeypatch):
+    from calls.call_manager import CallStatus
+    from pipeline import outbound as plout
+    monkeypatch.setattr(plout, "OUTCOME_SUMMARY_TIMEOUT_S", 0.05)
+
+    class SilentLLM(ControlLLM):
+        async def send_message(self, text):
+            self.prompts.append(text)
+            await asyncio.Event().wait()
+            yield ""
+
+    p, call = _outbound_call(make_pipeline, SilentLLM(), monkeypatch)
+    p.state._call_complete = True
+    asyncio.run(asyncio.wait_for(p._finalize_outbound_call(), 5))
+    assert call.status is CallStatus.COMPLETED and call.outcome == plout.SUMMARY_UNAVAILABLE
+
+
+class _SummaryWS(FakeWS):
+    """The proxy's side: the summary turn is answered, in order of arrival."""
+
+    def __init__(self, order):
+        super().__init__()
+        self.order = order
+
+    async def send(self, raw):
+        await super().send(raw)
+        frame = self.sent[-1]
+        if frame.get("type") == "chat" and frame["prompt"].startswith("The call has ended"):
+            self.order.append("summary")
+            self.push({"type": "text", "turn": frame["turn"], "data": {"content": "Table booked for eight."}})
+            self.push({"type": "done", "turn": frame["turn"]})
+
+
+def _hung_up_during(p, reply):
+    """``run()`` with the farewell turn running as the utterance task when
+    the media leg closes."""
+    from transport.base import TransportError
+
+    async def warm():
+        p.state._warmup_done.set()
+
+    async def opening():
+        p.state._utterance_task = asyncio.create_task(reply())
+
+    async def closed():
+        await asyncio.sleep(0.01)
+        raise TransportError("Connection closed during header read")
+
+    p._warmup_session = warm
+    p._send_outbound_opening = opening
+    p._listen_loop = closed
+
+
+def test_a_hangup_during_the_cut_waits_for_it_then_closes_the_record(make_pipeline, monkeypatch):
+    """Call b302ceb4: the person hung up while the farewell turn was still
+    being cut. The summary waits for the cut, opens its own turn once, and
+    the record closes with it."""
+    from calls.call_manager import CallStatus
+    order = []
+    client = _client()
+    client._ws = _SummaryWS(order)
+    p, call = _outbound_call(make_pipeline, client, monkeypatch)
+
+    async def reply():
+        client._ws.push({"type": "text", "turn": 1, "data": {"content": "Goodbye."}})
+        gen = client._ws_send_message("thanks, bye")
+        assert await gen.__anext__() == "Goodbye."
+        p._record_call_control("end", 1, {"reason": "done"})
+        p.state._call_complete = True
+        await asyncio.sleep(0.1)                          # still cutting at the hangup
+        client.discard_turn(1)
+        order.append("cut")
+        await gen.aclose()
+
+    async def run():
+        client._recv_task = asyncio.create_task(client._recv_loop())
+        _hung_up_during(p, reply)
+        await asyncio.wait_for(p.run(), 10)
+    asyncio.run(run())
+    assert order == ["cut", "summary"]
+    assert call.status is CallStatus.COMPLETED and call.outcome == "Table booked for eight."
+
+
+def test_a_reply_that_swallows_its_cancel_is_left_at_the_bound(make_pipeline, monkeypatch):
+    from calls.call_manager import CallStatus
+    from pipeline import core as plcore
+    monkeypatch.setattr(plcore, "UTTERANCE_SETTLE_S", 0.05)
+    monkeypatch.setattr(plcore, "UTTERANCE_CANCEL_S", 0.05)
+    llm = ControlLLM(responses=[["Table booked for eight."]])
+    p, call = _outbound_call(make_pipeline, llm, monkeypatch)
+
+    async def reply():
+        p._record_call_control("end", 1, {})
+        with contextlib.suppress(asyncio.CancelledError):  # as the TTS waits do
+            await asyncio.Event().wait()
+        await asyncio.Event().wait()                      # the cleanup's cancel ends it
+
+    async def run():
+        _hung_up_during(p, reply)
+        await asyncio.wait_for(p.run(), 10)
+    asyncio.run(run())
+    assert call.status is CallStatus.COMPLETED and call.outcome == "Table booked for eight."
+    assert len(llm.prompts) == 1
+
+
+def test_a_hangup_with_nothing_pending_waits_for_nothing(make_pipeline, monkeypatch):
+    import time
+
+    from calls.call_manager import CallStatus
+    from pipeline import core as plcore
+    monkeypatch.setattr(plcore, "UTTERANCE_SETTLE_S", 30.0)
+    llm = ControlLLM()
+    p, call = _outbound_call(make_pipeline, llm, monkeypatch)
+
+    async def reply():
+        await asyncio.Event().wait()                      # the agent mid-reply
+
+    async def run():
+        _hung_up_during(p, reply)
+        started = time.monotonic()
+        await asyncio.wait_for(p.run(), 10)
+        return time.monotonic() - started
+    assert asyncio.run(run()) < 5.0
+    assert p.state._utterance_task.cancelled()
+    assert call.status is CallStatus.FAILED and "hung up" in call.error
+    assert llm.prompts == []
+
+
+def test_a_hangup_before_a_pending_transfer_moves_nobody(make_pipeline, monkeypatch):
+    """The person hung up while the hand-over sentence played: no Redirect
+    of a dead channel, no new turn on a dead line, and the end the agent
+    asked for stands."""
+    from calls.call_manager import CallStatus
+    handle = FakeTransfer()
+    llm = ControlLLM(responses=[["Transfer to reception requested."]])
+    p, call = _outbound_call(make_pipeline, llm, monkeypatch)
+    p._transfer = handle
+    p.state._running = True
+
+    async def run():
+        p.state._transfer_target = {"label": "Reception", "number": "200"}
+        p._record_call_control("transfer", 1, {"target": "Reception"})
+        p._note_remote_hangup()
+        ended = await p._execute_pending_end()
+        await p._finalize_outbound_call()
+        return ended
+    assert asyncio.run(run()) is True
+    assert handle.executed == [] and p.state._running is False
+    assert p.state.call_outcome == "completed"
+    assert call.status is CallStatus.COMPLETED and call.outcome == "Transfer to reception requested."
+    assert len(llm.prompts) == 1                         # the summary alone
+
+
+def test_a_transfer_unanswered_after_the_media_leg_ended_reads_as_the_move(make_pipeline, monkeypatch):
+    """A leg the PBX closed (a read EOF) leaves the connection's own flag
+    unset: the hangup note counts the same as a closed connection."""
+    from pipeline import call_control as plcc
+    monkeypatch.setattr(plcc, "TRANSFER_SETTLE_S", 0.05)
+    p = make_pipeline(route=_route(), llm=ControlLLM())
+
+    class LegEnds(GatedTransfer):
+        async def execute(self, number, **kw):
+            p._note_remote_hangup()                       # the move closed the leg
+            await super().execute(number, **kw)
+
+    p._transfer = LegEnds()
+    p.state._running = True
+    p.state._transfer_target = {"label": "Reception", "number": "200"}
+    p._record_call_control("transfer", 1, {"target": "Reception"})
+    assert asyncio.run(p._do_transfer(p.state._transfer_target)) is True
+    assert p.conn.is_closed is False
+    assert p.state.call_outcome == "transferred" and p.state._transferred_to == "Reception"
+
+
+def test_a_transfer_refused_after_the_person_hung_up_keeps_the_agents_end(make_pipeline, monkeypatch):
+    """The person hangs up between the line-closed check and the PBX's
+    answer, and the Redirect is refused: no failure phrase on a dead line,
+    no new turn, and the record counts the end the agent asked for. A move
+    the PBX applied closes the leg too, and still reads as the move."""
+    from calls.call_manager import CallStatus
+    llm = ControlLLM(responses=[["Transfer to reception requested."]])
+    p, call = _outbound_call(make_pipeline, llm, monkeypatch)
+    phrases = []
+
+    async def play_phrase(key):
+        phrases.append(key)
+    p._play_phrase = play_phrase
+
+    class RefusedAfterHangup(FakeTransfer):
+        async def execute(self, number, **kw):
+            p._note_remote_hangup()
+            raise TransferError("Redirect refused: Channel does not exist")
+
+    p._transfer = RefusedAfterHangup()
+    p.state._running = True
+
+    async def run():
+        p.state._transfer_target = {"label": "Reception", "number": "200"}
+        p._record_call_control("transfer", 1, {"target": "Reception"})
+        ended = await p._do_transfer(p.state._transfer_target)
+        await p._finalize_outbound_call()
+        return ended
+    assert asyncio.run(run()) is True
+    assert phrases == [] and p.state._running is False
+    assert p.state.call_outcome == "completed" and p.state._transferred_to == ""
+    assert call.status is CallStatus.COMPLETED and call.outcome == "Transfer to reception requested."
+
+    moved = make_pipeline(route=_route(), llm=ControlLLM())
+
+    class AppliedThenLegClosed(FakeTransfer):
+        async def execute(self, number, **kw):
+            moved._note_remote_hangup()
+            await super().execute(number, **kw)
+
+    moved._transfer = AppliedThenLegClosed()
+    moved.state._running = True
+    moved.state._transfer_target = {"label": "Reception", "number": "200"}
+    moved._record_call_control("transfer", 1, {"target": "Reception"})
+    assert asyncio.run(moved._do_transfer(moved.state._transfer_target)) is True
+    assert moved.state.call_outcome == "transferred" and moved.state._transferred_to == "Reception"

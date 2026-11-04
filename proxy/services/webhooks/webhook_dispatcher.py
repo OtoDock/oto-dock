@@ -50,6 +50,7 @@ from services.webhooks.event_normalizer import (
     walk_path,
 )
 from storage.automation import trigger_store, webhook_subscription_store
+from storage.mcp import mcp_store
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock.webhook-dispatcher")
@@ -158,6 +159,12 @@ _signature_failures: dict[str, tuple[int, float]] = {}
 _relay_secret: tuple[str, float] | None = None
 
 
+def forget_forward_secret() -> None:
+    """A new forward secret was stored: the next forward reads it."""
+    global _relay_secret
+    _relay_secret = None
+
+
 def reset_caches() -> None:
     """Forget the signature counters, the relay secret and the app secrets
     (tests)."""
@@ -250,6 +257,11 @@ async def dispatch_webhook(
     # 2. Resolve manifest + provider implementation.
     if manifest is None:
         return (500, {"error": "manifest not found"}, {"content-type": "application/json"})
+    # A switched-off MCP's subscriptions stay (a switch is undone) and
+    # receive nothing; 200, so no vendor retries or disables the hook.
+    state = await run_db(mcp_store.get_mcp_state, str(row.get("mcp_name") or ""))
+    if state is not None and state.get("enabled") is False:
+        return (200, {"status": "ignored", "reason": "mcp_off", "fired": 0}, _JSON_CT)
     webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
     if not webhooks_block.get("available", False):
         return (500, {"error": "MCP no longer declares webhook receiver support"},
@@ -487,6 +499,7 @@ async def _dispatch_installation_event(
         )
         if r.get("status") in webhook_subscription_store.RECEIVING
     ]
+    rows = await _receiving_rows(rows)
     if not rows:
         return (200, {"status": "ignored", "reason": "unknown_installation", "fired": 0}, _JSON_CT)
     standing = await asyncio.to_thread(_installation_rows_standing, rows, installation_id)
@@ -550,6 +563,78 @@ def _installation_rows_standing(rows: list[dict], installation_id: str) -> list[
     return out
 
 
+# What the receiver tells the relay it did with a forward
+# (``X-OtoDock-Event-Outcome``, a closed set the relay logs).
+OUTCOME_HEADER = "x-otodock-event-outcome"
+OUTCOME_FIRED = "fired"
+OUTCOME_NO_SUBSCRIPTION = "no_subscription"
+OUTCOME_NOT_SELECTED = "not_selected"
+OUTCOME_GONE = "gone"
+# A forward that finds the provider gone re-reads it under the relay
+# registration lock (a create holds it while its row is ``creating``), this
+# long at most.
+_GONE_LOCK_WAIT_S = 5.0
+
+
+def _with_outcome(status: int, body: dict, outcome: str) -> tuple[int, dict, dict[str, str]]:
+    return status, body, {**_JSON_CT, OUTCOME_HEADER: outcome}
+
+
+def _outcome_of(results: list[dict], fired: int) -> str:
+    """``fired`` when an action fired (or the event repeated one that did),
+    else ``not_selected``: a subscription of the scope saw the event and
+    neither its events nor its triggers selected it."""
+    if fired > 0 or any(r.get("status") == "duplicate" for r in results):
+        return OUTCOME_FIRED
+    return OUTCOME_NOT_SELECTED
+
+
+def _mcp_on(states: dict[str, bool], row: dict) -> bool:
+    """A subscription receives while its MCP is installed and switched on
+    (no state row reads as on)."""
+    name = str(row.get("mcp_name") or "")
+    return mcp_registry.get_manifest(name) is not None and states.get(name, True) is not False
+
+
+async def _receiving_rows(rows: list[dict]) -> list[dict]:
+    if not rows:
+        return rows
+    states = await run_db(mcp_store.get_all_mcp_states)
+    return [r for r in rows if _mcp_on(states, r)]
+
+
+async def _gone_or_unmatched(
+    provider_id: str, headers_lc: dict[str, str], secret: str, body: dict,
+) -> tuple[int, dict, dict[str, str]]:
+    """No subscription here takes the forward. When nothing on this install
+    takes the provider at all (``relay_events.provider_gone``), a 410 with
+    the gone mark: the relay switches its endpoint for the provider off (it
+    comes back at the next register). Else 200 ``no_subscription``. Gone is
+    said only when certain: re-read under the registration lock, any doubt
+    reads as not gone."""
+    from services.webhooks import relay_events
+    try:
+        gone = await asyncio.to_thread(relay_events.provider_gone, provider_id)
+        if gone:
+            lock = relay_events.registration_lock()
+            await asyncio.wait_for(lock.acquire(), timeout=_GONE_LOCK_WAIT_S)
+            try:
+                gone = await asyncio.to_thread(relay_events.provider_gone, provider_id)
+            finally:
+                lock.release()
+    except Exception as e:  # noqa: BLE001  # an unsure answer must never switch the provider off
+        logger.info("relay forward for %s: the gone check failed (%s), answered as unmatched", provider_id, e)
+        gone = False
+    if not gone:
+        return _with_outcome(200, body, OUTCOME_NO_SUBSCRIPTION)
+    timestamp = headers_lc.get("x-otodock-event-timestamp", "")
+    logger.info("relay forward for %s: nothing here takes it, answered gone", provider_id)
+    return 410, {"status": "gone"}, {
+        **_JSON_CT, OUTCOME_HEADER: OUTCOME_GONE,
+        "x-otodock-event-gone-signature": relay_events.gone_mark(secret, provider_id, timestamp),
+    }
+
+
 async def dispatch_relay_webhook(
     *,
     provider_id: str,
@@ -561,28 +646,22 @@ async def dispatch_relay_webhook(
     The OtoDock relay verified the vendor's signature upstream and re-signed
     the VERBATIM body with this install's forward secret. Flow:
 
-      1. Resolve the manifest declaring ``provider_id``.
-      2. Verify the forward signature (constant ``_RELAY_SIG_BLOCK`` + the
-         secret in ``infra_credentials['otodock-relay']``).
+      1. Verify the forward signature (constant ``_RELAY_SIG_BLOCK`` + the
+         secret in ``infra_credentials['otodock-relay']``) before anything
+         else: only the relay holds that secret.
+      2. Resolve the manifest declaring ``provider_id``.
       3. Extract the workspace id via the manifest's ``workspace_id_path``.
       4. Fan IN: every relay-delivered subscription whose ``vendor_target``
-         equals the workspace id (the defense against a relay mis-route)
-         runs the standard pipeline.
+         equals the workspace id (the defense against a relay mis-route) and
+         whose MCP is installed and on runs the standard pipeline.
+      5. Nothing ran: ``_gone_or_unmatched`` (a signed 410 when nothing on
+         this install takes the provider).
 
-    Always 200 once the forward signature passes; 401 only on signature
-    failure (the relay drops hard-4xx forwards without retrying).
+    Every 200 carries ``X-OtoDock-Event-Outcome`` (``fired``,
+    ``not_selected``, ``no_subscription``); 401 only on signature failure
+    (the relay drops hard-4xx forwards without retrying).
     """
     json_ct = {"content-type": "application/json"}
-
-    manifest, webhooks_block = _manifest_for_webhook_provider(provider_id)
-    if manifest is None or not webhooks_block:
-        return (404, {"error": f"no manifest declares provider {provider_id!r}"},
-                json_ct)
-    workspace_id_path = webhooks_block.get("workspace_id_path", "")
-    app_hook = webhooks_block.get("app_webhook") or {}
-    if not workspace_id_path and not app_hook:
-        return (404, {"error": "provider is not relay-capable on this install"},
-                json_ct)
 
     headers_lc = {k.lower(): v for k, v in (headers or {}).items()}
     hinted = headers_lc.get("x-otodock-event-provider", provider_id)
@@ -602,6 +681,7 @@ async def dispatch_relay_webhook(
         # window, then the same check again.
         fresh = await _forward_secret(max_age_s=_RELAY_SECRET_RETRY_S)
         if fresh != forward_secret:
+            forward_secret = fresh
             verify = await _verified(
                 relay, raw_body=raw_body, headers=headers_lc, signing_secret=fresh,
                 manifest_sig_block=_RELAY_SIG_BLOCK,
@@ -609,6 +689,14 @@ async def dispatch_relay_webhook(
     if not verify.ok:
         return (401, {"error": "forward signature verification failed",
                       "reason": verify.reason}, json_ct)
+
+    manifest, webhooks_block = _manifest_for_webhook_provider(provider_id)
+    workspace_id_path = webhooks_block.get("workspace_id_path", "") if webhooks_block else ""
+    app_hook = (webhooks_block.get("app_webhook") or {}) if webhooks_block else {}
+    if manifest is None or (not workspace_id_path and not app_hook):
+        return await _gone_or_unmatched(
+            provider_id, headers_lc, forward_secret,
+            {"status": "ignored", "reason": "provider is not relay-capable on this install"})
 
     parsed_body = await _parse_body(raw_body)
     if app_hook and not workspace_id_path:
@@ -625,7 +713,7 @@ async def dispatch_relay_webhook(
         if delivery_id and await _is_duplicate(ring, delivery_id):
             return (200, {"status": "duplicate", "fired": 0}, json_ct)
         try:
-            return await _dispatch_installation_event(
+            status, answer, out_headers = await _dispatch_installation_event(
                 provider_id=provider_id, provider=provider, manifest=manifest,
                 webhooks_block=webhooks_block, body=body,
                 headers_lc=headers_lc, confirm=False, delivery_mode="relay",
@@ -635,22 +723,32 @@ async def dispatch_relay_webhook(
             if delivery_id:
                 await _forget_delivery(ring, delivery_id)
             raise
+        if status == 200 and answer.get("status") == "ignored":
+            return await _gone_or_unmatched(provider_id, headers_lc, forward_secret, answer)
+        if status == 200:
+            ran = [r for r in answer.get("results") or [] if not r.get("skipped")]
+            if not ran:
+                return _with_outcome(200, answer, OUTCOME_NO_SUBSCRIPTION)
+            return _with_outcome(200, answer, _outcome_of(ran, int(answer.get("fired") or 0)))
+        return status, answer, out_headers
     workspace_id = walk_path(
         body=parsed_body, headers=headers_lc, path=workspace_id_path,
     )
     if not workspace_id:
-        return (200, {"status": "ignored", "reason": "no_workspace_id"}, json_ct)
+        return await _gone_or_unmatched(
+            provider_id, headers_lc, forward_secret, {"status": "ignored", "reason": "no_workspace_id"})
 
-    rows = [
+    rows = await _receiving_rows([
         r for r in await run_db(
             webhook_subscription_store.list_subscriptions,
             provider_id=provider_id, vendor_target=workspace_id,
             delivery_mode="relay",
         )
         if r.get("status") in webhook_subscription_store.DELIVERING
-    ]
+    ])
     if not rows:
-        return (200, {"status": "no_subscriptions", "fired": 0}, json_ct)
+        return await _gone_or_unmatched(
+            provider_id, headers_lc, forward_secret, {"status": "no_subscriptions", "fired": 0})
 
     try:
         provider = webhook_providers.get_provider(provider_id)
@@ -666,8 +764,8 @@ async def dispatch_relay_webhook(
         )
         total_fired += int(resp.get("fired", 0))
         results.append({"subscription_id": row["id"], **resp})
-    return (200, {"status": "ok", "fired": total_fired, "results": results},
-            json_ct)
+    return _with_outcome(200, {"status": "ok", "fired": total_fired, "results": results},
+                         _outcome_of(results, total_fired))
 
 
 def _manifest_for_webhook_provider(provider_id: str):

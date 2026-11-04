@@ -232,7 +232,10 @@ async def build_meeting_agent_config(
     # Async — builder blocks invoke remote MCP tools.
     assigned_mcp_names = [m.name for m in (await asyncio.to_thread(
         mcp_registry.get_agent_mcps, agent_name, placement=target,
-    ) or [])]
+    ) or [])
+        # Only the MCPs that attach describe themselves, as in a chat and a
+        # task: a tool a meeting leaves out is never named in its prompt.
+        if m.name not in (excluded_mcps or {})]
     dynamic_contexts = await dynamic_context.get_dynamic_contexts(
         agent_name, assigned_mcp_names,
         user_sub=user_sub_for_creds or "",
@@ -244,6 +247,7 @@ async def build_meeting_agent_config(
         # meetings (agent-scope passes "" → roster fallback).
         delegation_roster=await asyncio.to_thread(
             dynamic_context.build_delegation_roster, resolved_targets,
+            user_sub_for_creds or "",
         ),
         meetings_access=await asyncio.to_thread(
             dynamic_context.build_meetings_access,
@@ -326,6 +330,7 @@ async def build_meeting_agent_config(
         mcp_config_path=str(mcp_config) if mcp_config else "",
         credential_env=credential_env,
         mcp_secret_bundles=secret_bundles or {},
+        excluded_mcps=frozenset(excluded_mcps or ()),
         permission_mode="auto",
         client_type=session_kind.MEETING.name,
         model=resolved_model,
@@ -479,7 +484,7 @@ def _roster(meeting: dict) -> list[str]:
 
 # The host chat's note keeps the moderator's words, the topic and the
 # participant list to these many characters: one bounded line, the shape the
-# interactive prelude matchers strip (``transcript_tailer._TIME_PRELUDE_RE``).
+# title stripper drops (``storage/chat/chat_titles.PRELUDE_RE``).
 PARENT_NOTE_SUMMARY_CHARS = 1500
 PARENT_NOTE_TOPIC_CHARS = 200
 PARENT_NOTE_NAMES_CHARS = 400

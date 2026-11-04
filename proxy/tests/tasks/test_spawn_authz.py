@@ -296,6 +296,37 @@ class TestSpawnCap:
             from services.delegation.spawn_authz import _max_parallel_spawns
             assert _max_parallel_spawns() == 4, raw
 
+    def test_a_continue_is_not_counted_here(self, delegation_env):
+        # The route counts a continue once it knows whether it starts work:
+        # a follow-up to a worker in the middle of a turn never counts.
+        mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "1"})
+        _add_active_run("user-alice")
+        user = _real_user(COLLAB_USER, "editor")
+        _denied(user, 403)
+        assert _spawn(user, continuing=True).created_by == "user-alice"
+        assert len(task_store.list_runs(created_by="user-alice")) == 1
+
+    def test_a_zero_limit_refuses_a_continue_too(self, delegation_env):
+        mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "0"})
+        exc = _denied(_real_user(COLLAB_USER, "editor"), 403, continuing=True)
+        assert "limited to 0" in exc.detail
+
+    def test_the_count_says_a_follow_up_does_not_count(self, delegation_env):
+        from services.delegation.spawn_authz import check_spawn_cap
+        mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "1"})
+        check_spawn_cap("user-alice")
+        _add_active_run("user-alice")
+        with pytest.raises(HTTPException) as exc:
+            check_spawn_cap("user-alice")
+        assert exc.value.status_code == 403
+        assert exc.value.detail.startswith("Delegation limit reached: 1 worker(s) already active (max 1).")
+        assert exc.value.detail.endswith("A follow-up to a worker in the middle of a turn does not count.")
+        with pytest.raises(HTTPException) as exc:
+            check_spawn_cap("user-alice", follow_up=True)
+        assert exc.value.detail.endswith(
+            "This follow-up counts: the worker is starting or ending a turn, or another "
+            "follow-up already waits for it. Send it again in a moment.")
+
     def test_invalid_config_value_falls_back(self, delegation_env):
         mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "lots"})
         assert _spawn(_real_user(COLLAB_USER, "editor")).scope == "user"
@@ -367,6 +398,40 @@ class TestValidateSpawnOverrides:
         self._agent(monkeypatch, path="claude-code-cli")
         with pytest.raises(HTTPException):
             validate_spawn_overrides("w", "codex-cli", None)
+
+    def test_a_model_alone_is_judged_where_it_is_offered(self, monkeypatch):
+        """A model copied from a line of the roster passes without its
+        layer: the validator finds the first allowed engine that offers it
+        (the runner runs it there), and refuses only a model no allowed
+        engine offers."""
+        from fastapi import HTTPException
+
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        from storage.billing import subscription_store
+        self._agent(monkeypatch, path="claude-code-cli", extras='["codex-cli"]')
+        rows = {"claude-code-cli": [{"model_id": "m-claude", "enabled": True}],
+                "codex-cli": [{"model_id": "m-codex", "enabled": True}],
+                "direct-llm": [{"model_id": "m-direct", "enabled": True}]}
+        monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: rows.get(layer, []))
+        validate_spawn_overrides("w", None, "m-codex")   # no raise: codex-cli offers it
+        with pytest.raises(HTTPException):
+            validate_spawn_overrides("w", None, "m-direct")   # direct-llm is not allowed
+
+    def test_a_model_alone_is_judged_on_the_persons_engine_first(self, monkeypatch):
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        from services.engines import engine_resolution as er
+        from storage.billing import subscription_store
+        self._agent(monkeypatch, path="claude-code-cli", extras='["codex-cli"]')
+        asked = []
+        monkeypatch.setattr(er, "resolve_session_engine", lambda agent, sub: er.Resolution(
+            "codex-cli", "m-codex", er.REASON_OWN, ("claude-code-cli", "codex-cli"), ("codex-cli",),
+            {"codex-cli": "m-codex"}))
+        monkeypatch.setattr(er, "engine_for_model",
+                            lambda row, model, first="": asked.append(first) or "codex-cli")
+        monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [])
+        validate_spawn_overrides("w", None, "m-codex", user_sub="u-1")
+        validate_spawn_overrides("w", None, "m-codex")
+        assert asked == ["codex-cli", "claude-code-cli"]
 
 
 # ───────────────────────────────────────────────────────────────────────────

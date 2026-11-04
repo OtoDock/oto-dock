@@ -171,6 +171,12 @@ async def _push_audio_player(file_path: str, title: str, caption: str = "") -> b
         return False
 
 
+# Cartesia's primary emotions, the ones it reads best (docs.cartesia.ai,
+# "Volume, Speed, and Emotion"). The engine knows more words; the tool offers
+# these.
+_EMOTIONS = ("neutral", "calm", "content", "sad", "angry", "scared")
+
+
 def _format_voices(voices: list[dict], *, with_owner: bool = False) -> list[str]:
     lines = []
     for v in voices:
@@ -204,10 +210,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="list_voices",
             description=(
-                "List the voices available on the configured TTS provider "
-                "(workspace + premade voices for engines with a voice catalog; "
-                "the configured per-language map otherwise). Each entry shows "
-                "the voice_id to pass to generate_speech and a preview link."
+                "List the voices the configured TTS engine speaks with. "
+                "Cartesia: the account's own voices first, then public voices, "
+                "50 in all. ElevenLabs: the workspace's voices and its premade "
+                "voices, each with a preview link. Each entry shows the voice_id "
+                "to pass to generate_speech. To find a style, use "
+                "search_voice_library."
             ),
             inputSchema={
                 "type": "object",
@@ -218,12 +226,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_voice_library",
             description=(
-                "Search the provider's shared voice library (ElevenLabs: "
-                "10,000+ community voices) by free text, language, gender, age "
-                "or category — the way to FIND a voice matching a video's "
-                "style. Library voices must be added to the vendor workspace "
-                "before use: pass the result's owner_id + voice_id to "
-                "add_library_voice (admin approval needed)."
+                "Search the engine's voice library by free text, language or "
+                "gender: the way to FIND a voice that fits a video's style. "
+                "Cartesia: a voice found here is used at once, by passing its "
+                "voice_id to generate_speech. ElevenLabs: a voice from the "
+                "shared library is added once with add_library_voice, by an "
+                "admin. The age and category filters work on ElevenLabs only."
             ),
             inputSchema={
                 "type": "object",
@@ -243,10 +251,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="add_library_voice",
             description=(
-                "Add a shared-library voice to the vendor workspace so "
-                "generate_speech can use it. Admin-only (each add permanently "
-                "consumes one of the account's limited voice slots) — "
-                "non-admin sessions get a clear refusal."
+                "ElevenLabs only: add a shared-library voice to the vendor "
+                "workspace so generate_speech can use it. Admin-only, because "
+                "each add uses one of the account's limited voice slots for "
+                "good. Other sessions get a clear refusal. Cartesia voices need "
+                "no adding."
             ),
             inputSchema={
                 "type": "object",
@@ -295,7 +304,14 @@ async def list_tools() -> list[Tool]:
                     "similarity_boost": {**_setting, "description": "Voice similarity 0-1. Provider-specific."},
                     "style": {**_setting, "description": "Style exaggeration 0-1. Provider-specific."},
                     "speed": {"type": "number", "minimum": 0.7, "maximum": 1.2,
-                              "description": "Speaking speed multiplier (1.0 = normal)."},
+                              "description": "Speaking speed multiplier (1.0 = normal). "
+                                             "Cartesia and ElevenLabs."},
+                    "emotion": {
+                        "type": "string", "enum": list(_EMOTIONS),
+                        "description": "Emotion of the read. Cartesia only, and English "
+                                       "speech only: other engines ignore it. Omit it and "
+                                       "the voice reads the feeling from the text.",
+                    },
                     "sample_rate": {
                         "type": "integer", "enum": [8000, 16000, 22050, 24000, 44100], "default": 24000,
                         "description": "Output sample rate. 24000 is right for video voice-over; 44100 needs "
@@ -349,7 +365,8 @@ async def _handle_list_voices(args: dict) -> list[TextContent]:
         return _err(_proxy_error(resp))
     body = resp.json()
     voices = body.get("voices") or []
-    configured = body.get("configured") or {}
+    # A language the admin left blank speaks the engine's shipped voice: not listed.
+    configured = {k: v for k, v in (body.get("configured") or {}).items() if v}
     lines = [f"## Voices — {body.get('provider_name', 'provider')} ({len(voices)})"]
     if configured:
         lines.append("Configured per-language defaults: "
@@ -379,11 +396,14 @@ async def _handle_search(args: dict) -> list[TextContent]:
     lines = [f"## Voice library results ({len(voices)})", ""]
     lines.extend(_format_voices(voices, with_owner=True))
     lines.append("")
-    lines.append(
-        "To USE a library voice it must first be added to the vendor workspace: "
-        "`add_library_voice(public_owner_id=<owner_id>, voice_id=<voice_id>)` "
-        "(admin-only). Already-added voices appear in `list_voices`."
-    )
+    if any(v.get("owner_id") for v in voices):
+        lines.append(
+            "To USE a library voice it must first be added to the vendor workspace: "
+            "`add_library_voice(public_owner_id=<owner_id>, voice_id=<voice_id>)` "
+            "(admin-only). Already-added voices appear in `list_voices`."
+        )
+    else:
+        lines.append("Use a voice by passing its `voice_id` to `generate_speech`.")
     return _text("\n".join(lines))
 
 
@@ -400,8 +420,9 @@ async def _handle_add_voice(args: dict) -> list[TextContent]:
         payload["provider_id"] = pid
     resp = await _proxy_request("POST", "/v1/audio/tts/voices/add", json=payload)
     if resp.status_code == 403:
-        return _err("adding library voices is admin-only (it permanently consumes a "
-                    "vendor voice slot) — ask a platform admin to run this")
+        return _err("adding library voices is admin-only, because each add uses one of "
+                    "ElevenLabs' limited voice slots for good: ask a platform admin to run "
+                    "this. Cartesia voices need no adding: pass the voice_id to generate_speech")
     if resp.status_code != 200:
         return _err(_proxy_error(resp))
     added = resp.json().get("voice_id", vid)
@@ -420,7 +441,7 @@ async def _handle_generate(args: dict) -> list[TextContent]:
     for key in ("voice_id", "language", "model_id"):
         if args.get(key):
             payload[key] = args[key]
-    settings = {k: args[k] for k in ("stability", "similarity_boost", "style", "speed")
+    settings = {k: args[k] for k in ("stability", "similarity_boost", "style", "speed", "emotion")
                 if args.get(k) is not None}
     if settings:
         payload["voice_settings"] = settings

@@ -491,7 +491,7 @@ def test_an_unsupported_browser_language_means_english(switching):
     assert client.fakes[0].started_with["language"] == "en"
 
 
-def test_one_candidate_at_a_time(switching):
+def test_one_candidate_at_a_time_and_two_per_dictation(switching):
     client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
     with client.websocket_connect("/ws/audio/stt") as ws:
         _open_auto(ws)
@@ -505,11 +505,12 @@ def test_one_candidate_at_a_time(switching):
         _voiced(ws, 2)
         assert [f.language for f in client.fakes] == ["en", "el", "de"]
         assert not client.fakes[1].closed and not client.fakes[2].closed
-        # The leader moves on again: the German candidate goes, a French one opens.
+        # The leader moves on again: a third language never opens in one
+        # dictation (MAX_DICTATION_CANDIDATES), the German candidate stays.
         client.identifiers[-1].probs = {"en": 0.1, "el": 0.05, "fr": 0.85}
         _voiced(ws, 2)
-        assert [f.language for f in client.fakes] == ["en", "el", "de", "fr"]
-        assert client.fakes[2].closed and not client.fakes[3].closed
+        assert [f.language for f in client.fakes] == ["en", "el", "de"]
+        assert not client.fakes[2].closed
         ws.send_json({"type": "stop"})
         _frames_until(ws, "final")
 

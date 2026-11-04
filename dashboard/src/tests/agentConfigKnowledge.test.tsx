@@ -480,16 +480,6 @@ describe('AgentConfig — shared knowledge card', () => {
     expect(screen.getByText('kb')).toBeTruthy()
   })
 
-  it('shows a bulletin badge on libraries and attachments that publish one', () => {
-    h.knowledgeData = {
-      is_library: true,
-      libraries: [mkLib({ subdir: 'docs', name: 'Docs', has_bulletin: true })],
-      attachments: [mkAtt({ has_bulletin: true })],
-    }
-    renderConfig()
-    expect(screen.getAllByText('bulletin')).toHaveLength(2)
-  })
-
   it("shows this agent's own label and the unchanged mirror layout", () => {
     h.knowledgeData = {
       is_library: true,

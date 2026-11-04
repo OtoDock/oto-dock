@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.0/mcps/agent-template.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.1/mcps/agent-template.schema.json",
   "title": "OtoDock agent template",
   "description": "The catalog rules for an OtoDock agent template (OtoDock is a fair source project): the template's folder validated as one document. The document is an object keyed by paths inside the folder (POSIX separators): each file x-otodock-documents names holds its parsed JSON, and every other file at the folder's top level holds true. Deeper files (the apps' trees, context/, the dashboards' pages) are not part of it. The platform's template loader (services/community/community_agent_template_store.py, through storage/catalog_schema.py) refuses a template that breaks these rules and adds the ones a schema cannot state: the template's mode against its apps and dashboards, duplicate slugs, the files a dashboard names, each app folder's files and its client/index.html, at most four apps and eight checks, the checks' own validator. Unknown files and keys are allowed: a catalog is additive. A field the platform reads with a default, or reads not at all, takes null and is read as absent.",
   "$comment": "Custom annotation keywords, ignored by validators. x-otodock-documents (here): the folder paths read as JSON documents; a * stands for one path segment, the whole path must match, and a dot-name never matches. x-otodock-first-release (here): the platform release that first ships this schema. x-otodock-since: the platform release that first reads the field; x-otodock-floors: a list of {pattern, since}, a value matching the pattern needs that release. Both are read on properties and items, never under patternProperties. x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",
@@ -317,6 +317,11 @@
           "x-otodock-floors": [
             {"pattern": "^(auto|none)$", "since": "1.9.0"}
           ]
+        },
+        "audience": {
+          "enum": ["manager", "editor", "contributor", "viewer", null],
+          "x-otodock-since": "1.9.1",
+          "description": "Who is told, for an agent-scope item: the lowest per-agent role its notifications reach (platform admins always). Absent tells editors and managers, the platform's default for a new task; viewer tells everyone who uses the agent."
         }
       }
     },
@@ -342,7 +347,12 @@
         "prompt": {"$ref": "#/$defs/nonEmptyString"},
         "default_state": {"$ref": "#/$defs/defaultState"},
         "auto_create_for_new_users": {"type": ["boolean", "null"], "description": "Default false for a trigger."},
-        "roles": {"$ref": "#/$defs/agentRoles"}
+        "roles": {"$ref": "#/$defs/agentRoles"},
+        "audience": {
+          "enum": ["manager", "editor", "contributor", "viewer", null],
+          "x-otodock-since": "1.9.1",
+          "description": "Who is told, for an agent-scope item: the lowest per-agent role its notifications reach (platform admins always). Absent tells editors and managers, the platform's default for a new task; viewer tells everyone who uses the agent."
+        }
       }
     },
     "notificationsJson": {

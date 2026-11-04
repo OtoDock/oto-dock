@@ -5,6 +5,7 @@ the offboarding event; other membership changes land within the TTL."""
 
 import asyncio
 import uuid
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -19,11 +20,24 @@ pytestmark = pytest.mark.asyncio
 ADMIN = "user-admin"  # the seeded platform admin: in every audience
 
 
-def _agent_with(*subs: str) -> str:
+def _agent_with(*subs: str, shared_only: bool = False) -> str:
+    """An agent with ``subs`` as editors; a Shared-only one when asked (its
+    ``agent::`` chats are the human pool every member sees)."""
     agent = f"aud-{uuid.uuid4().hex[:8]}"
+    if shared_only:
+        from storage.agents import agent_store
+        agent_store.create_agent(agent, agent, collaborative=False, default_scope="agent")
     for sub in subs:
         db_users.add_user_agent(sub, agent, "editor", ADMIN)
     return agent
+
+
+def _set_role(sub: str, agent: str, role: str) -> None:
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE user_agents SET agent_role=%s WHERE sub=%s AND agent=%s",
+                     (role, sub, agent))
+        conn.commit()
 
 
 async def _settle():
@@ -59,12 +73,15 @@ async def test_offboarding_events_drop_the_person_at_once(temp_db, loop_db_guard
     with loop_db_guard.active():
         assert set(nm.agent_audience(agent)) == {ADMIN, "user-viewer2"}
 
-    # A lower role, still a member: nothing changes.
+    # A lower role: out at once (a stale entry served on the loop never
+    # carries the old role), back at the stored one when the refresh lands.
     await nm._on_offboard(OffboardEvent(
         "user-viewer2", offboarding.DEMOTED,
         (AgentLoss(agent, "editor", "viewer", old_row="editor", new_row="viewer"),), ADMIN))
     with loop_db_guard.active():
-        assert "user-viewer2" in nm.agent_audience(agent)
+        assert "user-viewer2" not in nm.agent_audience(agent)
+    await _settle()
+    assert "user-viewer2" in nm.agent_audience(agent)
 
     # An admin unassigned from the agent keeps access (admins are in every
     # audience): served as is, refreshed off the loop.
@@ -94,18 +111,20 @@ async def test_stale_entry_is_served_and_refreshed_off_the_loop(temp_db, loop_db
         served = nm.agent_audience(agent)
     assert "user-viewer2" not in served and nm._audience_tasks
     await _settle()
-    assert "user-viewer2" in nm._audience[agent].subs
+    assert "user-viewer2" in {sub for sub, _role in nm._audience[agent].members}
 
     # A result that started before an invalidation is discarded when it lands.
     generation = nm._audience[agent].generation
     nm.invalidate_audience(agent)
-    nm._store_audience(agent, generation, ("nobody",), nm.notification_store.get_agent_user_subs)
-    assert "nobody" not in nm._audience[agent].subs and nm._audience[agent].stale
+    nm._store_audience(agent, generation, (("nobody", "viewer"),),
+                       nm.notification_store.get_agent_members)
+    assert "nobody" not in {sub for sub, _role in nm._audience[agent].members}
+    assert nm._audience[agent].stale
     await _settle()
 
 
 async def test_stale_entry_read_from_a_worker_thread_refreshes_there(temp_db, monkeypatch):
-    agent = _agent_with("user-viewer")
+    agent = _agent_with("user-viewer", shared_only=True)
     nm.reset_audience_cache()
     nm.agent_audience(agent)
     await asyncio.to_thread(db_users.add_user_agent, "user-viewer2", agent, "viewer", ADMIN)
@@ -124,11 +143,11 @@ async def test_an_invalidation_during_a_worker_refresh_keeps_the_entry_stale(mon
     during: list = []
 
     def getter(agent):
-        out = list(members["now"])
+        out = [(sub, "viewer") for sub in members["now"]]
         for step in during:
             step()
         return out
-    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", getter)
+    monkeypatch.setattr(nm.notification_store, "get_agent_members", getter)
     assert await asyncio.to_thread(nm.agent_audience, "x") == ["a"]
 
     def add_b():  # an attach route, mid-read: the read answered before it
@@ -151,13 +170,13 @@ async def test_the_first_fan_out_read_on_the_loop_reads_off_the_loop(temp_db, lo
 
     agent = _agent_with("user-viewer")
     nm.reset_audience_cache()
-    real = nm.notification_store.get_agent_user_subs
+    real = nm.notification_store.get_agent_members
     readers: list[int] = []
 
     def recording(a):
         readers.append(threading.get_ident())
         return real(a)
-    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", recording)
+    monkeypatch.setattr(nm.notification_store, "get_agent_members", recording)
     with loop_db_guard.active():
         first = nm.chat_status_targets(f"agent::{agent}", agent)
     assert threading.get_ident() not in readers, "store read on the loop"
@@ -200,7 +219,7 @@ async def test_a_failed_cold_read_caches_nothing_and_the_getter_is_pinned(temp_d
 
     def boom(agent):
         raise psycopg.OperationalError("db down")
-    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", boom)
+    monkeypatch.setattr(nm.notification_store, "get_agent_members", boom)
     assert await asyncio.to_thread(nm.chat_status_targets, "agent::x", "x") == []
     assert "x" not in nm._audience
     # On the loop the fan-out's miss answers nobody; the failed fill leaves
@@ -214,9 +233,9 @@ async def test_a_failed_cold_read_caches_nothing_and_the_getter_is_pinned(temp_d
     assert "x" not in nm._audience
     # A test-style replacement of the getter misses the cache (the entry
     # remembers which function filled it).
-    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", lambda agent: ["a"])
+    monkeypatch.setattr(nm.notification_store, "get_agent_members", lambda agent: [("a", "viewer")])
     assert nm.agent_audience("x") == ["a"]
-    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", lambda agent: ["b"])
+    monkeypatch.setattr(nm.notification_store, "get_agent_members", lambda agent: [("b", "viewer")])
     assert nm.agent_audience("x") == ["b"]
     nm.reset_audience_cache()
     assert not nm._audience
@@ -289,3 +308,107 @@ async def test_a_platform_role_change_refreshes_every_audience(temp_db, loop_db_
     await _settle()
     with loop_db_guard.active():
         assert "user-viewer2" not in nm.agent_audience(agent)
+
+
+async def test_the_agents_own_runs_reach_the_editor_tier(temp_db, loop_db_guard):
+    """A scheduled run's chat (``task::``) is what the agent does on its own
+    behalf: its live frames reach the editors, managers and admins, never a
+    contributor or a viewer; the shared pool (``agent::``) reaches every
+    member; a demotion refreshes the entry."""
+    agent = _agent_with("user-viewer", shared_only=True)
+    await asyncio.to_thread(db_users.add_user_agent, "user-viewer2", agent, "viewer", ADMIN)
+    await asyncio.to_thread(db_users.add_user_agent, "user-manager", agent, "contributor", ADMIN)
+    nm.reset_audience_cache()
+    assert set(nm.agent_audience(agent)) == {ADMIN, "user-viewer", "user-viewer2", "user-manager"}
+    with loop_db_guard.active():
+        assert set(nm.chat_status_targets(f"task::{agent}", agent)) == {ADMIN, "user-viewer"}
+        assert set(nm.chat_status_targets(f"agent::{agent}", agent)) == {
+            ADMIN, "user-viewer", "user-viewer2", "user-manager"}
+        assert nm.agent_audience(agent, floor="contributor") == [
+            s for s in nm.agent_audience(agent) if s != "user-viewer2"]
+    await nm._on_offboard(OffboardEvent(
+        "user-viewer", offboarding.DEMOTED,
+        (AgentLoss(agent, "editor", "viewer", old_row="editor", new_row="viewer"),), ADMIN))
+    assert nm._audience[agent].stale
+    await asyncio.to_thread(_set_role, "user-viewer", agent, "viewer")
+    assert set(await asyncio.to_thread(nm.agent_audience, agent, floor="editor")) == {ADMIN}
+    await _settle()
+
+
+# --- an agent:: owner off a Shared-only agent (a delegated worker) ---------
+
+_MEMBERS = [("u-view", "viewer"), ("u-contrib", "contributor"), ("u-ed", "editor"),
+            ("u-adm", "admin")]
+
+
+@pytest.fixture
+def two_modes(monkeypatch):
+    """Two agents with the same four people: ``collab`` (collaborative) and
+    ``pool`` (Shared-only), and a socket per person."""
+    from core.session import visibility
+
+    nm.reset_audience_cache()
+    monkeypatch.setattr(nm.notification_store, "get_agent_members", lambda agent: list(_MEMBERS))
+    monkeypatch.setattr(visibility, "is_shared_only", lambda agent: agent == "pool")
+    conns = {sub: SimpleNamespace(queue=asyncio.Queue(), focus=None, live_queue=None)
+             for sub, _ in _MEMBERS}
+    monkeypatch.setattr(nm, "_user_connections", {s: [c] for s, c in conns.items()})
+    return conns
+
+
+def _told(conns, frame_type: str) -> set[str]:
+    out = set()
+    for sub, c in conns.items():
+        while not c.queue.empty():
+            if c.queue.get_nowait().get("type") == frame_type:
+                out.add(sub)
+    return out
+
+
+_EDITOR_TIER = {"u-ed", "u-adm"}
+_EVERYONE = {"u-view", "u-contrib", "u-ed", "u-adm"}
+
+
+@pytest.mark.parametrize("agent,expected", [("collab", _EDITOR_TIER), ("pool", _EVERYONE)])
+async def test_every_frame_class_of_an_agent_owned_chat_follows_the_rule(two_modes, agent,
+                                                                         expected):
+    """A delegated worker's chat (an ``agent::`` owner on a collaborative
+    agent) is the agent's own work: its status, title, read marker, engine
+    switch and move frames reach the editor tier only. A Shared-only pool
+    chat's reach every member. Read from a worker thread (the cache fills
+    there; on the loop a cold read answers nobody)."""
+    from ws import wire_events as wire
+    conns, owner = two_modes, f"agent::{agent}"
+    await asyncio.to_thread(nm.agent_audience, agent)
+    cases = [
+        (wire.CHAT_STATUS, lambda: nm.broadcast_chat_status(owner, "w-1", "streaming", agent=agent)),
+        (wire.TITLE_UPDATED, lambda: nm.broadcast_chat_title(owner, "w-1", "Lane: report", agent=agent)),
+        (wire.CHAT_READ, lambda: nm.broadcast_chat_read(owner, "w-1", agent=agent)),
+        (wire.ENGINE_SWITCHED, lambda: nm.broadcast_engine_switched(owner, "w-1", "codex-cli", "m",
+                                                                    agent=agent)),
+        ("chat_moved", lambda: nm._send_move_frame(owner, agent, "", {"type": "chat_moved",
+                                                                      "chat_id": "w-1"}, set())),
+    ]
+    for frame_type, send in cases:
+        send()
+        assert _told(conns, frame_type) == expected, frame_type
+
+
+@pytest.mark.parametrize("agent,expected", [("collab", _EDITOR_TIER), ("pool", _EVERYONE)])
+async def test_the_queue_frames_of_an_agent_owned_chat_follow_the_rule(two_modes, monkeypatch,
+                                                                       agent, expected):
+    """The input queue's ``queued``, ``queue_snapshot`` and ``steered`` frames
+    carry a queued message's text: on a collaborative agent's worker they
+    reach the editor tier (and the message's own author) only."""
+    from core.events import input_queue
+    from ws import wire_events as wire
+    await asyncio.to_thread(nm.agent_audience, agent)
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(nm, "push_live", lambda sub, frame: pushed.append((sub, frame["type"])) or 1)
+    q = input_queue.get(f"q-{agent}")
+    q.owner_sub, q.agent = f"agent::{agent}", agent
+    for frame_type in (wire.QUEUED, wire.QUEUE_SNAPSHOT, wire.STEERED):
+        pushed.clear()
+        input_queue.fan_out(q.chat_id, {"type": frame_type, "text": "a late steer"})
+        assert {sub for sub, _ in pushed} == expected, frame_type
+    input_queue._registry.pop(q.chat_id, None)

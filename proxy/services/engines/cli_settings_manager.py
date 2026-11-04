@@ -62,7 +62,11 @@ def seed_interactive_cli_config(
     # "3. Don't ask me again" persists (verified empirically on 2.1.220;
     # changelog-reviewed to 2.1.243 — no picker/key change);
     # seeding it resumes the full session as-is, which is the platform's
-    # resume contract.
+    # resume contract. 2.1.304's "Resume this conversation?" question (a Pro
+    # or Max login, a large conversation idle past its cache: "Resume" or
+    # "Start a new conversation", held over the first prompt sent) checks the
+    # same key first, so it never stands between the cold prompt and the
+    # resumed session either (read in the 2.1.312 binary).
     data["resumeReturnDismissed"] = True
     # Map the dashboard mode to a Claude theme; default dark. Claude's TUI text
     # color follows this, so it MUST match the xterm background or text is

@@ -209,6 +209,32 @@ class TestStart:
         assert "An admin must allow mcp.example.com for notion-hosted" in resp.json()["detail"]
         assert rig.vendor.requests == []
 
+    def test_a_catalog_install_connects_with_no_admin_row_and_a_zip_waits(self, rig):
+        """The connect's 400 meets only an MCP installed another way: a ZIP
+        before its Allow; a catalog install's own server host is allowed."""
+        from services.community import manifest_hosts
+        from storage.mcp import mcp_store
+        with get_conn() as conn:
+            conn.execute("DELETE FROM oauth_bearer_allowlist WHERE provider_id = %s", (PROVIDER,))
+            conn.commit()
+        mcp_store.set_mcp_enabled(MCP, True)
+        try:
+            assert manifest_hosts.after_install(MCP, from_catalog=False)["hosts"] == ["mcp.example.com"]
+            resp = _start(rig)
+            assert resp.status_code == 400
+            assert resp.json()["detail"] == (
+                f"An admin must allow mcp.example.com for {PROVIDER} in Admin > Security "
+                "before accounts can be connected.")
+            assert rig.vendor.requests == []
+            assert manifest_hosts.after_install(MCP, from_catalog=True) is None
+            resp = _start(rig)
+            assert resp.status_code == 200 and "url" in resp.json()
+        finally:
+            bearer_allowlist.forget_mcp(MCP)
+            with get_conn() as conn:
+                conn.execute("DELETE FROM mcp_state WHERE name = %s", (MCP,))
+                conn.commit()
+
     def test_consent_url_and_one_registration(self, rig):
         resp = _start(rig)
         assert resp.status_code == 200, resp.text
@@ -355,6 +381,45 @@ class TestCallback:
                                params={"code": "c-1", "state": q["state"], "iss": ISSUER})
         assert "expired or was already used" in again.text and len(rig.posted["token"]) == 1
 
+    def test_a_consent_page_on_another_origin_exchanges_at_the_issuer(self, rig):
+        meta = dict(rig.vendor.routes[AS_META][1], authorization_endpoint="https://login.example.org/authorize")
+        rig.vendor.routes[AS_META] = (200, meta, {})
+        q_url = _start(rig).json()["url"]
+        assert q_url.startswith("https://login.example.org/authorize?")
+        q = _params(q_url)
+        resp = rig.client.get(f"/v1/oauth/{PROVIDER}/callback",
+                              params={"code": "c-1", "state": q["state"], "iss": ISSUER})
+        assert "Account Connected" in resp.text
+        assert [str(r.url).split("?")[0] for r in rig.vendor.requests if r.method == "POST"][-1] == TOKEN
+        assert not [r for r in rig.vendor.requests if r.url.host == "login.example.org"]
+
+    @pytest.mark.parametrize("mobile", [False, True])
+    def test_a_code_back_on_another_providers_callback_is_never_exchanged(self, rig, mobile):
+        q = self._consent(rig, mobile=mobile)
+        if mobile:
+            resp = rig.client.post("/v1/oauth/google/exchange",
+                                   json={"code": "c", "state": q["state"], "iss": ISSUER})
+            assert resp.status_code == 400
+        else:
+            resp = rig.client.get("/v1/oauth/google/callback",
+                                  params={"code": "c", "state": q["state"], "iss": ISSUER})
+            assert "Token exchange failed" in resp.text
+        assert rig.posted["token"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_app_flow_code_on_another_providers_callback_is_never_exchanged(self, monkeypatch):
+        """The guard runs before any flow's exchange, the app flow too."""
+        from auth import oauth_providers
+        from services.oauth import oauth_engine
+
+        def no_provider(pid):
+            raise AssertionError("no exchange may start")
+        monkeypatch.setattr(oauth_providers, "get_provider", no_provider)
+        state = oauth_engine.create_state(user_sub="alice", mcp_name="slack-mcp", provider_id="slack",
+                                          services=["chat"], redirect_uri="https://x/cb")
+        with pytest.raises(RuntimeError, match="came back for another provider"):
+            await oauth_engine.do_oauth_exchange(code="c", state_token=state, callback_provider="google")
+
     def test_typed_label_wins(self, rig):
         q = self._consent(rig, label="Work")
         rig.client.get(f"/v1/oauth/{PROVIDER}/callback", params={"code": "c", "state": q["state"], "iss": ISSUER})
@@ -411,7 +476,7 @@ class TestCallback:
         assert resp.status_code == 400 and "secret vendor words" not in resp.text
         assert resp.json()["detail"] == "Token exchange failed (OAuthTokenError)"
 
-    def test_an_unusable_identity_label_revokes_the_grant(self, rig):
+    def test_a_vendor_label_with_a_path_in_it_stays_in_the_token_folder(self, rig):
         def token(request):
             form = dict(httpx.QueryParams(request.content.decode()))
             if form.get("grant_type") == "authorization_code":
@@ -421,6 +486,15 @@ class TestCallback:
             return httpx.Response(200)
         rig.vendor.routes[("POST", TOKEN)] = token
         q = self._consent(rig)
+        resp = rig.client.get(f"/v1/oauth/{PROVIDER}/callback",
+                              params={"code": "c", "state": q["state"], "iss": ISSUER})
+        assert "Account Connected" in resp.text and rig.posted["revoke"] == []
+        assert [p.name for p in rig.token_dir().iterdir()] == ["ws.json"]
+
+    def test_an_unusable_typed_label_revokes_the_grant(self, rig):
+        q = self._consent(rig, label="Work")
+        from services.oauth import oauth_engine
+        oauth_engine._states[q["state"]].account_label_hint = "../x"
         resp = rig.client.get(f"/v1/oauth/{PROVIDER}/callback",
                               params={"code": "c", "state": q["state"], "iss": ISSUER})
         assert "Token exchange failed" in resp.text
@@ -519,6 +593,71 @@ class TestDisconnect:
         assert resp.status_code == 400
 
 
+class TestSharedProvider:
+    """Two MCPs on one provider: one login shares one file, another login
+    with the same name never moves the first MCP, and a disconnect on one
+    MCP keeps the login for the other."""
+
+    def _rig(self, rig):
+        data = _manifest_data()
+        data["name"] = "notion-hosted-two"
+        rig.install(data)
+
+        def token(request):
+            form = dict(httpx.QueryParams(request.content.decode()))
+            if form.get("grant_type") != "authorization_code":
+                rig.posted["revoke"].append(form)
+                return httpx.Response(200, text="")
+            rig.posted["token"].append(form)
+            who = form["code"].split("-")[-1]
+            return httpx.Response(200, json={
+                "access_token": f"AT-{who}", "refresh_token": f"RT-{who}", "expires_in": 3600,
+                "workspace_id": "ws-1", "email_domain": "acme.com", "user_id": f"u-{who}",
+            })
+        rig.vendor.routes[("POST", TOKEN)] = token
+
+    def _connect(self, rig, mcp, code, label=""):
+        resp = rig.client.post(f"/v1/oauth/{PROVIDER}/start",
+                               json={"mcp_name": mcp, "services": ["read"], "account_label": label})
+        q = _params(resp.json()["url"])
+        page = rig.client.get(f"/v1/oauth/{PROVIDER}/callback",
+                              params={"code": code, "state": q["state"], "iss": ISSUER})
+        assert "Account Connected" in page.text, page.text[:300]
+
+    def _login(self, rig, label):
+        return json.loads((rig.token_dir() / f"{label}.json").read_text())["account_id"]
+
+    def test_choosing_an_account_for_one_mcp_leaves_the_other(self, rig):
+        self._rig(rig)
+        self._connect(rig, MCP, "c-1")
+        self._connect(rig, "notion-hosted-two", "c-1")
+        assert sorted(p.name for p in rig.token_dir().iterdir()) == ["ws-1.json"]
+        # another login with the same workspace name, added on the second MCP
+        self._connect(rig, "notion-hosted-two", "c-2")
+        assert self._login(rig, "ws-1") == "u-1" and self._login(rig, "ws-1 2") == "u-2"
+        assert [a["account_label"] for a in credential_store.list_user_accounts(rig.sub, MCP)] == ["ws-1"]
+        assert sorted(a["account_label"] for a in credential_store.list_user_accounts(rig.sub, "notion-hosted-two")) \
+            == ["ws-1", "ws-1 2"]
+        # a Reconnect of the shared card signed in as the other login
+        self._connect(rig, MCP, "c-2", label="ws-1")
+        assert self._login(rig, "ws-1") == "u-1"
+
+    def test_a_disconnect_on_one_mcp_keeps_the_login_for_the_other(self, rig):
+        self._rig(rig)
+        self._connect(rig, MCP, "c-1")
+        self._connect(rig, "notion-hosted-two", "c-1")
+        resp = rig.client.post(f"/v1/oauth/{PROVIDER}/disconnect",
+                               json={"mcp_name": "notion-hosted-two", "account_label": "ws-1"})
+        assert resp.json() == {"status": "ok", "kept_for": ["Notion (hosted)"]}
+        assert rig.posted["revoke"] == [] and (rig.token_dir() / "ws-1.json").exists()
+        assert credential_store.list_user_accounts(rig.sub, "notion-hosted-two") == []
+        assert [a["account_label"] for a in credential_store.list_user_accounts(rig.sub, MCP)] == ["ws-1"]
+        # the last holder's disconnect ends the login
+        resp = rig.client.post(f"/v1/oauth/{PROVIDER}/disconnect", json={"mcp_name": MCP, "account_label": "ws-1"})
+        assert resp.json() == {"status": "ok", "kept_for": []}
+        assert rig.posted["revoke"][0]["token"] == "RT-1" and not (rig.token_dir() / "ws-1.json").exists()
+
+
 # ---------------------------------------------------------------------------
 # The file's verdict and the token-origin invariant
 # ---------------------------------------------------------------------------
@@ -588,6 +727,35 @@ class TestTokenOrigin:
             "reconnect it in Settings > Integrations."
         )
         (token_dir / "ws-1.json").write_text(json.dumps(_file(extra={"flow": "mcp_authorization", "resource": RESOURCE})))
+        out = credential_resolver.resolve_credentials("pa", rig.sub, task_scope="user")
+        assert MCP in out.available_mcps
+
+    def test_a_refusal_mark_leaves_its_own_mcp_out_and_no_other(self, rig, monkeypatch):
+        """The MCP's own server refused the file's token: its new sessions
+        leave it out with the reason; the gateway's own check, and another
+        MCP of the same file, are not refused by it."""
+        token_dir = rig.token_dir()
+        marks = {"refused_by": {MCP: {"at": "2026-11-03T10:00:00Z", "methods": ["tools/call"]}}}
+        marked = _file(extra={"flow": "mcp_authorization", "resource": RESOURCE, **marks})
+        (token_dir / "ws-1.json").write_text(json.dumps(marked))
+        assert credential_resolver.account_unusable_reason(marked, rig.manifest) == "refused"
+        assert credential_resolver.account_unusable_reason(marked, rig.manifest, refused=False) == ""
+        assert credential_resolver.marked_methods(marked, MCP) == ("tools/call",)
+        assert credential_resolver.marked_methods(marked, "another-mcp") == ()
+        monkeypatch.setattr(credential_resolver, "pick_account",
+                            lambda mcp, agent, *, user_sub="": credential_resolver.AccountRef("ws-1", user_sub))
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: [rig.manifest])
+        out = credential_resolver.resolve_credentials("pa", rig.sub, task_scope="user")
+        assert MCP in out.excluded_mcps
+        assert out.exclusion_reasons[MCP] == (
+            "Notion Account: the vendor no longer accepts the account's access; "
+            "reconnect it in Settings > Integrations."
+        )
+        ref, reason = mcp_registry._gateway_bearer_source(rig.manifest, rig.sub, "pa", "user")
+        assert ref is None and "no longer accepts" in reason
+        other = _file(extra={"flow": "mcp_authorization", "resource": RESOURCE,
+                             "refused_by": {"another-mcp": {"at": "x", "methods": ["tools/call"]}}})
+        (token_dir / "ws-1.json").write_text(json.dumps(other))
         out = credential_resolver.resolve_credentials("pa", rig.sub, task_scope="user")
         assert MCP in out.available_mcps
 

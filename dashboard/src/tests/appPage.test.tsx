@@ -20,10 +20,14 @@ const wsSpy = vi.hoisted(() => ({ connect: vi.fn(), disconnect: vi.fn() }))
 vi.mock('@/hooks/useDashboardWs', () => ({ useDashboardWs: () => wsSpy }))
 const appRow = vi.hoisted(() => ({ current: null as any, loading: false }))
 const rollbackMutate = vi.hoisted(() => vi.fn())
+const followCalls = vi.hoisted(() => ({ take: vi.fn(), send: vi.fn(), stop: vi.fn() }))
 vi.mock('@/api/apps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/apps')>()),
   useApp: () => ({ data: appRow.current, isLoading: appRow.loading }),
   useRollbackApp: () => ({ mutate: rollbackMutate, isPending: false }),
+  useTakeRelease: () => ({ mutate: followCalls.take, isPending: false }),
+  useSendToSource: () => ({ mutate: followCalls.send, isPending: false }),
+  useStopFollowing: () => ({ mutate: followCalls.stop, isPending: false }),
 }))
 const authUser = vi.hoisted(() => ({ current: { role: 'member', agents: ['dev'] } as any }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: authUser.current }) }))
@@ -108,6 +112,37 @@ describe('AppPage', () => {
     act(() => { rollbackMutate.mock.calls[0][1].onSuccess({ release: 1, screens: 1, db_restored: false }) })
     expect(screen.getByTestId('app-rollback-notice').textContent)
       .toContain('No copy from before release 2 exists')
+  })
+
+  it('an app that follows its source shows its card and its menu rows full screen too', () => {
+    window.localStorage.clear()
+    followCalls.take.mockClear()
+    followCalls.send.mockClear()
+    followCalls.stop.mockClear()
+    const follows = {
+      agent: 'head', agent_name: 'Head Office', slug: 'board', release: 1, exists: true,
+      held_release: 0, can_take: true, update: { release: 2, mode: 'update' as const },
+    }
+    appRow.current = mkApp({ kind: 'folder', release: 1, follows })
+    renderPage()
+    expect(screen.getByTestId('app-follow-card').textContent).toContain('Release 2 of Head Office’s app is available for “Morning brief”.')
+    fireEvent.click(screen.getByTestId('follow-update'))
+    expect(followCalls.take.mock.calls[0][0]).toEqual({ appId: 'app-1', mode: 'update' })
+    act(() => { followCalls.take.mock.calls[0][1].onSuccess({ status: 'ok', mode: 'update', release: 2, source_release: 2, text: 'Release 2 of "Morning brief" waits for approval here.' }) })
+    expect(screen.getByTestId('app-follow-notice').textContent).toContain('Release 2 of "Morning brief" waits for approval here.')
+    // Send asks first; Stop following too.
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Send this release to the source' }))
+    expect(screen.getByTestId('app-send-to-source-confirm').textContent).toContain('Send release 1 of “Morning brief” to Head Office’s app?')
+    expect(followCalls.send).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Send this release' }))
+    expect(followCalls.send).toHaveBeenCalledWith('app-1', expect.anything())
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Stop following' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stop following' }))
+    expect(followCalls.stop).toHaveBeenCalledWith('app-1', expect.anything())
+    act(() => { followCalls.stop.mock.calls[0][1].onSuccess() })
+    expect(screen.getByTestId('app-follow-notice').textContent).toContain('“Morning brief” no longer follows Head Office’s app.')
   })
 
   it('renders the app full screen with its title, back link and menu', () => {

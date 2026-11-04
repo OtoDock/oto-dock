@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 
 // ─── AI Engines settings card: status-truthful rows (an expired row must not
 //     claim "Using your subscription", scope toggles die with the row, and
@@ -35,7 +36,8 @@ vi.mock('@/api/auth', () => ({ fetchCurrentUser: vi.fn(async () => null) }))
 vi.mock('@/lib/nativeBridge', () => ({ setNativeAuthInProgress: vi.fn() }))
 
 import { ExecutionLayersSection } from '@/pages/UserSettings.aiEngines'
-import { claudeLike } from './fixtures/engines'
+import { accountEmail, accountName, loginEndsIn, type Subscription } from '@/api/executionLayers'
+import { claudeLike, codexLike } from './fixtures/engines'
 
 function layer(subs: object[], overrides: object = {}) {
   return {
@@ -59,12 +61,21 @@ function sub(overrides: object = {}) {
   }
 }
 
-function renderCard(subs: object[], overrides: object = {}) {
-  layersRef.current = [layer(subs, overrides)]
-  render(<ExecutionLayersSection />)
-  // Expand the card so rows render.
-  fireEvent.click(screen.getByText('Claude Code'))
+function renderSection(rows: unknown[], path = '/user-settings/ai-engines') {
+  layersRef.current = rows
+  return render(<MemoryRouter initialEntries={[path]}><ExecutionLayersSection /></MemoryRouter>)
 }
+
+function renderCard(subs: object[], overrides: object = {}) {
+  renderSection([layer(subs, overrides)])
+  // Expand the card so rows render (the card's own span).
+  fireEvent.click(screen.getByText('Claude Code', { selector: 'span' }))
+}
+
+const codexLayer = (over: object = {}) => ({
+  name: 'codex-cli', display_name: 'OpenAI Codex', capabilities: codexLike(),
+  user_subscriptions: [], platform_available: false, allow_platform_auth: true, can_run: true, ...over,
+})
 
 describe('AI Engines settings card', () => {
   it('active row: subscription claimed, toggles live, no Reconnect', () => {
@@ -133,7 +144,7 @@ describe('AI Engines settings card', () => {
     expect(screen.getByText('Connect your Claude account')).toBeInTheDocument()
     fireEvent.click(screen.getByText('Use an API key instead'))
     // The engine's vendor is fixed on the user card: no provider select.
-    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(screen.queryAllByRole('combobox')).toHaveLength(0)
     fireEvent.change(screen.getByLabelText('API key'), { target: { value: ' sk-ant-test ' } })
     fireEvent.click(screen.getByText('Add'))
     expect(added).toEqual([{
@@ -148,9 +159,126 @@ describe('AI Engines settings card', () => {
 
 import { warmupFailSubtype } from '@/hooks/useChatStream'
 
+// ─── Engines resolve per person: the order by use and the limit notice ─────
+
+describe('A login that ends soon', () => {
+  const H = 3_600_000
+  const NOW = Date.parse('2026-10-29T12:00:00Z')
+  const row = (over: object) => sub(over) as unknown as Subscription
+  const ends = (hours: number, over: object = {}) =>
+    loginEndsIn(row({ login_expires_at: new Date(NOW + hours * H).toISOString(), ...over }), NOW)
+  // From the wall clock: the page times the row by Date.now().
+  const inHours = (hours: number) => new Date(Date.now() + hours * H).toISOString()
+
+  it('says when inside the notice window only, rounded half up with no gap', () => {
+    expect(ends(72)).toBe('in 3 days')
+    expect(ends(71)).toBe('in 3 days')
+    expect(ends(49)).toBe('in 2 days')
+    expect(ends(47 + 40 / 60)).toBe('in 2 days')
+    expect(ends(47 + 20 / 60)).toBe('in 47 hours')
+    expect(ends(5)).toBe('in 5 hours')
+    expect(ends(1)).toBe('in 1 hour')
+    expect(ends(40 / 60)).toBe('in 1 hour')
+    expect(ends(20 / 60)).toBe('within the hour')
+    expect(ends(-0.5)).toBe('now')
+    expect(ends(72.1)).toBeNull()
+    expect(ends(96)).toBeNull()
+  })
+
+  it('says nothing on a row it does not apply to', () => {
+    expect(ends(10, { status: 'expired' })).toBeNull()
+    expect(ends(10, { status: 'disabled' })).toBeNull()
+    // An API-key row carries no login end at all.
+    expect(loginEndsIn(row({ auth_type: 'api_key' }), NOW)).toBeNull()
+    expect(loginEndsIn(row({ login_expires_at: null }), NOW)).toBeNull()
+    expect(loginEndsIn(row({ login_expires_at: 'soon' }), NOW)).toBeNull()
+    expect(loginEndsIn(row({}), NOW)).toBeNull()
+  })
+
+  it('names the account as the notice does', () => {
+    expect(accountName({ label: 'Claude Max', oauth_email: 'a@example.com' })).toBe('Claude Max (a@example.com)')
+    expect(accountName({ label: 'a@example.com', oauth_email: 'A@Example.com' })).toBe('a@example.com')
+    expect(accountName({ label: 'Claude Max', oauth_email: '3f2a9c1e-0000-4000-8000-000000000000' })).toBe('Claude Max')
+    expect(accountName({ label: '', oauth_email: 'a@example.com' })).toBe('a@example.com')
+    expect(accountName({ label: '', oauth_email: '3f2a9c1e' }, 'the account')).toBe('the account')
+    expect(accountEmail(' a@example.com ')).toBe('a@example.com')
+    expect(accountEmail('3f2a9c1e-0000-4000-8000-000000000000')).toBe('')
+    expect(accountEmail(null)).toBe('')
+  })
+
+  it('at 71 hours the card opens by itself, with the chip and Reconnect', () => {
+    // No header click: the card is already open, and a click would close it.
+    renderSection([layer([sub({ login_expires_at: inHours(71) })])])
+    expect(screen.getByText('Login ends in 3 days')).toBeInTheDocument()
+    expect(screen.getByText('active')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+    const dialog = screen.getByRole('dialog', { name: 'Reconnect a@example.com' })
+    expect(dialog).toHaveTextContent('sign in again as a@example.com')
+  })
+
+  it('under 48 hours the chip counts hours', () => {
+    renderSection([layer([sub({ login_expires_at: inHours(5) })])])
+    expect(screen.getByText('Login ends in 5 hours')).toBeInTheDocument()
+  })
+
+  it('past the instant on a row still active, the chip says the login is ending', () => {
+    renderSection([layer([sub({ login_expires_at: inHours(-1) })])])
+    expect(screen.getByText('Login ending')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  })
+
+  it('at four days the card starts closed and the row is as today', () => {
+    renderSection([layer([sub({ login_expires_at: inHours(96) })])])
+    expect(screen.queryByText('Claude Max')).toBeNull()
+    fireEvent.click(screen.getByText('Claude Code', { selector: 'span' }))
+    expect(screen.getByText('Claude Max')).toBeInTheDocument()
+    expect(screen.queryByText(/Login end/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).toBeNull()
+  })
+
+  it('an expired row is as today, even with its instant inside the window', () => {
+    renderCard([sub({ status: 'expired', login_expires_at: inHours(10) })])
+    expect(screen.queryByText(/Login end/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+    expect(screen.getByText("This account's login expired. Reconnect the same account to revive it.")).toBeInTheDocument()
+  })
+})
+
+describe('The engine order', () => {
+  it('has no setting: the page says new chats follow use', () => {
+    renderSection([layer([sub()], { can_run: true }), codexLayer({ can_run: true })])
+    expect(screen.queryByText('Preferred engine')).toBeNull()
+    expect(screen.queryByRole('combobox', { name: 'Preferred engine' })).toBeNull()
+    expect(screen.getByText(/New chats list your engines by how much you use them on each agent\./)).toBeInTheDocument()
+  })
+})
+
+describe('The limit notice', () => {
+  it('the limit link names the account and says where to pick another engine, with no card', () => {
+    renderSection([layer([sub()], { can_run: true }), codexLayer({ can_run: true })], '/user-settings/ai-engines?limit=codex-cli')
+    const notice = screen.getByTestId('engine-limit-notice')
+    expect(notice).toHaveTextContent('Your Codex account reached its limit.')
+    expect(notice).toHaveTextContent('Until it resets, pick another engine in a chat’s Model menu. An open chat offers it once its session has ended.')
+    expect(notice.querySelector('button')).toBeNull()
+    expect(screen.queryByText(/everywhere\?/)).toBeNull()
+  })
+
+  it('the limit link with no other engine says to connect one', () => {
+    renderSection([layer([sub()], { can_run: true })], '/user-settings/ai-engines?limit=claude-code-cli')
+    expect(screen.getByTestId('engine-limit-notice')).toHaveTextContent('No other engine is connected.')
+  })
+
+  it('an old switch link draws the page as it is, with no card and no notice', () => {
+    renderSection([layer([sub()], { can_run: true }), codexLayer()], '/user-settings/ai-engines?switch=claude-code-cli')
+    expect(screen.getByText('AI Engines')).toBeInTheDocument()
+    expect(screen.queryByTestId('engine-limit-notice')).toBeNull()
+    expect(screen.queryByText(/everywhere\?/)).toBeNull()
+  })
+})
+
 describe('warmupFailSubtype', () => {
   it('maps every emitted subscription-block reason to the amber card', () => {
-    for (const reason of ['auth_off', 'admin_oauth_only', 'no_pool', 'none', 'own_sub_expired']) {
+    for (const reason of ['auth_off', 'admin_oauth_only', 'no_pool', 'none', 'own_sub_expired', 'local_only']) {
       expect(warmupFailSubtype(reason)).toBe('no_subscription')
     }
   })

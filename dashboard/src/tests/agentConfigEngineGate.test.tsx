@@ -1,14 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { act, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
 
-// ─── AgentConfig — platform-configured gate on the engine cards ─────────────
-// A non-admin manager can only NEWLY enable an engine the platform has a
-// subscription for (`configured` on /v1/execution-layers; server mirror in
-// PATCH /v1/agents). Already-enabled engines stay uncheckable-only
-// (grandfathering); admins toggle freely; a loading catalog must never flash
-// a locked card.
+// ─── AgentConfig — the engine cards are an allowlist ─────────────────────────
+// A person's own account may serve any engine the agent allows, so no card
+// is locked; an engine the platform pool lacks keeps a hint (the agent's
+// own tasks cannot use it; the server refuses a move of the DEFAULT engine
+// there). An engine with a local provider gets the "Only allow local
+// models" row below its checked card, Claude Code never.
 
 const h = vi.hoisted(() => ({
   updateMock: vi.fn(),
@@ -101,7 +101,7 @@ const engineCards = () =>
 const engineCard = (label: string) =>
   engineCards().find(b => b.textContent?.includes(label)) as HTMLButtonElement
 
-describe('AgentConfig — engine enable gate', () => {
+describe('AgentConfig — the default-engine gate', () => {
   beforeEach(() => {
     h.updateMock.mockClear()
     h.user = { role: 'member', sub: 'u1', agent_roles: { demo: 'manager' } }
@@ -109,34 +109,45 @@ describe('AgentConfig — engine enable gate', () => {
     h.agentInfo.execution_paths = ['claude-code-cli']
   })
 
-  it('manager: unconfigured + unchecked engine renders disabled with the hint', () => {
+  it('manager: an unpooled engine is never locked and keeps the hint', () => {
     renderConfig()
     const codex = engineCard('Codex')
-    expect(codex.disabled).toBe(true)
-    expect(codex.textContent).toContain(
-      'No Codex subscription is connected on this platform')
+    expect(codex.disabled).toBe(false)
+    expect(codex.textContent).toContain('No platform subscription.')
+    expect(codex.textContent).toContain('People with their own account can.')
     // No admin tail on the manager's hint.
     expect(codex.textContent).not.toContain('Setup, AI Engines')
+    expect(engineCard('Claude Code').textContent).not.toContain('No platform subscription.')
   })
 
-  it('manager: configured engine stays toggleable', () => {
+  it('manager: ticking an unpooled engine saves the allowlist', () => {
     renderConfig()
-    expect(engineCard('Claude Code').disabled).toBe(false)
+    fireEvent.click(engineCard('Codex'))
+    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', execution_paths: ['claude-code-cli', 'codex-cli'] })
   })
 
-  it('manager: an ENABLED engine stays uncheckable-only when its platform sub vanished', () => {
-    h.agentInfo.execution_paths = ['claude-code-cli', 'codex-cli']
-    renderConfig()
-    // Grandfathered: still enabled (uncheck allowed) → not disabled.
-    expect(engineCard('Codex').disabled).toBe(false)
-  })
-
-  it('admin: unconfigured engine stays enabled, hint points at Setup, AI Engines', () => {
+  it('admin: the hint points at Setup, AI Engines', () => {
     h.user = { role: 'admin', sub: 'u1', agent_roles: {} }
     renderConfig()
     const codex = engineCard('Codex')
     expect(codex.disabled).toBe(false)
     expect(codex.textContent).toContain('Setup, AI Engines')
+  })
+
+  it('the local-only row sits below a checked engine with a local provider and saves', () => {
+    h.agentInfo.execution_paths = ['claude-code-cli', 'codex-cli']
+    renderConfig()
+    const rows = screen.getAllByRole('switch', { name: 'Only allow local models' })
+    // Codex declares a local provider, Claude Code does not: one row.
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(rows[0])
+    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', local_only_engines: ['codex-cli'] })
+  })
+
+  it('an unchecked engine shows no local-only row', () => {
+    renderConfig()
+    expect(screen.queryAllByRole('switch', { name: 'Only allow local models' })).toHaveLength(0)
   })
 
   it('a loading catalog renders no engine card at all (nothing to flash locked)', () => {

@@ -36,8 +36,8 @@ class GroqAdapter(OpenAIAdapter):
         # Qwen3 models on Groq are hybrid thinkers that THINK by default and
         # stream the reasoning as raw ``<think>`` text inside message.content.
         # The platform ships qwen as its fast non-reasoning Groq tier, so pin
-        # thinking off — Groq's qwen vocabulary is "none"/"default" (the
-        # platform effort scale doesn't map onto it).
+        # thinking off: Groq's qwen vocabulary is none, default, low, medium
+        # and high (Qwen 3.8), and the pin stays none.
         if model.startswith("qwen"):
             return {"reasoning_effort": "none"}
         return {}

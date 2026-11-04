@@ -1080,7 +1080,7 @@ class TestModeModelChange:
                 started = await ws.expect({
                     "type": "warmup_started", "chat_id": ANY, "agent": slug,
                     "execution_path": "claude-code-cli",
-                    "execution_target": "local", "new_chat": True,
+                    "execution_target": "", "new_chat": True,
                 })
                 await ws.expect({"type": "notification_count", "count": 0})
                 layer.start_gate.set()
@@ -2193,10 +2193,12 @@ class TestDeterministicTitlePrelude:
                 "UTC (UTC+00:00)]\n\nPlease delegate a task to yourself")
         assert self._title(text) == "Please delegate a task to yourself"
 
-    def test_prelude_only_prompt_falls_back(self):
+    def test_a_prompt_with_nothing_typed_titles_nothing(self):
+        # The chat stays untitled (no "New Chat" written), so its next real
+        # message titles it.
         assert self._title(
             "[Current time: Wednesday, July 08, 2026 13:00 (1:00 PM) UTC (UTC+00:00)]\n"
-        ) == "New Chat"
+        ) == ""
 
     def test_plain_prompt_unchanged(self):
         assert self._title("run the tests please") == "run the tests please"

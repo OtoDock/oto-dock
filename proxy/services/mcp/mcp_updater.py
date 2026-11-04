@@ -5,10 +5,12 @@ Extracted from the admin endpoints in ``api/mcp/mcps.py`` so that BOTH the manua
 (``services/mcp/mcp_autoupdate.py``) drive the exact same code path — there is one
 detection function and one update function, not two copies that can drift.
 
-Tier behaviour (resolved by ``core/config/deployment.current_mode()``) lives in
-``_update_docker_mcp``: T1 rebuilds + recreates the container, T2 pulls the new
-pre-built image + recreates, T3 (cloud / external-pool) only refreshes the
-catalog files (the central pool owns the image lifecycle). npm/pypi MCPs converge
+Tier behaviour (resolved by ``core/config/deployment.current_mode()``): a Docker
+MCP's catalog install starts its container on T1 and T2 (it pulls the new image,
+T1 builds only when none is published, then force-recreates);
+``_update_docker_mcp`` checks that start and reclaims the previous image tag. On
+T3 (cloud / external-pool) the update only refreshes the catalog files (the
+central pool owns the image lifecycle). npm/pypi MCPs converge
 to the catalog folder (``_update_node_python_mcp`` → ``install_from_catalog``) and
 install the latest version within the catalog ``version_constraint``, pinning the
 resolved version into the local manifest.
@@ -19,6 +21,12 @@ so it can't race a manual install/update of the same MCP (those paths hold the
 same lock). The lock is NOT acquired inside
 ``community_installer.install_from_catalog`` — its callers own it — so taking
 it here cannot self-deadlock.
+
+An update runs as a job (``start_update`` for the admin's button, which
+answers at once; ``run_update`` for the weekly job, which awaits it): one per
+MCP, a second one refused while it runs, its phase and the end read back by
+``job_state`` for the MCP Servers page. The jobs live in this process only and
+end with it, as the compose runs they drive do.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ import asyncio
 import http.client
 import json
 import logging
+import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -39,7 +48,6 @@ from fastapi import HTTPException
 
 from services.mcp import mcp_manifest_types as _mt, mcp_registry
 from storage import database as task_store
-from storage.mcp import mcp_store
 
 logger = logging.getLogger("otodock.mcp-updater")
 
@@ -800,14 +808,15 @@ async def _update_docker_mcp(name: str) -> dict:
 
     Docker MCPs run a pre-built image whose version of record is the catalog's
     manifest + ``server.image`` tag. ``install_from_catalog`` re-fetches the
-    manifest + compose and, on T2, pulls the (retagged/rebuilt) image and
-    force-recreates the container. Two topology fix-ups on top:
-      * T1 bare-metal — the catalog install only replaces files (auto-start is
-        T2-only), so rebuild + recreate the container here.
-      * T3 cloud (external-pool) — there is no per-install container; the MCP is
-        a connection to the OtoDock-owned central pool. Refreshing the catalog
-        files is the whole update (the orchestrator skips docker MCPs on T3
-        anyway; this stays correct if a manual update is invoked).
+    manifest + compose and, when the MCP is enabled on a self-host tier (T1
+    and T2), pulls (or, on T1, builds) the image and force-recreates the
+    container: that is the update's one start. On T3 (external-pool) there is
+    no per-install container; refreshing the catalog files is the whole
+    update (the orchestrator skips docker MCPs on T3 anyway).
+
+    A start that failed (``container_started`` False: a pull cut by the
+    proxy's stop, an image that did not come) keeps the previous image and
+    the offer, and raises, so the update can run again.
     """
     from core.config import deployment
     from services.community import community_installer
@@ -818,24 +827,15 @@ async def _update_docker_mcp(name: str) -> dict:
     old = mcp_registry.get_manifest(name)
     old_image = (getattr(old.server, "image", "") if old else "") or ""
 
-    result = await community_installer.install_from_catalog(name)
-
-    refreshed = mcp_registry.get_manifest(name)
-    if (
-        refreshed
-        and _mt.is_container(refreshed.server)
-        and deployment.current_mode() == deployment.MANAGED_LOCAL
-    ):
-        states = await asyncio.to_thread(mcp_store.get_all_mcp_states)
-        if states.get(name, False):
-            await asyncio.to_thread(
-                docker_manager.start_container, refreshed,
-                force_recreate=True,
-            )
+    result = await community_installer.install_from_catalog(
+        name, progress_cb=_installer_progress(name))
+    if result.get("container_started") is False:
+        raise HTTPException(500, CONTAINER_NOT_STARTED)
 
     # Reclaim the previous image tag once the new one is running, so the daemon
     # doesn't keep one stale image per update. Only when the tag changed and
     # we're self-host (cloud has no local image). Best-effort.
+    refreshed = mcp_registry.get_manifest(name)
     new_image = (getattr(refreshed.server, "image", "") if refreshed else "") or ""
     if (
         old_image
@@ -843,9 +843,20 @@ async def _update_docker_mcp(name: str) -> dict:
         and old_image != new_image
         and deployment.current_mode() != deployment.EXTERNAL_POOL
     ):
+        _set_phase(name, PHASE_FINISHING, "Removing the previous image.")
         await asyncio.to_thread(docker_manager.remove_image, old_image)
 
     return result
+
+
+def _installer_progress(name: str):
+    """The installer's progress events as the job's phase. The compose run's
+    own record (``compose_progress``) says more while the image moves."""
+    def _cb(event: dict) -> None:
+        step = _INSTALLER_PHASES.get(event.get("phase") or "")
+        if step:
+            _set_phase(name, *step)
+    return _cb
 
 
 async def _catalog_entry(name: str) -> dict | None:
@@ -967,14 +978,20 @@ async def update_one(name: str, *, settled_only: bool = False) -> dict:
         raise HTTPException(404, f"MCP '{name}' not found")
 
     async with catalog_install_registry.lock_for(name):
-        # Re-read inside the lock in case a concurrent update just changed it.
-        manifest = mcp_registry.get_manifest(name) or manifest
+        # Re-read inside the lock in case a concurrent update just changed it;
+        # one deleted while this waited stays deleted.
+        manifest = mcp_registry.get_manifest(name)
+        if not manifest:
+            raise HTTPException(404, f"MCP '{name}' not found")
+        container = _mt.is_container(manifest.server)
+        _set_phase(name, PHASE_PREPARING, "Getting the new version ready." if container
+                   else "Installing the new version.", status=JOB_RUNNING)
         if manifest.category == "skill":
             # Converge to the skills catalog (idempotent reinstall — the
             # generic runtime-none path below would 400 on "no source").
             from services.community import skills_installer
             result = await skills_installer.install_skill_package_from_catalog(name)
-        elif _mt.is_container(manifest.server):
+        elif container:
             result = await _update_docker_mcp(name)
         elif _is_git(manifest):
             from services.community import community_installer
@@ -1018,6 +1035,184 @@ def _forget_check_result(name: str) -> None:
         state_store.delete_check_result(name)
     except psycopg.Error:
         logger.warning("The persisted check result of %s could not be dropped", name)
+
+
+# ---------------------------------------------------------------------------
+# Update jobs: one per MCP, read back by the MCP Servers page
+# ---------------------------------------------------------------------------
+
+JOB_QUEUED = "queued"
+JOB_RUNNING = "running"
+JOB_DONE = "done"
+JOB_FAILED = "failed"
+PHASE_QUEUED = "queued"
+PHASE_PREPARING = "preparing"
+PHASE_PULLING = "pulling"
+PHASE_FINISHING = "finishing"
+
+# The catalog installer's progress events (``community_installer._emit``):
+# its "start" comes after the container started.
+_INSTALLER_PHASES = {
+    "prepare": (PHASE_PREPARING, "Getting the new version ready."),
+    "image": (PHASE_PULLING, "Getting the new image."),
+    "start": (PHASE_FINISHING, "Finishing the update."),
+    "finalize": (PHASE_FINISHING, "Finishing the update."),
+}
+
+UPDATE_RUNNING = "An update of this MCP is already running."
+CONTAINER_NOT_STARTED = ("The new version is installed but its container did not start. "
+                         "Press Update to try again.")
+
+# A finished job stays readable this long after the first read that follows
+# its end (a second tab and the Skills page's wait read it too), and never
+# longer than _FINISHED_KEEP_S after its end.
+_FINISHED_AFTER_READ_S = 30.0
+_FINISHED_KEEP_S = 600.0
+
+
+class UpdateAlreadyRunning(HTTPException):
+    """A second update of an MCP while one is queued or running."""
+
+    def __init__(self) -> None:
+        super().__init__(409, UPDATE_RUNNING)
+
+
+@dataclass
+class UpdateJob:
+    name: str
+    started_at: str
+    status: str = JOB_QUEUED
+    phase: str = PHASE_QUEUED
+    detail: str = "Waiting for another change to this MCP to finish."
+    ended_at: str = ""
+    log: str = ""
+    ended_mono: float = 0.0
+    read_mono: float | None = None
+
+
+_jobs: dict[str, UpdateJob] = {}
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def update_running(name: str) -> bool:
+    """Whether an update of ``name`` is queued or running."""
+    job = _jobs.get(name)
+    return job is not None and job.status in (JOB_QUEUED, JOB_RUNNING)
+
+
+def _register(name: str) -> UpdateJob:
+    # No await between the check and the set: two requests on the loop
+    # cannot both pass.
+    if update_running(name):
+        raise UpdateAlreadyRunning()
+    job = UpdateJob(name=name, started_at=_utcnow().isoformat())
+    _jobs[name] = job
+    return job
+
+
+def _set_phase(name: str, phase: str, detail: str, *, status: str | None = None) -> None:
+    """The phase of ``name``'s live job; nothing when no job runs it."""
+    job = _jobs.get(name)
+    if job is None or job.status not in (JOB_QUEUED, JOB_RUNNING):
+        return
+    if status:
+        job.status = status
+    job.phase, job.detail = phase, detail
+
+
+def _finish(job: UpdateJob, status: str, log: str) -> None:
+    job.status, job.log = status, log
+    job.ended_at, job.ended_mono = _utcnow().isoformat(), _clock()
+
+
+def _result_log(result: dict) -> str:
+    """What the page shows when the update ended well."""
+    status = result.get("status")
+    if status == "already_latest":
+        return "Already the newest version."
+    if status == "waiting":
+        return "The newest release is still in its waiting period."
+    runtime = _mt.runtime_of(result.get("runtime"))
+    if runtime is not None and runtime.container:
+        started = result.get("container_started")
+        return f"Updated to v{result.get('version', '')}." + (
+            " The container runs the new version." if started
+            else " The MCP is turned off: its container starts with the new version "
+                 "when it is turned on.")
+    return result.get("install_log") or f"Updated to v{result.get('version', '')}."
+
+
+def start_update(name: str) -> dict:
+    """Start the update of ``name`` and answer at once (the admin's button):
+    404 for an unknown MCP, 409 while one runs."""
+    from core import background
+
+    if not mcp_registry.get_manifest(name):
+        raise HTTPException(404, f"MCP '{name}' not found")
+    job = _register(name)
+    background.spawn(_drive(job, settled_only=False, raise_errors=False),
+                     name=f"update:{name}", owner="mcp-updater")
+    return {"status": "started", "name": name}
+
+
+async def run_update(name: str, *, settled_only: bool = False) -> dict:
+    """Run the update of ``name`` as a job and await it (the weekly job).
+    Raises ``UpdateAlreadyRunning`` while another one runs, and whatever
+    ``update_one`` raises."""
+    job = _register(name)
+    result = await _drive(job, settled_only=settled_only, raise_errors=True)
+    return cast("dict", result)
+
+
+async def _drive(job: UpdateJob, *, settled_only: bool, raise_errors: bool) -> dict | None:
+    try:
+        result = await update_one(job.name, settled_only=settled_only)
+    except asyncio.CancelledError:
+        _finish(job, JOB_FAILED, "The update stopped with the server.")
+        raise
+    except HTTPException as e:
+        _finish(job, JOB_FAILED, str(e.detail))
+        if raise_errors:
+            raise
+        logger.warning("The update of %s failed: %s", job.name, e.detail)
+        return None
+    except Exception as e:
+        _finish(job, JOB_FAILED, f"The update failed: {e}")
+        if raise_errors:
+            raise
+        logger.exception("The update of %s failed", job.name)
+        return None
+    _finish(job, JOB_DONE, _result_log(result))
+    return result
+
+
+def job_state() -> dict:
+    """``{"running": {name: {phase, detail, started_at}}, "finished": {name:
+    {status, log, ended_at}}}``. A running job shows its compose run's
+    latest progress when one is going. Reading marks the finished ones read
+    and drops those past their time."""
+    from services.mcp import compose_progress
+
+    now = _clock()
+    running: dict[str, dict] = {}
+    finished: dict[str, dict] = {}
+    for name, job in list(_jobs.items()):
+        if job.status in (JOB_QUEUED, JOB_RUNNING):
+            live = compose_progress.progress_of(name) if job.status == JOB_RUNNING else None
+            running[name] = {**(live or {"phase": job.phase, "detail": job.detail}),
+                             "started_at": job.started_at}
+            continue
+        if job.read_mono is None:
+            job.read_mono = now
+        if (now - job.read_mono > _FINISHED_AFTER_READ_S
+                or now - job.ended_mono > _FINISHED_KEEP_S):
+            del _jobs[name]
+            continue
+        finished[name] = {"status": job.status, "log": job.log, "ended_at": job.ended_at}
+    return {"running": running, "finished": finished}
 
 
 # ---------------------------------------------------------------------------

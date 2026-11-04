@@ -345,7 +345,7 @@ def _drive(monkeypatch, layer: _Layer, task: shared.TaskDefinition, run_id: str,
     from services.remote import remote_status
 
     async def _cfg(agent, task_def, sid, **kw):
-        return SimpleNamespace(execution_target="local", execution_path="claude-code-cli",
+        return SimpleNamespace(placement_sub=None, execution_target="local", execution_path="claude-code-cli",
                                interactive=False, resume=False, extra_env={}, chat_id="")
 
     monkeypatch.setattr(task_config_builder, "build_task_agent_config", _cfg)
@@ -600,7 +600,7 @@ async def test_a_direct_workers_continue_keeps_its_id_and_skips_its_prompt_row(t
     t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
 
     async def _direct_cfg(agent, task_def, sid, **kw):
-        return SimpleNamespace(execution_target="local", execution_path="direct-llm",
+        return SimpleNamespace(placement_sub=None, execution_target="local", execution_path="direct-llm",
                                interactive=False, resume=False, extra_env={}, chat_id="")
     monkeypatch.setattr(task_config_builder, "build_task_agent_config", _direct_cfg)
     try:
@@ -677,7 +677,7 @@ async def test_an_interactive_runs_first_prompt_carries_both_lines(temp_db, monk
     task = _task(f"t-tz3-{via_argv}")
     task.user_tz = "UTC"
     t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
-    cfg = SimpleNamespace(execution_target="local", execution_path=engine, interactive=True,
+    cfg = SimpleNamespace(placement_sub=None, execution_target="local", execution_path=engine, interactive=True,
                           resume=False, extra_env={}, chat_id="", interactive_first_prompt="")
 
     async def _interactive_cfg(agent, task_def, sid, **kw):
@@ -707,3 +707,50 @@ async def test_an_interactive_runs_first_prompt_carries_both_lines(temp_db, monk
     assert "\n" not in prompt
     assert cfg.interactive_first_prompt == (prompt if via_argv else "")
     assert layer.sends == []      # no pump for a terminal
+    # The run's prompt row is the card, an interactive run's too; the argv
+    # prompt is noted before the spawn so the rollout's copy is skipped (the
+    # PTY path notes where it submits, patched out here).
+    import json as _json
+
+    from core.session import transcript_tool_events as TE
+    rows = [m for m in task_store.get_chat_messages(f"task-{run_id}") if m["role"] == "user"]
+    assert [(m["content"], _json.loads(m["event_data"])["badge"]) for m in rows] == [
+        ("count", "task prompt")]
+    assert TE.consume_sent_prompt(f"task-{run_id}", prompt) is via_argv
+
+
+async def test_a_failed_start_takes_the_argv_prompts_note_back(temp_db, monkeypatch):
+    """Codex's launch argument is noted before the spawn; a start that fails
+    registers no session, so the note would stand for a journal line that
+    never comes until the hour: the start's failure drops it."""
+    from core.config import task_config_builder
+    from core.session import sibling_awareness, transcript_tool_events as TE
+    run_id, session_id = "run-argv-fail", "33333333-3333-4333-8333-333333333339"
+
+    class _RefusingLayer(_RecordingLayer):
+        async def start_session(self, session_id, agent_cfg):
+            raise RuntimeError("the spawn failed")
+
+    layer = _RefusingLayer()
+    task = _task("t-argv-fail")
+    task.user_tz = "UTC"
+    t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
+    cfg = SimpleNamespace(placement_sub=None, execution_target="local", execution_path="codex-cli", interactive=True,
+                          resume=False, extra_env={}, chat_id="", interactive_first_prompt="")
+
+    async def _interactive_cfg(agent, task_def, sid, **kw):
+        return cfg
+    monkeypatch.setattr(task_config_builder, "build_task_agent_config", _interactive_cfg)
+
+    async def _line(sid):
+        return ""
+    monkeypatch.setattr(sibling_awareness, "prelude_line", _line)
+    TE._sent_prompts.pop(f"task-{run_id}", None)
+    try:
+        await asyncio.wait_for(t, 15)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    assert cfg.interactive_first_prompt.endswith("count")
+    assert temp_db.get_run(run_id)["status"] == run_status.FAILED
+    assert f"task-{run_id}" not in TE._sent_prompts

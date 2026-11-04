@@ -315,6 +315,17 @@ def _no_remembered_resume_targets():
     remote_resume._resume_targets.clear()
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _no_exit_failsafe():
+    """A test whose app shutdown ran (a lifespan client) arms the proxy's
+    hard-exit failsafe: a daemon timer that os._exit(3)s the process three
+    seconds later, here an xdist worker in the middle of a later test. The
+    failsafe's own tests arm it by hand."""
+    import startup
+    startup._ARM_EXIT_FAILSAFE = False
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _compose_runs_allowed():
     """A test whose app shutdown ran (a lifespan client) stops every later
@@ -338,6 +349,21 @@ def _platform_running():
     pump_module = sys.modules.get("core.events.stream_pump")
     if pump_module is not None:
         pump_module._platform_ending = False
+
+
+@pytest.fixture(autouse=True)
+def _catalog_loop_unbound():
+    """A test whose app startup ran (a lifespan client) binds the app
+    catalog to that client's loop, closed when the client exits: each
+    test starts with none, so an emit runs inline."""
+    import sys
+    catalog = sys.modules.get("services.apps.catalog")
+    if catalog is not None:
+        catalog._loop = None
+    yield
+    catalog = sys.modules.get("services.apps.catalog")
+    if catalog is not None:
+        catalog._loop = None
 
 
 @pytest.fixture(autouse=True)
@@ -375,6 +401,14 @@ def temp_db():
     try:
         from services.billing import pool_caps as _pool_caps
         _pool_caps.clear_cache()
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
+        pass
+
+    # A person's engine use is kept for a minute: the chats a previous test
+    # opened must not order the next test's engines.
+    try:
+        from services.engines import engine_resolution as _engine_resolution
+        _engine_resolution.clear_use_cache()
     except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 

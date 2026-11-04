@@ -8,6 +8,7 @@ import asyncio
 import logging
 
 import httpx
+import psycopg
 from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -20,6 +21,7 @@ from api.agents._common import (
 from api.agents._router import router
 from auth.providers import (
     UserContext,
+    automation_agents,
     get_current_user,
     require_agent_access,
     require_auth,
@@ -29,7 +31,7 @@ from core import layout, placement
 from core.execution_layer import PROVIDER_LOCAL
 from storage import database as task_store
 from storage.agents import agent_store
-from storage.agents.agent_store import _get_execution_paths
+from storage.agents.agent_store import _get_execution_paths, _get_local_only_engines
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
 from storage.automation import trigger_store
 from storage.pg import run_db
@@ -61,9 +63,9 @@ def _mcp_names_by_agent(slugs: list[str]) -> dict[str, list[str]]:
     and every capability probe once per capability token. The rule mirrors
     ``mcp_registry._agent_base_manifests`` drop for drop (not manager-enabled,
     not platform-enabled, unknown manifest, explicit and not visible,
-    capability unavailable) plus the skill filter of ``_get_mcp_info``;
-    the listing's parity test holds the two together."""
-    from services.mcp import mcp_registry
+    platform-attached, capability unavailable) plus the skill filter of
+    ``_get_mcp_info``; the listing's parity test holds the two together."""
+    from services.mcp import mcp_manifest_types, mcp_registry
     from storage.mcp import mcp_store
     enabled = mcp_store.get_all_manager_enabled_mcps()
     state = mcp_store.get_all_mcp_states()
@@ -79,6 +81,8 @@ def _mcp_names_by_agent(slugs: list[str]) -> dict[str, list[str]]:
             if not manifest:
                 continue
             if manifest.assignment_mode == "explicit" and name not in visible.get(slug, ()):
+                continue
+            if manifest.assignment_mode == mcp_manifest_types.ASSIGNMENT_PLATFORM:
                 continue
             cap = manifest.requires_capability or ""
             if cap not in available:
@@ -274,14 +278,16 @@ def _list_agents_rows(u: UserContext, all: bool) -> list[dict]:
     # Bulk DB counts (avoids N queries-per-agent in the loop below). The
     # schedule/trigger numbers must reflect what THIS caller can see — agent-scoped
     # (shared) + their OWN user-scoped — and never leak other users' private items,
-    # so they match the Scheduled Tasks / Triggers tabs for the same user. An
-    # API-key caller is agent-scope (sees the agent's full set), like those tabs.
-    if u.is_api_key:
+    # so they match the Scheduled Tasks / Triggers tabs for the same user,
+    # whose agent-scope rows count only where the caller sees the agent's own
+    # work (the editor tier). The master key counts the agent's full set.
+    if u.is_service:
         task_counts = task_store.count_dynamic_tasks_by_agent()
         trigger_counts = trigger_store.count_triggers_by_agent()
     else:
-        task_counts = task_store.count_user_visible_dynamic_tasks_by_agent(u.sub)
-        trigger_counts = trigger_store.count_user_visible_triggers_by_agent(u.sub)
+        shared = automation_agents(u)
+        task_counts = task_store.count_user_visible_dynamic_tasks_by_agent(u.sub, shared)
+        trigger_counts = trigger_store.count_user_visible_triggers_by_agent(u.sub, shared)
 
     visible: list[str] = []
     for name in sorted(agent_store.get_agent_slugs()):
@@ -314,19 +320,28 @@ def _list_agents_rows(u: UserContext, all: bool) -> list[dict]:
         return layer_default[path]
 
     agents = []
+    rows_by_name = {name: agent_store.get_agent(name) for name in visible}
+    # The engine and model the caller's new chat on each agent takes, and
+    # the engines they may run there (engine_resolution): one read of the
+    # person's holdings and the catalog for the whole listing. Left out
+    # for a principal that is nobody and on a store error (the page falls
+    # back to the per-engine can_run map).
+    resolved = _resolutions_for(u, [r for r in rows_by_name.values() if r])
     for name in visible:
         agent_dir = config.get_agent_dir(name)
         mcp_names = mcp_names_by_agent.get(name, [])
         schedule_count = task_counts.get(name, 0)
         trigger_count = trigger_counts.get(name, 0)
         has_workspace = (agent_dir / layout.WORKSPACE).is_dir()
-        agent_data = agent_store.get_agent(name)
+        agent_data = rows_by_name.get(name)
 
         agents.append({
             "name": name,
             "display_name": agent_data["display_name"] if agent_data else name,
             "execution_path": agent_data["execution_path"] if agent_data else DEFAULT_EXECUTION_PATH,
             "execution_paths": _get_execution_paths(agent_data),
+            "local_only_engines": _get_local_only_engines(agent_data),
+            **_for_me_fields(resolved.get(name)),
             "execution_target": (agent_data.get("execution_target") or placement.LOCAL) if agent_data else placement.LOCAL,
             "default_model": _model(agent_data),
             "default_scope": (agent_data.get("default_scope") if agent_data else "user") or "user",
@@ -346,6 +361,38 @@ def _list_agents_rows(u: UserContext, all: bool) -> list[dict]:
     return agents
 
 
+def _resolutions_for(u: UserContext, rows: list[dict]) -> dict:
+    """``engine_resolution.resolve_many`` for the caller, when the caller is
+    a person (``acting_sub``); ``{}`` otherwise and on a store error. A
+    person's own fetch (not a session token) is the model picker's: it
+    remembers the first engine each agent's order shows."""
+    from services.engines import engine_resolution
+    sub = u.acting_sub or ""
+    if not sub or not rows:
+        return {}
+    try:
+        return engine_resolution.resolve_many(rows, sub, remember=not u.is_session)
+    except (psycopg.Error, RuntimeError):
+        logger.warning("engine resolution for %s failed; the listing carries none",
+                       sub[:8], exc_info=True)
+        return {}
+
+
+def _for_me_fields(resolution) -> dict:
+    """The per-person engine fields of an agent row: the engine and model a
+    new chat takes (``""`` when nothing resolves), the agent's engines the
+    person may run, and the agent's engines in the person's order (the
+    model picker's groups); absent when there is no resolution."""
+    if resolution is None:
+        return {}
+    return {
+        "engine_for_me": resolution.execution_path,
+        "model_for_me": resolution.model,
+        "engines_for_me": resolution.engines_for_me,
+        "engine_order_for_me": list(resolution.order_for_me),
+    }
+
+
 @router.get("/v1/agents/{name}/info")
 async def get_agent_info(name: str, user: UserContext | None = Depends(get_current_user)):
     """Return detailed metadata for a single agent."""
@@ -360,6 +407,8 @@ async def get_agent_info(name: str, user: UserContext | None = Depends(get_curre
             name, agent_data, mcp_names, (agent_dir / layout.WORKSPACE).is_dir(),
             agent_store.is_admin_only(name), agent_store.get_delegation_targets(name),
         )
+        if agent_data:
+            payload.update(_for_me_fields(_resolutions_for(u, [agent_data]).get(name)))
         return payload, json_body(payload), agent_data
 
     # The store reads and the answer's encoding as one executor job; the
@@ -400,6 +449,7 @@ def _agent_info(name: str, agent_data: dict | None, mcp_names: list[str], has_wo
         "admin_only": admin_only,
         "execution_path": agent_data["execution_path"] if agent_data else DEFAULT_EXECUTION_PATH,
         "execution_paths": _get_execution_paths(agent_data),
+        "local_only_engines": _get_local_only_engines(agent_data),
         "execution_target": (agent_data.get("execution_target") or placement.LOCAL) if agent_data else placement.LOCAL,
         "default_model": agent_data["default_model"] if agent_data else "",
         "default_effort": agent_data["default_effort"] if agent_data else "",

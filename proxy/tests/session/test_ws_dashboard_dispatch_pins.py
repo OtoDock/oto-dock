@@ -65,11 +65,14 @@ def _plan_review_item(request_id: str) -> dict:
 
 class TestPlanReviewMidStream:
     """The held turn: the review card arrives while the turn streams and the
-    answer resolves the pump's active permission."""
+    answer resolves the pump's active permission. ``waits``: the turn waits
+    on the answer as Claude's ExitPlanMode hook does, and goes on to
+    implement in the same turn; else nobody waits (a Codex card answered
+    before its turn's end) and the implement message runs behind it."""
 
-    def _scenario(self, temp_db, monkeypatch, action: str):
+    def _scenario(self, temp_db, monkeypatch, action: str, *, waits: bool = False):
         from core.events.common_events import DONE, TEXT, CommonEvent
-        from core.session.session_state import get_permission_queue
+        from core.session.session_state import get_permission_queue, wait_for_permission
 
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
@@ -83,7 +86,11 @@ class TestPlanReviewMidStream:
 
             async def review_turn(sid):
                 yield CommonEvent(type=TEXT, data={"content": "here is a plan"})
+                waiter = (asyncio.create_task(wait_for_permission(request_id, sid, timeout=30))
+                          if waits else None)
                 get_permission_queue(sid).put_nowait(_plan_review_item(request_id))
+                if waiter is not None:
+                    seen["approved"] = await waiter
                 await answered.wait()
                 yield CommonEvent(type=TEXT, data={"content": "noted"})
                 yield CommonEvent(type=DONE, data={})
@@ -121,12 +128,25 @@ class TestPlanReviewMidStream:
                 mode = {"reject": "ask", "implement_auto": "autoReview",
                         "implement_ask": "ask"}[action]
                 await ws.expect({"type": "mode_changed", "mode": mode, "chat_id": chat_id})
+                if waits:
+                    # The answer took the wait: the card closes on every viewer.
+                    await ws.expect({"type": "permission_resolved", "request_id": request_id,
+                                     "action": action, "chat_id": chat_id})
                 await asyncio.sleep(0.2)
                 answered.set()
 
                 await ws.expect({"type": "text", "content": "noted", "chat_id": chat_id})
                 if action == "reject":
                     await _turn_end(ws, chat_id)
+                elif waits:
+                    # The turn that waited implements: no implement message,
+                    # the plan marked when that turn ends.
+                    await ws.expect({"type": "done", "chat_id": chat_id})
+                    await ws.expect({"type": "plan_status", "filename": PLAN_FILE,
+                                     "status": "implemented"})
+                    await ws.expect({"type": "chat_status", "chat_id": chat_id, "status": "ready"})
+                    await ws.expect({"type": "turn_complete", "chat_id": chat_id,
+                                     "title": "WS Dash Test finished", "body": "Response ready"})
                 else:
                     # The queued implement prompt drains as the next turn.
                     await ws.expect({"type": "queue_sent", "queue_ids": [],
@@ -147,20 +167,27 @@ class TestPlanReviewMidStream:
         run_ws_scenario(scenario)
         return layer, seen
 
-    def test_reject_restores_the_pre_plan_mode(self, temp_db, monkeypatch):
-        layer, seen = self._scenario(temp_db, monkeypatch, "reject")
+    @pytest.mark.parametrize("waits", [False, True])
+    def test_reject_restores_the_pre_plan_mode(self, temp_db, monkeypatch, waits):
+        # Cancel denies a waiting ExitPlanMode (the engine stays in Plan for
+        # the rest of the turn) and the engine's own mode follows after it.
+        layer, seen = self._scenario(temp_db, monkeypatch, "reject", waits=waits)
+        assert seen.get("approved", False) is False
         chat = temp_db.get_chat(seen["chat_id"])
         assert chat["permission_mode"] == "ask"
         plans = temp_db.get_chat_plans(seen["chat_id"])
         assert [(p["filename"], p["status"]) for p in plans] == [(PLAN_FILE, "rejected")]
-        assert layer.control_requests == []
+        assert layer.control_requests == [(seen["sid"], "set_permission_mode", {"mode": "ask"})]
         assert layer.mode_changes == []
 
+    @pytest.mark.parametrize("waits", [False, True])
     @pytest.mark.parametrize("action,mode", [("implement_auto", "autoReview"), ("implement_ask", "ask")])
-    def test_implement_queues_the_control_request(self, temp_db, monkeypatch, action, mode):
+    def test_implement_queues_the_control_request(self, temp_db, monkeypatch, action, mode, waits):
         # Both answers tell the engine its mode after the turn (the CLI's
-        # own word for Auto is its classifier mode).
-        layer, seen = self._scenario(temp_db, monkeypatch, action)
+        # own word for Auto is its classifier mode), whether the turn
+        # implements itself or the implement message does.
+        layer, seen = self._scenario(temp_db, monkeypatch, action, waits=waits)
+        assert seen.get("approved", True) is True
         chat = temp_db.get_chat(seen["chat_id"])
         assert chat["permission_mode"] == mode
         plans = temp_db.get_chat_plans(seen["chat_id"])
@@ -428,3 +455,142 @@ class TestCompactContext:
         # kind the pump writes for the same block (it wrote none before).
         assert events[0]["event_type"] == "context_compact"
         assert temp_db.get_chat(seen["chat_id"])["context_used"] == 1234
+
+    @pytest.mark.parametrize("answer, armed", [({"post_tokens": 99}, True), (None, False)])
+    def test_a_completed_compaction_arms_the_memory_reminder(self, temp_db, monkeypatch, answer, armed):
+        from services.memory import memory_nudge
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        arms: list[str] = []
+        monkeypatch.setattr(memory_nudge, "arm", arms.append)
+
+        async def compact(sid):
+            return answer
+        layer.compact = compact
+        seen: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+                seen["sid"] = sid
+                ws.client_send({"type": "compact_context"})
+                await ws.expect({"type": "context_compact", "phase": "started",
+                                 "trigger": "manual", "chat_id": chat_id})
+                await ws.expect({"type": "context_compact", "phase": "completed", "trigger": "manual",
+                                 "post_tokens": 99, "chat_id": chat_id} if armed else
+                                {"type": "context_compact", "phase": "failed", "chat_id": chat_id})
+                if not armed:
+                    await ws.expect({"type": "error", "message": "Context compaction failed or is "
+                                                                 "not supported by this engine."})
+                await sync_dispatch(ws)
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+
+        assert arms == ([seen["sid"]] if armed else [])
+
+
+class _PlanConnection:
+    """The prompt mixin with only what a plan review's answer between turns
+    touches: the mode change and the chat turn recorded, the plan row
+    pending, the row writes kept."""
+
+    def __init__(self, *, session_id: str | None, chat_id: str = "chat-plan"):
+        from ws.dashboard_prompts import PromptController
+
+        class _Conn(PromptController):
+            pass
+        conn = _Conn.__new__(_Conn)
+        conn.session_id = session_id
+        conn.chat_id = chat_id
+        conn.implementing_plan = ""
+        conn.implement_queue = []
+        conn.modes = []
+        conn.chats = []
+
+        async def _may_resolve_permission(rid):
+            return True
+
+        async def _handle_mode_change(msg):
+            conn.modes.append(msg["mode"])
+
+        async def _handle_chat(msg):
+            conn.chats.append(msg["text"])
+
+        async def _plan_row_pending(chat_id, filename):
+            return True
+        conn._may_resolve_permission = _may_resolve_permission
+        conn._handle_mode_change = _handle_mode_change
+        conn._handle_chat = _handle_chat
+        conn._plan_row_pending = _plan_row_pending
+        self.conn = conn
+
+
+@pytest.fixture
+def plan_rows(monkeypatch):
+    from ws import dashboard_prompts
+    rows: list = []
+
+    class _Writer:
+        @staticmethod
+        def submit(chat_id, fn, *, label=""):
+            rows.append((label, fn.args[1:]))
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result(None)
+            return fut
+    monkeypatch.setattr(dashboard_prompts, "chat_writer", _Writer)
+    monkeypatch.setattr(dashboard_prompts, "broadcast_chat_frame", lambda chat_id, frame: None)
+    return rows
+
+
+class TestImplementBetweenTurns:
+    """The implement message only when nothing waits on the answer."""
+
+    def _answer(self, conn, rid: str):
+        asyncio.run(conn._on_plan_review_response({
+            "type": "plan_review_response", "request_id": rid,
+            "action": "implement_auto", "filename": PLAN_FILE}))
+
+    def test_a_dead_session_gets_no_implement_message(self, plan_rows):
+        conn = _PlanConnection(session_id=None).conn
+        self._answer(conn, f"req-{uuid.uuid4().hex[:8]}")
+        assert conn.modes == ["autoReview"]
+        assert conn.chats == [] and conn.implement_queue == []
+        # No flag on the socket: it would follow the socket to another chat.
+        assert conn.implementing_plan == ""
+        assert plan_rows == [("plan_status", (PLAN_FILE, "implemented"))]
+
+    def test_a_live_session_with_nothing_waiting_gets_it_as_the_persons_message(self, plan_rows):
+        conn = _PlanConnection(session_id="sid-live").conn
+        self._answer(conn, f"req-{uuid.uuid4().hex[:8]}")
+        assert conn.chats == ["Please implement the plan now."]
+        assert conn.implementing_plan == PLAN_FILE
+
+    def test_a_waiting_call_answered_from_another_socket_implements_in_its_turn(
+            self, plan_rows, monkeypatch):
+        from core.events import stream_pump
+        from core.session import session_state
+        conn = _PlanConnection(session_id="sid-live").conn
+        rid = f"req-{uuid.uuid4().hex[:8]}"
+
+        class _Pump:
+            is_done = False
+            implementing_plan = ""
+
+            def push_ws_event(self, frame):
+                return True
+        pump = _Pump()
+        monkeypatch.setitem(stream_pump._active_pumps, conn.chat_id, pump)
+        session_state.open_permission_wait(rid, "sid-live")
+        try:
+            self._answer(conn, rid)
+        finally:
+            session_state._permission_events.pop(rid, None)
+            session_state._permission_decisions.pop(rid, None)
+            session_state._permission_request_sessions.pop(rid, None)
+            session_state._session_permission_requests.pop("sid-live", None)
+        assert conn.chats == []
+        assert pump.implementing_plan == PLAN_FILE
+        assert conn.implementing_plan == ""

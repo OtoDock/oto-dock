@@ -475,6 +475,23 @@ def test_a_reattached_photo_is_checked_and_read_in_one_job(agents_root):
     assert attached == [] and meta == []
 
 
+def test_a_reattached_photo_by_a_dotted_or_control_path_is_refused(agents_root):
+    """A photo named by a path that climbs out with ``..`` or carries a
+    control character never reaches the agent, even when the file it points
+    at exists: another person's photo stays theirs."""
+    mine = _saved_photo(agents_root, _SCOPE + "uploads/photos/img_mine.png")
+    _saved_photo(agents_root, "users/bob/workspace/uploads/photos/img_bob.png")
+    climbing = _SCOPE + "../../bob/workspace/uploads/photos/img_bob.png"
+    dotted = _SCOPE + "uploads/./photos/img_mine.png"
+    control = _SCOPE + "uploads/photos/img\nmine.png"
+    cli, attached, meta, _files = asyncio.run(_attach(
+        [{"path": climbing, "name": "bob.png"}, {"path": dotted, "name": "dot.png"},
+         {"path": control, "name": "nl.png"}, {"path": mine, "name": "mine.png"}], direct=True))
+    assert meta == [{"name": "mine.png", "path": mine}]
+    assert len(attached) == 1
+    assert "bob" not in cli
+
+
 def test_no_attachment_path_is_resolved_on_the_loop(agents_root, monkeypatch):
     """Re-attached photos and attached files are scope-checked in a worker
     thread: nothing in the attachment path touches the filesystem on the

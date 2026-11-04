@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useLayoutEffect, useRef, type RefObject } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { isAdmin as isPlatformAdmin } from '../lib/permissions'
 import { toastError } from '../lib/http/apiJson'
@@ -23,6 +24,10 @@ import {
   useFinishOpenAIOAuth,
   loginAlreadyFinished,
   alreadyConnectedMessage,
+  accountEmail,
+  accountName,
+  loginEndingChip,
+  loginEndsIn,
   ClaudeExchangeError,
   CLAUDE_SECOND_ACCOUNT_HINT,
   type ClaudeExchangeResult,
@@ -54,11 +59,15 @@ const STATUS_CHIP: Record<EngineSubscriptionStatus, keyof typeof BADGE_TONE> = {
 
 function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const dialogs = useDialogs()
-  const [expanded, setExpanded] = useState(false)
+  // A card holding a login that ends soon starts open, so its row is seen.
+  const [expanded, setExpanded] = useState(
+    () => (layer.user_subscriptions || []).some(s => loginEndsIn(s) !== null),
+  )
   const [showApiKey, setShowApiKey] = useState(false)
-  // The open connect dialog; `reconnect` is the expired row a Reconnect
-  // click is trying to revive. The backend matches by account identity, so
-  // the dialog checks the account the person signed in as.
+  // The open connect dialog; `reconnect` is the row a Reconnect click is
+  // trying to revive (expired) or renew (its login ends soon). The backend
+  // matches by account identity, so the dialog checks the account the
+  // person signed in as.
   const [connect, setConnect] = useState<{ reconnect: Subscription | null } | null>(null)
   const apiKeyButtonRef = useRef<HTMLButtonElement>(null)
   // The card's facts come from the engine's descriptor, never its id: the
@@ -76,6 +85,11 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const isAdmin = isPlatformAdmin(user)
 
   const userSubs = layer.user_subscriptions || []
+  // An active login that ends inside the notice's window: its chip, else null.
+  const endingChip = (sub: Subscription) => {
+    const when = loginEndsIn(sub)
+    return when ? loginEndingChip(when) : null
+  }
   // "Your subscription" claims key on ACTIVE rows only — an expired row still
   // lists (so it can be reconnected) but must not report a working setup.
   const hasOwnSub = userSubs.some(s => s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE)
@@ -190,9 +204,14 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                   <span className={`${BADGE_BASE} ${BADGE_TONE[STATUS_CHIP[sub.status] || STATUS_CHIP[ENGINE_SUBSCRIPTION_STATUS.DISABLED]]} shrink-0`}>
                     {sub.status}
                   </span>
+                  {endingChip(sub) && (
+                    <span className={`${BADGE_BASE} ${BADGE_TONE.warning} shrink-0`}>
+                      {endingChip(sub)}
+                    </span>
+                  )}
                 </div>
                 <div className="shrink-0 flex items-center gap-2">
-                  {sub.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED && hasLogin && (
+                  {(sub.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED || endingChip(sub)) && hasLogin && (
                     <Button
                       variant="primary"
                       size="xs"
@@ -375,6 +394,9 @@ function EngineConnectDialog({ layer, reconnect, adding, onClose }: {
   const starting = startClaude.isPending || startOpenAI.isPending
   const startRef = useRef<HTMLButtonElement>(null)
   const stepRef = useRef<HTMLDivElement>(null)
+  // The rows the card listed when the dialog opened: the ChatGPT finish
+  // answers the row alone, so one of these was refreshed, not added.
+  const [knownIds] = useState(() => new Set((layer.user_subscriptions || []).map(s => s.id)))
 
   const aliveRef = useRef(true)
   // A status call slower than the poll's period must not overlap the next:
@@ -415,24 +437,39 @@ function EngineConnectDialog({ layer, reconnect, adding, onClose }: {
     target.focus({ preventScroll: true })
   }, [oauthStep])
 
-  // After a Reconnect, verify the revived row IS the one the user clicked:
+  // After a Reconnect, verify the renewed row IS the one the user clicked:
   // signing into a different account creates a fresh row (or refreshes
-  // another connected one) and leaves the expired one behind, which without
-  // this reads as "nothing happened". `created` tells the two apart:
-  // undefined for the ChatGPT flow, which has no such flag. False when the
-  // dialog must stay open to say so.
+  // another connected one) and leaves the clicked one as it was, which
+  // without this reads as "nothing happened". `created` tells the two apart;
+  // the ChatGPT flow has no such flag, so a row the card already listed
+  // counts as refreshed. False when the dialog must stay open to say so.
   const reconnectedRightAccount = (sub?: Subscription, created?: boolean): boolean => {
     if (!reconnect || !sub || sub.id === reconnect.id) return true
-    const who = sub.oauth_email || 'a different account'
-    const dead = reconnect.label || reconnect.oauth_email || 'the expired account'
-    setNotice(
-      created === false
-        ? `You signed in as ${who}, which is already connected. “${dead}” ` +
-          `is still expired. Reconnect that exact account to revive it, or remove it.`
-        : `You signed in as ${who}, so a new ` +
-          `subscription was added. “${dead}” ` +
-          `is still expired. Reconnect that exact account to revive it, or remove it.`,
-    )
+    const who = accountEmail(sub.oauth_email) || 'a different account'
+    const added = created ?? !knownIds.has(sub.id)
+    if (reconnect.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE) {
+      const clicked = accountName(reconnect, 'the account you chose')
+      const when = loginEndsIn(reconnect)
+      setNotice(
+        (added
+          ? `You signed in as ${who}, so a new subscription was added. `
+          : `You signed in as ${who}, which is already connected, so its login was renewed. `) +
+        (when === 'now'
+          ? `The login of “${clicked}” is ending now. `
+          : when
+            ? `The login of “${clicked}” still ends ${when}. `
+            : `The login of “${clicked}” was not renewed. `) +
+        'Press Reconnect again and sign in as that account to renew it.',
+      )
+    } else {
+      const dead = accountName(reconnect, 'the expired account')
+      setNotice(
+        (added
+          ? `You signed in as ${who}, so a new subscription was added. `
+          : `You signed in as ${who}, which is already connected. `) +
+        `“${dead}” is still expired. Reconnect that exact account to revive it, or remove it.`,
+      )
+    }
     setOauthStep('other-account')
     return false
   }
@@ -442,7 +479,7 @@ function EngineConnectDialog({ layer, reconnect, adding, onClose }: {
   // a second account had been added.
   const connectedNewAccount = (result: ClaudeExchangeResult): boolean => {
     if (result.created || result.previous_status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE) return true
-    setNotice(alreadyConnectedMessage(result.subscription?.oauth_email || ''))
+    setNotice(alreadyConnectedMessage(accountEmail(result.subscription?.oauth_email)))
     return false
   }
 
@@ -552,7 +589,7 @@ function EngineConnectDialog({ layer, reconnect, adding, onClose }: {
     }
   }
 
-  const who = reconnect ? (reconnect.oauth_email || reconnect.label) : ''
+  const who = reconnect ? (accountEmail(reconnect.oauth_email) || reconnect.label) : ''
   const title = reconnect
     ? `Reconnect ${who || `your ${account} account`}`
     : adding ? `Add another ${account} account` : `Connect your ${account} account`
@@ -734,6 +771,11 @@ function InPlaceApiKeyForm({ layer, providers, mutation, onDone, returnTo }: {
 
 export function ExecutionLayersSection() {
   const { data: layers, isLoading } = useUserExecutionLayers()
+  const [searchParams] = useSearchParams()
+  // ?limit=<engine>: the usage-limit notification's link (an account the
+  // person uses themselves, at its overall limit, with no other account on
+  // the engine).
+  const limitOf = searchParams.get('limit') || ''
 
   if (isLoading) return null
   if (!layers || layers.length === 0) return null
@@ -742,13 +784,27 @@ export function ExecutionLayersSection() {
   // takes a login — in engine order.
   const oauthLayers = sortEngineRows(layers.filter(l => supportsOAuth(l.capabilities)))
   if (oauthLayers.length === 0) return null
+  const others = limitOf ? layers.filter(l => l.can_run !== false && l.name !== limitOf) : []
+  const limitLabel = limitOf ? engineLabel(layers.find(l => l.name === limitOf)?.capabilities
+    ?? oauthLayers[0].capabilities) : ''
 
   return (
     <div className="mb-8">
       <h2 className={`${PAGE_TITLE} mb-3`}>AI Engines</h2>
       <p className="text-sm text-secondary mb-4">
         Connect your subscriptions. They’ll be used to run your own chats and agents.
+        New chats list your engines by how much you use them on each agent.
       </p>
+      {limitOf && (
+        <div className={`${CARD} p-4 mb-3`} data-testid="engine-limit-notice">
+          <p className="text-sm text-primary">Your {limitLabel} account reached its limit.</p>
+          <p className="text-sm text-secondary mt-1">
+            {others.length === 0
+              ? 'No other engine is connected. Connect one below to use it on your chats and tasks.'
+              : 'Until it resets, pick another engine in a chat’s Model menu. An open chat offers it once its session has ended.'}
+          </p>
+        </div>
+      )}
       <div className="space-y-3">
         {oauthLayers.map(layer => (
           <UserLayerCard key={layer.name} layer={layer} />

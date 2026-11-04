@@ -1,30 +1,41 @@
 /**
- * ChatPolicyRadio — the 3-mode chat audio policy selector (admin).
+ * ChatPolicyRadio — the chat audio policy selector (admin).
  *
- * Decides whether the chat sound/mic icons use the browser's native voice,
- * the platform providers, or let each user choose. Drives
- * ``audio_chat_user_policy`` (consumed by the chat-audio capability resolver).
+ * Decides whether the chat sound/mic icons use the device's own voice and
+ * recognizer, the platform providers, or let each person choose. Drives
+ * ``audio_chat_user_policy`` (consumed by the chat-audio capability
+ * resolver). "Platform only" and "User's choice" need a platform speech
+ * provider to point at, so they are offered only while a chat default is
+ * usable (the stored value always shows). The rule is the server's too, whose
+ * write refuses only Platform only: User's choice saves without a provider.
  */
 
-import { type AudioPolicy, useAudioPolicy, useUpdateAudioPolicy } from '../../api/audio'
+import { type AudioPolicy, platformProviderUsable, useAudioPolicy, useAudioProviders, useUpdateAudioPolicy } from '../../api/audio'
 import { SaveState, SettingRow } from '../ui/SettingsControls'
 import Switch from '../ui/Switch'
 import { useSaveState } from '../../hooks/useSaveState'
 
-const OPTIONS: { value: AudioPolicy['chat_user_policy']; label: string; desc: string }[] = [
-  { value: 'native_only', label: 'Native only', desc: 'Use only the device or browser voice. The icons hide when it is unavailable. The platform voice is never used.' },
-  { value: 'native_preferred', label: 'Native preferred', desc: 'Use native when available, otherwise the platform provider. Users cannot override.' },
-  { value: 'user_choice', label: 'User choice', desc: 'Each user picks native or platform in their audio settings. The choice follows them to all their devices.' },
+type PolicyValue = AudioPolicy['chat_user_policy']
+
+const OPTIONS: { value: PolicyValue; label: string; desc: string; needsProvider?: boolean }[] = [
+  { value: 'native_only', label: 'Native only', desc: 'The device speaks and listens, and the icons hide where it cannot.' },
+  { value: 'native_preferred', label: 'Native preferred', desc: "The device speaks and listens where it can, and the platform's speech provider does where it cannot." },
+  { value: 'platform_only', label: 'Platform only', desc: "The platform's speech provider speaks and listens, and the device does only where no provider is set.", needsProvider: true },
+  { value: 'user_choice', label: "User's choice", desc: 'Each person picks the device or the platform in User Settings, Audio, for every device of theirs.', needsProvider: true },
 ]
 
 export function ChatPolicyRadio() {
   const { data: policy, isLoading } = useAudioPolicy()
+  const { data: providers } = useAudioProviders()
   const update = useUpdateAudioPolicy()
   const { stateOf, run } = useSaveState()
 
   if (isLoading || !policy) return <p className="text-sm text-secondary">Loading...</p>
 
-  const select = (value: AudioPolicy['chat_user_policy']) => {
+  const usable = platformProviderUsable(providers)
+  const offered = OPTIONS.filter(opt => !opt.needsProvider || usable !== false || opt.value === policy.chat_user_policy)
+
+  const select = (value: PolicyValue) => {
     if (value === policy.chat_user_policy) return
     void run('policy', () => update.mutateAsync({ chat_user_policy: value }), { failTitle: 'The voice setting was not saved' })
   }
@@ -48,7 +59,7 @@ export function ChatPolicyRadio() {
         />
       </SettingRow>
       <div className={`space-y-1.5 ${policy.chat_enabled ? '' : 'opacity-50 pointer-events-none'}`}>
-        {OPTIONS.map(opt => (
+        {offered.map(opt => (
           <button
             key={opt.value}
             onClick={() => select(opt.value)}
@@ -67,6 +78,11 @@ export function ChatPolicyRadio() {
             <p className="text-xs text-tertiary mt-1 ml-5">{opt.desc}</p>
           </button>
         ))}
+        <p className="text-xs text-tertiary">
+          {usable === false
+            ? "Add a speech provider below to offer the platform's voice or dictation."
+            : 'Safari, iPhones, iPads and Automatic dictation use the speech provider when one is set.'}
+        </p>
       </div>
     </div>
   )

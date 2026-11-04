@@ -558,16 +558,16 @@ class TestOtherSessions:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("chat_model, expected", [
         ("gpt-6-astra", "gpt-6-astra"),          # the engine serves it
-        ("claude-fable-5-1", "gpt-5.6-terra"),   # foreign to it: the reported one
+        ("claude-fable-5-1", "gpt-6.1-terra"),   # foreign to it: the reported one
     ])
     async def test_the_chats_model_wins_when_it_is_the_engines(
             self, temp_db, layer, placed, monkeypatch, chat_model, expected):
         from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [
-            {"model_id": "gpt-6-astra"}, {"model_id": "gpt-5.6-terra"}] if layer == "codex-cli" else [])
+            {"model_id": "gpt-6-astra"}, {"model_id": "gpt-6.1-terra"}] if layer == "codex-cli" else [])
         _, sid = _codex_chat(temp_db, model=chat_model)
         placed(sid)
-        await run_recovery.on_sessions_alive("machine-1", [], [_other(sid, model="gpt-5.6-terra")])
+        await run_recovery.on_sessions_alive("machine-1", [], [_other(sid, model="gpt-6.1-terra")])
         assert layer.idle_kwargs[sid]["model"] == expected
 
     @pytest.mark.asyncio
@@ -728,6 +728,135 @@ class TestSweepExpired:
         assert task_store.get_run(run_id)["status"] == "failed"
         assert "did not reconnect" in task_store.get_run(run_id)["error_message"]
         assert sid not in run_recovery._parked
+
+
+class TestARestartCutsALane:
+    """A lane in flight across an unclean restart: parked while its machine
+    may still replay it (the chat's turn stays open, so a move waits), then
+    failed when its machine reports no such session or the deadline lapses,
+    and its delegator told that the restart cut it. A lane its machine kept
+    (a clean restart) comes back instead; a run another path ended, or a
+    lane that ran again since, is not reported."""
+
+    @pytest.fixture
+    def delivered(self, monkeypatch):
+        from services.scheduler import scheduler
+        got: list[tuple] = []
+
+        async def _deliver(task, final_status, output, **kw):
+            got.append((task, final_status, output, kw))
+        monkeypatch.setattr(task_store, "get_dynamic_task", lambda tid: {"id": tid} if tid else None)
+        monkeypatch.setattr(scheduler, "_row_to_task", lambda row: row["id"])
+        monkeypatch.setattr(scheduler, "_deliver_task_result", _deliver)
+        return got
+
+    @staticmethod
+    def _lane(temp_db):
+        from datetime import datetime, timezone
+        run_id, chat_id, sid = _mk_remote_run(temp_db)
+        before = task_store.add_chat_messages_batch(chat_id, [("assistant", "an earlier round", "", "")])
+        task_store.update_run(run_id, started_at=datetime.now(timezone.utc).isoformat())
+        task_store.add_chat_messages_batch(chat_id, [("assistant", "half a report", "", "")])
+        return run_id, chat_id, sid, before
+
+    @staticmethod
+    def _turn_open(chat_id: str) -> bool:
+        from services.remote import chat_move
+        return chat_move.open_turn(task_store.get_chat(chat_id))
+
+    def _cut(self, delivered, run_id, chat_id, before) -> None:
+        from core.events import turn_ending
+        assert task_store.get_run(run_id)["status"] == "failed"
+        assert self._turn_open(chat_id) is False
+        [(task, status, output, kw)] = delivered
+        assert (task, status, output) == ("task-x", "failed", "")
+        assert kw["ending"].reason == turn_ending.RESTARTED
+        assert (kw["worker_chat_id"], kw["output_cursor"], kw["run_id"]) == (chat_id, before, run_id)
+        assert kw["turn_end_cursor"] > before
+        assert kw["prompt_text"] == "do it"
+
+    @pytest.mark.asyncio
+    async def test_a_lane_its_machine_lost_fails_and_its_delegator_hears_it(self, temp_db, delivered):
+        run_id, chat_id, _, before = self._lane(temp_db)
+        run_recovery.defer_orphaned_runs()
+        assert self._turn_open(chat_id) is True
+        await run_recovery.on_sessions_alive("machine-1", [])
+        self._cut(delivered, run_id, chat_id, before)
+        assert "lost" in task_store.get_run(run_id)["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_a_lane_whose_machine_never_came_back_is_cut_at_the_deadline(self, temp_db, delivered):
+        run_id, chat_id, sid, before = self._lane(temp_db)
+        run_recovery.defer_orphaned_runs()
+        assert self._turn_open(chat_id) is True
+        run_recovery._parked[sid]["deadline"] = 0.0
+        await run_recovery.sweep_expired()
+        self._cut(delivered, run_id, chat_id, before)
+        assert "did not reconnect" in task_store.get_run(run_id)["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_a_lane_its_machine_kept_comes_back_and_is_not_reported_cut(
+            self, temp_db, delivered, monkeypatch, placed):
+        run_id, chat_id, sid, before = self._lane(temp_db)
+        placed(sid)
+        run_recovery.defer_orphaned_runs()
+        assert self._turn_open(chat_id) is True
+        layer = _FakeLayer()
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": True, "command_id": "c1"}])
+        await _until(lambda: task_store.get_run(run_id)["status"] != "running")
+        assert layer.adopted == [sid]
+        assert task_store.get_run(run_id)["status"] == "completed"
+        await _until(lambda: bool(delivered))
+        [(_task, status, output, kw)] = delivered
+        assert status == "completed" and kw["ending"] is None
+        assert (kw["worker_chat_id"], kw["output_cursor"], kw["prompt_text"]) == (chat_id, before, "do it")
+        assert "an earlier round" not in output
+
+    @pytest.mark.asyncio
+    async def test_a_run_already_ended_or_a_lane_that_ran_again_is_not_reported(self, temp_db, delivered):
+        from datetime import datetime, timezone
+        ended, _, ended_sid, _ = self._lane(temp_db)
+        again, again_chat, _, _ = self._lane(temp_db)
+        run_recovery.defer_orphaned_runs()
+        task_store.update_run(ended, status="completed")
+        newer = f"run-{uuid.uuid4().hex[:10]}"
+        task_store.create_run(newer, "task-x", "pa", "manual", None, "go on")
+        task_store.update_run(newer, status="running", chat_id=again_chat,
+                              started_at=datetime.now(timezone.utc).isoformat())
+        run_recovery._parked[ended_sid]["deadline"] = 0.0
+        await run_recovery.sweep_expired()
+        await run_recovery.on_sessions_alive("machine-1", [])
+        assert task_store.get_run(ended)["status"] == "completed"
+        assert task_store.get_run(again)["status"] == "failed"
+        assert delivered == []
+
+    @pytest.mark.asyncio
+    async def test_a_lane_a_waiting_round_continues_is_not_reported(self, temp_db, delivered):
+        """The delegator continued the lane inside the window: its round waits
+        at the lane gate, with no start and no chat on its run yet."""
+        from services.scheduler import task_kinds
+        run_id, chat_id, sid, _ = self._lane(temp_db)
+        run_recovery.defer_orphaned_runs()
+        task_store.create_dynamic_task("task-again", "pa", "again", "go on", "auto", "one_time",
+                                       None, None, None, 600, "user-1", target_chat_id=chat_id)
+        waiting = f"run-{uuid.uuid4().hex[:10]}"
+        task_store.create_run(waiting, "task-again", "pa", "manual", None, "go on",
+                              task_type=task_kinds.RUN_DELEGATE)
+        assert (task_store.get_run(waiting)["chat_id"] or "") == ""
+        run_recovery._parked[sid]["deadline"] = 0.0
+        await run_recovery.sweep_expired()
+        assert task_store.get_run(run_id)["status"] == "failed"
+        assert delivered == []
+
+    def test_a_restart_counts_as_a_cut_without_a_report(self):
+        from core.events import turn_ending
+        from services.scheduler import lanes
+        assert lanes.report_missing(turn_ending.RESTARTED, "failed", "half a report", [], []) is True
+        assert lanes.report_missing(turn_ending.RESTARTED, "failed", "Blocked on: a key", [], []) is False
+        assert "the platform restarted" in lanes.missing_report_note(turn_ending.RESTARTED, "c1")
 
 
 def _closing_rows(chat_id: str) -> list[dict]:

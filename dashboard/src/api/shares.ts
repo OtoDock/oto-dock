@@ -336,6 +336,11 @@ export interface SnapshotMessage {
   event_type?: string
   data?: Record<string, unknown>
   event_data?: string
+  /** A person's message: how many photos and files went with it. */
+  attachments?: { photos: number; files: number }
+  /** The agent's blocks: the row in the chat, which a report names (a copy
+   *  made before 1.9.1 has none). */
+  id?: number
 }
 
 export interface ChatSnapshot {

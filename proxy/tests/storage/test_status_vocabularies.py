@@ -21,7 +21,12 @@ from services.delegation import lane_status
 from services.mcp import docker_manager
 from services.remote import remote_status
 from storage import db_app_deliveries, db_apps, remote_store
-from storage.automation import run_status, webhook_subscription_store
+from storage.agents import db_set_installs
+from storage.automation import (
+    notification_severity,
+    run_status,
+    webhook_subscription_store,
+)
 from storage.billing import subscription_status, subscription_store
 from storage.chat import meeting_status
 from storage.mcp import mcp_request_store
@@ -39,6 +44,8 @@ _STATUS_DIR = REPO_ROOT / "dashboard" / "src" / "lib" / "status"
     ("storage.automation.run_status", ["storage", "storage.automation", "storage.automation.run_status"]),
     ("ws.chat_phase", ["ws", "ws.chat_phase"]),
     ("storage.chat.meeting_status", ["storage", "storage.chat", "storage.chat.meeting_status"]),
+    ("storage.automation.notification_severity",
+     ["storage", "storage.automation", "storage.automation.notification_severity"]),
 ])
 def test_the_leaf_imports_nothing_of_the_tree(module, loaded):
     script = (f"import sys, json\nimport {module}\n"
@@ -126,6 +133,43 @@ def test_update_meeting_refuses_a_word_outside_the_set():
     from storage.chat import db_meetings
     with pytest.raises(ValueError):
         db_meetings.update_meeting("m-1", status="cancelled")
+
+
+# ---------------------------------------------------------------------------
+# the notification severity
+# ---------------------------------------------------------------------------
+
+def test_the_notification_severity_vocabulary():
+    ns = notification_severity
+    assert ns.SEVERITIES == ("info", "success", "warning", "danger")
+    for s in ns.SEVERITIES:
+        assert ns.normalize(s) == s
+    assert ns.normalize("error") == "info"
+    assert ns.normalize(None) == "info"
+    assert ns.normalize(3) == "info"
+    assert [s for s in ns.SEVERITIES if ns.is_alarm(s)] == ["danger"]
+    assert not ns.is_alarm(None)
+
+
+def test_a_notification_or_task_write_stores_an_unknown_severity_as_info():
+    from api.notifications.notifications import (
+        CreateNotificationRequest,
+        EditNotificationRequest,
+    )
+    from api.tasks.tasks import (
+        CreateOneTimeTaskRequest,
+        CreateScheduledTaskRequest,
+        EditTaskRequest,
+    )
+    assert CreateNotificationRequest(title="t", body="b", severity="error").severity == "info"
+    assert CreateNotificationRequest(title="t", body="b", severity="danger").severity == "danger"
+    assert EditNotificationRequest(severity="loud").severity == "info"
+    assert EditNotificationRequest().severity is None
+    task = {"name": "n", "agent": "a", "prompt": "p", "notification_mode": "auto"}
+    assert CreateScheduledTaskRequest(**task, notify_severity="red").notify_severity == "info"
+    assert CreateOneTimeTaskRequest(**task, notify_severity="warning").notify_severity == "warning"
+    assert EditTaskRequest(notify_severity="red").notify_severity == "info"
+    assert EditTaskRequest().notify_severity is None
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +322,12 @@ def test_the_meeting_mirror():
     assert set(words) == meeting_status.STATUSES and len(words) == len(meeting_status.STATUSES)
 
 
+def test_the_notification_severity_mirror():
+    text = _mirror("notificationSeverity.ts")
+    assert _ts_const_strings(text, "NOTIFICATION_SEVERITY") == list(notification_severity.SEVERITIES)
+    assert "export function isAlarm(" in text
+
+
 def test_the_mcp_request_mirror():
     words = _ts_const_strings(_mirror("mcpRequest.ts"), "MCP_REQUEST_STATUS")
     assert set(words) == mcp_request_store.STATUSES and len(words) == len(mcp_request_store.STATUSES)
@@ -311,6 +361,11 @@ def test_the_docker_mirror():
     assert set(words) == docker_manager.STATUSES and len(words) == 8
     assert _ts_const_strings(text, "ENABLE_DOCKER") == [docker_manager.ENABLE_STARTED,
                                                         docker_manager.ENABLE_FAILED]
+
+
+def test_the_set_install_mirror():
+    words = _ts_const_strings(_mirror("setInstall.ts"), "SET_INSTALL_STATUS")
+    assert set(words) == set(db_set_installs.STATUSES) and len(words) == 4
 
 
 def test_the_machine_mirror():

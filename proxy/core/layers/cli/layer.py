@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import stat
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -92,6 +93,12 @@ if TYPE_CHECKING:
     from auth.path_policy import SecurityContext
 
 logger = logging.getLogger("otodock")
+
+#: The first satellite whose headless Plan spawn passes the prompt tool.
+PLAN_PROMPT_SATELLITE_VERSION = "0.5.164"
+#: The newest Claude Code an older satellite's Plan spawn runs right (from
+#: 2.1.299 its plan mode asks for a call the hook allowed).
+PLAN_FLOOR_FREE_PIN = "2.1.296"
 
 # How long the graceful interrupt gets to close the turn (result event →
 # producer completion) before the watchdog falls back to killpg. The CLI
@@ -371,7 +378,6 @@ _CLI_CAPABILITIES = LayerCapabilities(
             "plan_exit": ("ExitPlanMode",),
             "question": ("AskUserQuestion",),
         },
-        question_tool_holds_turn=False,       # headless: the platform denies AskUserQuestion, shows the card; the answer is the next message
         # Under --setting-sources user the CLI reads no CLAUDE.md or AGENTS.md
         # of a repository below its working folder (probed on 2.1.289).
         repository_instruction_files=("CLAUDE.md", "AGENTS.md"),
@@ -396,9 +402,18 @@ _CLI_CAPABILITIES = LayerCapabilities(
 )
 
 
+def _real_dir(path: Path) -> bool:
+    """A folder itself, never a link to one."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # CLIExecutionLayer
 # ---------------------------------------------------------------------------
+
 
 class CLIExecutionLayer(ExecutionLayer):
     """Execution layer wrapping the Claude Code CLI via PersistentSession.
@@ -681,6 +696,12 @@ class CLIExecutionLayer(ExecutionLayer):
     def pinned_cli_version(self) -> str:
         return app_config.PINNED_CLAUDE_CODE_VERSION
 
+    # A satellite older than PLAN_PROMPT_SATELLITE_VERSION spawns a headless
+    # Plan chat without the prompt tool, which Claude Code past 2.1.296 needs
+    # there (its plan mode asks for a call the hook allowed): such a machine
+    # keeps PLAN_FLOOR_FREE_PIN until it updates.
+    older_satellite_cap = (PLAN_PROMPT_SATELLITE_VERSION, PLAN_FLOOR_FREE_PIN)
+
     def cli_binary_path(self) -> str:
         return app_config.CLAUDE_BIN
 
@@ -731,8 +752,19 @@ class CLIExecutionLayer(ExecutionLayer):
         return files
 
     def iter_session_files(self, home: Path):
-        for f in (home / ".claude" / "projects").glob("*/*.jsonl"):
+        projects = home / ".claude" / "projects"
+        for f in projects.glob("*/*.jsonl"):
             yield f, f.stem
+        # The ``<id>/`` folder (subagents, tool results) of a transcript an
+        # older sweep removed alone.
+        for d in projects.glob("*/*"):
+            if not d.suffix and not d.with_suffix(".jsonl").exists() and _real_dir(d):
+                yield d, d.name
+
+    def session_file_companions(self, path: Path) -> list[Path]:
+        """The ``<id>/`` folder beside ``<id>.jsonl``
+        (``core/remote/session_files.py`` moves it with the file)."""
+        return [path.with_suffix("")] if path.suffix == ".jsonl" else []
 
     # --- Credentials -------------------------------------------------------
 
@@ -876,15 +908,14 @@ class CLIExecutionLayer(ExecutionLayer):
     async def steer(self, session_id: str, text: str) -> bool:
         """Mid-turn steering for a headless Claude session: the user frame
         goes into the live turn's stdin (see PersistentSession.steer). Refused
-        while the turn is parked on a permission card or a question — the
-        card is the question, and a typed message keeps the auto-deny plus
-        queue path — so the caller falls back to the queue."""
+        while the turn is parked on a permission card — the card is the
+        question, and a typed message keeps the auto-deny plus queue path —
+        so the caller falls back to the queue."""
         session = _persistent_sessions.get(session_id)
         if session is None or not session.is_alive:
             return False
         from core.events.stream_pump import _pending_permissions
-        from core.session.session_state import has_pending_question
-        if _pending_permissions.get(session_id) or has_pending_question(session_id):
+        if _pending_permissions.get(session_id):
             return False
         return await session.steer(text)
 

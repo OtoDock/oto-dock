@@ -15,7 +15,9 @@ hears next (``pending_dials``, ``dial_action_twiml``).
 The handle is built where the call is accepted (``main._handle_connection``
 for AudioSocket, ``calls/twilio_http.py`` for Twilio) and asked at the tool's
 ack whether a transfer is possible at all; the pipeline executes it at the
-completion point (``pipeline/call_control.py``).
+completion point (``pipeline/call_control.py``). An outbound AudioSocket
+call's channel comes from the PBX's ``OriginateResponse``, which may land
+after the media leg: its handle reads the channel when asked.
 """
 
 from __future__ import annotations
@@ -189,18 +191,24 @@ def dial_action_twiml(entry: PendingDial, dial_status: str, caller_gone: bool) -
 class AmiTransfer:
     """Redirect of a registered AudioSocket call's channel."""
 
+    _NO_CHANNEL = "the PBX did not name this call's channel"
+    _DOWN = "the PBX connection is down"
+
     def __init__(self, manager, server_key: str, uniqueid: str, channel: str):
         self._manager = manager
         self._server_key = server_key
         self._uniqueid = uniqueid
         self._channel = channel
 
+    def _target_channel(self) -> str:
+        return self._channel
+
     def unavailable_reason(self) -> str:
-        if not self._channel:
-            return "the PBX did not name this call's channel"
+        if not self._target_channel():
+            return self._NO_CHANNEL
         client = self._manager.action_client(self._server_key)
         if client is None or not client.connected:
-            return "the PBX connection is down"
+            return self._DOWN
         return ""
 
     async def execute(self, number: str, *, unanswered_text: str = "",
@@ -211,7 +219,7 @@ class AmiTransfer:
         client = self._manager.action_client(self._server_key)
         response = await client.send_action({
             "Action": "Redirect",
-            "Channel": self._channel,
+            "Channel": self._target_channel(),
             "Context": REDIRECT_CONTEXT,
             "Exten": dialable(number),
             "Priority": "1",
@@ -219,6 +227,35 @@ class AmiTransfer:
         if "Success" not in str(response.get("Response", "")):
             raise TransferError(f"Redirect refused: {response.get('Message', 'unknown')}")
         logger.info("AMI Redirect to %s@%s accepted", loggable_label(label), REDIRECT_CONTEXT)
+
+
+class AmiOutboundTransfer(AmiTransfer):
+    """Redirect of an outbound call's channel, the one the PBX's
+    ``OriginateResponse`` names: the ``;1`` half of the originated
+    ``Local/<n>@from-internal`` pair, which runs the AudioSocket context
+    while its ``;2`` half carries the person's trunk leg. The Redirect breaks
+    ``;1`` out of ``AudioSocket()`` and dials the target from it, so the
+    person is bridged to the target through the pair. The report and the
+    media leg arrive in either order: the channel is read from the listener
+    at the tool's ack and again at the move."""
+
+    _NO_CHANNEL = "the PBX has not named this call's channel yet"
+
+    def __init__(self, manager, server_key: str, audio_uuid: str):
+        super().__init__(manager, server_key, "", "")
+        self._audio_uuid = audio_uuid
+
+    def _target_channel(self) -> str:
+        bound = self._manager.outbound_call(self._server_key, self._audio_uuid)
+        return bound[1] if bound else ""
+
+    def unavailable_reason(self) -> str:
+        # The connection first: a listener that never logged in will never
+        # learn the channel either.
+        client = self._manager.action_client(self._server_key)
+        if client is None or not client.connected:
+            return self._DOWN
+        return self._NO_CHANNEL if not self._target_channel() else ""
 
 
 class TwilioTransfer:

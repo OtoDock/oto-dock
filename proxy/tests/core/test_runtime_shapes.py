@@ -64,7 +64,7 @@ def test_the_resume_rows_keep_their_fields():
     from ws.dashboard_chat_resume import _ResumeRows
     assert _shape(_ResumeRows) == [
         (name, "-", "-") for name in (
-            "rows", "has_more", "plans", "restore", "held", "related_pumps",
+            "rows", "has_more", "plans", "restore", "held", "live", "related_pumps",
             "active_task_pump", "as_delta", "read_floors", "is_task_chat", "_cut_of")
     ]
 
@@ -109,7 +109,7 @@ def test_the_cli_translator_keeps_its_slots():
         "session_id", "actual_session_id", "block_types", "active_tool", "open_tools",
         "interrupted", "has_emitted_text", "_emitted_note", "_tool_inputs", "_tool_input_names",
         "agents_spawned", "last_turn_context", "_cc_tasks", "_pending_task_creates",
-        "_bg_bash_commands", "_in_settle", "ending_emitted", "_limit_notice",
+        "_bg_bash_commands", "_foreground_bash", "_in_settle", "ending_emitted", "_limit_notice",
         "_limit_resets_at", "_limit_window",
     )
     assert not hasattr(ClaudeCLIEventTranslator("s"), "__dict__")

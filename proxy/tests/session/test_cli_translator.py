@@ -8,7 +8,9 @@ The test DB fixture (autouse) is still initialized but unused by these tests.
 
 from __future__ import annotations
 
-from core.layers.cli.translator import ClaudeCLIEventTranslator
+import pytest
+
+from core.layers.cli.translator import ClaudeCLIEventTranslator, terminal_task_status
 from core.session.session_state import get_subagent_registry, reset_subagent_registry
 
 
@@ -759,3 +761,22 @@ def test_parallel_calls_and_a_narration_before_a_call_mark_only_the_text():
     out += _narration_block(t, 0, "Read both. Next the run.")
     out += _tool_block(t, 1, "tu3")
     assert _marks(out) == []  # the narration is a note already
+
+
+@pytest.mark.parametrize(("line", "status"), [
+    ({"type": "system", "subtype": "task_updated", "patch": {"status": "completed"}}, "completed"),
+    ({"type": "system", "subtype": "task_updated", "patch": {"status": "killed"}}, "killed"),
+    ({"type": "system", "subtype": "task_updated", "patch": {"status": "running"}}, None),
+    ({"type": "system", "subtype": "task_updated", "patch": {"is_backgrounded": True}}, None),
+    ({"type": "system", "subtype": "task_updated"}, None),
+    ({"type": "system", "subtype": "task_notification", "status": "failed"}, "completed"),
+    ({"type": "system", "subtype": "task_started"}, None),
+    ({"type": "system", "subtype": "background_tasks_changed", "tasks": []}, None),
+    ({"type": "user", "subtype": "task_notification"}, None),
+    ("not a frame", None),
+])
+def test_the_status_a_task_frame_ends_its_task_with(line, status):
+    """The one reading of a task frame's end that the idle drains, the stale
+    drains and the remote turn-end drain share (background commands and
+    sub-agents alike)."""
+    assert terminal_task_status(line) == status

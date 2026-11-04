@@ -22,7 +22,6 @@ CORE_SPLIT = [
     ("triggers-mcp", "trigger-instructions", "triggers-guide"),
     ("notifications-mcp", "notification-instructions", "notifications-guide"),
     ("meetings-mcp", "meetings", "meetings-guide"),
-    ("memory-mcp", "memory-usage", "memory-guide"),
     ("display-mcp", "display-tools", "app-authoring"),
 ]
 CARD_MAX_BYTES = 4500
@@ -67,3 +66,14 @@ def test_cards_total_stays_under_the_budget():
         card = next(s for s in m["skills"] if s["id"] == card_id)
         total += len((app_config.MCPS_DIR / "custom" / mcp / card["file"]).read_bytes())
     assert total <= CARDS_TOTAL_MAX_BYTES, f"always-loaded core skills total {total} bytes"
+
+
+def test_memory_mcp_has_no_card_and_keeps_its_guide():
+    """The memory rules reach the model once, in the prompt's Memory
+    section: the memory MCP loads no card, only the on-demand guide, which
+    the tool's description names."""
+    m = _manifest("memory-mcp")
+    assert [(s["id"], s["loading"]) for s in m["skills"]] == [("memory-guide", "on_demand")]
+    test_guide_is_an_on_demand_skill_folder("memory-mcp", "", "memory-guide")
+    server = (app_config.MCPS_DIR / "custom" / "memory-mcp" / "server.py").read_text()
+    assert "the skill `memory-guide`" in server

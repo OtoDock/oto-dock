@@ -1,7 +1,8 @@
 """A prompt that waits on a person answers with keepalives.
 
-``/v1/hooks/permission`` and ``/v1/hooks/codex-question`` answer a quick
-decision as plain JSON. One that waits on a person streams whitespace every
+``/v1/hooks/permission`` answers a quick decision as plain JSON (and
+``/v1/hooks/codex-question`` always does: a question waits on nothing). One
+that waits on a person streams whitespace every
 keepalive interval and the JSON last (JSON readers skip leading whitespace,
 and the content type stays ``application/json`` for aiohttp's ``json()``),
 so the stream is never idle through a satellite's tunnel; a caller that went
@@ -220,25 +221,18 @@ async def test_a_plan_review_whose_caller_goes_away_retires_its_card(prompt_sess
 
 
 @pytest.mark.asyncio
-async def test_a_question_whose_wait_ends_unanswered_retires_its_card():
+async def test_a_codex_question_waits_on_nothing_and_retires_nothing():
+    """A question the hook did not see is a card of the turn, answered at
+    once: no wait opens, so no card is ever retired for it."""
     sid = "sess-retire-question"
     queue = session_state.get_permission_queue(sid)
     questions = [{"id": "q1", "question": "Which one?"}]
     try:
-        task, prompt = await _raise(queue, permission.ask_user_question(sid, questions))
-        assert prompt["event_type"] == "question_prompt"
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert await asyncio.wait_for(queue.get(), 1) == _retired(prompt["request_id"], gone=True)
-        task, prompt = await _raise(queue, permission.ask_user_question(sid, questions, timeout=0.05))
-        assert await task == {}
-        assert await asyncio.wait_for(queue.get(), 1) == _retired(prompt["request_id"])
-        task, prompt = await _raise(queue, permission.ask_user_question(sid, questions))
-        assert session_state.resolve_question(prompt["request_id"], {"q1": {"answers": ["a"]}})
-        assert await task == {"q1": {"answers": ["a"]}}
-        await asyncio.sleep(0)
-        assert queue.empty()
+        answers = await asyncio.wait_for(permission.ask_user_question(sid, questions), 1)
+        assert answers == {"q1": {"answers": [permission.question_shown_reason("")]}}
+        card = queue.get_nowait()
+        assert card["event_type"] == "question" and "request_id" not in card
+        assert queue.empty() and not session_state.prompt_waits("q1")
     finally:
         session_state._permission_emitters.pop(sid, None)
 

@@ -21,6 +21,7 @@ import { useInstallCommunityMcp, useApproveMcpRequest } from '@/api/community'
 import { useClearMyMemory } from '@/api/memory'
 import { useApp, useApps } from '@/api/apps'
 import { useDeleteNotification } from '@/api/notifications'
+import { useDeleteNotebookEntry } from '@/api/notebook'
 import { useSetAgentServiceBinding } from '@/api/serviceAccounts'
 import { fetchSigningSecret } from '@/api/subscriptions'
 import { useDeleteTrigger } from '@/api/triggers'
@@ -55,6 +56,7 @@ const CASES: Case[] = [
   ['approve a request', 'Could not approve the request', mutation(useApproveMcpRequest, { id: 3 })],
   ['clear my memory', 'Could not clear your memory', mutation(useClearMyMemory, undefined)],
   ['delete a notification', 'Could not delete the notification', mutation(useDeleteNotification, 'n1')],
+  ['delete a Notebook entry', 'Could not delete the entry', mutation(useDeleteNotebookEntry, 'e1')],
   ['bind an account', 'Could not set the account',
     mutation(useSetAgentServiceBinding, { agentName: 'a', mcpName: 'github-mcp', accountLabel: 'alice' })],
   ['read a signing secret', 'Could not read the signing secret', () => fetchSigningSecret('s1')],
@@ -137,6 +139,7 @@ const SHOWN_ELSEWHERE: Record<string, string> = {
   'pages/admin/UsagePage.tsx setLimit': 'both periods are saved in one Promise.all whose refusal shows one toast',
   'pages/admin/UsagePage.tsx deleteLimit': 'both periods are saved in one Promise.all whose refusal shows one toast',
   'pages/agent/AgentSchedules.modals.tsx editMode': 'TaskSettingsModal awaits onSaveExtra in its submit and shows the refusal inline',
+  'pages/agent/AgentSchedules.modals.tsx editDetails': 'TaskSettingsModal awaits onSaveExtra in its submit and shows the refusal inline',
 }
 
 function sourceFiles(dir: string, out: string[] = []): string[] {

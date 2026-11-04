@@ -152,7 +152,7 @@ class _Scan(NamedTuple):
 def _deny_busy() -> Admission:
     return Admission(
         False, "busy",
-        "Too many active sessions — platform busy. Try again shortly, or close an idle chat.",
+        "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat.",
     )
 
 

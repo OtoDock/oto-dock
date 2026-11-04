@@ -5,6 +5,8 @@ import type { ReactNode } from 'react'
 
 import { VoiceControl, type DuplexControlProps } from '@/components/chat/VoiceControl'
 import { LANGUAGES } from '@/audio/lang'
+import { _resetSttDiagForTests, openSttDiagSession } from '@/audio/sttDiag'
+import { _resetNativeSttProbeForTests } from '@/audio/backends/nativeStt'
 import * as authApi from '@/api/auth'
 
 // ─── VoiceControl — hold the mic for the dictation language ─────────────────
@@ -21,6 +23,8 @@ vi.mock('@/hooks/useSpeechSession', () => ({
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 const PREFS = { stt_mode: 'auto', tts_mode: 'auto', tts_voice_map: {}, stt_language: 'el-GR' }
+// The capability the menu reads for its recognizer line; a test overrides it.
+let CAP: Record<string, unknown> = { stt: 'either', stt_provider_id: 1, stt_automatic: 'platform', tts: 'unavailable', icons_enabled: true, reason: '' }
 
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -54,14 +58,24 @@ beforeEach(() => {
       return { ok: true, json: async () => ({ ...PREFS, ...JSON.parse(String(init.body)) }) } as Response
     }
     if (path === '/v1/users/me/audio-prefs') return { ok: true, json: async () => PREFS } as Response
+    if (path.startsWith('/v1/audio/capability')) return { ok: true, json: async () => CAP } as Response
     return { ok: true, json: async () => ({}) } as Response
   })
+  // Both recognizers are there for the resolver: a device one (Web Speech)
+  // and the platform's microphone capture.
+  _resetNativeSttProbeForTests()
+  vi.stubGlobal('SpeechRecognition', class { start() {} stop() {} })
+  Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia: async () => ({}) }, configurable: true })
 })
 afterEach(() => {
   vi.useRealTimers()
   fetchSpy.mockReset()
   speech.toggle.mockReset()
   speech.stop.mockReset()
+  _resetSttDiagForTests()
+  PREFS.stt_language = 'el-GR'
+  vi.unstubAllGlobals()
+  CAP = { stt: 'either', stt_provider_id: 1, stt_automatic: 'platform', tts: 'unavailable', icons_enabled: true, reason: '' }
 })
 
 describe('VoiceControl — dictation language menu', () => {
@@ -86,8 +100,57 @@ describe('VoiceControl — dictation language menu', () => {
     fireEvent.click(mic())
     expect(speech.toggle).not.toHaveBeenCalled()
     expect(menu()).toBeTruthy()
-    // No live conversation: no footer.
+    // No live conversation and nothing recorded: no footer.
     expect(screen.queryByText(/next conversation/)).toBeNull()
+    expect(screen.queryByText('Save the dictation log')).toBeNull()
+  })
+
+  it('says which recognizer the stored pick gets', async () => {
+    // Greek picked, mode auto, both allowed: the device (not Apple WebKit here).
+    render(<VoiceControl {...baseProps} />, { wrapper })
+    down(mic())
+    hold()
+    await waitFor(() => expect(screen.getByText('Listens on this device.')).toBeTruthy())
+    expect(screen.queryByText('Listens through OtoDock.')).toBeNull()
+  })
+
+  it('the Automatic pick with a provider names OtoDock', async () => {
+    PREFS.stt_language = 'auto'
+    render(<VoiceControl {...baseProps} />, { wrapper })
+    down(mic())
+    hold()
+    await waitFor(() => expect(screen.getByText('Listens through OtoDock.')).toBeTruthy())
+  })
+
+  it('the recognizer line hides while a conversation is live', async () => {
+    const d = dup({ active: true, phase: 'listening' })
+    render(<VoiceControl {...baseProps} duplex={d} />, { wrapper })
+    const button = screen.getByTitle('Tap to mute the mic')
+    down(button)
+    hold()
+    expect(screen.getByText('Applies to your next conversation')).toBeTruthy()
+    // Once the capability answered the line would show: not in a conversation.
+    await waitFor(() => expect(fetchSpy.mock.calls.some(([p]) => String(p).startsWith('/v1/audio/capability'))).toBe(true))
+    await act(async () => { await Promise.resolve() })
+    expect(screen.queryByText(/^Listens/)).toBeNull()
+  })
+
+  it('offers the dictation log while the recorder holds events, and saves it on a tap', () => {
+    // The debug flag reads on under vitest (a development build); the
+    // recorder has a session's events.
+    openSttDiagSession({ engine: 'web_speech', lang: 'el-GR', continuous: true, interimResults: true })!.event('start')
+    vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} }))
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    render(<VoiceControl {...baseProps} />, { wrapper })
+    down(mic())
+    hold()
+    const save = screen.getByText('Save the dictation log')
+    fireEvent.click(save)
+    expect(click).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('The log was saved.')).toBeTruthy()
+    expect(menu()).toBeTruthy()
+    click.mockRestore()
+    vi.unstubAllGlobals()
   })
 
   it('picking a row saves the language and closes the menu', async () => {

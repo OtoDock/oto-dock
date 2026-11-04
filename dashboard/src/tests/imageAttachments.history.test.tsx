@@ -7,7 +7,7 @@
  * before paths existed (or views without an agent slug) keep the count badge.
  */
 import { describe, it, expect } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { dbMessagesToDisplay } from '@/lib/messageBlocks'
 import BlockRenderer from '@/components/chat/ChatBlockRenderer'
 
@@ -95,5 +95,50 @@ describe('image_attachments history rendering', () => {
       />,
     )
     expect(screen.getByText('1 image attached')).toBeTruthy()
+  })
+
+  const strip = (images: string[], paths?: Array<string | null>) => render(
+    <BlockRenderer
+      block={{ type: 'image_attachments', images, ...(paths ? { paths } : {}) }}
+      blockId="m1-b0"
+      blockOrder={0}
+      isUserMessage
+      agentName="my-agent"
+      onPermissionRespond={() => {}}
+    />,
+  )
+  const DATA = 'data:image/png;base64,iVBORw0KGgo='
+
+  it('draws a bubble mixing a fresh photo and a saved one, each from its own source', () => {
+    // A photo handed back from a cancelled queued message (saved), then a new one.
+    strip(['old.png', DATA], [PHOTO_PATH, null])
+    expect(screen.getByAltText('Attached image 1').getAttribute('src')).toBe(`/v1/agents/my-agent/files/${PHOTO_PATH}`)
+    expect(screen.getByAltText('Attached image 2').getAttribute('src')).toBe(DATA)
+    strip([DATA, 'old.png'], [null, PHOTO_PATH])
+    expect(screen.getAllByAltText('Attached image 2')[1].getAttribute('src')).toBe(`/v1/agents/my-agent/files/${PHOTO_PATH}`)
+  })
+
+  it('a photo whose file does not load turns into a quiet tile, never a broken image', () => {
+    strip(['a.png', 'b.png'], [PHOTO_PATH, 'users/admin/workspace/uploads/photos/gone.png'])
+    fireEvent.error(screen.getByAltText('Attached image 2'))
+    expect(screen.queryByAltText('Attached image 2')).toBeNull()
+    expect(screen.getByTestId('photo-not-available')).toHaveTextContent('Photo not available')
+    expect(screen.getByAltText('Attached image 1')).toBeInTheDocument()
+  })
+
+  it('a photo with no saved path beside one that has it shows the tile in its place', () => {
+    strip(['a.png', 'b.png'], [PHOTO_PATH, null])
+    expect(screen.getAllByTestId('photo-not-available')).toHaveLength(1)
+    expect(screen.getByAltText('Attached image 1')).toBeInTheDocument()
+  })
+
+  it('the lightbox opens on the photos that loaded', () => {
+    strip(['a.png', 'b.png', 'c.png'], [PHOTO_PATH, 'users/admin/workspace/uploads/photos/gone.png',
+                                         'users/admin/workspace/uploads/photos/c.png'])
+    fireEvent.error(screen.getByAltText('Attached image 2'))
+    fireEvent.click(screen.getByAltText('Attached image 3'))
+    const shown = screen.getByAltText('Image') as HTMLImageElement
+    expect(shown.getAttribute('src')).toBe('/v1/agents/my-agent/files/users/admin/workspace/uploads/photos/c.png')
+    expect(document.body.textContent).toContain('2 / 2')
   })
 })

@@ -9,7 +9,9 @@ the credential per request and streams the answer back without holding a
 body on the loop. It answers on the internal listener only (the sandbox
 splice and the Direct layer land there) when the app bound one. A refusal
 is a JSON-RPC error the MCP client reads, never a 401 (CREDENTIALS.md "The
-credential gateway").
+credential gateway"). The server's own 401 and its 2xx answers to a POST are
+told to ``services/oauth/token_refusals``, which marks an account its server
+keeps refusing for a reconnect.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from auth.request_path import has_traversal
 from auth.session_token import validate_session_token
 from core.credentials import mcp_gateway
 from core.session.session_state import session_token_refusal
+from services.oauth import token_refusals
 
 logger = logging.getLogger("otodock.mcp-gateway")
 router = APIRouter()
@@ -114,10 +117,15 @@ async def gateway(mcp: str, rest: str, request: Request):
         await upstream.aclose()
         return _refuse(method, body, mcp_gateway._REFUSAL_REDIRECT)
     if upstream.status_code == 401:
+        challenge = upstream.headers.get("www-authenticate", "")
         await upstream.aclose()
         logger.info("mcp-gateway: the server refused the credential for session %s mcp %r",
                     session_id[:8], mcp)
+        token_refusals.refused(prepared, session_id=session_id, method=method, body=body,
+                               challenge=challenge)
         return _refuse(method, body, mcp_gateway._REFUSAL_VENDOR_401)
+    if 200 <= upstream.status_code < 300 and method == "POST":
+        token_refusals.served(prepared, body)
     headers = dict(mcp_gateway.forward_response_headers(upstream.headers.multi_items()))
     return StreamingResponse(
         upstream.aiter_raw(), status_code=upstream.status_code, headers=headers,

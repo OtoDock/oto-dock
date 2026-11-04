@@ -88,6 +88,9 @@ export interface QueuedMessage {
   /** The queue's own chat when it is not the slice's (a task chat viewed
    *  through a sibling run's pump): a cancel names it. */
   queueChatId?: string
+  /** A card's say button sent it for the person: the chip offers no cancel
+   *  (a returned answer would leave a false one on the card). */
+  card?: { card_id: string; button: string }
 }
 
 /** A queue entry as the wire or the persisted store carries it: a frame
@@ -105,6 +108,7 @@ export function toQueuedMessage(m: unknown): QueuedMessage {
     if (typeof authorSub === 'string' && authorSub) out.authorSub = authorSub
     if (typeof o.waiting === 'string' && o.waiting) out.waiting = o.waiting
     if (typeof o.queueChatId === 'string' && o.queueChatId) out.queueChatId = o.queueChatId
+    if (o.card && typeof o.card === 'object') out.card = o.card as QueuedMessage['card']
     return out
   }
   return { text: '' }

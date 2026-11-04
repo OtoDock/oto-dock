@@ -13,6 +13,17 @@ export interface AgentSummary {
   admin_only: boolean
   execution_path: string
   execution_paths: string[]
+  // The engines of the allowlist on which the agent runs local models only.
+  local_only_engines?: string[]
+  // Engines resolve per person: the engine and model the caller's new chat
+  // takes on this agent ('' when nothing of theirs runs here) and, per
+  // engine of the allowlist, whether they may run it, and the allowlist in
+  // their order (the engines they use most there first: the model picker's
+  // groups). Absent for a caller that is nobody (an agent's own session).
+  engine_for_me?: string
+  model_for_me?: string
+  engines_for_me?: Record<string, boolean>
+  engine_order_for_me?: string[]
   execution_target: string
   // Visibility mode column. Together with `default_scope` it maps to one of the
   // four modes — see `lib/visibility.ts`.
@@ -107,6 +118,17 @@ export interface AgentInfo {
   admin_only: boolean
   execution_path: string
   execution_paths: string[]
+  // The engines of the allowlist on which the agent runs local models only.
+  local_only_engines?: string[]
+  // Engines resolve per person: the engine and model the caller's new chat
+  // takes on this agent ('' when nothing of theirs runs here) and, per
+  // engine of the allowlist, whether they may run it, and the allowlist in
+  // their order (the engines they use most there first: the model picker's
+  // groups). Absent for a caller that is nobody (an agent's own session).
+  engine_for_me?: string
+  model_for_me?: string
+  engines_for_me?: Record<string, boolean>
+  engine_order_for_me?: string[]
   execution_target: string
   default_effort: string
   // Visibility mode column. Together with `default_scope` it maps to one of the
@@ -183,7 +205,9 @@ export type { LayerModelOption } from './engineDescriptor'
 export type LayerCapabilities = EngineDescriptor & {
   // Platform-level availability: some subscription for this engine is
   // connected anywhere on the platform (pool or any user's personal). Drives
-  // the AgentConfig engine-card enable gate (server mirror: PATCH /v1/agents).
+  // AgentConfig's "No platform subscription" line on an engine card; the
+  // server refuses only a move of the default engine onto such an engine
+  // (PATCH /v1/agents).
   // Optional: absent on stale caches from an older proxy → treat as true.
   configured?: boolean
   // What "Auto" runs on this engine right now — the resolver's answer for an

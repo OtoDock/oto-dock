@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import { useAuth } from '../contexts/AuthContext'
 import { isAdmin } from '../lib/permissions'
-import { isLocalTarget, type PairingScope } from '../lib/placement'
+import { isLocalTarget, PAIRING_SCOPE, type PairingScope } from '../lib/placement'
 import { isReachableMachine, type MachineState } from '../lib/status/machine'
 import type { BootstrapOs, DisplayServer } from '../lib/hostOs/os'
 import { apiJson, apiOk, withMessage } from '../lib/http/apiJson'
@@ -17,6 +17,12 @@ export interface RemoteMachine {
   last_seen: string | null
   last_heartbeat_age_s?: number | null
   reachable?: boolean
+  // The machine's local link: the loopback tunnel its sessions reach the
+  // platform through (satellite 0.5.168 reports it; an older one reads as
+  // up). While it is down the platform refuses new sessions there.
+  link_ok?: boolean
+  link_down_s?: number | null
+  link_error?: string
   registered_by: string  // user_sub of who paired it
   // 'admin' = paired via the admin Remote Machines page (platform
   // infrastructure, can be agent-scope default). 'user' = paired via
@@ -91,6 +97,13 @@ export interface RemoteMachine {
   // Whether unattended sessions (scheduled tasks, triggers, calls, meetings)
   // may use the saved token; off, only a session a person drives does.
   browser_unattended?: boolean
+  // "Browser profile": the profile that has the Playwright Extension, as the
+  // browser names it ('' = the one profile that has it).
+  browser_profile?: string
+  // An admin machine's "Every role of its agents runs here": below the owner
+  // tier, a chat of an agent whose default place is this machine runs on it
+  // only while this is on (else on the platform). Off by default.
+  all_roles_run_here?: boolean
   // Proxy-side concurrent-session override. null = use the
   // satellite's own reported recommendation. The satellite still hard-caps
   // at its physical max regardless of this value.
@@ -157,6 +170,22 @@ export const useSetAllowFullFs = () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ enabled }),
         }, 'Could not change full filesystem access')
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
+  })
+}
+
+export const useSetAllRolesRunHere = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (
+      { machineId, enabled }: { machineId: string; enabled: boolean },
+    ) => {
+      await apiOk(`/v1/admin/remote-machines/${machineId}/all-roles`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        }, 'Could not change who runs on this machine')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
   })
@@ -295,6 +324,22 @@ export const useSetBrowserUnattended = (scope: MachineScope) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       }, 'Failed to update unattended use')
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: machinesKey(scope) }),
+  })
+}
+
+export const useSetBrowserProfile = (scope: MachineScope) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (
+      { machineId, profile }: { machineId: string; profile: string },
+    ) => {
+      await apiOk(`${machinePath(scope, machineId)}/browser-profile`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile }),
+      }, 'Failed to update the browser profile')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: machinesKey(scope) }),
   })
@@ -561,6 +606,10 @@ export interface ChatTargets {
   /** The chat's place came from a person's move: the mismatch banner and
    *  the row menu's move to the default stay hidden. */
   place_chosen: boolean
+  /** A Shared-only chat: it runs with the agent's accounts, which stay on
+   *  the server when it moves to a person's computer (accountsStayFor).
+   *  An older proxy sends none. */
+  shared?: boolean
 }
 
 /** A running move's transfer: `done` of `total` bytes (`total` 0: unknown)
@@ -620,6 +669,14 @@ export function moveMemoryOf(data: ChatTargets, target: string): MoveMemory {
   const there = data.targets.find((t) => t.target === target)
   return here?.moves_files === false || there?.moves_files === false
     ? MOVE_MEMORY.SUMMARY : MOVE_MEMORY.FILES
+}
+
+/** A move of a shared chat to a person's own computer: the agent's
+ *  accounts stay on the server there, except the ones that person connected
+ *  (the move dialog's sentence). False while the targets are loading. */
+export function accountsStayFor(data: ChatTargets | undefined, target: string): boolean {
+  if (!data?.shared) return false
+  return data.targets.find((t) => t.target === target)?.pairing === PAIRING_SCOPE.USER
 }
 
 /** Move a chat (POST /v1/chats/{id}/move, `from` = the place the chip

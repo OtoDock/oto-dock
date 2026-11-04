@@ -271,7 +271,28 @@ async def list_subscriptions(
         # Filter service-scope rows by manageable agents (view ≠ manage; we
         # still SHOW agent-scope rows for any agent the user can access).
         rows = [r for r in rows if _can_view_subscription(r, u)]
-    return {"subscriptions": _decorate_creators(rows)}
+    return {"subscriptions": _decorate_mcp_state(_decorate_creators(rows))}
+
+
+def _decorate_mcp_state(rows: list[dict]) -> list[dict]:
+    """Add ``mcp_state``: ``removed`` when no installed MCP has the row's
+    name (a subscription left from before an uninstall deleted them),
+    ``off`` when an admin switched the MCP off (its rows stay and receive
+    nothing until it is on again), else ``on``."""
+    if not rows:
+        return rows
+    from services.mcp import mcp_registry
+    from storage.mcp import mcp_store
+    states = mcp_store.get_all_mcp_states()
+    for r in rows:
+        name = str(r.get("mcp_name") or "")
+        if mcp_registry.get_manifest(name) is None:
+            r["mcp_state"] = "removed"
+        elif states.get(name, True) is False:
+            r["mcp_state"] = "off"
+        else:
+            r["mcp_state"] = "on"
+    return rows
 
 
 @router.get("/v1/subscriptions/{subscription_id}")

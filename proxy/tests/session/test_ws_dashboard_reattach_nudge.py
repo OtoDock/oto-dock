@@ -394,3 +394,287 @@ class TestMidTurnReattachKeepsSteeredMessage:
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
+
+
+async def _history_of(ws, cid: str) -> dict:
+    for _ in range(20):
+        frame = await ws.next_frame()
+        if frame.get("type") == "chat_history" and frame.get("chat_id") == cid:
+            return frame
+    raise AssertionError(f"no chat_history for {cid}")
+
+
+class TestResumeAsTheTurnEnds:
+    def test_a_turn_that_ends_during_the_history_read_is_in_the_frame(
+            self, temp_db, monkeypatch):
+        """Opening a chat as its turn ends: the history read is queued on the
+        chat's lane while the turn still runs, the engine's last save queues
+        behind it, and the pump reads done before the frame is cut. The frame
+        then has no cut and no live state follows (the attach is skipped for
+        a done pump, and no done reaches this socket), so it must carry the
+        reply itself."""
+        from core.events.common_events import DONE, TEXT, CommonEvent
+        from core.events.stream_pump import _active_pumps
+        from storage import database as task_store
+        from ws import dashboard_chat_resume as resume
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        other = str(uuid.uuid4())
+        task_store.create_chat(other, "user-admin", slug, "autoReview",
+                               model=TEST_MODEL, execution_path="claude-code-cli")
+
+        async def scenario():
+            hold = asyncio.Event()
+
+            async def slow_turn():
+                yield CommonEvent(type=TEXT, data={"content": "working… "})
+                await hold.wait()
+                yield CommonEvent(type=TEXT, data={"content": "the reply"})
+                yield CommonEvent(type=DONE, data={})
+
+            layer.turn_events = lambda sid, prompt: slow_turn()
+            watched: list[str] = []
+            original = resume.ChatResumeMixin._resume_read
+
+            async def read_the_turn_end_overtakes(self, cid, *args, **kwargs):
+                read = asyncio.ensure_future(original(self, cid, *args, **kwargs))
+                if cid not in watched or hold.is_set():
+                    return await read
+                # The read job is on the chat's lane before the turn ends.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                hold.set()
+                for _ in range(300):
+                    pump = _active_pumps.get(cid)
+                    if pump is None or pump.is_done:
+                        break
+                    await asyncio.sleep(0.01)
+                return await read
+
+            monkeypatch.setattr(resume.ChatResumeMixin, "_resume_read",
+                                read_the_turn_end_overtakes)
+
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+                ws.client_send({"type": "chat", "text": "long job", "chat_id": chat_id})
+                await ws.expect({"type": "title_updated", "chat_id": chat_id,
+                                 "title": "long job"})
+                await ws.expect({"type": "chat_status", "chat_id": chat_id,
+                                 "status": "streaming"})
+                await ws.next_frame()  # the turn's live_state
+                await ws.expect({"type": "text", "content": "working… ",
+                                 "chat_id": chat_id})
+
+                # Another chat on show: the socket leaves the turn.
+                ws.client_send({"type": "resume_chat", "chat_id": other})
+                await _history_of(ws, other)
+
+                # Back to the chat just as its turn ends.
+                watched.append(chat_id)
+                ws.client_send({"type": "resume_chat", "chat_id": chat_id})
+                history = await _history_of(ws, chat_id)
+                assert hold.is_set()
+                assert not history.get("live_pending")
+                assert [(m["role"], m["content"]) for m in history["messages"]] == [
+                    ("user", "long job"),
+                    ("assistant", "working… the reply"),
+                ]
+                # Nothing after it brings the turn to this socket: the page
+                # shows what this frame carries until it opens the chat again.
+                rest: list[dict] = []
+                while True:
+                    try:
+                        rest.append(await ws.next_frame(timeout=0.5))
+                    except TimeoutError:
+                        break
+                assert not [f for f in rest if f.get("chat_id") == chat_id and f.get("type") in (
+                    "done", "live_state", "chat_history", "chat_history_delta", "text")]
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+
+    def test_a_pump_past_its_turn_end_lands_its_rest_before_the_read(
+            self, temp_db, monkeypatch):
+        """A pump that already reads done is neither held nor attached, and
+        its tail can still queue the turn's rest (an error turn's text): the
+        resume waits for the pump's task before it reads."""
+        import functools
+
+        from core.events import chat_writer
+        from core.events.stream_pump import _active_pumps
+        from storage import database as task_store
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        cid = str(uuid.uuid4())
+        task_store.create_chat(cid, "user-admin", slug, "autoReview",
+                               model=TEST_MODEL, execution_path="claude-code-cli")
+        task_store.add_chat_message(cid, "user", "long job", author_sub="user-admin")
+
+        class _EndingPump:
+            is_done = True
+            source_type = "dashboard"
+            chat_id = cid
+            session_id = "s-ending"
+            _task: "asyncio.Future | None" = None
+
+        async def scenario():
+            pump = _EndingPump()
+            release = asyncio.Event()
+
+            async def tail():
+                await release.wait()
+                await chat_writer.submit(cid, functools.partial(
+                    task_store.add_chat_message, cid, "assistant", "the rest"), label="tail")
+                _active_pumps.pop(cid, None)
+
+            pump._task = asyncio.ensure_future(tail())
+            _active_pumps[cid] = pump
+            asyncio.get_running_loop().call_later(0.2, release.set)
+            try:
+                async with dashboard_connection(session_cookie()) as ws:
+                    await drain_startup(ws)
+                    ws.client_send({"type": "resume_chat", "chat_id": cid})
+                    history = await _history_of(ws, cid)
+                    assert [(m["role"], m["content"]) for m in history["messages"]] == [
+                        ("user", "long job"),
+                        ("assistant", "the rest"),
+                    ]
+                    ws.client_send({"type": "close"})
+            finally:
+                _active_pumps.pop(cid, None)
+                await asyncio.wait([pump._task], timeout=1.0)
+        run_ws_scenario(scenario)
+
+    def test_a_live_pump_not_yet_held_that_ends_during_the_read_is_in_the_frame(
+            self, temp_db, monkeypatch):
+        """A pump whose start job had not landed at the snapshot (no cutoff)
+        is live but not held, a turn that fails at once while the page opens
+        the chat: its error card, saved behind the read as the pump ends,
+        is in the frame."""
+        import functools
+
+        from core.events import chat_writer
+        from core.events.stream_pump import _active_pumps
+        from storage import database as task_store
+        from ws import dashboard_chat_resume as resume
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        cid = str(uuid.uuid4())
+        task_store.create_chat(cid, "user-admin", slug, "autoReview",
+                               model=TEST_MODEL, execution_path="claude-code-cli")
+        task_store.add_chat_message(cid, "user", "long job", author_sub="user-admin")
+
+        class _StartingPump:
+            is_done = False
+            source_type = "dashboard"
+            chat_id = cid
+            session_id = "s-starting"
+            _db_msg_cutoff_id = None
+            accepts_in_flight = 0
+            _task: "asyncio.Future | None" = None
+
+        async def scenario():
+            pump = _StartingPump()
+            pump.producer = asyncio.get_running_loop().create_future()  # still running: no reap
+            original = resume.ChatResumeMixin._resume_read
+            reads: list[int] = []
+
+            async def tail():
+                await chat_writer.submit(cid, functools.partial(
+                    task_store.add_chat_message, cid, "event", "the error card"), label="tail")
+                _active_pumps.pop(cid, None)
+
+            async def read_the_pump_ends_during(self, rcid, *args, **kwargs):
+                reads.append(1)
+                read = asyncio.ensure_future(original(self, rcid, *args, **kwargs))
+                if len(reads) == 1:
+                    # The read job is on the chat's lane, then the pump ends.
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    pump.is_done = True
+                    pump._task = asyncio.ensure_future(tail())
+                return await read
+
+            monkeypatch.setattr(resume.ChatResumeMixin, "_resume_read", read_the_pump_ends_during)
+            _active_pumps[cid] = pump
+            try:
+                async with dashboard_connection(session_cookie()) as ws:
+                    await drain_startup(ws)
+                    ws.client_send({"type": "resume_chat", "chat_id": cid})
+                    history = await _history_of(ws, cid)
+                    assert [(m["role"], m["content"]) for m in history["messages"]] == [
+                        ("user", "long job"),
+                        ("event", "the error card"),
+                    ]
+                    assert len(reads) == 2
+                    ws.client_send({"type": "close"})
+            finally:
+                _active_pumps.pop(cid, None)
+                if pump._task is not None:
+                    await asyncio.wait([pump._task], timeout=1.0)
+        run_ws_scenario(scenario)
+
+    def test_a_turn_end_that_never_lands_times_out_and_leaves_the_pump_running(
+            self, temp_db, monkeypatch, caplog):
+        """A pump that reads done but whose task never ends (a stuck tail):
+        the wait gives up at its bound, the frame still goes out with what has
+        landed, a warning names the wait, and the pump's task is never
+        cancelled (its end still sends the chat's ready and the alert)."""
+        import logging
+        import time
+
+        from core.events.stream_pump import _active_pumps
+        from storage import database as task_store
+        from ws import dashboard_chat_resume as resume
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        monkeypatch.setattr(resume, "_TURN_END_SETTLE_S", 0.1)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        cid = str(uuid.uuid4())
+        task_store.create_chat(cid, "user-admin", slug, "autoReview",
+                               model=TEST_MODEL, execution_path="claude-code-cli")
+        task_store.add_chat_message(cid, "user", "long job", author_sub="user-admin")
+
+        class _StuckPump:
+            is_done = True
+            source_type = "dashboard"
+            chat_id = cid
+            session_id = "s-stuck"
+            _task: "asyncio.Future | None" = None
+
+        async def scenario():
+            pump = _StuckPump()
+            never = asyncio.Event()
+            pump._task = asyncio.ensure_future(never.wait())
+            _active_pumps[cid] = pump
+            try:
+                async with dashboard_connection(session_cookie()) as ws:
+                    await drain_startup(ws)
+                    started = time.monotonic()
+                    ws.client_send({"type": "resume_chat", "chat_id": cid})
+                    history = await _history_of(ws, cid)
+                    assert time.monotonic() - started < 2.0
+                    assert [(m["role"], m["content"]) for m in history["messages"]] == [
+                        ("user", "long job"),
+                    ]
+                    assert not pump._task.done() and not pump._task.cancelled()
+                    ws.client_send({"type": "close"})
+            finally:
+                _active_pumps.pop(cid, None)
+                never.set()
+                await asyncio.wait([pump._task], timeout=1.0)
+
+        with caplog.at_level(logging.WARNING, logger="otodock"):
+            run_ws_scenario(scenario)
+        assert any("still ending after" in r.getMessage() for r in caplog.records)

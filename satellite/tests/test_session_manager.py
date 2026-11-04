@@ -1315,6 +1315,51 @@ class TestSyncMcpsCategoryGate:
         assert not (sat_config.mcps_dir / "skill").exists()
         assert ack["installed_mcps"] == []
 
+    @pytest.mark.asyncio
+    async def test_a_fresh_venv_is_pinned_and_marked_reconciled(self, sat_config):
+        """The install runs on the satellite's own Python, and a venv made on
+        it reads reconciled to the boot's check (the marker lands after the
+        swap, which replaces the folder). One made on uv's default does not."""
+        from types import SimpleNamespace
+
+        from satellite.sessions import mcp_install_support as mis
+        sm = SessionManager(sat_config)
+        ws = AsyncMock()
+        made = {"pinned-mcp": "/opt/py/bin/python3.13", "fallback-mcp": ""}
+
+        async def fake_install(root, runtime, source, **kw):
+            name = root.name.removesuffix(".new")
+            return SimpleNamespace(ok=True, log="", version_hash="h1", venv_python=made[name],
+                                   spec=kw.get("python_spec"))
+
+        inst = AsyncMock(side_effect=fake_install)
+        with patch("satellite._vendored.mcp_installer.install_mcp", inst), \
+             patch("satellite.sessions.session_manager.mcp_python_spec", return_value="/opt/py/bin/python3.13"), \
+             patch("satellite.sessions.session_manager._warm_one_mcp",
+                   AsyncMock(side_effect=lambda root, name, sem: (name, "ok"))):
+            await sm.sync_mcps({"command_id": "c1", "mcps_to_install": [
+                self._spec("pinned-mcp", "core"), self._spec("fallback-mcp", "core")],
+                "mcps_to_remove": []}, ws)
+        assert {c.kwargs["python_spec"] for c in inst.await_args_list} == {"/opt/py/bin/python3.13"}
+        minor = f"{sys.version_info[0]}.{sys.version_info[1]}"
+        pinned = sat_config.mcps_dir / "core" / "pinned-mcp" / mis._RUNTIME_MARKER
+        assert json.loads(pinned.read_text()) == {"python": minor}
+        assert not (sat_config.mcps_dir / "core" / "fallback-mcp" / mis._RUNTIME_MARKER).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_reports_its_cause_alone(self, sat_config):
+        from types import SimpleNamespace
+        sm = SessionManager(sat_config)
+        ws = AsyncMock()
+        failed = SimpleNamespace(ok=False, log="Resolved 3 packages\n  × Failed to build `rpds-py==0.30.0`\n"
+                                              "      error: rustc not found\n", version_hash="")
+        with patch("satellite._vendored.mcp_installer.install_mcp", AsyncMock(return_value=failed)):
+            await sm.sync_mcps({"command_id": "c1", "mcps_to_install": [self._spec("memory-mcp", "core")],
+                                "mcps_to_remove": []}, ws)
+        ack = ws.enqueue_send.call_args_list[-1].args[0]
+        assert ack["results"]["memory-mcp"] == {
+            "status": "error", "error": "Failed to build `rpds-py==0.30.0` / error: rustc not found"}
+
     def test_allow_list_covers_every_shipped_manifest(self):
         """The platform ships install specs with the manifest's ``category``
         verbatim; a category the satellite refuses drops that MCP from every

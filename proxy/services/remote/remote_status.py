@@ -66,6 +66,9 @@ def get_live_machine_status(
           "last_heartbeat_age_s": int | None,
           "last_seen_iso": str,
           "reachable": bool,  # True iff state in {online, stale}
+          "link_ok": bool,     # the local link answers (``_link``)
+          "link_down_s": int | None,
+          "link_error": str,
         }
     """
     from core.remote.satellite_connection import get_connection_manager
@@ -92,6 +95,7 @@ def get_live_machine_status(
             "last_heartbeat_age_s": int(age),
             "last_seen_iso": last_seen,
             "reachable": state in REACHABLE,
+            **_link(conn),
         }
 
     if machine is None:
@@ -107,6 +111,7 @@ def get_live_machine_status(
             "last_heartbeat_age_s": None,
             "last_seen_iso": last_seen,
             "reachable": False,
+            **_link(None),
         }
 
     # Distinguish never-paired/never-online from formerly-connected via
@@ -117,6 +122,7 @@ def get_live_machine_status(
             "last_heartbeat_age_s": None,
             "last_seen_iso": last_seen,
             "reachable": False,
+            **_link(None),
         }
 
     return {
@@ -124,6 +130,23 @@ def get_live_machine_status(
         "last_heartbeat_age_s": None,
         "last_seen_iso": last_seen,
         "reachable": False,
+        **_link(None),
+    }
+
+
+def _link(conn) -> dict[str, Any]:
+    """The machine's local link: the loopback tunnel its sessions reach the
+    platform through, as satellite 0.5.168 reports it. Up for an older
+    satellite and a machine not connected. ``reachable`` does not read it: a
+    machine whose link is down still takes commands, and its new sessions are
+    refused with the reason (``core/remote/tunnel_state.py``)."""
+    if conn is None or getattr(conn, "tunnel_ok", True):
+        return {"link_ok": True, "link_down_s": None, "link_error": ""}
+    since = getattr(conn, "tunnel_down_since", None)
+    return {
+        "link_ok": False,
+        "link_down_s": None if since is None else int(time.monotonic() - since),
+        "link_error": getattr(conn, "tunnel_error", "") or "",
     }
 
 
@@ -150,17 +173,18 @@ def resolve_execution_target(
           and fallback-to-agent-default is enabled
         * "agent-default-offline" — agent-default machine offline and fallback
           to local is enabled
-        * "viewer-on-admin-remote" — non-owner per-agent role (viewer/editor)
-          forced to local because remote has no bwrap isolation; non-owners
-          may still set own user-level overrides (registered_by themselves)
-          since they own the hardware. Slug name is historical — covers
-          both viewer and editor
+        * "viewer-on-admin-remote" — a role below the owner tier (viewer,
+          contributor, editor) kept on the platform host: a machine runs the
+          engines with no sandbox. The slug is historical. Their own paired
+          machine (step 1) is still honored: they own the hardware
+        * "all-roles-on-admin-remote" — such a person's session runs on the
+          agent's default machine because its admin let every role of its
+          agents run there (``placement.admits_every_role``)
 
     The 'role' parameter is the caller's effective per-agent role for this
-    agent (admin/manager/editor/viewer). Non-owner sessions (anything other
-    than manager/admin) never run on admin-configured remote targets
-    (security regression — remote has no bwrap sandbox). Non-owner
-    user-level overrides (their own paired machine) are still honored.
+    agent (admin/manager/editor/contributor/viewer). Below the owner tier a
+    session runs on the agent's admin machine only by that machine's switch,
+    and a session with no person (an outside caller) never does.
     """
     from storage import database as _db, remote_store
     from storage.agents import agent_store
@@ -220,23 +244,32 @@ def resolve_execution_target(
             return (placement.LOCAL, "user-override-offline")
         return (placement.LOCAL, None)
 
-    # 3. Agent-set remote target. Only OWNERS (manager/admin) can run on
-    #    admin-paired remotes — satellite has no bwrap kernel isolation,
-    #    so role-based filesystem restrictions enforced via the path_policy
-    #    hook for non-owner roles (viewer, editor) are bypassable on satellite
-    #    via Codex's hook-bypass surface. Force-to-local for non-owners
-    #    preserves the role isolation guarantee. Users who paired their own
-    #    machine via User Settings still hit it via user_remote_targets in
-    #    step 1 (above) — that's their own hardware, machine-trust model.
+    # 3. Agent-set remote target. A satellite runs the engines with no
+    #    sandbox, on every OS: the path gate applies a role's limits to the
+    #    paths it sees, and a command it allows reads whatever the machine's
+    #    user reads. So below the owner tier a session stays on the platform
+    #    host unless the machine's admin let every role of its agents run
+    #    there (``placement.admits_every_role``), and only a PERSON's session
+    #    follows that switch: one with no person below the owner tier is an
+    #    outside caller (a phone call's external identity), which stays on the
+    #    platform host in every case. A machine the person paired themselves
+    #    is step 1's (their own hardware).
+    on_switch = False
     if not roles.can_manage(role):
-        reason = "viewer-on-admin-remote"  # historical name; extended to editor+viewer
-        return (placement.LOCAL, reason)
+        on_switch = bool(user_sub) and placement.admits_every_role(
+            remote_store.get_remote_machine(agent_target), agent_target)
+        if not on_switch:
+            return (placement.LOCAL, "viewer-on-admin-remote")  # the slug is historical
+        logger.info(
+            "resolve_execution_target: %s as %s runs on %s by the machine's "
+            "every-role switch", agent_slug, role, agent_target[:8],
+        )
 
-    # 4. Owner (manager/admin) with agent remote target — honor if reachable.
+    # 4. An owner (manager/admin), or a person the switch admits — honor if reachable.
     if is_reachable(agent_target):
         if _user_override_fallback:
             return (agent_target, "user-override-offline")
-        return (agent_target, None)
+        return (agent_target, "all-roles-on-admin-remote" if on_switch else None)
 
     # Agent target offline.
     if allow_fallback_agent:
