@@ -197,8 +197,10 @@ async def test_reconnect_walks_wait_behind_the_gate(monkeypatch):
     with _agents({"a1", "a2"}):
         await _fleet()
     assert state["max"] == 1 and state["n"] == 6
-    # A wider gate lets the machines' walks overlap.
+    # A wider gate lets the machines' walks overlap. The second fleet is not
+    # a reconnect right after the first: without its debounce (30 s a machine).
     monkeypatch.setattr(rws, "_RECONNECT_SYNC_CONCURRENCY", 4)
+    rws._reconnect_completed_at.clear()
     state.update(active=0, max=0, n=0)
     with _agents({"a1", "a2"}):
         await _fleet()

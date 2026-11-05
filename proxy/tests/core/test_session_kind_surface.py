@@ -31,6 +31,7 @@ and every ``.ts`` / ``.tsx`` under ``dashboard/src`` (tests excluded):
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import subprocess
 from pathlib import Path
@@ -146,6 +147,8 @@ def _mints(tree: ast.AST) -> list[int]:
     return lines
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan() -> tuple[dict[str, int], dict[str, list[int]], dict[str, list[int]]]:
     shapes: dict[str, int] = {}
     compares: dict[str, list[int]] = {}

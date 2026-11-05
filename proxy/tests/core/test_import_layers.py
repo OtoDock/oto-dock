@@ -20,6 +20,7 @@ only shrinks.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import sys
 from pathlib import Path
@@ -81,8 +82,10 @@ def imports_of(path: Path) -> set[str]:
     return out
 
 
-def current_edges() -> set[str]:
-    """Every ``"<file> -> <module>"`` edge that crosses a forbidden direction."""
+@functools.cache
+def current_edges() -> frozenset[str]:
+    """Every ``"<file> -> <module>"`` edge that crosses a forbidden direction
+    (one pass for the module's tests)."""
     edges: set[str] = set()
     for layer, above in FORBIDDEN.items():
         for path in sorted((PROXY / layer).rglob("*.py")):
@@ -92,7 +95,7 @@ def current_edges() -> set[str]:
             for module in imports_of(path):
                 if module.split(".")[0] in above and module not in LEAVES:
                     edges.add(f"{rel} -> {module}")
-    return edges
+    return frozenset(edges)
 
 
 def _allowed() -> set[str]:

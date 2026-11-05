@@ -89,7 +89,9 @@ cd dashboard/ios/OtoDockShell && swift test      # the iOS shell's rules (a Mac)
   `dashboard/ios/App/CapApp-SPM/Package.swift`. It changes only when the
   native plugins do.
 - A test that fails, then passes alone, under `-n 8` on a loaded machine is
-  worth one serial re-run before you debug it.
+  worth one serial re-run before you debug it. If it fails again only in the
+  suite, `OTODOCK_TEST_SHUFFLE=<seed>` runs the suite in a seeded random
+  order: a failing seed reproduces what the test depends on.
 
 ## Conventions
 

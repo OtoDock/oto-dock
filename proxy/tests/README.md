@@ -23,9 +23,11 @@ database**:
   (override with `TEST_DATABASE_URL`), creating it automatically if missing.
 - Under `pytest-xdist` each worker gets its own database — `otodock_test_gw0`,
   `otodock_test_gw1`, … — so parallel workers never share rows.
-- Every test starts from a clean slate: the schema is (idempotently) applied
-  and all rows are wiped. The wipe uses `DELETE` (not `TRUNCATE`) to avoid a
-  per-table `fsync`, which is what previously made the suite take an hour.
+- Every test starts from a clean slate: all rows are wiped, and the schema is
+  applied once per database and again only after a test changed it (the
+  database counts its own DDL statements). The wipe uses `DELETE` (not
+  `TRUNCATE`) to avoid a per-table `fsync`, which is what previously made the
+  suite take an hour.
 - The test databases are throwaway; drop them any time with
   `DROP DATABASE otodock_test*`.
 
@@ -35,8 +37,14 @@ Point elsewhere with `TEST_DATABASE_URL` (or `DATABASE_URL`).
 ## Running
 
 ```bash
-# whole suite, in parallel (recommended) — ~1.5 min
+# whole suite, in parallel (recommended) — about 6 min on a ten-core machine
 pytest -n 8
+
+# one half of the test files (CI runs the two halves side by side)
+pytest -n 8 --shard 1/2
+
+# the same tests in a seeded random order (for a test that passes alone only)
+OTODOCK_TEST_SHUFFLE=7 pytest -n 8
 
 # whole suite, serially
 pytest
@@ -80,10 +88,11 @@ CI runs the same commands against a PostgreSQL service container. Because the
 per-test wipe uses `DELETE`, no special server tuning (`fsync=off`, etc.) is
 required for the suite to be fast.
 
-The public `ci.yml` runs the proxy and audio suites twice: the `proxy` job on
-`ubuntu-latest` (a required check) and the `proxy-arm64` job on
-`ubuntu-24.04-arm` (the same steps on a GitHub-hosted arm64 runner, a
-required check too). Both install the audio package with its `localmodels` extra,
+The public `ci.yml` runs the proxy and audio suites twice: on `ubuntu-24.04`
+and on `ubuntu-24.04-arm` (a GitHub-hosted arm64 runner). On each, the proxy
+suite runs as two halves side by side (`proxy-shard`, `proxy-arm64-shard`:
+`--shard 1/2` and `2/2`), and the required checks `proxy` and `proxy-arm64`
+pass when both of their halves did. Both install the audio package with its `localmodels` extra,
 so the bundled Silero VAD and Smart Turn models run for real there instead of
 skipping; the private `ci-private-python.yml` does the same on amd64 only
 (arm64 runners are billed on private repositories). Locally, the release gate

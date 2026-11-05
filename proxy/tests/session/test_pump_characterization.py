@@ -458,6 +458,11 @@ async def _trace(name: str, chat_id: str, sid: str, steps: list[tuple], seams: _
             await _settle(pump)
             if settle_s:
                 await asyncio.sleep(settle_s)   # the clock trace's flush timers
+                # A timer's flush saves on the writer's thread and trims the
+                # live blocks when the save lands: read them after it.
+                from core.events import chat_writer
+                await chat_writer.drain(chat_id, timeout=5.0)
+                await _settle(pump)
             trace.append({
                 "step": _label(kind, payload),
                 "frames": _drain(q) if q is not None else [],

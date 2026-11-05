@@ -32,12 +32,20 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  proxy:
+  # The proxy suite in two halves that run side by side (`--shard I/2` keeps
+  # the test files whose path hashes to that half, so a new file needs no
+  # list). The `proxy` job below is the one branch protection requires.
+  proxy-shard:
     if: github.repository == 'OtoDock/oto-dock'
     # A named image, never ubuntu-latest: the sandbox tests run bwrap and pasta on the
     # runner itself, and the moving label reached Ubuntu 26.04 on 2026-11-04, where
     # pasta reads no nameserver and refuses to start the command.
     runs-on: ubuntu-24.04
+    strategy:
+      # Both halves run to their end: one half's failure must not hide the other's.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     services:
       postgres:
         image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
@@ -67,6 +75,7 @@ jobs:
       - name: ruff
         # The import and dead-code rules this check has always held; the rest
         # of ruff.toml's policy (and its baseline) runs in the `lint` job.
+        if: matrix.shard == 1
         run: |
           python -m pip install -q "ruff==0.15.22"
           ruff check --select F401,F821,F403,F405,F811,F841,B018,E722,SIM105,PLW0108 .
@@ -93,13 +102,27 @@ jobs:
         working-directory: proxy
         env:
           TEST_DATABASE_URL: postgresql://otodock:otodock@localhost:5432/otodock_test
-        run: python -m pytest -n 8 -q
+          SHARD: ${{ matrix.shard }}
+        run: python -m pytest -n 8 -q --shard "$SHARD/2" --durations=25
 
       - name: pytest (audio package)
         # Colocated per-subpackage tests (providers/*/tests, streaming/tests)
         # discovered via audio/pyproject.toml testpaths.
+        if: matrix.shard == 1
         working-directory: audio
         run: python -m pytest -q
+
+  proxy:
+    # Runs when a half failed or was cancelled too, and fails then: a required
+    # check that was skipped would let the merge through.
+    if: ${{ always() && github.repository == 'OtoDock/oto-dock' }}
+    needs: proxy-shard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Both halves passed
+        env:
+          RESULT: ${{ needs.proxy-shard.result }}
+        run: test "$RESULT" = success
 
   # The sandbox suite on GitHub's newest Ubuntu image: the one check that
   # follows the moving label. Informational until it has been green on two
@@ -157,11 +180,15 @@ jobs:
   # The same suites on arm64: the release images publish for both
   # architectures, and the sandbox (bwrap + pasta namespaces) and the ONNX
   # models are the parts a build alone does not prove.
-  # Same steps as `proxy` on a GitHub-hosted arm64 runner (free for public
-  # repositories).
-  proxy-arm64:
+  # Same steps as `proxy-shard` on a GitHub-hosted arm64 runner (free for
+  # public repositories).
+  proxy-arm64-shard:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     services:
       postgres:
         image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
@@ -204,11 +231,23 @@ jobs:
         working-directory: proxy
         env:
           TEST_DATABASE_URL: postgresql://otodock:otodock@localhost:5432/otodock_test
-        run: python -m pytest -n 4 -q
+          SHARD: ${{ matrix.shard }}
+        run: python -m pytest -n 4 -q --shard "$SHARD/2" --durations=25
 
       - name: pytest (audio package)
+        if: matrix.shard == 1
         working-directory: audio
         run: python -m pytest -q
+
+  proxy-arm64:
+    if: ${{ always() && github.repository == 'OtoDock/oto-dock' }}
+    needs: proxy-arm64-shard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Both halves passed
+        env:
+          RESULT: ${{ needs.proxy-arm64-shard.result }}
+        run: test "$RESULT" = success
 
   # The satellite's suite in the satellite's own environment: its lockfile
   # (what a paired machine installs) plus the test tools. Run from the repo

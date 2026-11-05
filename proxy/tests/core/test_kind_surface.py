@@ -32,6 +32,7 @@ module-qualified. TypeScript: ``=== '…'`` / ``!== '…'``, ``case '…':`` and
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import subprocess
 from collections import defaultdict
@@ -238,6 +239,8 @@ def _named_leaf_imports(tree: ast.AST) -> list[str]:
             if isinstance(n, ast.ImportFrom) and n.module == "services.scheduler.task_kinds" for a in n.names]
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan_python():
     sites: dict[str, dict[str, int]] = {}
     imports: dict[str, list[str]] = {}
@@ -311,6 +314,8 @@ def _ts_files() -> list[Path]:
             if "/tests/" not in p.relative_to(REPO_ROOT).as_posix() and ".test." not in p.name]
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan_ts() -> dict[str, dict[str, int]]:
     sites: dict[str, dict[str, int]] = {}
     for p in _ts_files():

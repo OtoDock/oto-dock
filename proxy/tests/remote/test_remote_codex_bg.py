@@ -902,6 +902,11 @@ def test_an_idle_codex_session_is_adopted_on_its_thread(monkeypatch):
             assert state.default_consumer.get_nowait()["params"]["threadId"] == MAIN
             assert state.thread_consumers[SUB].qsize() == 1
         finally:
+            # No satellite answers here: the close frame's 15 s wait for one
+            # is not this test's subject.
+            async def _sent(*a, **k):
+                return {}
+            layer._cm.send_command = _sent
             await layer.close_session("s-ad1")
 
     try:

@@ -34,6 +34,7 @@ and every ``.ts`` / ``.tsx`` under ``dashboard/src`` (tests excluded):
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import subprocess
 from pathlib import Path
@@ -151,6 +152,8 @@ def _named_leaf_imports(tree: ast.AST) -> list[str]:
             for a in n.names if a.name not in _LEAF_NAMES_BY_NAME]
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan():
     local: dict[str, int] = {}
     kinds: dict[str, list[str]] = {}

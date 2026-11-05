@@ -16,6 +16,22 @@ still meets the written bound, and never above ten, so a quadratic blow-up
     lint_tree(root, walked, declared)
     assert time.monotonic() - started < bound(5)
 
+``cpu_bound(seconds)`` is the same bound on the CPU time of the calling
+thread, read with ``thread_cpu()``, for work that runs on one thread and
+holds the interpreter lock all through (a regex pass, a parse): what it
+guards is how long that work freezes the process, and a runner that packs
+eight workers onto two cores stretches its wall time many times over while
+its CPU time stays the work's own::
+
+    from tests._timing import cpu_bound, thread_cpu
+
+    started = thread_cpu()
+    lint_tree(root, walked, declared)
+    assert thread_cpu() - started < cpu_bound(5)
+
+Work that crosses threads, waits on I/O or sleeps keeps ``bound()`` and the
+wall clock: its CPU time says nothing about how long it took.
+
 ``cpu_share(call)`` runs a call and says how much of its wall time this
 process spent on the CPU, for a test whose premise is that the process ran
 all through the call (a loaded host may not grant that; the test skips).
@@ -52,6 +68,32 @@ def host_factor() -> float:
 def bound(seconds: float) -> float:
     """``seconds`` as written on the dev box, scaled to this host right now."""
     return seconds * host_factor()
+
+
+def thread_cpu() -> float:
+    """The CPU seconds the calling thread has used so far."""
+    return time.thread_time()
+
+
+def _reference_cpu_run() -> float:
+    started = time.thread_time()
+    json.dumps(list(range(_REFERENCE_N)))
+    return time.thread_time() - started
+
+
+def cpu_factor() -> float:
+    """``host_factor`` on the thread's CPU clock: how many times more CPU the
+    reference run costs here than on the dev box (a slower core, a sibling
+    hyperthread at work), between one and ten. Waiting for a core is not in
+    it: that is the point."""
+    measured = statistics.median(_reference_cpu_run() for _ in range(_REFERENCE_RUNS))
+    return min(max(1.0, measured / _REFERENCE_S), _MAX_FACTOR)
+
+
+def cpu_bound(seconds: float) -> float:
+    """``seconds`` of one thread's CPU as written on the dev box, scaled to
+    this host's cores right now. Compare with a ``thread_cpu()`` interval."""
+    return seconds * cpu_factor()
 
 
 def cpu_share(call: Callable[[], object]) -> tuple[float, float]:

@@ -45,6 +45,7 @@ outside ``dashboard/src/lib/tools/``.
 from __future__ import annotations
 
 import ast
+import functools
 import inspect
 import re
 import subprocess
@@ -267,6 +268,8 @@ def _scan(path: Path) -> tuple[dict[str, int], dict[str, int], int]:
     return ids, spellings, outside_registry
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan_tree() -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]], dict[str, int]]:
     dirs = _engine_package_dirs()
     owned = _satellite_engine_files()

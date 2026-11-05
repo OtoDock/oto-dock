@@ -186,7 +186,6 @@ def _ws_record(loop_db_guard, cookie: str, *drives) -> set[tuple[str, str]]:
         dashboard_connection,
         drain_startup,
         run_ws_scenario,
-        sync_dispatch,
     )
     recorded: set = set()
     for drive in drives:
@@ -196,7 +195,10 @@ def _ws_record(loop_db_guard, cookie: str, *drives) -> set[tuple[str, str]]:
                 with loop_db_guard.recording() as sites:
                     agent_store._invalidate_cache()
                     await drive(ws)
-                    await sync_dispatch(ws)
+                    # The barrier, by frame name: an unread-count frame of
+                    # the drive may still be on its way ahead of the pong.
+                    ws.client_send({"type": "ping"})
+                    await _frame(ws, "pong")
                 recorded.update(sites)
         run_ws_scenario(scenario)
     return recorded

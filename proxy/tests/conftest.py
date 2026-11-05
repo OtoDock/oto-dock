@@ -1,7 +1,8 @@
 """Shared test fixtures for proxy tests.
 
 Uses a DEDICATED PostgreSQL test database (otodock_test) to avoid
-destroying production data. Each test gets a clean slate via TRUNCATE.
+destroying production data. Each test starts from emptied tables; the schema
+is applied once per database and again only after a test changed it.
 
 IMPORTANT: Tests NEVER run against the production database.
 Set TEST_DATABASE_URL to override the test DB location.
@@ -9,8 +10,11 @@ Set TEST_DATABASE_URL to override the test DB location.
 
 import contextlib
 import os
+import random
+import re
 import sys
 import threading
+import zlib
 from pathlib import Path
 from urllib.parse import urlparse as _urlparse, urlunparse as _urlunparse
 
@@ -163,6 +167,19 @@ def _assert_test_db_reachable(url: str) -> None:
 _assert_test_db_reachable(_test_url)
 os.environ["DATABASE_URL"] = _test_url
 
+# The override above reaches ``config`` only when this file runs before the
+# proxy is imported. An in-process ``pytest.main()`` that imported a proxy
+# module first already holds ``config.DATABASE_URL`` from config.env (or the
+# default): the live database. Re-point the loaded module and drop any pool
+# built on it, so the per-test wipe can only reach a disposable database;
+# ``_assert_disposable`` is the fence behind this for every other path.
+_config_loaded = sys.modules.get("config")
+if _config_loaded is not None and getattr(_config_loaded, "DATABASE_URL", "") != _test_url:
+    _config_loaded.DATABASE_URL = _test_url
+    _pg_loaded = sys.modules.get("storage.pg")
+    if _pg_loaded is not None:
+        _pg_loaded.close_pool()
+
 # Redirect AGENTS_DIR to a temp scratch path so tests that exercise the
 # real filesystem (community-agent installer, agent-create endpoint) don't
 # pollute the dev install. Tests that don't touch the FS aren't affected.
@@ -236,6 +253,64 @@ from services.agents import agent_provisioning
 agent_provisioning.install()
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--shard", default="", metavar="I/N",
+        help="run part I of N of the suite: the test files whose path hashes to it "
+             "(whole files, every file in exactly one part)",
+    )
+
+
+def _parse_shard(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)/(\d+)", value)
+    if not match or not 1 <= int(match.group(1)) <= int(match.group(2)):
+        raise pytest.UsageError(f"--shard takes I/N with 1 <= I <= N, got {value!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def _shard_of(path: str, parts: int) -> int:
+    """The part (1..parts) a test file runs in: a hash of its path as pytest
+    names it, so every host and every xdist worker agrees, a file's tests
+    stay together and a new file needs no list."""
+    return zlib.crc32(path.encode("utf-8")) % parts + 1
+
+
+def pytest_configure(config):
+    shard = config.getoption("--shard")
+    if shard:
+        _parse_shard(shard)
+        if os.environ.get("OTODOCK_LOADTEST") == "1":
+            raise pytest.UsageError("--shard with OTODOCK_LOADTEST=1: the load harness runs whole and alone")
+
+
+def pytest_report_header(config):
+    lines = []
+    if config.getoption("--shard"):
+        lines.append(f"shard: {config.getoption('--shard')} of the test files, by path")
+    if os.environ.get("OTODOCK_TEST_SHUFFLE"):
+        lines.append(f"order: shuffled, OTODOCK_TEST_SHUFFLE={os.environ['OTODOCK_TEST_SHUFFLE']}")
+    return lines
+
+
+def pytest_collection_modifyitems(config, items):
+    shard = config.getoption("--shard")
+    if shard:
+        part, parts = _parse_shard(shard)
+        keep, drop = [], []
+        for item in items:
+            mine = _shard_of(item.nodeid.split("::", 1)[0], parts) == part
+            (keep if mine else drop).append(item)
+        if drop:
+            config.hook.pytest_deselected(items=drop)
+            items[:] = keep
+    # A test that passes alone and fails in the suite depends on what ran
+    # before it: OTODOCK_TEST_SHUFFLE=<seed> runs the collected tests in a
+    # seeded random order (the same in every xdist worker) to find it.
+    seed = os.environ.get("OTODOCK_TEST_SHUFFLE", "")
+    if seed:
+        random.Random(seed).shuffle(items)
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Controller/serial only: drop this run's own databases + scratch dirs.
 
@@ -260,6 +335,11 @@ def pytest_sessionfinish(session, exitstatus):
                 print("\n[db-loop-guard] loop-side store calls:\n" + "\n".join(_lines))
     except (ImportError, OSError):
         pass
+    _stats_out = os.environ.get("OTODOCK_TEST_SCHEMA_STATS", "")
+    if _stats_out and _schema_stats["tests"]:
+        import json
+        with contextlib.suppress(OSError), open(_stats_out, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"worker": _xdist_worker or "serial", **_schema_stats}) + "\n")
     # Stop the run_db lanes, then close the pools: their worker threads are
     # non-daemon, so left open they stall interpreter exit (about 20 s per
     # test process) and keep this run's databases busy, so the DROP below
@@ -279,8 +359,23 @@ def pytest_sessionfinish(session, exitstatus):
         shutil.rmtree(_d, ignore_errors=True)
 
 
-def _truncate_all_tables(conn):
-    """Wipe every row from the public-schema tables for a clean per-test slate.
+def _assert_disposable(conn) -> None:
+    """The connection must be on a database the suite owns, one whose name
+    carries ``test``: everything the per-test wipe does goes through here."""
+    dbname = conn.info.dbname or ""
+    assert "test" in dbname, f"refusing to touch non-test database {dbname!r}"
+
+
+def _public_tables(conn) -> list[str]:
+    rows = conn.execute(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+    ).fetchall()
+    return [r["tablename"] for r in rows]
+
+
+def _truncate_all_tables(conn, tables=None):
+    """Wipe every row from the public-schema tables for a clean per-test slate
+    (``tables``: the list read when the schema was applied; read here without).
 
     Uses DELETE, NOT ``TRUNCATE``: TRUNCATE forces a synchronous per-file fsync
     (``DataFileImmediateSync``) for every table it touches, and this fixture
@@ -290,19 +385,182 @@ def _truncate_all_tables(conn):
     gone, sequences NOT reset (plain TRUNCATE also keeps sequences).
 
     FK ordering is sidestepped by disabling replication-role triggers for the
-    duration of this transaction; ``SET LOCAL`` auto-resets on commit/rollback,
-    so no state leaks back to the pooled connection.
+    DELETEs; ``SET LOCAL`` auto-resets on commit/rollback, so no state leaks
+    back to the pooled connection.
+
+    One text, one round trip (a statement per table cost five times the
+    wipe). A text with no parameters goes out unprepared, so it can hold
+    many statements; it must stay outside any pipeline.
     """
-    rows = conn.execute(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-    ).fetchall()
-    table_names = [r["tablename"] for r in rows]
-    if not table_names:
+    _assert_disposable(conn)
+    if tables is None:
+        tables = _public_tables(conn)
+    if not tables:
         return
-    # First statement opens the transaction; SET LOCAL is valid from here.
-    conn.execute("SET LOCAL session_replication_role = 'replica'")
-    for t in table_names:
-        conn.execute(f'DELETE FROM "{t}"')
+    conn.execute(
+        "SET LOCAL session_replication_role = 'replica';"
+        + "".join(f'DELETE FROM "{t}";' for t in tables)
+        + "SET LOCAL session_replication_role = 'origin';"
+    )
+
+
+# The schema is applied once per database, then again only when its structure
+# may have changed: a sequence in a schema of the suite's own counts every DDL
+# statement the database sees (two event triggers call nextval), and a test
+# starts with an apply when the count is not the one this process stored.
+#   - both events: a failed CREATE INDEX CONCURRENTLY leaves an invalid index
+#     and never reaches ddl_command_end;
+#   - ENABLE ALWAYS: DDL under session_replication_role = replica counts too;
+#   - the function lives in the suite's schema with the definer's rights, so a
+#     recreated public schema keeps it and a role with no grant can run DDL;
+#   - a sequence is not transactional: rolled-back DDL counts.
+_HARNESS = "otodock_test_harness"
+_HARNESS_SQL = (
+    f"CREATE SCHEMA IF NOT EXISTS {_HARNESS}",
+    f"CREATE SEQUENCE IF NOT EXISTS {_HARNESS}.ddl_seq",
+    f"CREATE OR REPLACE FUNCTION {_HARNESS}.note_ddl() RETURNS event_trigger "
+    "LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog "
+    f"AS $$ BEGIN PERFORM nextval('{_HARNESS}.ddl_seq'); END $$",
+    f"DROP EVENT TRIGGER IF EXISTS {_HARNESS}_start",
+    f"CREATE EVENT TRIGGER {_HARNESS}_start ON ddl_command_start "
+    f"EXECUTE FUNCTION {_HARNESS}.note_ddl()",
+    f"ALTER EVENT TRIGGER {_HARNESS}_start ENABLE ALWAYS",
+    f"DROP EVENT TRIGGER IF EXISTS {_HARNESS}_end",
+    f"CREATE EVENT TRIGGER {_HARNESS}_end ON ddl_command_end "
+    f"EXECUTE FUNCTION {_HARNESS}.note_ddl()",
+    f"ALTER EVENT TRIGGER {_HARNESS}_end ENABLE ALWAYS",
+    # A sequence never read has no last value: the count starts at one.
+    f"SELECT nextval('{_HARNESS}.ddl_seq')",
+)
+# The database's name and the sequence's oid ride the mark: two databases, or
+# one dropped and created again under its name, never share one. ``writers``
+# is not part of it: the other sessions of this database that hold a write
+# transaction open (a previous test's thread still at work).
+_MARK_SQL = (
+    "SELECT current_database() AS db, "
+    f"to_regclass('{_HARNESS}.ddl_seq')::oid AS seq, "
+    f"pg_sequence_last_value(to_regclass('{_HARNESS}.ddl_seq')) AS count, "
+    "(SELECT count(*) FROM pg_event_trigger "
+    f"  WHERE evtname IN ('{_HARNESS}_start', '{_HARNESS}_end') AND evtenabled = 'A') AS triggers, "
+    "(SELECT count(*) FROM pg_stat_activity "
+    "  WHERE datname = current_database() AND pid <> pg_backend_pid() "
+    "    AND backend_type = 'client backend' AND backend_xid IS NOT NULL) AS writers"
+)
+_WRITERS_WAIT_S = 2.0
+
+# What this process applied last: the mark and the public tables it left.
+_applied_mark: tuple | None = None
+_applied_tables: list[str] = []
+# How often the schema was applied and the wipe waited, and after which test
+# (OTODOCK_TEST_SCHEMA_STATS names a file the session's end appends them to).
+_schema_stats: dict = {"tests": 0, "applies": 0, "waits": 0, "lane_waits": 0, "after": []}
+_previous_test = ""
+
+
+def _ddl_mark(conn) -> tuple[tuple | None, int]:
+    """The database's DDL mark (None when the count cannot be trusted: no
+    sequence, never read, a trigger gone or disabled) and how many other
+    sessions hold a write transaction open."""
+    row = conn.execute(_MARK_SQL).fetchone()
+    if row["count"] is None or row["triggers"] != 2:
+        return None, row["writers"]
+    return (row["db"], row["seq"], row["count"]), row["writers"]
+
+
+def _settled_mark(conn) -> tuple | None:
+    """The mark once no other session of this database holds a write
+    transaction open, or after ``_WRITERS_WAIT_S``: rows a previous test's
+    thread commits after the wipe would stay for this test. The activity
+    view is frozen for a transaction, so each look ends its own."""
+    mark, writers = _ddl_mark(conn)
+    if writers:
+        _schema_stats["waits"] += 1
+        deadline = time.monotonic() + _WRITERS_WAIT_S
+        while writers and time.monotonic() < deadline:
+            conn.rollback()
+            time.sleep(0.01)
+            mark, writers = _ddl_mark(conn)
+    return mark
+
+
+# A store job runs on a lane's thread, not on the test's loop: when the loop
+# ends and cancels the task that awaited it, the job goes on, and what it
+# reads or writes then belongs to the test before. The schema's apply used to
+# give such a job 190 ms by accident. Each test now starts once every lane
+# has finished what it was given: as many gate jobs as the lane has workers,
+# which can all run at once only when no worker holds an earlier job.
+_LANE_WAIT_S = 2.0
+# Lanes given up on: a worker held for good (a test that froze its database
+# on purpose) must not cost every later test the wait. A new lane (the pools
+# closed, the lanes stopped) is drained again.
+_held_lanes: set[int] = set()
+
+
+def _drain_store_lanes() -> None:
+    from concurrent.futures import wait as wait_all
+
+    from storage import pg
+
+    for lane in list(pg._executors.values()):
+        if id(lane) in _held_lanes:
+            continue
+        workers = lane._max_workers
+        gate = threading.Barrier(workers)
+
+        def _hold(gate=gate) -> None:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                gate.wait(_LANE_WAIT_S)
+
+        started = time.monotonic()
+        try:
+            jobs = [lane.submit(_hold) for _ in range(workers)]
+        except RuntimeError:
+            continue    # stopped by the test before
+        wait_all(jobs, timeout=_LANE_WAIT_S + 1.0)
+        if gate.broken:
+            _held_lanes.add(id(lane))
+        if time.monotonic() - started > 0.05:
+            _schema_stats["lane_waits"] += 1
+
+
+def _install_harness(conn) -> None:
+    """The DDL count's sequence, function and triggers, inside a savepoint: a
+    role that may not create an event trigger leaves nothing behind, the mark
+    stays None and every test applies the schema."""
+    import psycopg
+
+    try:
+        with conn.transaction():
+            for sql in _HARNESS_SQL:
+                conn.execute(sql)
+    except psycopg.Error:
+        pass
+
+
+def _apply_schema(conn) -> None:
+    """Apply the schema to an emptied database and store its mark. Emptied
+    first: a step that reads the rows (a unique index created only without
+    duplicates, a CHECK rewritten only when every row passes) must not keep
+    what a previous test's rows made of it."""
+    global _applied_mark, _applied_tables
+    from storage import schema as pg_schema
+
+    _applied_mark = None
+    _truncate_all_tables(conn)
+    conn.commit()
+    pg_schema.init_schema(conn)
+    pg_schema.run_migrations(conn)
+    mark, _writers = _ddl_mark(conn)
+    if mark is None:
+        _install_harness(conn)
+    conn.commit()
+    _applied_tables = _public_tables(conn)
+    # Read after the commit: the apply's own statements moved the count.
+    _applied_mark, _writers = _ddl_mark(conn)
+    conn.rollback()
+    _schema_stats["applies"] += 1
+    if len(_schema_stats["after"]) < 200:
+        _schema_stats["after"].append(_previous_test)
 
 
 @pytest.fixture(autouse=True)
@@ -367,32 +625,52 @@ def _catalog_loop_unbound():
 
 
 @pytest.fixture(autouse=True)
+def _no_renderer_of_the_box(monkeypatch):
+    """A folder app's deploy has file-tools render its page when one answers,
+    found through the manifests (the checkout's own, once a test scanned
+    them) and remembered for a while. On a box that runs an install, that is
+    the install's sidecar: a deploy test would call it, and fail on what it
+    said. Each test starts with no renderer known and none to find; a test
+    of the rendered check brings its own."""
+    from services.apps import app_render
+    monkeypatch.setattr(app_render, "renderer_base_url", lambda: "")
+    app_render._probe.update({"at": 0.0, "ok": False, "reason": "", "base": ""})
+    yield
+
+
+@pytest.fixture(autouse=True)
 def temp_db():
     """Provide a clean database for each test.
 
-    - On first call: ensures schema exists (idempotent)
-    - Before each test: truncates all tables
+    - The schema: applied when this process has not applied it to this
+      database yet, or a statement changed its structure since
+    - Before each test: every table emptied
     - Seeds minimal user data that most tests need
     """
-    from storage import pg as pg_pool, schema as pg_schema
+    global _previous_test
+    from storage import pg as pg_pool
 
-    # Ensure schema exists (no-op if already created)
+    _drain_store_lanes()
     with pg_pool.get_conn() as conn:
-        pg_schema.init_schema(conn)
-        pg_schema.run_migrations(conn)
+        _assert_disposable(conn)
+        mark = _settled_mark(conn)
+        if mark is None or mark != _applied_mark:
+            _apply_schema(conn)
+        _truncate_all_tables(conn, _applied_tables)
+        _seed_users(conn)
         conn.commit()
-
-    # Truncate all data for a clean slate
-    with pg_pool.get_conn() as conn:
-        _truncate_all_tables(conn)
-        conn.commit()
+    _schema_stats["tests"] += 1
+    _previous_test = os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0]
 
     # Invalidate in-memory caches so post-TRUNCATE state is observed. The
     # agent_store cache is the load-bearing one — its API normally
     # invalidates itself on writes, but TRUNCATE goes around the API.
+    # Under the cache's own lock: a load that began before the wipe
+    # stores what it read when it ends, and must end before the reset.
     try:
         from storage.agents import agent_store as _agent_store
-        _agent_store._invalidate_cache()
+        with _agent_store._cache_lock:
+            _agent_store._invalidate_cache()
     except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
@@ -474,9 +752,6 @@ def temp_db():
 
     from storage import database as db
 
-    # Seed minimal user data
-    _seed_users()
-
     # The session liveness tables are per process: a test's marks, floors
     # and headless entries must not make the next test's made-up session id
     # live. The ids ``live_session_token`` minted for stay live (a token
@@ -484,6 +759,8 @@ def temp_db():
     try:
         from core.session import session_state as _liveness
         _liveness.reset_liveness_for_tests()
+        # A prompt's wait a test's loop ended with is no live wait of the next.
+        _liveness._prompt_watch.clear()
         for _sid in _LIVE_TEST_SIDS:
             _liveness.mark_starting(_sid, _LIVE_TEST_TTL_S)
     except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
@@ -564,8 +841,9 @@ def loop_db_guard():
     pg.disarm_loop_guard()
 
 
-def _seed_users():
-    """Insert test users into the DB."""
+def _seed_users(conn=None):
+    """Insert test users into the DB (on ``conn``, the caller commits; on a
+    connection of its own without)."""
     from datetime import datetime, timezone
 
     from storage.pg import get_conn
@@ -577,11 +855,11 @@ def _seed_users():
         ("user-viewer", "viewer@test.com", "Viewer User", "member", now, now),
         ("user-viewer2", "viewer2@test.com", "Viewer Two", "member", now, now),
     ]
-    with get_conn() as conn:
-        for sub, email, name, role, created_at, last_login in users:
-            conn.execute(
-                "INSERT INTO users (sub, email, name, role, created_at, last_login) "
-                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (sub, email, name, role, created_at, last_login),
-            )
-        conn.commit()
+    insert = ("INSERT INTO users (sub, email, name, role, created_at, last_login) "
+              "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING")
+    if conn is not None:
+        conn.cursor().executemany(insert, users)
+        return
+    with get_conn() as own:
+        own.cursor().executemany(insert, users)
+        own.commit()

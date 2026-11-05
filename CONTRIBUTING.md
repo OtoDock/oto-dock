@@ -73,7 +73,7 @@ and the test extras into it and use its interpreter in place of
 The short version:
 
 ```bash
-cd proxy && venv/bin/python -m pytest -n 8          # the whole suite in parallel (recommended), about 1.5 min
+cd proxy && venv/bin/python -m pytest -n 8          # the whole suite in parallel (recommended), about 6 min on ten cores
 cd proxy && venv/bin/python -m pytest tests/auth    # one area
 ```
 

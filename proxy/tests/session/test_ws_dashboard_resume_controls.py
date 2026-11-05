@@ -2134,6 +2134,9 @@ class TestWedgedPumpReap:
     def test_reaped_task_run_stamped_failed_with_reason(self, temp_db,
                                                         monkeypatch):
         from storage import database as task_store
+        from ws import dashboard_chat_stream
+        # The loop polls five times for a next-turn pump after the reap.
+        monkeypatch.setattr(dashboard_chat_stream, "_PUMP_POLL_S", 0.2)
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
         slug = make_test_agent()
@@ -2166,8 +2169,8 @@ class TestWedgedPumpReap:
 
                 ws.client_send({"type": "resume_chat", "chat_id": chat_id})
                 await self._drain_until(ws, "chat_history")
-                # Task chats poll ~10s for a next-turn pump after the reap
-                # before the loop breaks — allow for it.
+                # Task chats poll for a next-turn pump after the reap before
+                # the loop breaks — allow for it.
                 ws.client_send({"type": "ping"})
                 await self._drain_until(ws, "pong", timeout=14.0)
                 assert layer.prepared_resume == [sid]

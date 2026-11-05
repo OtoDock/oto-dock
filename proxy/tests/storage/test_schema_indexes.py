@@ -26,8 +26,16 @@ from storage import pg, schema
 from storage.automation import db_tasks
 from storage.chat import db_chats, engine_use
 
+# The tables the seed fills and the sidebar's query joins.
+_PLANNED = ("chats", "task_runs", "chat_reads")
+
 
 def _seed(conn) -> None:
+    # A plan is chosen on the tables' and indexes' sizes as well as on their
+    # rows, and the suite's wipe deletes rows without shrinking either: what
+    # earlier tests of the process left would pick between two near-equal
+    # indexes. TRUNCATE gives the tables and their indexes new, empty files.
+    conn.execute("TRUNCATE " + ", ".join(_PLANNED) + " CASCADE")
     now = "2026-09-26T10:00:00"
     chats, runs = [], []
     for i in range(400):
@@ -50,8 +58,10 @@ def _seed(conn) -> None:
     conn.cursor().executemany(
         "INSERT INTO task_runs (id, task_id, agent, trigger_type, status, started_at, "
         "session_id, chat_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", runs)
-    conn.execute("ANALYZE chats")
-    conn.execute("ANALYZE task_runs")
+    # chat_reads too: with the statistics another test left (or none yet, on
+    # a fresh database) the sidebar's plan skips the chats index.
+    for table in _PLANNED:
+        conn.execute(f"ANALYZE {table}")
 
 
 class _Recorder:
@@ -146,11 +156,27 @@ def test_the_hot_lookups_use_their_index(seeded, monkeypatch, index, module, fn,
     assert any(i in generic for i in wanted), f"{fn}: {wanted} not in the generic plan"
 
 
+def _a_long_history(user: str) -> None:
+    """The person's chats on fifty other agents: the case the agent index
+    is for. A person with a few dozen chats is read by the user index and
+    sorted, which costs the same; which of the two the planner then takes
+    depends on the files' sizes, so on what ran before."""
+    now = "2026-09-26T09:00:00"
+    with pg.get_conn() as conn:
+        conn.cursor().executemany(
+            "INSERT INTO chats (id, user_sub, agent, created_at, updated_at, source_type, origin) "
+            "VALUES (%s, %s, %s, %s, %s, 'chat', 'dashboard')",
+            [(f"h{i}", user, f"other{i % 50}", now, now) for i in range(2000)])
+        conn.execute("ANALYZE chats")
+        conn.commit()
+
+
 @pytest.mark.parametrize("fn,args", [
     ("list_chats", ("u3", "agent3")),
     ("list_task_chats", ("agent1", "u1")),
 ])
 def test_a_sidebar_page_after_a_cursor_reads_the_agent_index(seeded, monkeypatch, fn, args):
+    _a_long_history(next(a for a in args if a.startswith("u")))
     rec = _Recorder()
     monkeypatch.setattr(db_chats, "get_conn", rec.get_conn)
     getattr(db_chats, fn)(*args, before=("2026-09-26T10:00:00", "c200"))

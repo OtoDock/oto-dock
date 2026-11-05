@@ -14,6 +14,10 @@ Docs (``*.md``) are excluded — only code identifiers are guarded here.
 
 from __future__ import annotations
 
+import functools
+import os
+from pathlib import Path
+
 import pytest
 
 from tests._paths import REPO_ROOT
@@ -77,34 +81,62 @@ EXCLUDE_DIR_PARTS = {"venv", "node_modules", "__pycache__", ".git", "dist", "bui
 EXCLUDE_FILES = {"test_grep_no_voice_strings.py"}
 
 
-def _iter_code_files():
+# A scan that read next to nothing would pass on nothing.
+_MIN_FILES = 500
+
+
+def _code_files() -> list:
+    files = []
     for d in SCAN_DIRS:
         base = REPO_ROOT / d
         if not base.exists():
             continue
-        for path in base.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.name in EXCLUDE_FILES:
-                continue
-            if any(part in EXCLUDE_DIR_PARTS for part in path.parts):
-                continue
-            if path.suffix not in SCAN_EXTS and not path.name.endswith(".example"):
-                continue
-            yield path
+        # Pruned on the way down: the virtualenvs hold most of the tree's files.
+        for root, dirs, names in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIR_PARTS]
+            for name in names:
+                path = Path(root) / name
+                if name in EXCLUDE_FILES or not path.is_file():
+                    continue
+                if path.suffix not in SCAN_EXTS and not name.endswith(".example"):
+                    continue
+                files.append(path)
+    return files
 
 
-@pytest.mark.parametrize("pattern", STALE_PATTERNS)
-def test_no_stale_voice_identifier(pattern):
-    hits = []
-    for path in _iter_code_files():
+@functools.cache
+def _hits() -> dict[str, tuple[str, ...]]:
+    """Every stale pattern and phrase with the lines that carry it, from one
+    read of the tree for the whole module (a pattern matches with its case,
+    a phrase without)."""
+    files = _code_files()
+    assert len(files) > _MIN_FILES, f"the scan read {len(files)} files: its roots moved"
+    found: dict[str, list[str]] = {needle: [] for needle in (*STALE_PATTERNS, *STALE_PHRASES)}
+    for path in files:
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        lowered = text.lower()
+        patterns = [p for p in STALE_PATTERNS if p in text]
+        phrases = [p for p in STALE_PHRASES if p in lowered]
+        if not patterns and not phrases:
+            continue
+        rel = path.relative_to(REPO_ROOT)
         for lineno, line in enumerate(text.splitlines(), 1):
-            if pattern in line:
-                hits.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {line.strip()[:100]}")
+            low = line.lower()
+            for pattern in patterns:
+                if pattern in line:
+                    found[pattern].append(f"{rel}:{lineno}: {line.strip()[:100]}")
+            for phrase in phrases:
+                if phrase in low:
+                    found[phrase].append(f"{rel}:{lineno}: {line.strip()[:100]}")
+    return {needle: tuple(lines) for needle, lines in found.items()}
+
+
+@pytest.mark.parametrize("pattern", STALE_PATTERNS)
+def test_no_stale_voice_identifier(pattern):
+    hits = _hits()[pattern]
     assert not hits, (
         f"Stale voice-feature identifier {pattern!r} (renamed to phone in P1b):\n"
         + "\n".join(hits[:20])
@@ -113,16 +145,33 @@ def test_no_stale_voice_identifier(pattern):
 
 @pytest.mark.parametrize("phrase", STALE_PHRASES)
 def test_no_stale_voice_phrase(phrase):
-    hits = []
-    for path in _iter_code_files():
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if phrase in line.lower():
-                hits.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {line.strip()[:100]}")
+    hits = _hits()[phrase]
     assert not hits, (
         f'Stale phone-feature phrase {phrase!r} in code — use "phone", not "voice":\n'
         + "\n".join(hits[:20])
     )
+
+
+def test_the_scan_finds_a_pattern_and_a_phrase_where_they_are(tmp_path, monkeypatch):
+    """The scan's own proof on a planted tree: a pattern with its case, a
+    phrase without, each at its line, an excluded folder left alone."""
+    import sys
+
+    module = sys.modules[__name__]
+    (tmp_path / "proxy" / "venv").mkdir(parents=True)
+    (tmp_path / "proxy" / "a.py").write_text(
+        'ok = 1\nx = "voice"\ny = VoiceAdapter()\n# The Voice Server answers\nz = voiceadapter\n')
+    (tmp_path / "proxy" / "venv" / "b.py").write_text("VoiceAdapter\n")
+    (tmp_path / "proxy" / "notes.md").write_text("VoiceAdapter\n")
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "_MIN_FILES", 0)
+    _hits.cache_clear()
+    try:
+        found = {needle: lines for needle, lines in _hits().items() if lines}
+    finally:
+        _hits.cache_clear()
+    assert found == {
+        '"voice"': ('proxy/a.py:2: x = "voice"',),
+        "VoiceAdapter": ("proxy/a.py:3: y = VoiceAdapter()",),
+        "voice server": ("proxy/a.py:4: # The Voice Server answers",),
+    }

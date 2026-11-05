@@ -349,6 +349,9 @@ def _found() -> dict[str, dict[str, int]]:
     return found
 
 
+# Every test file parsed and walked on one thread: a runner that packs eight
+# workers onto two cores took it past the suite's 120 s.
+@pytest.mark.timeout(300)
 def test_a_test_patches_a_name_where_its_reader_is():
     found = _found()
     known = {path: counts for path, (_, counts) in KNOWN_FACADE_PATCHES.items()}

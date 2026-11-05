@@ -35,6 +35,7 @@ and skills excluded):
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import subprocess
 from collections import Counter
@@ -151,9 +152,11 @@ INBOUND_SHARED_ELSEWHERE = frozenset({"abort", "close", "ping", "chat", "warmup"
                                       "pty_input", "pty_resize"})
 
 
+@functools.cache
 def _compare_operands(path: Path) -> Counter:
     """String constants used as a compare operand, an ``in (…)`` member or a
-    dict value under a ``type`` / ``pump_type`` / ``event_type`` key."""
+    dict value under a ``type`` / ``pump_type`` / ``event_type`` key (kept
+    per file: two tests read the same counts, neither changes them)."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     counts: Counter = Counter()
 

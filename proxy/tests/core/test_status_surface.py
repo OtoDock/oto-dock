@@ -35,6 +35,7 @@ and ``['…'].includes(`` over ``dashboard/src`` (tests excluded).
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import subprocess
 from collections import defaultdict
@@ -292,6 +293,8 @@ def _named_leaf_imports(tree: ast.AST) -> list[str]:
             if isinstance(n, ast.ImportFrom) and n.module in _LEAVES for a in n.names]
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan_python():
     sites: dict[str, dict[str, int]] = {}
     imports: dict[str, list[str]] = {}
@@ -359,6 +362,8 @@ def _ts_counts(text: str) -> dict[str, int]:
     return counts
 
 
+# One pass for the module's tests: they read the result, none changes it.
+@functools.cache
 def _scan_ts() -> dict[str, dict[str, int]]:
     src = REPO_ROOT / "dashboard" / "src"
     sites: dict[str, dict[str, int]] = {}

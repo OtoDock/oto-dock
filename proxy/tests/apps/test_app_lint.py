@@ -15,7 +15,7 @@ import pytest
 import config
 from services.apps import app_deploy, app_lint, releases
 from services.apps.app_lint import Declared, lint_html, lint_tree, strip_comments
-from tests._timing import bound
+from tests._timing import cpu_bound, thread_cpu
 
 AGENT = "lint-agent"
 
@@ -232,12 +232,11 @@ def test_the_script_rules_read_a_pages_scripts_not_its_prose(tmp_path):
 def test_a_crafted_page_lints_in_linear_time():
     # Openers with no closer made the old regexes rescan to the end from
     # every later opener: minutes at this size, hours at the 2 MB cap.
-    import time
     page = (("<!--" * 20_000) + ("<script>" + "/* a" * 20_000 + "</script>") + ("<a " * 30_000)
             + ("<meta " * 15_000) + ("on" * 400_000) + (" x.onclose=(" * 20_000))
-    started = time.monotonic()
+    started = thread_cpu()
     lint_html(page, "[]")
-    assert time.monotonic() - started < bound(5)
+    assert thread_cpu() - started < cpu_bound(5)
 
 
 @pytest.mark.parametrize("snippet,rule", [
@@ -672,8 +671,9 @@ def test_a_crafted_tree_at_the_release_caps_lints_in_bounded_time(tmp_path, side
     # Python's re holds the interpreter lock for a whole search, so a rule
     # that backtracks or rescans freezes the proxy while it runs. Every
     # file at the cap, the whole tree at the cap, every file the same shape.
+    # The bound is on this thread's CPU: the lint runs on one thread, and its
+    # wall time on a crowded runner says how crowded the runner is.
     import os
-    import time
     per_file = releases.MAX_RELEASE_FILE_BYTES - 64
     root = _tree(tmp_path, {"client/index.html": "<p>x</p>", "server/index.ts": GOOD_SERVER})
     first = root / CRAFTED_FILES[side][0]
@@ -684,18 +684,17 @@ def test_a_crafted_tree_at_the_release_caps_lints_in_bounded_time(tmp_path, side
         os.link(first, root / rel)
     walked = releases.walk_tree(root)
     assert len(walked) == 17
-    started = time.monotonic()
+    started = thread_cpu()
     lint_tree(root, walked, Declared(egress={"api.example.com"}, handlers={"gate"}))
-    assert time.monotonic() - started < bound(5)
+    assert thread_cpu() - started < cpu_bound(5)
 
 
 @pytest.mark.parametrize("shape", CRAFTED_SHAPES, ids=[f"shape{n}" for n in range(len(CRAFTED_SHAPES))])
 def test_a_crafted_page_at_the_pin_cap_lints_in_bounded_time(shape):
-    import time
     page = _crafted(shape, 2 * 1024 * 1024).decode("utf-8", "replace")
-    started = time.monotonic()
+    started = thread_cpu()
     lint_html(page, "[]")
-    assert time.monotonic() - started < bound(1)
+    assert thread_cpu() - started < cpu_bound(1)
 
 
 # ── a palette the theme never reaches ───────────────────────────────────────
@@ -982,10 +981,9 @@ def test_the_brand_follows_the_cascade_and_the_kit_reader_reads_its_rules(tmp_pa
     assert [(n, v) for n, v, _at, _w in found[brand.LIGHT]] == [("--p-bg", "#ffffff"), ("--p-text", "#111111")]
     assert [(n, v) for n, v, _at, _w in found[brand.DARK]] == [("--p-bg", "#000000"), ("--p-text", "#eeeeee")]
     # A crafted stylesheet is read in bounded time.
-    import time
-    started = time.monotonic()
+    started = thread_cpu()
     brand.lint_brand(";{" * (releases.MAX_RELEASE_FILE_BYTES // 2), 0, "client/brand.css", "")
-    assert time.monotonic() - started < bound(2)
+    assert thread_cpu() - started < cpu_bound(2)
 
 
 

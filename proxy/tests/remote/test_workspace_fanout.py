@@ -1096,12 +1096,15 @@ async def test_a_save_answers_while_a_target_never_answers(temp_db, tmp_path, mo
     cm.satellite_supports_file_stat = MagicMock(return_value=False)
     monkeypatch.setattr(sc, "get_connection_manager", lambda: cm)
 
-    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v1"), timeout=2)
-    await asyncio.wait_for(stalled.wait(), timeout=2)
+    # The waits are guards against a hang (the target never answers, so a
+    # save that waited for it would wait for good), wide enough for a box
+    # that stalls: their length is nobody's subject.
+    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v1"), timeout=20)
+    await asyncio.wait_for(stalled.wait(), timeout=20)
     # A second save while the first's fan-out is stuck: it answers too, and
     # one more fan-out queues behind the running one.
-    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v2"), timeout=2)
-    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v3"), timeout=2)
+    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v2"), timeout=20)
+    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v3"), timeout=20)
     assert len(wf._save_fan_out_tasks) == 2
     release.set()
     await wf.drain_save_fan_outs()
