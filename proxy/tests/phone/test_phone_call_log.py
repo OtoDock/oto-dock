@@ -211,9 +211,13 @@ class TestIngest:
 class TestReadApi:
     def test_filter_and_pagination(self, client):
         r1, r2 = _make_route("inbound"), _make_route("inbound")
-        for i in range(3):
-            _report(client, route_id=r1["id"],
-                    started_at=f"2026-08-1{i + 1}T00:00:00+00:00")
+        # Three consecutive days inside the retention window: a fixed date
+        # ages past the prune and the oldest row disappears.
+        today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        days = [today - timedelta(days=3 - i) for i in range(3)]
+        for day in days:
+            _report(client, route_id=r1["id"], started_at=day.isoformat())
         _report(client, route_id=r2["id"])
 
         all_rows = client.get("/v1/admin/phone/call-log").json()
@@ -226,7 +230,8 @@ class TestReadApi:
             "/v1/admin/phone/call-log",
             params={"route_id": r1["id"], "offset": 1, "limit": 1}).json()
         assert len(page["calls"]) == 1
-        assert page["calls"][0]["started_at"].startswith("2026-08-12")
+        assert page["calls"][0]["started_at"].startswith(
+            days[1].date().isoformat())
 
     def test_pin_value_never_present(self, client):
         # Belt-and-braces: nothing PIN-shaped is stored beyond the count.
