@@ -240,17 +240,69 @@ don't have to do anything for:
 1. CI validates your PR and a maintainer reviews it.
 2. Once accepted, your commits are applied to the internal tree first, with
    **you as the commit author**, where they run through the full internal
-   gates alongside the components that aren't public yet.
+   gates alongside the components that aren't public yet. Your name is
+   added to [CONTRIBUTORS.md](CONTRIBUTORS.md) in the same step.
 3. Your PR is then merged here, and the change ships (and is credited) in the
    next release.
 
 A short gap between approval and merge is that porting step, not a stall.
 
-## Licensing of contributions
+## The contributor agreement
 
-OtoDock is fair source, licensed
-[FSL-1.1-ALv2](LICENSE) (each release converts to Apache 2.0 after two
-years). By contributing, you agree your contribution is licensed under the
-same terms: standard inbound = outbound, no CLA to sign. You also agree we
-may make that Apache 2.0 conversion earlier, for the whole project, at any
-time.
+OtoDock asks every contributor to accept a contributor agreement,
+[CLA.md](CLA.md). Here is what it says.
+
+You give OtoDock a licence to your contribution. We can include it in
+OtoDock, change it, ship it, run it in a hosted service, sell licences on it
+and relicense it, as part of OtoDock. We do not need to ask you again for any
+of that. You also give a patent licence for your contribution, and you
+consent to it being changed and shipped without your name on binaries.
+
+You keep your copyright. You can use your own work anywhere else, for
+anything. Your moral rights stay yours. We may not distort your work or
+present it in a way that offends you.
+
+We promise something back, in the agreement itself. Every published version
+of OtoDock that contains your contribution stays available under the licence
+OtoDock had when you sent it, or under one that gives people more rights.
+Today that is FSL-1.1-ALv2, which turns into Apache-2.0 two years after each
+release. The promise binds whoever runs OtoDock after us, including a buyer.
+
+You get credit. Your name goes in [CONTRIBUTORS.md](CONTRIBUTORS.md) and in
+the release notes of the release that ships your work, and stays there if
+the code is later rewritten. Tell us if you prefer another name or no name.
+
+You confirm the work is yours to give, to the best of your knowledge. You are
+liable only if you acted with intent or gross negligence, and only up to the
+cost of taking your contribution out.
+
+Code is free. For documentation, images and translations Greek law gives you
+a right to payment that the agreement does not take away: a small
+contribution is a gift, and for a large one we agree a sum before you send
+it.
+
+You accept the agreement by ticking its line in the pull request template. A
+check on the pull request stays red until a line is ticked. The agreement
+covers each contribution as you send it, and nothing you sent before.
+
+If you live in Greece, Greek law needs a real signature for a licence to
+hold. For a change above 1,000 lines, or a new component, engine or
+integration, we send you a copy to sign through gov.gr before we merge, and
+we sign it too. That is a Taxisnet login, no printing, no cost. Smaller
+changes need only the tick.
+
+If you contribute as part of your job, write to legal@otodock.io and we send
+your employer the company part to sign once. Your pull requests then carry
+the company line instead of the personal one.
+
+Why an agreement and not just the licence: so that we can sell licences, run
+a hosted service, relicense, to Apache-2.0 early for example, and keep every
+right if OtoDock becomes a company or is bought. The licence alone does not
+give a project that for other people's code.
+
+We keep a private record of your acceptance, for twenty years after the last
+release that contains your work, as the privacy notice on otodock.io says
+under "Contributors". The agreement is under Greek law. If we ever had a
+claim against you, we would bring it where you live. The text is built on
+the Apache Software Foundation's contributor agreements, with the parts Greek
+law requires and the promises above added. Read it before you tick the line.

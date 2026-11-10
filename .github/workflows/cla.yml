@@ -1,0 +1,51 @@
+name: cla
+
+# A contributor accepts the contributor agreement (CLA.md) by ticking its
+# line in the pull request, the personal one or the company one. This check
+# reads the pull request body from the event and fails until a line is
+# ticked with the agreement's current version. `pull_request_target` runs
+# this file from the base branch, so a pull request cannot change the check
+# it is judged by, and the checkout below is the base branch too: no code
+# from the pull request runs here. Keep it that way: never check out the
+# pull request's head in this workflow.
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: An agreement line is ticked
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          KIND: ${{ github.event.pull_request.user.type }}
+          ASSOC: ${{ github.event.pull_request.author_association }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          author, kind, assoc = os.environ["AUTHOR"], os.environ["KIND"], os.environ["ASSOC"]
+          if kind == "Bot" or assoc in {"OWNER", "MEMBER"}:
+              print(f"{author}: no agreement needed")
+              sys.exit(0)
+          version = re.search(r"^Version (\d+\.\d+)", open("CLA.md").read(), re.M).group(1)
+          lines = (
+              f"- [x] I have read the Contributor Agreement (CLA.md, version {version}) and accept it for this contribution.",
+              f"- [x] This contribution is covered by my employer's company agreement (CLA.md Part B, version {version}) and this account is in its Schedule A.",
+          )
+          body = [line.strip().lower() for line in os.environ.get("BODY", "").splitlines()]
+          for want in lines:
+              if want.lower() in body:
+                  print(f"{author} accepted version {version}")
+                  sys.exit(0)
+          print("The pull request description must contain one of these lines, ticked:\n  " + "\n  ".join(lines))
+          sys.exit(1)
+          PY
