@@ -345,6 +345,9 @@ For news, follow OtoDock on [X](https://x.com/otodock) and
 
 Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) takes you from
 a clone to green tests and explains how a pull request gets merged.
+Contributions are covered by a contributor agreement, [CLA.md](CLA.md):
+you keep your copyright, OtoDock gets a licence, and every release with
+your work stays fair source.
 Ready-made agents, tools and skills live in their own catalogs, and new
 entries go there:
 [community-agents](https://github.com/OtoDock/community-agents),
