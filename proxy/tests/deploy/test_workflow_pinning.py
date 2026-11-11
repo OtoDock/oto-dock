@@ -5,7 +5,11 @@ checks run over whatever workflow files exist next to this checkout.
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -86,3 +90,52 @@ def test_a_required_proxy_check_stands_for_every_part_of_the_suite(required, par
     assert len(runs) == 1 and f'--shard "$SHARD/{len(shards)}"' in runs[0]
     suite = next(step for step in part["steps"] if "--shard" in str(step.get("run", "")))
     assert suite["env"]["SHARD"] == "${{ matrix.shard }}" and "if" not in suite
+
+
+# ── the contributor agreement's check ───────────────────────────────────────
+
+_REPO = _WORKFLOWS.parents[1]
+_OWN_BRANCHES_SKIP = "github.event.pull_request.head.repo.full_name != github.repository"
+
+
+def _cla_job() -> dict:
+    return yaml.safe_load((_WORKFLOWS / "cla.yml").read_text())["jobs"]["cla"]
+
+
+def _cla_verdict(body: str, kind: str = "User") -> int:
+    """The exit code of the workflow's own script for one pull request."""
+    run = next(step["run"] for step in _cla_job()["steps"] if "run" in step)
+    script = textwrap.dedent(re.search(r"<<'PY'\n(.*)\nPY", run, re.S).group(1))
+    env = {**os.environ, "BODY": body, "AUTHOR": "someone", "KIND": kind}
+    return subprocess.run([sys.executable, "-c", script], cwd=_REPO, env=env,
+                          capture_output=True, check=False).returncode
+
+
+def test_the_cla_check_judges_forks_and_never_runs_their_code():
+    """It runs from the base branch with the pull request's words only: a
+    checkout of the head would run a stranger's code with this repository's
+    token. A pull request from a branch of the repository itself is skipped,
+    which branch protection counts as passed."""
+    workflow = yaml.safe_load((_WORKFLOWS / "cla.yml").read_text())
+    assert set(workflow[True]) == {"pull_request_target"}      # YAML reads the key `on` as True
+    assert workflow["permissions"] == {"contents": "read"}
+    job = _cla_job()
+    assert job["if"] == _OWN_BRANCHES_SKIP
+    checkouts = [step for step in job["steps"] if str(step.get("uses", "")).startswith("actions/checkout@")]
+    assert [step["with"] for step in checkouts] == [{"persist-credentials": False}]
+    script = next(step for step in job["steps"] if "run" in step)
+    assert "${{" not in script["run"]                           # the body arrives by environment, never by template
+
+
+def test_a_ticked_line_of_the_template_is_what_the_cla_check_accepts():
+    template = (_REPO / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text()
+    boxes = [line for line in template.splitlines() if "CLA.md" in line and line.startswith("- [ ] ")]
+    assert len(boxes) == 2, "the template carries the personal line and the company line"
+    assert _cla_verdict(template) == 1
+    for box in boxes:
+        ticked = box.replace("- [ ] ", "- [x] ", 1)
+        assert _cla_verdict(template.replace(box, ticked)) == 0
+        assert _cla_verdict(ticked.replace("[x]", "[X]") + "\r\n") == 0
+        assert _cla_verdict(re.sub(r"version \d+\.\d+", "version 0.1", ticked)) == 1
+    assert _cla_verdict("") == 1
+    assert _cla_verdict("", kind="Bot") == 0

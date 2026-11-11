@@ -3,11 +3,14 @@ name: cla
 # A contributor accepts the contributor agreement (CLA.md) by ticking its
 # line in the pull request, the personal one or the company one. This check
 # reads the pull request body from the event and fails until a line is
-# ticked with the agreement's current version. `pull_request_target` runs
-# this file from the base branch, so a pull request cannot change the check
-# it is judged by, and the checkout below is the base branch too: no code
-# from the pull request runs here. Keep it that way: never check out the
-# pull request's head in this workflow.
+# ticked with the agreement's current version. It judges pull requests from
+# forks. One from a branch of this repository is skipped: only someone with
+# write access can open it, and the event cannot name a maintainer any other
+# way (it hides a private membership of the organisation).
+# `pull_request_target` runs this file from the base branch, so a pull
+# request cannot change the check it is judged by, and the checkout below is
+# the base branch too: no code from the pull request runs here. Keep it that
+# way: never check out the pull request's head in this workflow.
 
 on:
   pull_request_target:
@@ -18,6 +21,7 @@ permissions:
 
 jobs:
   cla:
+    if: github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,12 +32,11 @@ jobs:
           BODY: ${{ github.event.pull_request.body }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           KIND: ${{ github.event.pull_request.user.type }}
-          ASSOC: ${{ github.event.pull_request.author_association }}
         run: |
           python3 - <<'PY'
           import os, re, sys
-          author, kind, assoc = os.environ["AUTHOR"], os.environ["KIND"], os.environ["ASSOC"]
-          if kind == "Bot" or assoc in {"OWNER", "MEMBER"}:
+          author, kind = os.environ["AUTHOR"], os.environ["KIND"]
+          if kind == "Bot":
               print(f"{author}: no agreement needed")
               sys.exit(0)
           version = re.search(r"^Version (\d+\.\d+)", open("CLA.md").read(), re.M).group(1)
